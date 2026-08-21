@@ -69,6 +69,29 @@ fn emit_primitives(needed: &std::collections::BTreeSet<String>) -> String {
 /// Returns `None` when there are no tools, since an empty alternation is not a
 /// valid grammar.
 pub fn tool_call_grammar(tools: &[ToolSpec]) -> Option<String> {
+    build(tools, "\"<tool_call>\" ", " \"</tool_call>\"")
+}
+
+/// Build a grammar for the *body* of a call whose opening marker has already
+/// been emitted.
+///
+/// The full grammar cannot be applied from the first token: its root requires
+/// the opening marker, so it would force *every* response to be a tool call.
+/// The constraint can only be switched on once the model has committed to
+/// calling something — and by then the marker is already in the output, so the
+/// root has to start at the JSON instead.
+///
+/// `closer` is the marker that ends the call, for the formats that have one.
+pub fn tool_body_grammar(tools: &[ToolSpec], closer: Option<&str>) -> Option<String> {
+    let suffix = match closer {
+        Some(c) => format!(" \"{}\"", escape(c)),
+        None => String::new(),
+    };
+    build(tools, "", &suffix)
+}
+
+/// Shared construction; the two roots differ only in what brackets the call.
+fn build(tools: &[ToolSpec], root_prefix: &str, root_suffix: &str) -> Option<String> {
     if tools.is_empty() {
         return None;
     }
@@ -86,11 +109,11 @@ pub fn tool_call_grammar(tools: &[ToolSpec]) -> Option<String> {
         );
     }
 
-    // Wrap in the marker the parser reads. Without it the grammar yields bare
+    // The marker is what the parser reads. Without it the grammar yields bare
     // JSON, which `extract` treats as prose — the call is perfectly formed and
     // then silently ignored.
     let mut out = format!(
-        "root ::= \"<tool_call>\" ({}) \"</tool_call>\"\n",
+        "root ::= {root_prefix}({}){root_suffix}\n",
         alternatives.join(" | ")
     );
     out.push_str(&emit_primitives(&needed));

@@ -6,6 +6,7 @@
 //! use — while a one-shot `run` just drops the session afterwards.
 
 use crate::ngram::NgramCache;
+use crate::toolgate::ToolGate;
 use crate::utf8::Utf8Buffer;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
@@ -314,6 +315,8 @@ impl Engine {
             can_trim: true,
             rollback_safe: self.rollback_safe,
             media_dirty: false,
+            tool_grammars: Vec::new(),
+            gate_applied: false,
             opts: opts.clone(),
         })
     }
@@ -547,6 +550,12 @@ pub struct Session<'a> {
     /// Set after a turn that evaluated images: the cache then holds embeddings
     /// no token sequence describes, so it must be rebuilt before the next turn.
     media_dirty: bool,
+    /// Per-opener tool grammars, compiled once when tools are configured.
+    /// Empty when no tools are offered, which leaves the gate inert.
+    tool_grammars: Vec<(&'static str, String)>,
+    /// Set while the *gate* owns the installed grammar, so it can be lifted
+    /// again without disturbing a grammar set deliberately by a caller.
+    gate_applied: bool,
     /// Kept so the sampler can be rebuilt when a grammar is set or cleared.
     opts: Resolved,
 }
@@ -668,7 +677,6 @@ impl<'a> Session<'a> {
     /// before any temperature or top-p shaping sees them; applied afterwards
     /// it could only reject, and sampling would stall on a dead end.
     pub fn set_grammar(&mut self, grammar: Option<&str>) -> Result<(), EngineError> {
-        self.grammar_active = grammar.is_some();
         // One flat chain. Nesting a chain inside a chain does not reliably
         // propagate `accept`, so the grammar never advances past its root and
         // the next `apply` finds no live stacks — which llama.cpp turns into a
@@ -680,8 +688,21 @@ impl<'a> Session<'a> {
                     .map_err(|e| EngineError::Grammar(e.to_string()))?,
             ),
         };
+        // Only once the grammar is known good: set before, a rejected grammar
+        // would leave the flag claiming a constraint that was never installed,
+        // which silently disables speculation for the rest of the session.
+        self.grammar_active = grammar.is_some();
         self.sampler = build_sampler_with(&self.opts, constraint);
         Ok(())
+    }
+
+    /// Precompile the tool grammars used to constrain a call once it starts.
+    ///
+    /// Compiling here rather than per turn keeps schema-to-GBNF conversion —
+    /// which does not depend on the conversation — off the generation path.
+    /// Passing an empty slice disables gating.
+    pub fn set_tools(&mut self, tools: &[ozgent_core::ToolSpec]) {
+        self.tool_grammars = ToolGate::compile(tools);
     }
 
     /// Generate a completion, calling `on_token` with each decoded fragment.
@@ -710,6 +731,13 @@ impl<'a> Session<'a> {
         on_token: impl FnMut(&str) -> bool,
     ) -> Result<(Stats, StopReason), EngineError> {
         let mut on_token = on_token;
+        // A turn that returned early through `?` can leave the gate's grammar
+        // installed. Lifting it here rather than only on the way out means a
+        // failed tool call cannot constrain the next answer into being one.
+        if self.gate_applied {
+            self.set_grammar(None)?;
+            self.gate_applied = false;
+        }
         let n_ctx = self.context.n_ctx() as i32;
         let mut stats = Stats::default();
         let started = Instant::now();
@@ -830,6 +858,18 @@ impl<'a> Session<'a> {
             && self.rollback_safe
             && self.can_trim
             && matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto);
+        // Speculation and grammars cannot coexist (see above), and the gate
+        // exists to install a grammar mid-turn — so it stays inert whenever
+        // drafting is live. Nothing is lost on the models this matters for:
+        // hybrid and recurrent models already have speculation disabled.
+        // A caller-set grammar (a forced call, or a retry after a malformed
+        // one) already constrains the whole turn; the gate must not swap it
+        // out underneath.
+        let mut gate = if spec_on || self.grammar_active {
+            ToolGate::inert()
+        } else {
+            ToolGate::new(self.tool_grammars.clone())
+        };
         let tuning = self.opts.speculative_tuning.clone();
         // Seeded lazily from `self.cached` on the first pass through the
         // generation loop, which is authoritative and avoids copying the
@@ -841,16 +881,20 @@ impl<'a> Session<'a> {
         let mut emit = |token: LlamaToken,
                         model: &LlamaModel,
                         decoder: &mut Utf8Buffer,
+                        gate: &mut ToolGate,
                         on_token: &mut dyn FnMut(&str) -> bool|
-         -> Result<bool, EngineError> {
+         -> Result<(bool, Option<String>), EngineError> {
             let started = std::time::Instant::now();
             let bytes = model
                 .token_to_bytes(token, Special::Tokenize)
                 .map_err(|e| EngineError::Detokenize(e.to_string()))?;
             let text = decoder.push(&bytes);
+            // Checked before the callback so a slow consumer cannot delay the
+            // constraint past the first token of the call body.
+            let trigger = gate.observe(&text);
             let out = text.is_empty() || on_token(&text);
             callback_ns += started.elapsed().as_nanos();
-            Ok(out)
+            Ok((out, trigger))
         };
 
         // The token to decode next, sampled from the prefill's final logits.
@@ -874,7 +918,24 @@ impl<'a> Session<'a> {
             // token it returns. Accepting again advances stateful samplers
             // twice — which double-counts repetition penalties, and drives a
             // grammar into a dead state that llama.cpp aborts on.
-            if !emit(pending, self.model, &mut decoder, &mut on_token)? {
+            let (keep_going, trigger) =
+                emit(pending, self.model, &mut decoder, &mut gate, &mut on_token)?;
+            // The model has just committed to a call, so the body can be
+            // constrained from here without forcing the turn to be one.
+            if let Some(g) = trigger {
+                // Never fatal: a grammar the model's vocabulary happens to
+                // reject should cost the constraint, not the whole answer.
+                match self.set_grammar(Some(&g)) {
+                    Ok(()) => {
+                        tracing::debug!("tool call started; constraining the body under grammar");
+                        self.gate_applied = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("tool grammar rejected; continuing unconstrained: {e}")
+                    }
+                }
+            }
+            if !keep_going {
                 reason = StopReason::Cancelled;
                 break;
             }
@@ -940,7 +1001,7 @@ impl<'a> Session<'a> {
                 if produced >= limit {
                     break;
                 }
-                if !emit(chosen, self.model, &mut decoder, &mut on_token)? {
+                if !emit(chosen, self.model, &mut decoder, &mut gate, &mut on_token)?.0 {
                     reason = StopReason::Cancelled;
                     accepted = i + 1;
                     self.cached.push(chosen);
@@ -969,6 +1030,12 @@ impl<'a> Session<'a> {
         let tail = decoder.finish();
         if !tail.is_empty() {
             on_token(&tail);
+        }
+        // The constraint belongs to the call that has now finished; leaving it
+        // installed would force the next turn to be another tool call.
+        if self.gate_applied {
+            self.set_grammar(None)?;
+            self.gate_applied = false;
         }
         stats.generation_ms = gen_started.elapsed().as_millis();
         stats.callback_ms = callback_ns / 1_000_000;

@@ -8,6 +8,7 @@ pub mod mtmd;
 pub mod ngram;
 pub mod thinking;
 pub mod toolcall;
+pub mod toolgate;
 pub mod utf8;
 pub mod vision;
 

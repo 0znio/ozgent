@@ -167,6 +167,14 @@ async fn run_one(
         config: config.clone(),
     };
 
+    // Constrain the body of a tool call once one starts. This is the cheap
+    // half of the pair below: the retry path in `turn` fixes a malformed call
+    // after paying for it, while gating stops it being generated at all.
+    if let Some(host) = &chat.tools {
+        let specs = host.tools().to_vec();
+        chat.session.set_tools(&specs);
+    }
+
     chat.banner();
     let outcome = chat.repl(prompt).await;
     prompt.save();

@@ -267,6 +267,10 @@ fn turn(
         _ => Vec::new(),
     };
 
+    // Constrain the body of a tool call the moment one starts, so a malformed
+    // call is unreachable rather than emitted and then rejected.
+    session.set_tools(&offered);
+
     let mut messages = request.messages.clone();
     if !images.is_empty() {
         // Joined to the system prompt rather than replacing it, so a user's
