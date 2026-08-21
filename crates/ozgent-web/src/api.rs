@@ -1,0 +1,915 @@
+//! HTTP routes.
+
+use axum::extract::{Path, State as AxumState};
+use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, Sse};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{delete, get, patch, post};
+use axum::{Json, Router};
+use futures_util::stream::Stream;
+use ozgent_core::ThinkingMode;
+use ozgent_memory::{Budget, ContextBuilder, Embedder, OwnerKind};
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+
+use crate::state::State;
+use crate::worker::{Event, Request};
+
+pub fn router(state: State) -> Router {
+    Router::new()
+        .route("/", get(index))
+        // Client-side routes: the browser owns them, but a reload or a shared
+        // link asks the server for them, so the shell must be served.
+        .route("/new", get(index))
+        .route("/chat", get(index))
+        .route("/api/conversations/by-uuid/{uuid}", get(conversation_by_uuid))
+        .route("/media/{name}", get(media_file))
+        .route("/app.css", get(css))
+        .route("/app.js", get(js))
+        .route("/api/models", get(models))
+        .route("/api/conversations", get(list_conversations).post(new_conversation))
+        .route("/api/conversations/{id}", delete(drop_conversation))
+        .route("/api/conversations/{id}", patch(rename_conversation))
+        .route("/api/conversations/{id}/messages", get(messages))
+        .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/models/{model}/options", get(model_options).put(set_model_options))
+        .route("/api/tools", get(tools).put(set_tool_config))
+        .route("/api/conversations/{id}/facts", get(facts).post(add_fact))
+        .route("/api/conversations/{id}/recall", post(preview_recall))
+        .route("/api/facts/{id}", patch(pin_fact).delete(forget_fact))
+        .route("/api/chat", post(chat))
+        .route("/api/unload", post(unload))
+        .with_state(state)
+}
+
+// ------------------------------------------------------------------ assets
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../assets/index.html"))
+}
+
+async fn css() -> impl IntoResponse {
+    ([("content-type", "text/css; charset=utf-8")], include_str!("../assets/app.css"))
+}
+
+async fn js() -> impl IntoResponse {
+    (
+        [("content-type", "text/javascript; charset=utf-8")],
+        include_str!("../assets/app.js"),
+    )
+}
+
+// ------------------------------------------------------------------- errors
+
+/// Any handler failure, rendered as JSON so the frontend can show it.
+struct ApiError(anyhow::Error);
+
+impl<E: Into<anyhow::Error>> From<E> for ApiError {
+    fn from(e: E) -> Self {
+        Self(e.into())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        tracing::error!("{:#}", self.0);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": self.0.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+type ApiResult<T> = Result<T, ApiError>;
+
+// ------------------------------------------------------------------- models
+
+#[derive(Serialize)]
+struct ModelInfo {
+    reference: String,
+    alias: Option<String>,
+    quantization: Option<String>,
+    size_bytes: Option<u64>,
+    vision: bool,
+}
+
+async fn models(AxumState(state): AxumState<State>) -> Json<Vec<ModelInfo>> {
+    let models = ozgent_core::installed(&state.paths)
+        .into_iter()
+        .map(|m| ModelInfo {
+            reference: m.model.to_string(),
+            alias: m.manifest.alias.clone(),
+            quantization: m.manifest.quantization.clone(),
+            size_bytes: m.manifest.size_bytes,
+            vision: m.manifest.supports_vision(),
+        })
+        .collect();
+    Json(models)
+}
+
+// ------------------------------------------------------------ conversations
+
+#[derive(Serialize)]
+struct ConversationInfo {
+    id: i64,
+    /// What goes in the URL.
+    uuid: String,
+    title: String,
+    model: Option<String>,
+    created_at: i64,
+    messages: i64,
+}
+
+async fn list_conversations(
+    AxumState(state): AxumState<State>,
+) -> ApiResult<Json<Vec<ConversationInfo>>> {
+    let store = state.store.lock().unwrap();
+    let mut out = Vec::new();
+    for c in store.list_conversations(200)? {
+        let messages = store.message_count(c.id)?;
+        out.push(ConversationInfo {
+            id: c.id,
+            uuid: c.uuid,
+            title: c.title,
+            model: c.model,
+            created_at: c.created_at,
+            messages,
+        });
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct NewConversation {
+    title: Option<String>,
+    model: Option<String>,
+}
+
+async fn new_conversation(
+    AxumState(state): AxumState<State>,
+    Json(body): Json<NewConversation>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = state.store.lock().unwrap();
+    let id = store.create_conversation(
+        body.title.as_deref().unwrap_or("New chat"),
+        body.model.as_deref(),
+    )?;
+    let uuid = store.get_conversation(id)?.map(|c| c.uuid).unwrap_or_default();
+    Ok(Json(serde_json::json!({ "id": id, "uuid": uuid })))
+}
+
+/// Resolve a public id to the conversation behind it.
+async fn conversation_by_uuid(
+    AxumState(state): AxumState<State>,
+    Path(uuid): Path<String>,
+) -> ApiResult<Json<ConversationInfo>> {
+    let store = state.store.lock().unwrap();
+    let found = store
+        .conversation_by_uuid(&uuid)?
+        .ok_or_else(|| ApiError(anyhow::anyhow!("no conversation {uuid}")))?;
+    let messages = store.message_count(found.id)?;
+    Ok(Json(ConversationInfo {
+        id: found.id,
+        uuid: found.uuid,
+        title: found.title,
+        model: found.model,
+        created_at: found.created_at,
+        messages,
+    }))
+}
+
+async fn drop_conversation(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.store.lock().unwrap().delete_conversation(id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct Rename {
+    title: String,
+}
+
+async fn rename_conversation(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+    Json(body): Json<Rename>,
+) -> ApiResult<StatusCode> {
+    state.store.lock().unwrap().rename_conversation(id, &body.title)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct MessageInfo {
+    id: i64,
+    role: String,
+    text: String,
+    created_at: i64,
+    /// The reasoning trace, so reloading a conversation shows what the model
+    /// worked through rather than losing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+    /// Tool activity for this turn, in the order it happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    /// URLs of the attachments this message carried.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    media: Vec<String>,
+}
+
+async fn messages(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Vec<MessageInfo>>> {
+    let store = state.store.lock().unwrap();
+    let out = store
+        .messages(id)?
+        .into_iter()
+        .map(|m| MessageInfo {
+            id: m.id,
+            role: m.role,
+            text: m.content,
+            created_at: m.created_at,
+            thinking: m.thinking.filter(|t| !t.trim().is_empty()),
+            tool_calls: m
+                .tool_calls
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok()),
+            media: m
+                .media
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| crate::media::safe_name(n))
+                .map(|n| format!("/media/{n}"))
+                .collect(),
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+// ----------------------------------------------------------------- settings
+
+async fn get_settings(AxumState(state): AxumState<State>) -> Json<ozgent_core::Config> {
+    Json(state.config.lock().unwrap().clone())
+}
+
+async fn put_settings(
+    AxumState(state): AxumState<State>,
+    Json(body): Json<ozgent_core::Config>,
+) -> ApiResult<StatusCode> {
+    body.save(&state.paths)?;
+    *state.config.lock().unwrap() = body;
+    // The worker captured the old config at spawn; drop the model so the next
+    // turn reloads it under the new settings.
+    state.worker.unload();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unload(AxumState(state): AxumState<State>) -> StatusCode {
+    state.worker.unload();
+    StatusCode::NO_CONTENT
+}
+
+// --------------------------------------------------------------------- chat
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    conversation: i64,
+    model: String,
+    message: String,
+    #[serde(default)]
+    thinking: Option<String>,
+    /// Off lets the user ask a question without the model reaching for a tool.
+    #[serde(default = "yes")]
+    tools: bool,
+    /// Attached images, as `data:` URLs or bare base64.
+    #[serde(default)]
+    images: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+async fn chat(
+    AxumState(state): AxumState<State>,
+    Json(body): Json<ChatRequest>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let thinking = body.thinking.as_deref().and_then(|t| match t {
+        "on" => Some(ThinkingMode::On),
+        "off" => Some(ThinkingMode::Off),
+        "auto" => Some(ThinkingMode::Auto),
+        _ => None,
+    });
+
+    let images = body
+        .images
+        .iter()
+        .map(|d| decode_data_url(d))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+
+    // Record the question, then assemble context from pinned facts, the recent
+    // window and retrieval — the same path the terminal client uses, so a
+    // conversation reads identically in both.
+    let (messages, user_message_id) = {
+        let store = state.store.lock().unwrap();
+
+        // Name the conversation after its first line, so the sidebar shows
+        // something readable instead of a wall of "New chat". The terminal
+        // client does the same on its first turn.
+        if store.message_count(body.conversation)? == 0 {
+            let title: String = body.message.trim().lines().next().unwrap_or("").chars().take(60).collect();
+            if !title.is_empty() {
+                store.rename_conversation(body.conversation, &title)?;
+            }
+        }
+
+        let id = store.append_message(body.conversation, "user", &body.message, 0)?;
+
+        // Kept so a reload still shows what the question was about. A failure
+        // here must not lose the message, so it is logged rather than raised.
+        if !images.is_empty() {
+            let stored: Vec<String> = images
+                .iter()
+                .filter_map(|src| match src {
+                    ozgent_core::ImageSource::Bytes { bytes, mime } => {
+                        crate::media::store(&state.paths, bytes.as_slice(), mime.as_deref())
+                            .map_err(|e| tracing::warn!("storing an attachment: {e}"))
+                            .ok()
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !stored.is_empty() {
+                let _ = store.set_message_media(id, &stored);
+            }
+        }
+        store.put_embedding(
+            OwnerKind::Message,
+            id,
+            &state.embedder.embed(&body.message),
+        )?;
+
+        let budget = Budget {
+            total: 4096,
+            reserve_for_reply: 1024,
+            recent_messages: 12,
+            max_retrieved: 6,
+        };
+        let assembled = ContextBuilder::new(&store, &state.embedder)
+            .with_budget(budget)
+            .build(body.conversation, &body.message)?;
+
+        let config = state.config.lock().unwrap();
+        let system = config
+            .ui
+            .date_awareness
+            .then(|| ozgent_core::DateTime::now().prompt_line());
+        (assembled.to_messages(system.as_deref()), id)
+    };
+    let _ = user_message_id;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    state
+        .worker
+        .submit(Request {
+            model: body.model.clone(),
+            messages,
+            thinking,
+            max_tokens: None,
+            tools_enabled: body.tools,
+            overrides: None,
+            images,
+            out: tx,
+        })
+        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+
+    // A relay task, not the SSE stream itself, owns the reply.
+    //
+    // Persisting from inside the stream would lose the whole answer whenever
+    // the browser goes away mid-generation, because a dropped stream is never
+    // polled again. The relay keeps accumulating, writes what it has, and only
+    // then drops its end of the worker channel — which is what tells the
+    // inference thread to stop, so a closed tab still frees the GPU.
+    let persist = state.clone();
+    let conversation = body.conversation;
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+
+    tokio::spawn(async move {
+        let mut answer = String::new();
+        let mut thinking = String::new();
+        let mut activity: Vec<serde_json::Value> = Vec::new();
+
+        while let Some(event) = rx.recv().await {
+            match &event {
+                Event::Answer { text } => answer.push_str(text),
+                Event::Thinking { text } => thinking.push_str(text),
+                Event::ToolCall { name, arguments } => activity.push(serde_json::json!({
+                    "name": name,
+                    "arguments": arguments,
+                })),
+                Event::ToolResult { name, ok, summary, ms, detail } => {
+                    // Attach to the call this answers, so a reload replays the
+                    // pair rather than two loose halves.
+                    let slot = activity
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c["name"] == name.as_str() && c.get("ok").is_none());
+                    if let Some(call) = slot {
+                        call["ok"] = (*ok).into();
+                        call["ms"] = (*ms).into();
+                        call["summary"] = summary.clone().into();
+                        call["detail"] = bounded(detail);
+                    }
+                }
+                _ => {}
+            }
+            let finished = matches!(event, Event::Done { .. } | Event::Error { .. });
+            // A send failure means the browser disconnected. Stop relaying,
+            // but fall through to persist whatever arrived first.
+            let gone = sse_tx.send(event).is_err();
+            if finished || gone {
+                break;
+            }
+        }
+        drop(rx);
+
+        if answer.trim().is_empty() {
+            return;
+        }
+        let store = persist.store.lock().unwrap();
+        let trace = (!thinking.trim().is_empty()).then(|| thinking.trim().to_string());
+        let calls = (!activity.is_empty())
+            .then(|| serde_json::to_string(&activity).unwrap_or_default());
+        match store.append_message_full(
+            conversation,
+            "assistant",
+            answer.trim(),
+            trace.as_deref(),
+            calls.as_deref(),
+            None,
+            0,
+        ) {
+            Ok(id) => {
+                let _ = store.put_embedding(
+                    OwnerKind::Message,
+                    id,
+                    &persist.embedder.embed(answer.trim()),
+                );
+            }
+            Err(e) => tracing::error!("persisting the reply: {e}"),
+        }
+    });
+
+    let sse = futures_util::stream::unfold(sse_rx, |mut rx| async move {
+        let event = rx.recv().await?;
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        Some((Ok(SseEvent::default().data(json)), rx))
+    });
+
+    Ok(Sse::new(sse))
+}
+
+// -------------------------------------------------------- model options
+
+/// Every knob, with the value in force and whether this model overrides it.
+///
+/// The distinction matters: showing only the effective value makes it
+/// impossible to tell a deliberate per-model setting from an inherited
+/// default, and clearing an override then looks the same as setting it.
+#[derive(Serialize)]
+struct ModelOptions {
+    model: String,
+    /// What this model actually runs with, after defaults and manifest merge.
+    effective: serde_json::Value,
+    /// Only the keys set for this model in `config.toml`.
+    overrides: serde_json::Value,
+}
+
+async fn model_options(
+    AxumState(state): AxumState<State>,
+    Path(model): Path<String>,
+) -> ApiResult<Json<ModelOptions>> {
+    let found = ozgent_core::resolve(&state.paths, &model)?;
+    let key = found.model.to_string();
+    let config = state.config.lock().unwrap();
+
+    let merged = config.options_for(&key).merge(&found.manifest.defaults);
+    let resolved = merged.resolve();
+    let overrides = config.models.get(&key).cloned().unwrap_or_default();
+
+    Ok(Json(ModelOptions {
+        model: key,
+        effective: serde_json::to_value(resolved_view(&resolved))?,
+        overrides: serde_json::to_value(&overrides)?,
+    }))
+}
+
+/// A flat, JSON-friendly view of the resolved options for display.
+fn resolved_view(r: &ozgent_core::options::Resolved) -> serde_json::Value {
+    serde_json::json!({
+        "gpu_layers": r.gpu_layers.to_string(),
+        "cpu_moe": r.cpu_moe.to_string(),
+        "context_length": r.context_length,
+        "batch_size": r.batch_size,
+        "flash_attention": r.flash_attention,
+        "cache_type_k": format!("{:?}", r.cache_type_k).to_lowercase(),
+        "cache_type_v": format!("{:?}", r.cache_type_v).to_lowercase(),
+        "temperature": r.temperature,
+        "top_p": r.top_p,
+        "top_k": r.top_k,
+        "min_p": r.min_p,
+        "repeat_penalty": r.repeat_penalty,
+        "repeat_last_n": r.repeat_last_n,
+        "max_tokens": r.max_tokens,
+        "thinking": format!("{:?}", r.thinking).to_lowercase(),
+        "tools": r.tools,
+        "system_prompt": r.system_prompt,
+    })
+}
+
+async fn set_model_options(
+    AxumState(state): AxumState<State>,
+    Path(model): Path<String>,
+    Json(body): Json<ozgent_core::Options>,
+) -> ApiResult<StatusCode> {
+    let found = ozgent_core::resolve(&state.paths, &model)?;
+    let key = found.model.to_string();
+
+    let mut config = state.config.lock().unwrap();
+    // An empty override layer is removed rather than stored, so the file does
+    // not accumulate sections that say nothing.
+    if serde_json::to_value(&body)?.as_object().is_some_and(|o| o.is_empty()) {
+        config.models.remove(&key);
+    } else {
+        config.models.insert(key, body);
+    }
+    config.save(&state.paths)?;
+    drop(config);
+
+    // The loaded model was built from the old settings.
+    state.worker.unload();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- tools
+
+#[derive(Serialize)]
+struct ToolsView {
+    enabled: bool,
+    python: String,
+    timeout_seconds: u64,
+    max_calls_per_turn: u32,
+    available: Vec<crate::state::ToolSummary>,
+    /// Search providers ozgent ships, and whether each is usable.
+    search_providers: Vec<ProviderInfo>,
+    search_provider: String,
+}
+
+#[derive(Serialize)]
+struct ProviderInfo {
+    name: String,
+    /// Whether a key is present. The key itself is never sent to the browser.
+    configured: bool,
+    needs_key: bool,
+}
+
+/// Providers the shipped `web_search` tool supports.
+///
+/// Kept here rather than discovered, because the list is part of the settings
+/// UI's contract; `python/ozgent_tools/builtin/web_search.py` is the source of
+/// truth for what each one does.
+const SEARCH_PROVIDERS: [(&str, bool); 3] =
+    [("brave", true), ("tavily", true), ("duckduckgo", false)];
+
+async fn tools(AxumState(state): AxumState<State>) -> ApiResult<Json<ToolsView>> {
+    // Cloned rather than borrowed: discovering tools is async, and holding a
+    // std mutex guard across an await makes the whole handler future !Send.
+    let config = state.config.lock().unwrap().clone();
+    let ws = config.tools.config.get("web_search");
+    let current = ws
+        .and_then(|v| v.get("provider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("duckduckgo")
+        .to_string();
+
+    let search_providers = SEARCH_PROVIDERS
+        .iter()
+        .map(|(name, needs_key)| ProviderInfo {
+            name: (*name).to_string(),
+            needs_key: *needs_key,
+            configured: !needs_key
+                || ws
+                    .and_then(|v| v.get(name))
+                    .and_then(|v| v.get("api_key"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|k| !k.trim().is_empty()),
+        })
+        .collect();
+
+    // Listing tools means starting the Python worker, so a failure here is
+    // reported as an empty list with the reason rather than a dead page.
+    let available = match crate::state::discover_tools(&state.paths, &config).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!("listing tools: {e}");
+            Vec::new()
+        }
+    };
+
+    Ok(Json(ToolsView {
+        enabled: config.tools.enabled,
+        python: config.tools.python.clone(),
+        timeout_seconds: config.tools.timeout_seconds,
+        max_calls_per_turn: config.tools.max_calls_per_turn,
+        available,
+        search_providers,
+        search_provider: current,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ToolUpdate {
+    enabled: Option<bool>,
+    search_provider: Option<String>,
+    /// Set a key for `search_provider`. Absent leaves the stored key alone;
+    /// an empty string clears it.
+    api_key: Option<String>,
+    disabled: Option<Vec<String>>,
+}
+
+async fn set_tool_config(
+    AxumState(state): AxumState<State>,
+    Json(body): Json<ToolUpdate>,
+) -> ApiResult<StatusCode> {
+    let mut config = state.config.lock().unwrap();
+
+    if let Some(enabled) = body.enabled {
+        config.tools.enabled = enabled;
+    }
+    if let Some(disabled) = body.disabled {
+        config.tools.disabled = disabled;
+    }
+    if let Some(provider) = &body.search_provider {
+        if !SEARCH_PROVIDERS.iter().any(|(n, _)| n == provider) {
+            return Err(ApiError(anyhow::anyhow!("unknown search provider {provider:?}")));
+        }
+        set_search_provider(&mut config, provider, body.api_key.as_deref());
+    }
+
+    config.save(&state.paths)?;
+    // The key lives in this file; it must not be world-readable.
+    harden(&state.paths.config_file());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Write the provider choice, and its key when one was supplied.
+fn set_search_provider(config: &mut ozgent_core::Config, provider: &str, api_key: Option<&str>) {
+    let entry = config
+        .tools
+        .config
+        .entry("web_search".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let Some(table) = entry.as_table_mut() else { return };
+
+    table.insert("provider".into(), toml::Value::String(provider.into()));
+
+    if let Some(key) = api_key {
+        let slot = table
+            .entry(provider.to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        if let Some(inner) = slot.as_table_mut() {
+            if key.trim().is_empty() {
+                inner.remove("api_key");
+            } else {
+                inner.insert("api_key".into(), toml::Value::String(key.trim().into()));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn harden(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn harden(_path: &std::path::Path) {}
+
+// --------------------------------------------------------------- memory
+
+#[derive(Serialize)]
+struct FactInfo {
+    id: i64,
+    text: String,
+    scope: String,
+    pinned: bool,
+    created_at: i64,
+}
+
+async fn facts(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Vec<FactInfo>>> {
+    let store = state.store.lock().unwrap();
+    let out = store
+        .facts_for(id)?
+        .into_iter()
+        .map(|f| FactInfo {
+            id: f.id,
+            text: f.text,
+            scope: match f.scope {
+                ozgent_memory::Scope::User => "user".into(),
+                ozgent_memory::Scope::Conversation => "conversation".into(),
+            },
+            pinned: f.pinned,
+            created_at: f.created_at,
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct NewFact {
+    text: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    pinned: bool,
+}
+
+async fn add_fact(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+    Json(body): Json<NewFact>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if body.text.trim().is_empty() {
+        return Err(ApiError(anyhow::anyhow!("a fact needs some text")));
+    }
+    let scope = match body.scope.as_deref() {
+        Some("user") => ozgent_memory::Scope::User,
+        _ => ozgent_memory::Scope::Conversation,
+    };
+    let store = state.store.lock().unwrap();
+    let fact_id = store.add_fact(Some(id), scope, body.text.trim(), None)?;
+    if body.pinned {
+        store.set_pinned(fact_id, true)?;
+    }
+    // Indexed like anything else, so retrieval can surface it later.
+    store.put_embedding(
+        OwnerKind::Fact,
+        fact_id,
+        &state.embedder.embed(body.text.trim()),
+    )?;
+    Ok(Json(serde_json::json!({ "id": fact_id })))
+}
+
+#[derive(Deserialize)]
+struct PinUpdate {
+    pinned: bool,
+}
+
+async fn pin_fact(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+    Json(body): Json<PinUpdate>,
+) -> ApiResult<StatusCode> {
+    state.store.lock().unwrap().set_pinned(id, body.pinned)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn forget_fact(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.store.lock().unwrap().delete_fact(id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct RecallQuery {
+    query: String,
+}
+
+/// Show what the memory layer *would* put in front of the model.
+///
+/// Retrieval is otherwise invisible — the point of this endpoint is to make it
+/// inspectable, so a surprising answer can be traced to what was recalled.
+async fn preview_recall(
+    AxumState(state): AxumState<State>,
+    Path(id): Path<i64>,
+    Json(body): Json<RecallQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = state.store.lock().unwrap();
+    let assembled = ContextBuilder::new(&store, &state.embedder)
+        .with_budget(Budget {
+            total: 4096,
+            reserve_for_reply: 1024,
+            recent_messages: 12,
+            max_retrieved: 6,
+        })
+        .build(id, &body.query)?;
+
+    Ok(Json(serde_json::json!({
+        "pinned": assembled.pinned.iter().map(|f| &f.text).collect::<Vec<_>>(),
+        "retrieved": assembled.retrieved.iter().map(|h| serde_json::json!({
+            "text": h.text,
+            "seq": h.seq,
+        })).collect::<Vec<_>>(),
+        "recent": assembled.recent.len(),
+        "elided": assembled.messages_elided,
+        "tokens_used": assembled.tokens_used,
+    })))
+}
+
+/// A tool result trimmed to something worth storing.
+///
+/// A search can return kilobytes per result; the conversation only needs
+/// enough to redraw the card, and an unbounded copy would bloat every row.
+fn bounded(detail: &serde_json::Value) -> serde_json::Value {
+    const MAX_RESULTS: usize = 10;
+    const MAX_FIELD: usize = 400;
+
+    let clip = |v: &serde_json::Value| -> serde_json::Value {
+        match v.as_str() {
+            Some(s) if s.chars().count() > MAX_FIELD => {
+                serde_json::Value::String(s.chars().take(MAX_FIELD).collect())
+            }
+            _ => v.clone(),
+        }
+    };
+
+    if let Some(results) = detail.get("results").and_then(|r| r.as_array()) {
+        let trimmed: Vec<serde_json::Value> = results
+            .iter()
+            .take(MAX_RESULTS)
+            .map(|r| {
+                let mut out = serde_json::Map::new();
+                for key in ["title", "url", "snippet", "description"] {
+                    if let Some(v) = r.get(key) {
+                        out.insert(key.to_string(), clip(v));
+                    }
+                }
+                serde_json::Value::Object(out)
+            })
+            .collect();
+        return serde_json::json!({ "results": trimmed });
+    }
+
+    let text = serde_json::to_string(detail).unwrap_or_default();
+    if text.len() > 4000 {
+        return serde_json::json!({ "truncated": true });
+    }
+    detail.clone()
+}
+
+/// Serve one stored attachment.
+async fn media_file(
+    AxumState(state): AxumState<State>,
+    Path(name): Path<String>,
+) -> Response {
+    match crate::media::read(&state.paths, &name) {
+        Some((bytes, mime)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                // Immutable: a stored attachment is never rewritten under the
+                // same name, so the browser can keep it for the session.
+                (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such attachment").into_response(),
+    }
+}
+
+/// Decode a browser `data:` URL, or bare base64, into image bytes.
+///
+/// Browsers hand back `data:image/png;base64,...` from a file read, so the
+/// prefix is stripped rather than demanded — a caller posting raw base64
+/// should work too.
+pub fn decode_data_url(value: &str) -> Result<ozgent_core::ImageSource, String> {
+    let (mime, payload) = match value.strip_prefix("data:") {
+        Some(rest) => {
+            let (meta, data) = rest
+                .split_once(',')
+                .ok_or_else(|| "malformed data URL: no comma".to_string())?;
+            let mime = meta.split(';').next().unwrap_or("").to_string();
+            (Some(mime).filter(|m| !m.is_empty()), data)
+        }
+        None => (None, value),
+    };
+
+    let bytes = ozgent_core::chat::b64::decode(payload.trim())
+        .map_err(|_| "an attached image was not valid base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("an attached image was empty".into());
+    }
+    Ok(ozgent_core::ImageSource::Bytes { bytes, mime })
+}

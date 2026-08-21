@@ -1,0 +1,10 @@
+[package]
+name = "ozgent-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+crossterm.workspace = true

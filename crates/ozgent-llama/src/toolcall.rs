@@ -1,0 +1,602 @@
+//! Extracting tool calls from model output.
+//!
+//! There is no single format. Each model family invented its own, and a local
+//! runtime has to read all of them, because the user picks the model:
+//!
+//! ```text
+//! <tool_call>{"name": "x", "arguments": {}}</tool_call>   Qwen, Hermes
+//! [TOOL_CALLS][{"name": "x", "arguments": {}}]            Mistral
+//! <function=x>{"a": 1}</function>                         some Llama tunes
+//! <|python_tag|>{"name": "x", ...}                        Llama 3.x
+//! ```json { "name": "x", "arguments": {} } ```            models with no tool training
+//! ```
+//!
+//! Brace matching is done by a string-aware scanner rather than a regex, since
+//! arguments nest and may contain braces inside string literals.
+
+use ozgent_core::ToolCall;
+use serde_json::Value;
+
+/// Markers that introduce a tool call, and the marker that ends it if any.
+const OPENERS: &[(&str, Option<&str>)] = &[
+    ("<tool_call>", Some("</tool_call>")),
+    ("<|tool_call|>", Some("<|/tool_call|>")),
+    ("[TOOL_CALLS]", None),
+    ("<|python_tag|>", None),
+    ("<function=", Some("</function>")),
+];
+
+/// What the model produced, separated into what to show and what to run.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Parsed {
+    /// Text to render, with tool-call syntax removed.
+    pub text: String,
+    pub calls: Vec<ToolCall>,
+}
+
+impl Parsed {
+    pub fn has_calls(&self) -> bool {
+        !self.calls.is_empty()
+    }
+}
+
+/// Split model output into visible text and tool calls.
+///
+/// Nothing is invented: if no recognisable call is present the text is
+/// returned unchanged, so ordinary prose that merely mentions JSON is safe.
+pub fn extract(output: &str) -> Parsed {
+    let mut calls = Vec::new();
+    let mut text = String::new();
+    let mut rest = output;
+
+    while let Some((idx, opener, closer)) = next_opener(rest) {
+        text.push_str(&rest[..idx]);
+        let after = &rest[idx + opener.len()..];
+
+        // `<function=name>` carries the name in the marker itself.
+        let explicit_name = if opener == "<function=" {
+            match after.find('>') {
+                Some(end) => {
+                    let name = after[..end].trim().to_string();
+                    rest = &after[end + 1..];
+                    Some(name)
+                }
+                None => {
+                    text.push_str(opener);
+                    rest = after;
+                    continue;
+                }
+            }
+        } else {
+            rest = after;
+            None
+        };
+
+        // Bound the search at the closer so a malformed call cannot swallow
+        // the remainder of the response.
+        let (body, consumed) = match closer.and_then(|c| rest.find(c).map(|i| (i, c))) {
+            Some((end, c)) => (&rest[..end], end + c.len()),
+            None => (rest, rest.len()),
+        };
+
+        let before = calls.len();
+        harvest(body, explicit_name.as_deref(), &mut calls);
+        if calls.len() == before {
+            // Nothing parseable: keep the text rather than silently dropping it.
+            text.push_str(opener);
+            text.push_str(body);
+        }
+        rest = &rest[consumed..];
+    }
+    text.push_str(rest);
+
+    // Fall back to fenced JSON, which is how an untrained model complies.
+    if calls.is_empty() {
+        if let Some((cleaned, fenced)) = from_fenced_json(&text) {
+            text = cleaned;
+            calls = fenced;
+        }
+    }
+
+    for (i, call) in calls.iter_mut().enumerate() {
+        if call.id.is_empty() {
+            call.id = format!("call_{i}");
+        }
+    }
+    Parsed { text: text.trim().to_string(), calls }
+}
+
+fn next_opener(text: &str) -> Option<(usize, &'static str, Option<&'static str>)> {
+    OPENERS
+        .iter()
+        .filter_map(|(open, close)| text.find(open).map(|i| (i, *open, *close)))
+        .min_by_key(|(i, _, _)| *i)
+}
+
+/// Pull every JSON object or array of objects out of a tool-call body.
+fn harvest(body: &str, explicit_name: Option<&str>, out: &mut Vec<ToolCall>) {
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let Some(start) = body[cursor..].find(['{', '[']).map(|i| cursor + i) else {
+            break;
+        };
+        let Some(end) = balanced_end(body, start) else {
+            break;
+        };
+        let slice = &body[start..end];
+
+        if let Ok(value) = serde_json::from_str::<Value>(slice) {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(c) = to_call(&item, explicit_name) {
+                            out.push(c);
+                        }
+                    }
+                }
+                other => {
+                    if let Some(c) = to_call(&other, explicit_name) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        cursor = end;
+    }
+}
+
+/// Interpret one JSON value as a tool call.
+///
+/// Accepts the several key spellings models use, and treats an object with no
+/// recognisable name as arguments when the name came from the marker.
+fn to_call(value: &Value, explicit_name: Option<&str>) -> Option<ToolCall> {
+    let obj = value.as_object()?;
+
+    // OpenAI nests the real call under `function`.
+    if let Some(inner) = obj.get("function").and_then(Value::as_object) {
+        let name = inner.get("name")?.as_str()?.to_string();
+        return Some(ToolCall {
+            id: obj.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+            name,
+            arguments: normalize_arguments(inner.get("arguments")),
+        });
+    }
+
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("tool"))
+        .or_else(|| obj.get("tool_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| explicit_name.map(str::to_string))?;
+
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = obj
+        .get("arguments")
+        .or_else(|| obj.get("parameters"))
+        .or_else(|| obj.get("args"))
+        .or_else(|| obj.get("input"));
+
+    // With a name from the marker, the whole object is the argument set.
+    let arguments = match (arguments, explicit_name) {
+        (Some(a), _) => normalize_arguments(Some(a)),
+        (None, Some(_)) => value.clone(),
+        (None, None) => Value::Object(Default::default()),
+    };
+
+    Some(ToolCall {
+        id: obj.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+        name,
+        arguments,
+    })
+}
+
+/// Arguments are sometimes a JSON *string* containing JSON, which is how the
+/// OpenAI wire format encodes them.
+fn normalize_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+        }
+        Some(v) => v.clone(),
+        None => Value::Object(Default::default()),
+    }
+}
+
+/// Index just past the balanced bracket that opens at `start`.
+///
+/// String-aware, so braces inside quoted values do not throw off the count.
+fn balanced_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let open = bytes[start];
+    let close = match open {
+        b'{' => b'}',
+        b'[' => b']',
+        _ => return None,
+    };
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Recognise a fenced JSON block that is really a tool call.
+///
+/// Deliberately strict: the object must carry both a name and arguments, so a
+/// model showing the user an example JSON payload is not executed.
+fn from_fenced_json(text: &str) -> Option<(String, Vec<ToolCall>)> {
+    let mut calls = Vec::new();
+    let mut cleaned = String::new();
+    let mut rest = text;
+
+    while let Some(idx) = rest.find("```") {
+        let after_fence = &rest[idx + 3..];
+        let Some(nl) = after_fence.find('\n') else { break };
+        let lang = after_fence[..nl].trim();
+        let body_start = idx + 3 + nl + 1;
+        let Some(end_rel) = rest[body_start..].find("```") else { break };
+        let body = &rest[body_start..body_start + end_rel];
+
+        let is_json = lang.is_empty() || lang.eq_ignore_ascii_case("json");
+        let parsed = is_json
+            .then(|| serde_json::from_str::<Value>(body.trim()).ok())
+            .flatten();
+
+        let is_call = parsed.as_ref().is_some_and(|v| {
+            v.as_object().is_some_and(|o| {
+                o.contains_key("name")
+                    && (o.contains_key("arguments") || o.contains_key("parameters"))
+            })
+        });
+
+        if is_call {
+            if let Some(c) = parsed.as_ref().and_then(|v| to_call(v, None)) {
+                calls.push(c);
+            }
+            cleaned.push_str(&rest[..idx]);
+        } else {
+            cleaned.push_str(&rest[..body_start + end_rel + 3]);
+        }
+        rest = &rest[body_start + end_rel + 3..];
+    }
+
+    if calls.is_empty() {
+        return None;
+    }
+    cleaned.push_str(rest);
+    Some((cleaned, calls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_the_qwen_hermes_format() {
+        let out = extract(
+            r#"Let me look.<tool_call>{"name": "web_search", "arguments": {"query": "rust"}}</tool_call>"#,
+        );
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].name, "web_search");
+        assert_eq!(out.calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(out.text, "Let me look.", "call syntax must not reach the user");
+    }
+
+    #[test]
+    fn parses_the_mistral_format_with_several_calls() {
+        let out = extract(
+            r#"[TOOL_CALLS][{"name": "a", "arguments": {"x": 1}}, {"name": "b", "arguments": {}}]"#,
+        );
+        assert_eq!(out.calls.len(), 2);
+        assert_eq!(out.calls[0].name, "a");
+        assert_eq!(out.calls[1].name, "b");
+    }
+
+    #[test]
+    fn parses_the_function_marker_format() {
+        let out = extract(r#"<function=get_weather>{"city": "Oslo"}</function>"#);
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].name, "get_weather");
+        assert_eq!(out.calls[0].arguments, json!({"city": "Oslo"}));
+    }
+
+    #[test]
+    fn parses_the_python_tag_format() {
+        let out = extract(r#"<|python_tag|>{"name": "calc", "arguments": {"expr": "2+2"}}"#);
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].name, "calc");
+    }
+
+    #[test]
+    fn parses_the_openai_nested_shape_with_stringified_arguments() {
+        let out = extract(
+            r#"<tool_call>{"id":"abc","function":{"name":"search","arguments":"{\"q\":\"cats\"}"}}</tool_call>"#,
+        );
+        assert_eq!(out.calls[0].name, "search");
+        assert_eq!(out.calls[0].arguments, json!({"q": "cats"}), "stringified JSON must be decoded");
+        assert_eq!(out.calls[0].id, "abc", "a provided id must be kept");
+    }
+
+    #[test]
+    fn accepts_alternative_key_spellings() {
+        for body in [
+            r#"{"name": "t", "parameters": {"a": 1}}"#,
+            r#"{"tool": "t", "args": {"a": 1}}"#,
+            r#"{"tool_name": "t", "input": {"a": 1}}"#,
+        ] {
+            let out = extract(&format!("<tool_call>{body}</tool_call>"));
+            assert_eq!(out.calls.len(), 1, "failed on {body}");
+            assert_eq!(out.calls[0].name, "t");
+            assert_eq!(out.calls[0].arguments, json!({"a": 1}));
+        }
+    }
+
+    #[test]
+    fn handles_braces_inside_string_arguments() {
+        // A regex-based scanner gets this wrong.
+        let out = extract(
+            r#"<tool_call>{"name": "run", "arguments": {"code": "if (x) { y(); }"}}</tool_call>"#,
+        );
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].arguments["code"], "if (x) { y(); }");
+    }
+
+    #[test]
+    fn handles_escaped_quotes_inside_arguments() {
+        let out = extract(
+            r#"<tool_call>{"name": "echo", "arguments": {"text": "she said \"hi\" }"}}</tool_call>"#,
+        );
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].arguments["text"], r#"she said "hi" }"#);
+    }
+
+    #[test]
+    fn recognises_a_fenced_json_call_from_an_untrained_model() {
+        let out = extract("I'll search.\n\n```json\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"x\"}}\n```");
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].name, "web_search");
+        assert!(!out.text.contains("web_search"), "the fence must be removed: {:?}", out.text);
+    }
+
+    #[test]
+    fn an_illustrative_json_block_is_not_executed() {
+        // The model is showing the user a payload, not calling anything.
+        let text = "The config looks like:\n\n```json\n{\"model\": \"gemma4\", \"gpu_layers\": 20}\n```";
+        let out = extract(text);
+        assert!(out.calls.is_empty(), "must not execute example JSON: {:?}", out.calls);
+        assert!(out.text.contains("gpu_layers"), "the example must still be shown");
+    }
+
+    #[test]
+    fn ordinary_prose_is_returned_untouched() {
+        let text = "A tool call uses braces { like this } but this is just prose.";
+        let out = extract(text);
+        assert!(out.calls.is_empty());
+        assert_eq!(out.text, text);
+    }
+
+    #[test]
+    fn malformed_json_is_shown_rather_than_silently_dropped() {
+        let out = extract("<tool_call>{not valid json at all</tool_call>");
+        assert!(out.calls.is_empty());
+        assert!(out.text.contains("not valid json"), "content must not vanish: {:?}", out.text);
+    }
+
+    #[test]
+    fn an_unterminated_call_does_not_swallow_later_text() {
+        let out = extract(r#"<tool_call>{"name": "a", "arguments": {}}"#);
+        assert_eq!(out.calls.len(), 1, "a call with no closer should still parse");
+        assert_eq!(out.calls[0].name, "a");
+    }
+
+    #[test]
+    fn ids_are_assigned_when_the_model_gives_none() {
+        let out = extract(
+            r#"<tool_call>{"name":"a","arguments":{}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+        );
+        assert_eq!(out.calls.len(), 2);
+        assert_ne!(out.calls[0].id, out.calls[1].id, "ids must be distinct to correlate results");
+        assert!(!out.calls[0].id.is_empty());
+    }
+
+    #[test]
+    fn text_around_a_call_is_preserved_in_order() {
+        let out = extract(
+            r#"Before. <tool_call>{"name":"a","arguments":{}}</tool_call> After."#,
+        );
+        assert_eq!(out.text, "Before.  After.".trim());
+        assert!(out.text.starts_with("Before."));
+        assert!(out.text.ends_with("After."));
+    }
+
+    #[test]
+    fn empty_output_is_handled() {
+        let out = extract("");
+        assert!(out.text.is_empty());
+        assert!(!out.has_calls());
+    }
+
+    #[test]
+    fn a_call_with_no_name_is_rejected() {
+        let out = extract(r#"<tool_call>{"arguments": {"a": 1}}</tool_call>"#);
+        assert!(out.calls.is_empty(), "a nameless call is not runnable");
+    }
+}
+
+/// Hides tool-call syntax while it is being generated.
+///
+/// A tool call is a request to the runtime, not prose for the user, so the
+/// raw `<tool_call>{…}` must never reach the terminal. As with reasoning tags,
+/// the opener arrives split across tokens, so the gate holds back only the
+/// longest suffix that could still become one.
+#[derive(Debug, Default)]
+pub struct StreamGate {
+    buf: String,
+    suppressing: bool,
+}
+
+impl StreamGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a tool call has started and output is being withheld.
+    pub fn suppressing(&self) -> bool {
+        self.suppressing
+    }
+
+    /// Feed generated text, returning only what the user should see.
+    pub fn push(&mut self, text: &str) -> String {
+        if self.suppressing {
+            return String::new();
+        }
+        self.buf.push_str(text);
+
+        // Once an opener appears, everything from it onward belongs to the
+        // call, including whatever follows in later tokens.
+        if let Some(idx) = OPENERS
+            .iter()
+            .filter_map(|(open, _)| self.buf.find(open))
+            .min()
+        {
+            let visible = self.buf[..idx].to_string();
+            self.buf.clear();
+            self.suppressing = true;
+            return visible;
+        }
+
+        let keep = OPENERS
+            .iter()
+            .map(|(open, _)| partial_suffix(&self.buf, open))
+            .max()
+            .unwrap_or(0);
+        let split = self.buf.len() - keep;
+        self.buf.drain(..split).collect()
+    }
+
+    /// Flush anything held back that never became a tool call.
+    pub fn finish(&mut self) -> String {
+        if self.suppressing {
+            self.buf.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.buf)
+    }
+}
+
+/// Longest suffix of `haystack` that is a proper prefix of `tag`.
+fn partial_suffix(haystack: &str, tag: &str) -> usize {
+    let max = tag.len().min(haystack.len());
+    for len in (1..=max).rev() {
+        let start = haystack.len() - len;
+        if !haystack.is_char_boundary(start) {
+            continue;
+        }
+        if len < tag.len() && tag.as_bytes().starts_with(&haystack.as_bytes()[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn drip(input: &str) -> (String, bool) {
+        let mut g = StreamGate::new();
+        let mut out = String::new();
+        for ch in input.chars() {
+            out.push_str(&g.push(&ch.to_string()));
+        }
+        out.push_str(&g.finish());
+        (out, g.suppressing())
+    }
+
+    #[test]
+    fn ordinary_text_passes_through() {
+        let (out, suppressed) = drip("Just a normal answer.");
+        assert_eq!(out, "Just a normal answer.");
+        assert!(!suppressed);
+    }
+
+    #[test]
+    fn a_tool_call_is_hidden_from_the_user() {
+        let (out, suppressed) = drip(r#"Let me check.<tool_call>{"name":"x","arguments":{}}</tool_call>"#);
+        assert_eq!(out, "Let me check.", "the call must not reach the terminal");
+        assert!(suppressed);
+    }
+
+    #[test]
+    fn an_opener_split_across_tokens_is_still_caught() {
+        // The failure this gate exists to prevent.
+        let mut g = StreamGate::new();
+        let mut out = String::new();
+        for tok in ["Sure.", "<tool", "_call>", "{\"name\""] {
+            out.push_str(&g.push(tok));
+        }
+        out.push_str(&g.finish());
+        assert_eq!(out, "Sure.");
+        assert!(g.suppressing());
+    }
+
+    #[test]
+    fn text_merely_resembling_an_opener_is_released() {
+        let (out, suppressed) = drip("compare <tool and <too here");
+        assert_eq!(out, "compare <tool and <too here");
+        assert!(!suppressed);
+    }
+
+    #[test]
+    fn every_recognised_opener_is_gated() {
+        for (open, _) in OPENERS {
+            let (out, suppressed) = drip(&format!("text{open}rest"));
+            assert_eq!(out, "text", "failed to gate {open}");
+            assert!(suppressed);
+        }
+    }
+
+    #[test]
+    fn nothing_leaks_after_suppression_starts() {
+        let mut g = StreamGate::new();
+        let _ = g.push("<tool_call>");
+        assert_eq!(g.push("{\"name\": \"x\"}"), "");
+        assert_eq!(g.push("</tool_call> trailing"), "");
+        assert_eq!(g.finish(), "");
+    }
+
+    #[test]
+    fn multibyte_text_is_not_split() {
+        let (out, _) = drip("日本語のテキスト 🎉");
+        assert_eq!(out, "日本語のテキスト 🎉");
+    }
+}

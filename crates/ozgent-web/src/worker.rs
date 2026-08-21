@@ -1,0 +1,817 @@
+//! The inference thread.
+//!
+//! Everything that touches llama.cpp happens here, on one dedicated OS thread,
+//! for three reasons that together rule out doing it in the request handlers:
+//!
+//! * `Session` borrows from `Engine`, so the pair is self-referential and
+//!   cannot simply be stored in shared state.
+//! * A single GPU context cannot serve two generations at once, so requests
+//!   have to be serialised regardless.
+//! * Keeping one session alive across turns is what makes prefix KV reuse
+//!   work; building a session per request would throw the cache away every
+//!   time.
+//!
+//! Handlers send a [`Job`] and stream [`Event`]s back, so the async side never
+//! blocks on the GPU.
+
+use ozgent_core::{Config, Message, Paths, ThinkingMode};
+use ozgent_tools::ToolHost;
+use std::sync::Arc;
+use ozgent_llama::engine::{Engine, StopReason};
+use ozgent_llama::thinking::{Chunk, ThinkingFilter};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::UnboundedSender;
+
+/// A unit of work for the inference thread.
+pub enum Job {
+    Generate(Box<Request>),
+    /// Drop the loaded model and free its VRAM.
+    Unload,
+}
+
+pub struct Request {
+    /// Alias or `name:tag`.
+    pub model: String,
+    pub messages: Vec<Message>,
+    pub thinking: Option<ThinkingMode>,
+    pub max_tokens: Option<u32>,
+    /// Whether this turn may call tools. The user can switch it off per turn.
+    pub tools_enabled: bool,
+    /// Sampling overrides for this request only, as the API allows. Applied on
+    /// top of the server's configuration rather than replacing it.
+    pub overrides: Option<ozgent_core::Options>,
+    /// Images for this turn. Resolved on the inference thread, where the
+    /// projector lives.
+    pub images: Vec<ozgent_core::ImageSource>,
+    pub out: UnboundedSender<Event>,
+}
+
+/// Streamed back to the HTTP handler, which forwards it as SSE.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// Model load finished; generation is about to start.
+    Ready { model: String, context: u32 },
+    Thinking { text: String },
+    Answer { text: String },
+    /// The model asked for a tool. Emitted before the tool runs.
+    ToolCall { name: String, arguments: serde_json::Value },
+    /// How that call turned out. `detail` is the tool's own result, so the
+    /// browser can render it properly instead of showing raw JSON.
+    ToolResult {
+        name: String,
+        ok: bool,
+        summary: String,
+        ms: u64,
+        detail: serde_json::Value,
+    },
+    Done {
+        generated: u32,
+        tokens_per_second: f64,
+        reused: usize,
+        stop: String,
+        /// Prompt tokens actually processed, for API usage accounting.
+        prompt: u32,
+    },
+    Error { message: String },
+}
+
+/// Handle to the inference thread.
+#[derive(Clone)]
+pub struct Worker {
+    tx: Sender<Job>,
+}
+
+/// The projector type, aliased so the lifetime stays readable in signatures.
+pub type LoadedProjector<'a> = ozgent_llama::mtmd::Projector<'a>;
+
+/// What the inference thread needs to run tools.
+///
+/// The host is async and this thread is not, so calls are driven through a
+/// runtime handle rather than blocking the executor that serves HTTP.
+pub struct Tools {
+    pub host: Arc<ToolHost>,
+    pub runtime: tokio::runtime::Handle,
+}
+
+impl Worker {
+    /// Start the thread. It lives for the process.
+    pub fn spawn(paths: Paths, config: Config, tools: Option<Tools>) -> Self {
+        let (tx, rx) = channel::<Job>();
+        std::thread::Builder::new()
+            .name("ozgent-inference".into())
+            .spawn(move || run(paths, config, tools, rx))
+            .expect("spawning the inference thread");
+        Self { tx }
+    }
+
+    /// Queue a generation. Returns an error only if the thread has died.
+    pub fn submit(&self, request: Request) -> Result<(), &'static str> {
+        self.tx
+            .send(Job::Generate(Box::new(request)))
+            .map_err(|_| "the inference thread is not running")
+    }
+
+    pub fn unload(&self) {
+        let _ = self.tx.send(Job::Unload);
+    }
+}
+
+/// Outer loop: owns nothing but the channel, and loads a model on demand.
+fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
+    let mut pending: Option<Box<Request>> = None;
+    loop {
+        // Either carry over the job that forced a model switch, or wait.
+        let request = match pending.take() {
+            Some(r) => r,
+            None => match rx.recv() {
+                Ok(Job::Generate(r)) => r,
+                Ok(Job::Unload) => continue, // nothing loaded
+                Err(_) => return,            // all senders dropped
+            },
+        };
+
+        // Loading and the session that borrows it both live in this scope, so
+        // the borrow checker is satisfied without any self-referential trick.
+        match serve_model(&paths, &config, tools.as_ref(), request, &rx) {
+            Ok(next) => pending = next,
+            Err(e) => tracing::error!("inference thread: {e}"),
+        }
+    }
+}
+
+/// Load one model and serve jobs against it until a different one is asked
+/// for, returning that job so the caller can load its model.
+fn serve_model(
+    paths: &Paths,
+    config: &Config,
+    tools: Option<&Tools>,
+    first: Box<Request>,
+    rx: &Receiver<Job>,
+) -> anyhow::Result<Option<Box<Request>>> {
+    let wanted = first.model.clone();
+    let found = match ozgent_core::resolve(paths, &wanted) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = first.out.send(Event::Error { message: e.to_string() });
+            return Ok(None);
+        }
+    };
+
+    let resolved = config
+        .options_for(&found.model.to_string())
+        .merge(&found.manifest.defaults)
+        .merge(first.overrides.as_ref().unwrap_or(&Default::default()))
+        .resolve();
+
+    let weights = found.manifest.primary_weights(&found.dir);
+    let engine = match Engine::load(&weights, &resolved) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = first.out.send(Event::Error {
+                message: format!("loading {}: {e}", found.model),
+            });
+            return Ok(None);
+        }
+    };
+    let mut session = engine.session(&resolved)?;
+    // Loaded on the first turn that needs it and kept: it costs VRAM, but a
+    // conversation with one image usually has more.
+    let mut projector: Option<crate::worker::LoadedProjector<'_>> = None;
+    let mmproj = found.manifest.projector_path(&found.dir);
+
+    let mut request = first;
+    loop {
+        let thinking = request.thinking.unwrap_or(resolved.thinking);
+        let _ = request.out.send(Event::Ready {
+            model: found.model.to_string(),
+            context: session.n_ctx(),
+        });
+
+        if !request.images.is_empty() && projector.is_none() {
+            match &mmproj {
+                Some(path) => match engine.projector(path, &resolved) {
+                    Ok(p) => projector = Some(p),
+                    Err(e) => {
+                        let _ = request.out.send(Event::Error {
+                            message: format!("loading the vision projector: {e}"),
+                        });
+                    }
+                },
+                None => {
+                    let _ = request.out.send(Event::Error {
+                        message: format!("{} cannot see images: no vision projector installed", found.model),
+                    });
+                }
+            }
+        }
+
+        if let Err(e) = turn(
+            &engine,
+            &mut session,
+            &resolved,
+            thinking,
+            tools,
+            projector.as_ref(),
+            &request,
+        ) {
+            let _ = request.out.send(Event::Error { message: e.to_string() });
+        }
+        // Dropping the sender ends the SSE stream for this request.
+        drop(request);
+
+        request = match rx.recv() {
+            Ok(Job::Generate(r)) => r,
+            // Unloading means returning so the engine is dropped with the scope.
+            Ok(Job::Unload) => return Ok(None),
+            Err(_) => return Ok(None),
+        };
+        if request.model != wanted {
+            return Ok(Some(request));
+        }
+    }
+}
+
+/// One user turn: generate, run any tools the model asks for, generate again.
+///
+/// Mirrors the terminal client's loop so a conversation behaves the same in
+/// both front ends. Bounded, because a model that keeps calling tools would
+/// otherwise never produce an answer.
+fn turn(
+    engine: &Engine,
+    session: &mut ozgent_llama::engine::Session<'_>,
+    resolved: &ozgent_core::options::Resolved,
+    thinking: ThinkingMode,
+    tools: Option<&Tools>,
+    projector: Option<&LoadedProjector<'_>>,
+    request: &Request,
+) -> anyhow::Result<()> {
+    // Images are read here rather than in the handler: failures belong in the
+    // stream the user is watching, next to the turn they broke.
+    let images = match projector {
+        Some(_) if !request.images.is_empty() => {
+            match ozgent_llama::mtmd::load_media(&request.images) {
+                Ok(images) => images,
+                Err(e) => {
+                    let _ = request.out.send(Event::Error { message: e.to_string() });
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    let media_turn = !images.is_empty();
+    let offered: Vec<ozgent_core::ToolSpec> = match tools {
+        Some(t) if request.tools_enabled => t.host.tools().to_vec(),
+        _ => Vec::new(),
+    };
+
+    let mut messages = request.messages.clone();
+    if !images.is_empty() {
+        // Joined to the system prompt rather than replacing it, so a user's
+        // persona survives.
+        match messages.first_mut() {
+            Some(m) if m.role == ozgent_core::Role::System => {
+                let existing = m.text_content();
+                *m = Message::system(format!("{existing}\n\n{}", ozgent_tools::MEDIA_RULE));
+            }
+            _ => messages.insert(0, Message::system(ozgent_tools::MEDIA_RULE)),
+        }
+    }
+    if let (Some(p), false) = (projector, images.is_empty()) {
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == ozgent_core::Role::User) {
+            let text = ozgent_llama::mtmd::with_markers(p.marker(), &last.text_content(), images.len());
+            *last = Message::user(text);
+        }
+    }
+    if !offered.is_empty() {
+        // The tool description joins the system prompt rather than replacing
+        // it, so a user-set persona survives.
+        let preamble = ozgent_tools::tool_preamble(&offered);
+        match messages.first_mut() {
+            Some(m) if m.role == ozgent_core::Role::System => {
+                let existing = m.text_content();
+                *m = Message::system(format!("{existing}\n\n{preamble}"));
+            }
+            _ => messages.insert(0, Message::system(preamble)),
+        }
+    }
+
+    if media_turn {
+        if let Some(observation) = ground(engine, session, resolved, &messages, media_for(projector, &images), request) {
+            // The observation alone was not enough: the model read the image
+            // correctly, then searched anyway. Naming the *only* reason a tool
+            // is still warranted turns "should I search?" from an open question
+            // into a test it can apply.
+            let note = format!(
+                "You have already looked at the attached media. This is what is \
+                 actually in it:\n{observation}\n\nAnswer the user from that \
+                 observation. It is a complete and accurate record of the media, \
+                 so questions about what the media contains, shows, or looks like \
+                 are already answered — do not use a tool for them, and do not ask \
+                 the user to describe it.\n\nUse a tool only if the user asked for \
+                 something the media cannot contain: a current price, recent news, \
+                 today's weather, or another fact from the outside world."
+            );
+            match messages.first_mut() {
+                Some(m) if m.role == ozgent_core::Role::System => {
+                    let existing = m.text_content();
+                    *m = Message::system(format!("{existing}\n\n{note}"));
+                }
+                _ => messages.insert(0, Message::system(note)),
+            }
+            let _ = &observation;
+        }
+    }
+
+
+    // Ground the model in the picture before it is allowed to act on it.
+    //
+    // Asked "what can you tell me about this image", the model would search the
+    // web for terms lifted from the picture and then answer from the results —
+    // getting colours wrong that it had described correctly with no tools at
+    // all. Instructions not to did not stop it.
+    //
+    // Removing tools for the turn would fix that and break the opposite case:
+    // an image plus "what does this cost now?" genuinely needs a search. So
+    // instead of taking the capability away, the model is made to look first. A
+    // short, tool-free pass describes what is actually there; that description
+    // joins the prompt, and the real turn proceeds with every tool available.
+    //
+    // The question "what is in this image" is then already answered, so there
+    // is nothing to search for — and when a search *is* wanted, it is issued
+    // from an accurate reading of the image rather than a guess at it. This is
+    // the grounding-before-response pattern the vision-language literature
+    // settles on for the same failure.
+    let max_rounds = 4;
+    let mut generated = 0u32;
+    let mut prompt_tokens = 0u32;
+    let mut elapsed_ms = 0u128;
+    let mut reused = 0usize;
+    let mut stop = StopReason::EndOfText;
+
+    for round in 0..=max_rounds {
+        let last = round == max_rounds || offered.is_empty();
+        let media = (round == 0 && !images.is_empty())
+            .then(|| projector.map(|p| (p, &images[..], &request.images[..])))
+            .flatten();
+        let (reply, stats, reason) =
+            generate(engine, session, resolved, thinking, &messages, media, request)?;
+        // A turn can span several generations; the client is told once, at the
+        // end, with the totals. Sending `Done` per round ended the SSE stream
+        // before the first tool had even run.
+        generated += stats.generated_tokens as u32;
+        prompt_tokens += stats.prompt_tokens as u32;
+        elapsed_ms += stats.generation_ms;
+        reused += stats.reused_tokens;
+        stop = reason;
+
+        let parsed = ozgent_llama::extract_tool_calls(&reply);
+        tracing::debug!(calls = parsed.calls.len(), "tool round {round}");
+
+        if last || !parsed.has_calls() {
+            break;
+        }
+        let Some(t) = tools else { break };
+        // The visible part of the reply is whatever preceded the call.
+        messages.push(Message::assistant(parsed.text.clone()));
+
+        for call in &parsed.calls {
+            let _ = request.out.send(Event::ToolCall {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            });
+            let started = std::time::Instant::now();
+            let outcome = t.runtime.block_on(t.host.call(&call.name, call.arguments.clone()));
+            let ms = started.elapsed().as_millis() as u64;
+
+            let (ok, summary, detail, payload) = match outcome {
+                Ok(value) => {
+                    let text = serde_json::to_string(&value).unwrap_or_default();
+                    (true, summarise(&value), value, text)
+                }
+                // A tool failure is information the model can act on, not an
+                // error for the user: it is fed back so the model can retry or
+                // explain, exactly as the terminal client does.
+                Err(e) => {
+                    let text = e.for_model();
+                    let summary = ozgent_tools::first_line(&text).to_string();
+                    (false, summary, serde_json::json!({ "error": text.clone() }), text)
+                }
+            };
+            let _ = request.out.send(Event::ToolResult {
+                name: call.name.clone(),
+                ok,
+                summary,
+                ms,
+                detail,
+            });
+            // A search asked for 20 results can return more text than the whole
+            // context window holds. Unbounded, it crowds out the room the model
+            // needs to answer and the reply stops mid-sentence — which reads
+            // like a crash but is simply no space left.
+            let budget = fit_budget(resolved.context_length);
+            messages.push(Message::tool_result(call.id.clone(), fit(&payload, budget)));
+        }
+    }
+
+    let seconds = elapsed_ms as f64 / 1000.0;
+    let _ = request.out.send(Event::Done {
+        generated,
+        tokens_per_second: if seconds > 0.0 { generated as f64 / seconds } else { 0.0 },
+        reused,
+        stop: format!("{stop:?}"),
+        prompt: prompt_tokens,
+    });
+    Ok(())
+}
+
+/// Tokens the grounding pass may spend. Enough for a faithful description,
+/// short enough that it costs a fraction of a second.
+const GROUNDING_LIMIT: u32 = 200;
+
+fn media_for<'a>(
+    projector: Option<&'a LoadedProjector<'a>>,
+    images: &'a [ozgent_llama::mtmd::Media],
+) -> Option<(&'a LoadedProjector<'a>, &'a [ozgent_llama::mtmd::Media])> {
+    projector.filter(|_| !images.is_empty()).map(|p| (p, images))
+}
+
+/// Ask the model, with no tools available, what is actually in the media.
+///
+/// Streamed to the client as reasoning: it is the model's own observation, not
+/// its answer, and showing it makes the extra pass visible rather than a
+/// mysterious pause. A failure here is not fatal — the turn simply proceeds
+/// without the grounding.
+fn ground(
+    engine: &Engine,
+    session: &mut ozgent_llama::engine::Session<'_>,
+    resolved: &ozgent_core::options::Resolved,
+    messages: &[Message],
+    media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media])>,
+    request: &Request,
+) -> Option<String> {
+    let (projector, images) = media?;
+    let question = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == ozgent_core::Role::User)
+        .map(|m| m.text_content())
+        .unwrap_or_default();
+
+    let prompt = engine
+        .render_prompt_with(
+            &[
+                Message::system(
+                    "Describe exactly what is in the attached media: subjects, text,                      colours, layout. State only what you can actually see. Do not                      speculate about what it might be, and do not answer the user's                      question yet.",
+                ),
+                Message::user(question),
+            ],
+            ThinkingMode::Off,
+        )
+        .ok()?;
+
+    let out = request.out.clone();
+    let mut observed = String::new();
+    let sources: Vec<ozgent_core::ImageSource> = request.images.clone();
+    let result = session.generate_with_media(
+        &prompt,
+        Some((projector, images, &sources)),
+        GROUNDING_LIMIT,
+        |piece| {
+            observed.push_str(piece);
+            out.send(Event::Thinking { text: piece.to_string() }).is_ok()
+        },
+    );
+
+    match result {
+        Ok(_) if !observed.trim().is_empty() => Some(observed.trim().to_string()),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("grounding pass failed, continuing without it: {e}");
+            None
+        }
+    }
+}
+
+/// A human sentence about a tool result, for the collapsed row.
+///
+/// Shape-aware rather than a JSON prefix: `{"category":"news","provider":...`
+/// tells a reader nothing, while "15 news results from brave" tells them
+/// whether the call did what they wanted. Falls back to a trimmed first line
+/// for tools whose output has no shape worth naming.
+fn summarise(value: &serde_json::Value) -> String {
+    if let Some(results) = value.get("results").and_then(|r| r.as_array()) {
+        let mut out = format!(
+            "{} result{}",
+            results.len(),
+            if results.len() == 1 { "" } else { "s" }
+        );
+        if let Some(category) = value.get("category").and_then(|c| c.as_str()) {
+            out = format!("{} {out}", category);
+        }
+        if let Some(provider) = value.get("provider").and_then(|p| p.as_str()) {
+            out.push_str(&format!(" from {provider}"));
+        }
+        return out;
+    }
+    if let Some(path) = value.get("path").and_then(|p| p.as_str()) {
+        if let Some(total) = value.get("total_lines").and_then(|l| l.as_u64()) {
+            let shown = total - value.get("omitted").and_then(|o| o.as_u64()).unwrap_or(0);
+            let name = path.rsplit('/').next().unwrap_or(path);
+            return format!("{name}: {shown} of {total} lines");
+        }
+        if let Some(written) = value.get("lines_written").and_then(|l| l.as_u64()) {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            return format!("wrote {written} lines to {name}");
+        }
+    }
+    if let Some(text) = value.as_str() {
+        return trim_to(text, 110);
+    }
+    trim_to(&serde_json::to_string(value).unwrap_or_default(), 110)
+}
+
+/// Characters of tool output a single call may contribute to the prompt.
+///
+/// A quarter of the window, at roughly four characters per token. The model
+/// still needs room for the conversation and for its own answer.
+fn fit_budget(context_length: u32) -> usize {
+    (context_length as usize / 4) * 4
+}
+
+/// Trim a tool payload to `budget` characters without producing invalid JSON.
+///
+/// Whole results are dropped from the end where the shape allows it, because a
+/// list of five complete results is far more useful to a model than eight
+/// results with the last one cut in half.
+fn fit(payload: &str, budget: usize) -> String {
+    if payload.len() <= budget {
+        return payload.to_string();
+    }
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) {
+        let mut count = value
+            .get("results")
+            .and_then(|r| r.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        while count > 1 {
+            match value.get_mut("results").and_then(|r| r.as_array_mut()) {
+                Some(results) => {
+                    results.pop();
+                    count = results.len();
+                }
+                None => break,
+            }
+            let candidate = serde_json::to_string(&value).unwrap_or_default();
+            if candidate.len() <= budget {
+                return candidate;
+            }
+        }
+    }
+    let head: String = payload.chars().take(budget.saturating_sub(20)).collect();
+    format!("{head} …[truncated]")
+}
+
+fn trim_to(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(max.saturating_sub(3)).collect();
+    format!("{head}...")
+}
+
+fn generate(
+    engine: &Engine,
+    session: &mut ozgent_llama::engine::Session<'_>,
+    resolved: &ozgent_core::options::Resolved,
+    thinking: ThinkingMode,
+    messages: &[Message],
+    media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media], &[ozgent_core::ImageSource])>,
+    request: &Request,
+) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason)> {
+    let prompt = engine.render_prompt_with(messages, thinking)?;
+    let mut filter = ThinkingFilter::new(thinking);
+    // One gate per stream, not one shared between them. The gate latches shut
+    // the moment a tool call begins — correct for the answer, where the call is
+    // the last thing emitted, but fatal if shared: reasoning produced after the
+    // call would be withheld for the rest of the round and never shown.
+    let mut answer_gate = ozgent_llama::toolcall::StreamGate::new();
+    let mut thinking_gate = ozgent_llama::toolcall::StreamGate::new();
+    let out = request.out.clone();
+    let mut raw = String::new();
+
+    let limit = request.max_tokens.unwrap_or(resolved.max_tokens);
+    let (stats, reason) = session.generate_with_media(&prompt, media, limit, |piece| {
+        raw.push_str(piece);
+        for chunk in filter.push(piece) {
+            let event = match chunk {
+                Chunk::Thinking(text) => Event::Thinking { text: thinking_gate.push(&text) },
+                Chunk::Answer(text) => Event::Answer { text: answer_gate.push(&text) },
+            };
+            let empty = match &event {
+                Event::Thinking { text } | Event::Answer { text } => text.is_empty(),
+                _ => false,
+            };
+            if empty {
+                continue;
+            }
+            // A closed receiver means the browser navigated away; stopping
+            // frees the GPU instead of generating into nothing.
+            if out.send(event).is_err() {
+                return false;
+            }
+        }
+        true
+    })?;
+
+    for chunk in filter.finish() {
+        if let Chunk::Answer(text) = chunk {
+            let text = answer_gate.push(&text);
+            if !text.is_empty() {
+                let _ = out.send(Event::Answer { text });
+            }
+        }
+    }
+
+    Ok((raw, stats, reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The browser switches on `type` and reads these field names directly, so
+    /// the wire shape is a contract with `assets/app.js`, not an implementation
+    /// detail. Renaming a variant without updating the client would fail
+    /// silently as a chat that streams nothing.
+    #[test]
+    fn events_serialise_with_the_tags_the_client_switches_on() {
+        let cases = vec![
+            (
+                Event::Ready { model: "m:Q4".into(), context: 4096 },
+                serde_json::json!({"type": "ready", "model": "m:Q4", "context": 4096}),
+            ),
+            (
+                Event::Thinking { text: "hm".into() },
+                serde_json::json!({"type": "thinking", "text": "hm"}),
+            ),
+            (
+                Event::Answer { text: "hi".into() },
+                serde_json::json!({"type": "answer", "text": "hi"}),
+            ),
+            (
+                Event::Error { message: "boom".into() },
+                serde_json::json!({"type": "error", "message": "boom"}),
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(serde_json::to_value(&event).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn tool_events_carry_what_the_transcript_row_shows() {
+        let call = serde_json::to_value(Event::ToolCall {
+            name: "web_search".into(),
+            arguments: serde_json::json!({ "query": "nse" }),
+        })
+        .unwrap();
+        assert_eq!(call["type"], "tool_call");
+        assert_eq!(call["name"], "web_search");
+        assert_eq!(call["arguments"]["query"], "nse");
+
+        let result = serde_json::to_value(Event::ToolResult {
+            name: "web_search".into(),
+            ok: false,
+            summary: "rate limited".into(),
+            ms: 42,
+            detail: serde_json::json!({ "error": "rate limited" }),
+        })
+        .unwrap();
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["ms"], 42);
+    }
+
+    #[test]
+    fn the_done_event_carries_what_the_status_line_shows() {
+        let json = serde_json::to_value(Event::Done {
+            generated: 120,
+            tokens_per_second: 57.5,
+            reused: 64,
+            stop: "EndOfText".into(),
+            prompt: 40,
+        })
+        .unwrap();
+        assert_eq!(json["type"], "done");
+        assert_eq!(json["generated"], 120);
+        assert_eq!(json["reused"], 64);
+        assert_eq!(json["prompt"], 40, "the API reports prompt tokens from this");
+        // The client calls .toFixed(1) on this, so it must be a number.
+        assert!(json["tokens_per_second"].is_f64());
+    }
+
+    #[test]
+    fn a_large_tool_result_drops_whole_results_rather_than_cutting_one_in_half() {
+        // Five complete results beat eight with the last one truncated, and a
+        // half-written JSON object is worse than either.
+        let results: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({ "title": format!("result {i}"), "snippet": "x".repeat(300) }))
+            .collect();
+        let payload = serde_json::json!({ "provider": "brave", "results": results }).to_string();
+
+        let out = fit(&payload, 2000);
+        assert!(out.len() <= 2000, "still {} bytes", out.len());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("what is fed back must stay valid JSON");
+        let kept = parsed["results"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 20, "kept {kept} of 20");
+        assert_eq!(parsed["results"][0]["title"], "result 0", "the best results are kept");
+    }
+
+    #[test]
+    fn a_payload_within_budget_is_untouched() {
+        let small = serde_json::json!({ "celsius": -3 }).to_string();
+        assert_eq!(fit(&small, 2000), small);
+    }
+
+    #[test]
+    fn an_unshaped_payload_is_truncated_with_a_marker() {
+        let blob = "y".repeat(5000);
+        let out = fit(&blob, 500);
+        assert!(out.len() <= 500, "got {}", out.len());
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn the_budget_leaves_room_for_the_conversation_and_the_answer() {
+        // A tool must never be allowed to fill the window on its own.
+        assert!(fit_budget(4096) < 4096 * 4 / 2);
+        assert!(fit_budget(4096) > 0);
+    }
+
+    #[test]
+    fn a_search_result_is_summarised_by_what_it_found() {
+        // `{"category":"news","provider":"brave",...` tells a reader nothing.
+        let value = serde_json::json!({
+            "provider": "brave",
+            "category": "news",
+            "query": "nse bse",
+            "results": [{"title": "a"}, {"title": "b"}, {"title": "c"}],
+        });
+        assert_eq!(summarise(&value), "news 3 results from brave");
+    }
+
+    #[test]
+    fn one_result_is_not_pluralised() {
+        let value = serde_json::json!({ "provider": "tavily", "results": [{"title": "a"}] });
+        assert_eq!(summarise(&value), "1 result from tavily");
+    }
+
+    #[test]
+    fn a_file_read_is_summarised_by_how_much_of_it_came_back() {
+        let value = serde_json::json!({
+            "path": "/home/u/project/engine.rs",
+            "total_lines": 1091,
+            "omitted": 700,
+        });
+        assert_eq!(summarise(&value), "engine.rs: 391 of 1091 lines");
+
+        let written = serde_json::json!({ "path": "/tmp/notes.md", "lines_written": 12 });
+        assert_eq!(summarise(&written), "wrote 12 lines to notes.md");
+    }
+
+    #[test]
+    fn an_unrecognised_shape_falls_back_to_a_bounded_first_line() {
+        let long = serde_json::Value::String("x".repeat(400));
+        let out = summarise(&long);
+        assert!(out.chars().count() <= 110, "got {} chars", out.chars().count());
+        assert!(out.ends_with("..."));
+        assert_eq!(summarise(&serde_json::json!("first\nsecond")), "first");
+    }
+
+    #[test]
+    fn a_dead_worker_is_reported_rather_than_panicking() {
+        // Dropping the receiver simulates the thread having exited; submitting
+        // must surface an error so the handler can return a 500 instead of
+        // hanging the request forever.
+        let (tx, rx) = channel::<Job>();
+        drop(rx);
+        let worker = Worker { tx };
+        let (out, _keep) = tokio::sync::mpsc::unbounded_channel();
+        let result = worker.submit(Request {
+            model: "any".into(),
+            messages: Vec::new(),
+            thinking: None,
+            max_tokens: None,
+            tools_enabled: true,
+            overrides: None,
+            images: Vec::new(),
+            out,
+        });
+        assert!(result.is_err());
+    }
+}

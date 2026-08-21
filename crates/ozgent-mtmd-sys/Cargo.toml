@@ -1,0 +1,14 @@
+[package]
+name = "ozgent-mtmd-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bindings to llama.cpp's mtmd multimodal library"
+links = "mtmd"
+
+[dependencies]
+llama-cpp-sys-2 = "0.1.154"
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.72"

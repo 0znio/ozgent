@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ozgent</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="mark">oz</span>
+        <button class="icon-btn" id="new-chat" title="New chat" aria-label="New chat">+</button>
+      </div>
+      <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
+      <div class="sidebar-foot">
+        <button class="ghost-btn" id="open-settings">Settings</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn only-narrow" id="toggle-sidebar" aria-label="Toggle sidebar">☰</button>
+        <select id="model" class="select" aria-label="Model"></select>
+        <select id="thinking" class="select" aria-label="Reasoning">
+          <option value="auto">Reasoning: auto</option>
+          <option value="on">Reasoning: on</option>
+          <option value="off">Reasoning: off</option>
+        </select>
+        <span class="spacer"></span>
+        <span class="stat" id="stat"></span>
+      </header>
+
+      <div class="thread" id="thread">
+        <div class="empty" id="empty">
+          <h1>ozgent</h1>
+          <p>Local models, your machine. Pick a model and start typing.</p>
+        </div>
+      </div>
+
+      <form class="composer" id="composer">
+        <div class="quick" id="quick" hidden></div>
+        <div class="composer-box" id="composer-box">
+          <div class="attachments" id="attachments" hidden></div>
+          <textarea id="input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
+          <div class="composer-actions">
+            <button type="button" id="attach" class="icon-btn small" title="Attach a file" aria-label="Attach a file">+</button>
+            <button type="button" id="quick-toggle" class="icon-btn small" aria-expanded="false"
+                    title="Quick model settings" aria-label="Quick model settings">&#9881;</button>
+            <button type="button" id="tools-toggle" class="icon-btn small toggle" aria-pressed="true"
+                    title="Tools: web search and file access" aria-label="Toggle tools">search</button>
+            <span class="hint inline" id="attach-hint">paste, drop, or attach</span>
+            <span class="spacer"></span>
+            <button type="submit" id="send" class="send-btn" aria-label="Send">↑</button>
+          </div>
+        </div>
+        <input type="file" id="file-input" multiple hidden>
+        <div class="drop-veil" id="drop-veil" hidden><span>Drop to attach</span></div>
+      </form>
+    </main>
+  </div>
+
+  <div class="lightbox" id="lightbox" hidden>
+    <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
+    <img id="lightbox-img" alt="">
+  </div>
+
+  <dialog id="settings" class="settings">
+    <div class="settings-head">
+      <h2 id="settings-title">Settings</h2>
+      <button class="icon-btn" id="close-settings" aria-label="Close">&times;</button>
+    </div>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="general" aria-selected="true">General</button>
+      <button class="tab" role="tab" data-tab="params" aria-selected="false">Model</button>
+      <button class="tab" role="tab" data-tab="tools" aria-selected="false">Tools</button>
+      <button class="tab" role="tab" data-tab="memory" aria-selected="false">Memory</button>
+    </div>
+
+    <section class="panel" data-panel="general">
+      <label class="row"><span>Render markdown</span><span class="switch"><input type="checkbox" id="set-markdown"><span class="track"></span></span></label>
+      <label class="row"><span>Show reasoning</span><span class="switch"><input type="checkbox" id="set-thinking"><span class="track"></span></span></label>
+      <label class="row"><span>Tell the model today's date</span><span class="switch"><input type="checkbox" id="set-date"><span class="track"></span></span></label>
+      <p class="hint">Saved to <code>~/ozgent/configs/config.toml</code>, the same file the terminal reads.</p>
+    </section>
+
+    <section class="panel" data-panel="params" hidden>
+      <p class="hint" id="params-for"></p>
+      <div class="params" id="params"></div>
+      <p class="hint">
+        A blank field inherits the default. Changing anything here reloads the
+        model on your next message.
+      </p>
+    </section>
+
+    <section class="panel" data-panel="tools" hidden>
+      <label class="row"><span>Enable tools</span><span class="switch"><input type="checkbox" id="set-tools"><span class="track"></span></span></label>
+      <div class="row">
+        <span>Web search provider</span>
+        <select class="select" id="search-provider"></select>
+      </div>
+      <label class="row" id="key-row">
+        <span>API key</span>
+        <input type="password" id="search-key" class="text-input" placeholder="unchanged" autocomplete="off">
+      </label>
+      <p class="hint" id="key-hint"></p>
+      <h3 class="sub">Available tools</h3>
+      <div id="tool-list" class="tool-list"></div>
+    </section>
+
+    <section class="panel" data-panel="memory" hidden>
+      <h3 class="sub">Facts</h3>
+      <p class="hint">
+        Pinned facts are always in context. Everything else is retrieved only
+        when it is relevant to what you asked.
+      </p>
+      <div id="fact-list" class="fact-list"></div>
+      <form class="fact-add" id="fact-add">
+        <input type="text" id="fact-text" class="text-input" placeholder="Remember that..." autocomplete="off">
+        <button type="submit" class="primary-btn">Add</button>
+      </form>
+
+      <h3 class="sub">What would be recalled?</h3>
+      <p class="hint">
+        Retrieval is invisible during a chat. Try a question here to see exactly
+        what memory would put in front of the model.
+      </p>
+      <form class="fact-add" id="recall-form">
+        <input type="text" id="recall-query" class="text-input" placeholder="Ask something..." autocomplete="off">
+        <button type="submit" class="ghost-btn auto">Preview</button>
+      </form>
+      <div id="recall-out" class="recall-out"></div>
+    </section>
+
+    <menu class="settings-foot">
+      <span class="hint" id="save-note"></span>
+      <button class="ghost-btn auto" id="cancel-settings">Close</button>
+      <button class="primary-btn" id="save-settings">Save</button>
+    </menu>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

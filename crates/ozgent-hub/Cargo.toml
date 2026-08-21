@@ -1,0 +1,18 @@
+[package]
+name = "ozgent-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ozgent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+sha2 = "0.10"
+# rustls rather than native-tls: no OpenSSL headers needed to build, which
+# keeps `cargo install ozgent` working on a bare machine.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "charset", "http2"] }

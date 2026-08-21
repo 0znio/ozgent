@@ -1,0 +1,27 @@
+[package]
+name = "ozgent-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ozgent-core.workspace = true
+ozgent-llama.workspace = true
+ozgent-memory.workspace = true
+ozgent-tools.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+futures-util.workspace = true
+image.workspace = true
+
+[features]
+default = []
+cuda = ["ozgent-llama/cuda"]
+vulkan = ["ozgent-llama/vulkan"]
+metal = ["ozgent-llama/metal"]

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ozgent-core",
+    "crates/ozgent-tools",
+    "crates/ozgent-memory",
+    "crates/ozgent-render",
+    "crates/ozgent-hub",
+    "crates/ozgent-llama",
+    "crates/ozgent-mtmd-sys",
+    "crates/ozgent-web",
+    "crates/ozgent-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ozgent-core = { path = "crates/ozgent-core" }
+ozgent-tools = { path = "crates/ozgent-tools" }
+ozgent-render = { path = "crates/ozgent-render" }
+ozgent-memory = { path = "crates/ozgent-memory" }
+ozgent-hub = { path = "crates/ozgent-hub" }
+ozgent-llama = { path = "crates/ozgent-llama" }
+ozgent-web = { path = "crates/ozgent-web" }
+ozgent-mtmd-sys = { path = "crates/ozgent-mtmd-sys" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+rustyline = { version = "18", default-features = false, features = ["with-file-history"] }
+ctrlc = "3"
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# llama-cpp-2 keeps its raw handles private, so mtmd — which llama.cpp ships
+# but that crate does not wrap — cannot be called at all. This is the upstream
+# source with two additive `as_ptr()` accessors and nothing else changed.
+# `llama-cpp-sys-2` is deliberately left on crates.io: patching it would rebuild
+# llama.cpp from scratch.
+[patch.crates-io]
+llama-cpp-2 = { path = "vendor/llama-cpp-2" }

@@ -1,0 +1,25 @@
+[package]
+name = "ozgent-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# llama.cpp is always compiled in, with at least the CPU backend, so one binary
+# runs anywhere. The GPU features only *add* a backend; choosing CPU at runtime
+# is `gpu_layers = "off"`, never a rebuild.
+default = ["llama"]
+llama = ["dep:llama-cpp-2", "dep:ozgent-mtmd-sys"]
+cuda = ["llama", "llama-cpp-2/cuda"]
+vulkan = ["llama", "llama-cpp-2/vulkan"]
+metal = ["llama", "llama-cpp-2/metal"]
+
+[dependencies]
+ozgent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+llama-cpp-2 = { version = "0.1.154", optional = true }
+ozgent-mtmd-sys = { workspace = true, optional = true }
