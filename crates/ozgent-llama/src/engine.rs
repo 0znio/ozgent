@@ -670,6 +670,76 @@ impl<'a> Session<'a> {
         Ok((first, second, size))
     }
 
+    /// Propose `n` tokens continuing `context`, as a draft for another model
+    /// to verify.
+    ///
+    /// This session is left exactly as it was found: the proposal is generated
+    /// behind a snapshot and rolled back, so the drafter never drifts from the
+    /// confirmed transcript. Tokens of `context` this session has not seen are
+    /// prefilled first, which after the opening turn is only the handful the
+    /// target just confirmed.
+    ///
+    /// Greedy, because a draft is a guess at what the *target* will do, not a
+    /// sample in its own right — and the target re-samples every token anyway,
+    /// so a drafter's randomness would only lower the acceptance rate.
+    pub fn propose(
+        &mut self,
+        context: &[LlamaToken],
+        n: usize,
+    ) -> Result<Vec<LlamaToken>, EngineError> {
+        if n == 0 || context.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n_ctx = self.context.n_ctx() as i32;
+        if context.len() as i32 + n as i32 >= n_ctx {
+            return Ok(Vec::new());
+        }
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+
+        // Anything the drafter has not absorbed yet. A divergence means the
+        // target went somewhere this session never saw, so start over rather
+        // than draft from a transcript that never happened.
+        let shared = common_prefix(&self.cached, context);
+        if shared < self.cached.len() {
+            self.reset();
+        }
+        let fresh: Vec<LlamaToken> = context[self.cached.len()..].to_vec();
+        if !fresh.is_empty() {
+            self.prefill(&fresh, &mut batch, n_batch, true)?;
+            self.cached.extend_from_slice(&fresh);
+        }
+
+        let mark = self.n_past;
+        let cached_len = self.cached.len();
+        let state = self.snapshot(false, true)?;
+
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let token = self.sampler.sample(&self.context, -1);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+            out.push(token);
+            batch.clear();
+            batch
+                .add(token, self.n_past, &[0], true)
+                .map_err(|e| EngineError::Batch(e.to_string()))?;
+            self.context
+                .decode(&mut batch)
+                .map_err(|e| EngineError::Decode(e.to_string()))?;
+            self.n_past += 1;
+        }
+
+        // Put the drafter back where it started, so the next call resumes from
+        // what the target actually confirmed rather than from its own guesses.
+        self.restore(&state)?;
+        self.n_past = mark;
+        self.cached.truncate(cached_len);
+        self.sampler.reset();
+        Ok(out)
+    }
+
     /// Time a snapshot and a restore, which is what decides whether
     /// speculation can afford one per draft step.
     ///
@@ -745,6 +815,15 @@ impl<'a> Session<'a> {
         }
         out.push_str(&decoder.finish());
         Ok(out)
+    }
+
+    /// Size of this model's vocabulary.
+    ///
+    /// A drafter and its target must agree on this, or a proposed token id
+    /// means a different word to each of them and verification compares
+    /// unrelated things.
+    pub fn n_vocab(&self) -> i32 {
+        self.model.n_vocab()
     }
 
     /// Bytes needed to snapshot this sequence's state.
@@ -965,6 +1044,24 @@ impl<'a> Session<'a> {
         max_tokens: u32,
         on_token: impl FnMut(&str) -> bool,
     ) -> Result<(Stats, StopReason), EngineError> {
+        self.generate_drafted(prompt, media, max_tokens, None, on_token)
+    }
+
+    /// Generate, optionally with a second model proposing tokens.
+    ///
+    /// `drafter` is a session over a much smaller model sharing this one's
+    /// vocabulary. It proposes; this model verifies every token and keeps only
+    /// what it would have produced anyway, so the answer is identical to
+    /// generating without it. The drafter buys latency, never a different
+    /// answer.
+    pub fn generate_drafted(
+        &mut self,
+        prompt: &str,
+        media: Option<(&crate::mtmd::Projector<'_>, &[crate::mtmd::Media], &[ozgent_core::ImageSource])>,
+        max_tokens: u32,
+        mut drafter: Option<&mut Session<'_>>,
+        on_token: impl FnMut(&str) -> bool,
+    ) -> Result<(Stats, StopReason), EngineError> {
         let mut on_token = on_token;
         // A turn that returned early through `?` can leave the gate's grammar
         // installed. Lifting it here rather than only on the way out means a
@@ -1096,7 +1193,8 @@ impl<'a> Session<'a> {
         // Qwen3.5, whose cache refuses a partial trim outright.
         let by_trim = self.rollback_safe && self.can_trim;
         let mut spec_on = !self.grammar_active
-            && matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto);
+            && (drafter.is_some()
+                || matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto));
         let mut use_snapshot = spec_on && !by_trim;
         if use_snapshot && self.snapshot(false, true).is_err() {
             // The device-resident path is what makes this affordable; without
@@ -1213,7 +1311,8 @@ impl<'a> Session<'a> {
             // and collecting the whole context into a fresh Vec each time made
             // it quadratic in the length of the turn.
             let spec_started = std::time::Instant::now();
-            if spec_on {
+            // Pure overhead when a draft model is doing the proposing.
+            if spec_on && drafter.is_none() {
                 while ngram.len() < self.cached.len() {
                     ngram.push_token(self.cached[ngram.len()].0);
                 }
@@ -1240,9 +1339,25 @@ impl<'a> Session<'a> {
                 let cap = budget
                     .min(room)
                     .min(n_batch.saturating_sub(1));
-                // Draft longer while drafts are landing, shorter when they are
-                // not: a rejected draft wastes the whole batch slot.
-                ngram.draft(ngram.suggest_len(cap), min_reach).into_iter().map(LlamaToken).collect()
+                match drafter.as_mut() {
+                    // A draft model proposes from the whole distribution rather
+                    // than from repetition, so it needs neither the reach
+                    // filter nor the probe shortening — both exist to stop
+                    // n-grams betting on coincidences.
+                    Some(d) => {
+                        let want = (tuning.draft_tokens as usize)
+                            .min(room)
+                            .min(n_batch.saturating_sub(1));
+                        d.propose(&self.cached, want)?
+                    }
+                    // Draft longer while drafts are landing, shorter when they
+                    // are not: a rejected draft wastes the whole batch slot.
+                    None => ngram
+                        .draft(ngram.suggest_len(cap), min_reach)
+                        .into_iter()
+                        .map(LlamaToken)
+                        .collect(),
+                }
             } else {
                 Vec::new()
             };

@@ -600,6 +600,17 @@ async fn chat(
     chat::run(paths, config, model, options).await
 }
 
+/// A dim one-line note to stderr, so it never lands in piped output.
+fn theme_hint(text: &str) -> String {
+    format!("\x1b[2m{text}\x1b[0m")
+}
+
+/// Context window given to a draft model.
+///
+/// It is re-synced to the confirmed transcript every round and never needs the
+/// target's full window; a large KV here would only take VRAM the target needs.
+const DRAFT_CONTEXT: u32 = 4096;
+
 async fn run_once(
     paths: &Paths,
     config: &Config,
@@ -684,7 +695,66 @@ async fn run_once(
         eprintln!("note: this GGUF carries no chat template; using a generic format");
     }
 
+    // A draft model, when one is configured. Loaded here so it lives exactly as
+    // long as the session that verifies its proposals.
+    //
+    // Its own context is small and its KV cheap: it only ever holds the same
+    // transcript as the target, and rolls itself back after every proposal.
+    let draft_ref = match &resolved.speculative {
+        ozgent_core::accel::Speculative::Draft { model, gpu_layers } => {
+            Some((model.clone(), *gpu_layers))
+        }
+        _ => None,
+    };
+    let draft_loaded = match &draft_ref {
+        Some((name, gpu_layers)) => {
+            let found = ozgent_core::resolve(paths, name)
+                .with_context(|| format!("draft model {name:?} is not installed"))?;
+            let weights = found.manifest.primary_weights(&found.dir);
+            let mut opts = resolved.clone();
+            // The drafter never needs the target's context window: it is
+            // re-synced to the confirmed transcript every round, and a large
+            // KV here would take VRAM the target needs.
+            opts.context_length = resolved.context_length.min(DRAFT_CONTEXT);
+            opts.speculative = ozgent_core::accel::Speculative::Off;
+            if let Some(n) = gpu_layers {
+                opts.gpu_layers = ozgent_core::GpuLayers::Count(*n);
+            }
+            let engine = Engine::load(&weights, &opts).with_context(|| {
+                format!("loading draft model {name:?}")
+            })?;
+            Some((engine, opts))
+        }
+        None => None,
+    };
+    let mut draft_session = match &draft_loaded {
+        Some((engine, opts)) => Some(engine.session(opts)?),
+        None => None,
+    };
+
     let mut session = engine.session(&resolved)?;
+
+    // A drafter proposes token *ids*. If the two models do not share a
+    // vocabulary those ids mean different words to each, and verification
+    // silently compares unrelated things — so the mismatch is refused rather
+    // than discovered as nonsense output.
+    if let Some(draft) = draft_session.as_ref() {
+        anyhow::ensure!(
+            draft.n_vocab() == session.n_vocab(),
+            "the draft model's vocabulary ({}) does not match {}'s ({}); \
+             speculation needs both models to share a tokenizer",
+            draft.n_vocab(),
+            r,
+            session.n_vocab(),
+        );
+        eprintln!(
+            "{}",
+            theme_hint(&format!(
+                "drafting with {}",
+                draft_ref.as_ref().map(|(m, _)| m.as_str()).unwrap_or("?")
+            ))
+        );
+    }
 
     // Reasoning is separated from the answer, then the answer is rendered as
     // streaming markdown.
@@ -699,7 +769,7 @@ async fn run_once(
     let mut produced_answer = false;
 
     let media = projector.as_ref().map(|p| (p, &images[..], &extracted.images[..]));
-    let (stats, reason) = session.generate_with_media(&rendered_prompt, media, resolved.max_tokens, |piece| {
+    let (stats, reason) = session.generate_drafted(&rendered_prompt, media, resolved.max_tokens, draft_session.as_mut(), |piece| {
         for chunk in filter.push(piece) {
             match chunk {
                 Chunk::Thinking(text) => {

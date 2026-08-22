@@ -351,11 +351,21 @@ impl OptionFlags {
                 Some("ngram") => Some(Speculative::Ngram),
                 Some("mtp") => Some(Speculative::Mtp),
                 Some("auto") => Some(Speculative::Auto),
-                Some(other) => {
-                    return Err(anyhow::anyhow!(
-                        "unknown --spec {other:?}; expected auto, ngram, mtp, or off"
-                    ));
-                }
+                // `draft:<model>` names a second, smaller model to propose
+                // tokens. Spelled inside --spec rather than as its own flag so
+                // the strategies stay mutually exclusive by construction.
+                Some(other) => match other.strip_prefix("draft:") {
+                    Some(model) if !model.is_empty() => Some(Speculative::Draft {
+                        model: model.to_string(),
+                        gpu_layers: Some(99),
+                    }),
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "unknown --spec {other:?}; expected auto, ngram, mtp, off, \
+                             or draft:<model>"
+                        ));
+                    }
+                },
             },
             ..Default::default()
         })
