@@ -113,7 +113,13 @@ impl NgramCache {
     ///
     /// Returns an empty draft when nothing matches, which is the common case
     /// on novel text and costs nothing.
-    pub fn draft(&self, max: usize) -> Vec<i32> {
+    /// `min_reach` rejects a match that does not extend at least that far
+    /// behind the key. A two-token key collides constantly in ordinary prose
+    /// and predicts badly there, while genuine repetition — quoting a file,
+    /// reissuing a structure — matches for tens of tokens. Filtering on reach
+    /// separates the two before any draft is decoded, which costs nothing:
+    /// it is a hash lookup and a backward scan, not a forward pass.
+    pub fn draft(&self, max: usize, min_reach: usize) -> Vec<i32> {
         if max == 0 || self.tokens.len() <= NGRAM {
             return Vec::new();
         }
@@ -138,6 +144,9 @@ impl NgramCache {
                 continue;
             }
             let reach = self.match_length(p, cur);
+            if (reach as usize) < min_reach {
+                continue;
+            }
             if best.is_none_or(|(score, _)| reach >= score) {
                 best = Some((reach, p as u32));
             }
@@ -257,26 +266,26 @@ mod tests {
         // Having seen 1,2 -> 3,4,5 and then arrived back at 1,2, the same
         // continuation should replay.
         let c = seeded(&[1, 2, 3, 4, 5, 9, 1, 2]);
-        assert_eq!(c.draft(3), vec![3, 4, 5]);
+        assert_eq!(c.draft(3, 0), vec![3, 4, 5]);
     }
 
     #[test]
     fn an_unseen_context_drafts_nothing() {
         let c = seeded(&[1, 2, 3, 4, 90, 91]);
-        assert!(c.draft(4).is_empty());
+        assert!(c.draft(4, 0).is_empty());
     }
 
     #[test]
     fn drafting_is_capped_by_the_requested_length() {
         let c = seeded(&[1, 2, 3, 4, 5, 9, 1, 2]);
-        assert_eq!(c.draft(2).len(), 2);
-        assert_eq!(c.draft(0).len(), 0);
+        assert_eq!(c.draft(2, 0).len(), 2);
+        assert_eq!(c.draft(0, 0).len(), 0);
     }
 
     #[test]
     fn a_short_context_cannot_be_keyed() {
         let c = seeded(&[1, 2]);
-        assert!(c.draft(4).is_empty(), "needs more than NGRAM tokens");
+        assert!(c.draft(4, 0).is_empty(), "needs more than NGRAM tokens");
     }
 
     #[test]
@@ -290,7 +299,7 @@ mod tests {
         //   live:     ...,5,6,7,8 -> ?
         let c = seeded(&[5, 6, 7, 8, 100, 1, 2, 7, 8, 200, 42, 5, 6, 7, 8]);
         assert_eq!(
-            c.draft(1),
+            c.draft(1, 0),
             vec![100],
             "the candidate whose earlier context also matches should win"
         );
@@ -301,7 +310,7 @@ mod tests {
         // Both occurrences of 1,2 are preceded by nothing that matches, so the
         // scores tie and the most recent continuation should win.
         let c = seeded(&[1, 2, 7, 0, 1, 2, 9, 0, 1, 2]);
-        assert_eq!(c.draft(1), vec![9]);
+        assert_eq!(c.draft(1, 0), vec![9]);
     }
 
     #[test]
@@ -315,7 +324,7 @@ mod tests {
             c.push_token(t);
         }
         c.extend(&[9, 1, 2]);
-        assert_eq!(c.draft(3), vec![3, 4, 5]);
+        assert_eq!(c.draft(3, 0), vec![3, 4, 5]);
     }
 
     #[test]
@@ -418,7 +427,7 @@ mod tests {
     fn extending_with_too_few_tokens_is_safe() {
         let c = seeded(&[1, 2]);
         assert!(c.is_empty());
-        assert!(c.draft(4).is_empty());
+        assert!(c.draft(4, 0).is_empty());
     }
 
     #[test]
@@ -426,7 +435,7 @@ mod tests {
         // A run of identical tokens must not produce an unbounded or
         // out-of-range draft.
         let c = seeded(&[7; 64]);
-        let d = c.draft(16);
+        let d = c.draft(16, 0);
         assert!(d.len() <= 16, "draft exceeded its cap: {}", d.len());
         assert!(d.iter().all(|t| *t == 7));
     }

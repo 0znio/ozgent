@@ -60,6 +60,10 @@ pub struct Engine {
     weight_bytes: u64,
 }
 
+/// How far an n-gram match must extend behind the key before it is drafted,
+/// on the rollback path where a wrong guess costs an extra forward pass.
+const MIN_DRAFT_REACH: usize = 4;
+
 /// Draft length used while measuring whether drafting is worth it at all.
 ///
 /// Only relevant on the snapshot rollback path, where a rejected draft costs an
@@ -1109,6 +1113,11 @@ impl<'a> Session<'a> {
         // probe costs an extra forward pass on the snapshot path, so probing
         // has to be rarer there to stay cheap.
         let probe_every = if use_snapshot { 96 } else { 24 };
+        // How far a match must extend behind the key before it is worth
+        // betting on. Zero keeps the trim path exactly as it was; on the
+        // snapshot path a wrong bet costs an extra forward pass, so a bare
+        // two-token coincidence is not enough evidence to pay that.
+        let min_reach = if use_snapshot { MIN_DRAFT_REACH } else { 0 };
         let min_acceptance = if use_snapshot {
             (self.opts.speculative_tuning.min_acceptance * 2.0).min(0.6)
         } else {
@@ -1233,7 +1242,7 @@ impl<'a> Session<'a> {
                     .min(n_batch.saturating_sub(1));
                 // Draft longer while drafts are landing, shorter when they are
                 // not: a rejected draft wastes the whole batch slot.
-                ngram.draft(ngram.suggest_len(cap)).into_iter().map(LlamaToken).collect()
+                ngram.draft(ngram.suggest_len(cap), min_reach).into_iter().map(LlamaToken).collect()
             } else {
                 Vec::new()
             };
