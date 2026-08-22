@@ -480,15 +480,31 @@ fn turn(
 
         let Some(t) = tools else { break };
 
+        // Independent calls run together. In series, a turn asking for three
+        // searches paid three network round trips end to end, and the tool
+        // timeout applied to each in turn rather than to the set.
+        //
+        // Every call is announced before any is awaited, so the transcript
+        // shows the whole batch as pending rather than appearing to work
+        // through them one at a time.
         for call in &parsed.calls {
             let _ = request.out.send(Event::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            let started = std::time::Instant::now();
-            let outcome = t.runtime.block_on(t.host.call(&call.name, call.arguments.clone()));
-            let ms = started.elapsed().as_millis() as u64;
+        }
+        let outcomes = t.runtime.block_on(futures_util::future::join_all(
+            parsed.calls.iter().map(|call| async {
+                let started = std::time::Instant::now();
+                let outcome = t.host.call(&call.name, call.arguments.clone()).await;
+                (outcome, started.elapsed().as_millis() as u64)
+            }),
+        ));
 
+        // Consumed in the model's original order, not completion order: the
+        // results become the next prompt, so letting a race decide their order
+        // would make the same turn produce different continuations.
+        for (call, (outcome, ms)) in parsed.calls.iter().zip(outcomes) {
             let (ok, summary, detail, payload) = match outcome {
                 Ok(value) => {
                     let text = serde_json::to_string(&value).unwrap_or_default();
