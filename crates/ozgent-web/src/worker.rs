@@ -795,7 +795,7 @@ fn generate(
 ) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason)> {
     let prompt = engine.render_prompt_with(messages, thinking)?;
     let mut filter = ThinkingFilter::new(thinking);
-    if let Some(close) = engine.stream_starts_inside(thinking) {
+    if let Some(close) = Engine::stream_starts_inside(&prompt) {
         filter = filter.starting_inside(close);
     }
     // One gate per stream, not one shared between them. The gate latches shut

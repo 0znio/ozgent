@@ -61,8 +61,8 @@ pub struct Engine {
     /// False when the model keeps state that cannot be rolled back, which
     /// makes draft rejection unsafe. See [`Engine::rollback_safe`].
     rollback_safe: bool,
-    /// The tag pair this model's template opens for it, if any.
-    think_prefill: Option<crate::thinking::TagPair>,
+    /// The model's own chat template, when it could be compiled.
+    jinja: Option<crate::template::ChatTemplate>,
     /// KV elements stored per token across all layers, for cache sizing.
     kv_elements: u64,
     /// On-disk size of the weights, used as the denominator when deciding
@@ -225,16 +225,28 @@ impl Engine {
         // no capability flag in GGUF for it.
         let raw_template = model.meta_val_str("tokenizer.chat_template").unwrap_or_default();
         let reasoning = raw_template.contains("<think>");
-        // llama.cpp renders these families with its own built-in templates,
-        // which drop the opening tag the real Jinja prefills. Remember what
-        // the model expects so the prompt can put it back.
-        let think_prefill = crate::thinking::prefilled_open(&raw_template);
+        // The model's own Jinja, preferred over llama.cpp's approximation of
+        // it. Failing to compile is not an error: the built-in renderer is
+        // still there and is exactly right for most models.
+        let jinja = if raw_template.is_empty() {
+            None
+        } else {
+            let bos = model.token_to_str(model.token_bos(), Special::Tokenize).unwrap_or_default();
+            let eos = model.token_to_str(model.token_eos(), Special::Tokenize).unwrap_or_default();
+            match crate::template::ChatTemplate::new(&raw_template, bos, eos) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::debug!("using llama.cpp's built-in template instead: {e}");
+                    None
+                }
+            }
+        };
 
         Ok(Self {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
             reasoning,
-            think_prefill,
+            jinja,
             n_layer,
             rollback_safe,
             kv_elements,
@@ -252,27 +264,14 @@ impl Engine {
         self.rollback_safe
     }
 
-    /// The reasoning tag pair this model's prompt opens on its behalf.
+    /// The close tag a stream beginning from `prompt` starts inside.
     ///
-    /// A caller splitting the stream must start already inside the block, or
-    /// it will read the whole reasoning trace as the answer.
-    pub fn think_prefill(&self) -> Option<crate::thinking::TagPair> {
-        self.think_prefill
-    }
-
-    /// The close tag a stream would open inside, if the prompt carried this
-    /// model's own prefill.
-    ///
-    /// Currently always `None`: ozgent renders through llama.cpp's built-in
-    /// templates, which decide per turn whether reasoning is enabled and do
-    /// not report that decision. Supplying the opening tag without knowing it
-    /// swallows the answer of any turn that turns out not to reason. Wired up
-    /// once prompts are rendered from the model's real Jinja.
-    pub fn stream_starts_inside(
-        &self,
-        _thinking: ozgent_core::ThinkingMode,
-    ) -> Option<&'static str> {
-        None
+    /// Read off the rendered prompt rather than guessed from the template,
+    /// because only the render knows whether this particular turn reasons. A
+    /// prompt that ends inside an open block means the model writes reasoning
+    /// first and never emits an opening tag of its own.
+    pub fn stream_starts_inside(prompt: &str) -> Option<&'static str> {
+        crate::thinking::open_at_end(prompt)
     }
 
     pub fn n_layer(&self) -> u32 {
@@ -313,6 +312,29 @@ impl Engine {
         thinking: ozgent_core::ThinkingMode,
     ) -> Result<String, EngineError> {
         let suppress = thinking == ozgent_core::ThinkingMode::Off && self.reasoning;
+
+        // The model's own template first. It is the only thing that knows
+        // whether this turn reasons, and so the only thing that can decide
+        // whether the prompt should end inside an open block.
+        if let Some(jinja) = &self.jinja {
+            let opts = crate::template::RenderOptions {
+                // Always stated, never left to the template's default. Qwen3.5
+                // reads an undefined `enable_thinking` as "off" and writes a
+                // closed empty block, so silence is not neutral — it is a
+                // decision, and the wrong one for a model whose whole point is
+                // that it reasons. "Auto" is ozgent's own rule: think if the
+                // model advertises the capability.
+                enable_thinking: Some(match thinking {
+                    ozgent_core::ThinkingMode::On => true,
+                    ozgent_core::ThinkingMode::Off => false,
+                    ozgent_core::ThinkingMode::Auto => self.reasoning,
+                }),
+            };
+            match jinja.render(messages, opts) {
+                Ok(prompt) => return Ok(prompt),
+                Err(e) => tracing::debug!("falling back to the built-in template: {e}"),
+            }
+        }
 
         let Some(template) = &self.template else {
             let mut p = fallback_prompt(messages);

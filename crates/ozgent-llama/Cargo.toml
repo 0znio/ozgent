@@ -21,5 +21,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+minijinja.workspace = true
+minijinja-contrib.workspace = true
 llama-cpp-2 = { version = "0.1.154", optional = true }
 ozgent-mtmd-sys = { workspace = true, optional = true }

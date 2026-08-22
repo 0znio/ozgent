@@ -591,7 +591,7 @@ impl<'a> Chat<'a> {
         let mut markdown =
             StreamRenderer::new(MarkdownRenderer::new(self.theme.clone(), self.width));
         let mut filter = ThinkingFilter::new(self.opts.thinking);
-        if let Some(close) = self.engine.stream_starts_inside(self.opts.thinking) {
+        if let Some(close) = Engine::stream_starts_inside(&prompt) {
             filter = filter.starting_inside(close);
         }
         let mut out = std::io::stdout();

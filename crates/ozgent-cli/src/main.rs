@@ -819,7 +819,7 @@ async fn run_once(
     let width = terminal_width();
     let mut markdown = StreamRenderer::new(MarkdownRenderer::new(theme.clone(), width));
     let mut filter = ThinkingFilter::new(resolved.thinking);
-    if let Some(close) = engine.stream_starts_inside(resolved.thinking) {
+    if let Some(close) = Engine::stream_starts_inside(&rendered_prompt) {
         filter = filter.starting_inside(close);
     }
 

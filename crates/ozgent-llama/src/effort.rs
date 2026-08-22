@@ -52,9 +52,7 @@ impl ThinkBudget {
 
     /// Whether `prompt` leaves a reasoning block open.
     pub fn opens_thinking(prompt: &str) -> bool {
-        DEFAULT_TAGS
-            .iter()
-            .any(|t| prompt.matches(t.open).count() > prompt.matches(t.close).count())
+        crate::thinking::open_at_end(prompt).is_some()
     }
 
     /// Whether the block is open and the budget is gone.

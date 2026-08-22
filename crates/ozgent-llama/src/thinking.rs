@@ -39,29 +39,21 @@ pub const DEFAULT_TAGS: &[TagPair] = &[
     TagPair { open: "<|channel|>analysis<|message|>", close: "<|end|>" },
 ];
 
-/// Whether a chat template ends its generation prompt with an opening tag.
+/// The close tag a prompt leaves open, if it ends inside a reasoning block.
 ///
-/// Qwen3.5 and Ling 3.0 both do: their Jinja emits a bare `'<think>\n'` after
-/// the assistant header, so the model is already inside the block and writes
-/// only the reasoning and the closing tag. llama.cpp's built-in renderers for
-/// both families omit that prefill, and the resulting stream — reasoning text
-/// with no opening tag — is indistinguishable from a plain answer. Detecting
-/// the intent in the template lets the prompt supply what the renderer drops.
+/// Reasoning templates force a model to think by ending the generation prompt
+/// with the opening tag. Generation then starts *inside* the block, so the
+/// model writes the trace and the closing tag but never an opening one — and
+/// a filter waiting to see one reads the whole trace as the answer.
 ///
-/// The signal is a template literal that *ends* just after the open tag. A
-/// literal that continues into the matching close (`'<think>\n\n</think>'`,
-/// the way both templates spell "thinking off") means the opposite and must
-/// not match.
-pub fn prefilled_open(template: &str) -> Option<TagPair> {
-    DEFAULT_TAGS.iter().copied().find(|tag| {
-        template.match_indices(tag.open).any(|(at, _)| {
-            let rest = &template[at + tag.open.len()..];
-            // Step over the escape sequences a Jinja literal writes before its
-            // own closing quote; anything else means the literal carries on.
-            let tail = rest.trim_start_matches(['\\', 'n', 'r', ' ', '\t']);
-            tail.starts_with('\'') || tail.starts_with('"')
-        })
-    })
+/// Counting rather than searching from the end: a conversation replays earlier
+/// assistant turns, each with its own complete block, so the question is
+/// whether one more was opened than closed.
+pub fn open_at_end(prompt: &str) -> Option<&'static str> {
+    DEFAULT_TAGS
+        .iter()
+        .find(|t| prompt.matches(t.open).count() > prompt.matches(t.close).count())
+        .map(|t| t.close)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,27 +401,32 @@ mod tests {
         assert!(!f.is_thinking(), "the span closed");
     }
 
+
+
+
     #[test]
-    fn a_template_that_prefills_the_open_tag_is_recognised() {
-        // Qwen3.5: the generation prompt ends inside the block.
-        let qwen = "{%- if add_generation_prompt %}\n{{- '<think>\\n' }}\n{%- endif %}";
-        assert_eq!(prefilled_open(qwen).map(|t| t.close), Some("</think>"));
-        // Ling 3.0 spells the same thing with the newline in front.
-        let ling = "{{- '\\n<think>' }}";
-        assert_eq!(prefilled_open(ling).map(|t| t.close), Some("</think>"));
+    fn a_prompt_ending_in_an_open_tag_starts_inside() {
+        assert_eq!(open_at_end("<|im_start|>assistant\n<think>\n"), Some("</think>"));
     }
 
     #[test]
-    fn a_closed_empty_block_is_not_a_prefill() {
-        // Both templates use this to mean "thinking off". Treating it as a
-        // prefill would start the filter inside a block the model never opens.
-        let off = "{{- '<think>\\n\\n</think>\\n\\n' }}";
-        assert_eq!(prefilled_open(off), None);
+    fn a_prompt_ending_after_the_answer_does_not() {
+        assert_eq!(open_at_end("<|im_start|>assistant\n"), None);
+        // A closed block from an earlier turn is not an open one.
+        assert_eq!(open_at_end("<think>past</think>answer<|im_start|>assistant\n"), None);
     }
 
     #[test]
-    fn a_template_without_reasoning_prefills_nothing() {
-        let plain = "{{- '<|im_start|>assistant\\n' }}";
-        assert_eq!(prefilled_open(plain), None);
+    fn replayed_turns_do_not_confuse_the_count() {
+        // Two complete blocks from history, then one opened for this turn.
+        let p = "<think>a</think>x<think>b</think>y<|im_start|>assistant\n<think>\n";
+        assert_eq!(open_at_end(p), Some("</think>"));
+    }
+
+    #[test]
+    fn a_suppressed_block_reads_as_closed() {
+        // The `<think>\n\n</think>` prefill means "do not reason", and the
+        // stream that follows is answer text from its first character.
+        assert_eq!(open_at_end("<|im_start|>assistant\n<think>\n\n</think>\n\n"), None);
     }
 }
