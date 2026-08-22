@@ -27,6 +27,13 @@ use crate::engine::EngineError;
 /// silently averaging several chunks would be worse than using the opening.
 const MAX_TOKENS: usize = 512;
 
+/// Texts embedded per decode.
+///
+/// Each needs its own sequence lane and its own slice of context, so the group
+/// size is bounded by what the KV allocation is worth rather than by anything
+/// about the model.
+const GROUP: usize = 8;
+
 /// A loaded embedding model.
 pub struct Embedder {
     model: LlamaModel,
@@ -73,18 +80,26 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let backend = crate::engine::backend_handle()?;
+        // One sequence per text, so a group is embedded in a single decode.
+        // The context has to be told how many: it defaults to one, and a batch
+        // referring to sequence 1 against a one-sequence context is rejected
+        // as invalid — which llama-cpp-2 reports as "n_tokens == 0", a message
+        // that sends you looking at the batch size instead.
+        let lanes = texts.len().min(GROUP) as u32;
         let params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx * texts.len().min(8) as u32))
-            .with_n_batch(self.n_ctx * texts.len().min(8) as u32)
+            .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx * lanes))
+            .with_n_batch(self.n_ctx * lanes)
+            .with_n_seq_max(lanes)
             .with_embeddings(true)
-            // Mean pooling is what most GGUF embedding models are trained for;
-            // `Unspecified` would let llama.cpp fall back to no pooling, which
-            // returns per-token vectors and no sentence vector at all.
-            .with_pooling_type(LlamaPoolingType::Mean);
+            // `Unspecified` lets the model's own metadata choose. Forcing a
+            // strategy the model was not trained for produces vectors that
+            // decode fine and compare badly — Qwen3-Embedding pools the last
+            // token, while most BERT-style encoders pool the mean.
+            .with_pooling_type(LlamaPoolingType::Unspecified);
 
         let mut out = Vec::with_capacity(texts.len());
         // Chunked so a long list cannot demand one enormous context.
-        for group in texts.chunks(8) {
+        for group in texts.chunks(GROUP) {
             let mut context = self
                 .model
                 .new_context(backend, params.clone())
