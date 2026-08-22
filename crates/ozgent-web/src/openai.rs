@@ -223,6 +223,9 @@ pub struct ChatRequest {
     /// `true`/`false`, or `"auto"`/`"on"`/`"off"` for models that reason.
     #[serde(default)]
     pub reasoning: Option<serde_json::Value>,
+    /// `"low"`, `"medium"` or `"high"`, spelled as OpenAI spells it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Off by default so a plain OpenAI client never gets a surprise tool call.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
@@ -351,8 +354,18 @@ impl ChatMessage {
 ///
 /// Only what the caller actually set: an absent field must inherit the server's
 /// configuration rather than silently reset it to an OpenAI default.
+/// The effort level a request asked for, if it named a valid one.
+///
+/// An unrecognised level is ignored rather than refused: it narrows how long
+/// the model thinks and nothing else, so a client sending a level ozgent does
+/// not know should still get an answer.
+pub fn effort_from(value: Option<&String>) -> Option<ozgent_core::ReasoningEffort> {
+    value.and_then(|v| v.parse().ok())
+}
+
 pub fn options_from(request: &ChatRequest) -> ozgent_core::Options {
     ozgent_core::Options {
+        reasoning_effort: effort_from(request.reasoning_effort.as_ref()),
         temperature: request.temperature,
         top_p: request.top_p,
         top_k: request.top_k,

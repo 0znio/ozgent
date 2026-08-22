@@ -152,15 +152,17 @@ impl Worker {
 /// Outer loop: owns nothing but the channel, and loads a model on demand.
 fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
     let mut pending: Option<Box<Request>> = None;
+    // Held across model loads: the embedding model is independent of whichever
+    // chat model happens to be resident.
+    let mut embedder: Option<ozgent_llama::embed::Embedder> = None;
     loop {
         // Either carry over the job that forced a model switch, or wait.
         let request = match pending.take() {
             Some(r) => r,
             None => match rx.recv() {
                 Ok(Job::Generate(r)) => r,
-                Ok(Job::Embed { reply, .. }) => {
-                    // Refused rather than faked. See `embed_texts`.
-                    let _ = reply.send(Err(embedding_unavailable()));
+                Ok(Job::Embed { texts, reply }) => {
+                    let _ = reply.send(serve_embeddings(&paths, &config, &mut embedder, texts));
                     continue;
                 }
                 Ok(Job::Unload) => continue, // nothing loaded
@@ -170,7 +172,7 @@ fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
 
         // Loading and the session that borrows it both live in this scope, so
         // the borrow checker is satisfied without any self-referential trick.
-        match serve_model(&paths, &config, tools.as_ref(), request, &rx) {
+        match serve_model(&paths, &config, tools.as_ref(), &mut embedder, request, &rx) {
             Ok(next) => pending = next,
             Err(e) => tracing::error!("inference thread: {e}"),
         }
@@ -183,6 +185,9 @@ fn serve_model(
     paths: &Paths,
     config: &Config,
     tools: Option<&Tools>,
+    // Threaded through rather than rebuilt: an embedding request that arrives
+    // mid-conversation should not reload the model it already has.
+    embedder: &mut Option<ozgent_llama::embed::Embedder>,
     first: Box<Request>,
     rx: &Receiver<Job>,
 ) -> anyhow::Result<Option<Box<Request>>> {
@@ -262,8 +267,8 @@ fn serve_model(
         request = loop {
             match rx.recv() {
                 Ok(Job::Generate(r)) => break r,
-                Ok(Job::Embed { reply, .. }) => {
-                    let _ = reply.send(Err(embedding_unavailable()));
+                Ok(Job::Embed { texts, reply }) => {
+                    let _ = reply.send(serve_embeddings(paths, config, embedder, texts));
                 }
                 // Unloading means returning so the engine is dropped with the scope.
                 Ok(Job::Unload) => return Ok(None),
@@ -282,6 +287,38 @@ fn serve_model(
 /// states yields vectors that look plausible, cluster badly, and give the
 /// caller no way to tell — the same trap the memory layer fell into by shipping
 /// a lexical stand-in behind a semantic-sounding interface.
+/// Answer an embedding request, loading the model on first use.
+fn serve_embeddings(
+    paths: &Paths,
+    config: &Config,
+    slot: &mut Option<ozgent_llama::embed::Embedder>,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, String> {
+    if slot.is_none() {
+        *slot = Some(load_embedder(paths, config)?);
+    }
+    let embedder = slot.as_ref().expect("just loaded");
+    embedder.embed_batch(&texts).map_err(|e| e.to_string())
+}
+
+/// Load the configured embedding model, once.
+///
+/// Lazily, because most sessions never ask for an embedding and the model is
+/// another half-gigabyte of VRAM that a chat has better uses for.
+fn load_embedder(
+    paths: &Paths,
+    config: &Config,
+) -> Result<ozgent_llama::embed::Embedder, String> {
+    let Some(name) = config.embedding.model.as_deref() else {
+        return Err(embedding_unavailable());
+    };
+    let found = ozgent_core::resolve(paths, name)
+        .map_err(|e| format!("embedding model {name:?}: {e}"))?;
+    let weights = found.manifest.primary_weights(&found.dir);
+    ozgent_llama::embed::Embedder::load(&weights, 99)
+        .map_err(|e| format!("loading embedding model {name:?}: {e}"))
+}
+
 fn embedding_unavailable() -> String {
     "no embedding model is configured. Install one and set \
      [embedding] model = \"<name>\" in config.toml"

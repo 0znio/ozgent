@@ -27,6 +27,22 @@ pub struct Config {
     pub tools: ToolsConfig,
 
     pub ui: UiConfig,
+
+    pub embedding: EmbeddingConfig,
+}
+
+/// The model used for embeddings.
+///
+/// Separate from the chat model on purpose: pooling a chat model's hidden
+/// states produces vectors that look plausible and cluster badly, so ozgent
+/// would rather have none than pretend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    /// An installed model, as `name:tag` or an alias. `None` disables
+    /// embeddings and the memory layer falls back to lexical matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

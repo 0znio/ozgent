@@ -253,6 +253,10 @@ pub struct OptionFlags {
     #[arg(long, value_name = "N", global = true)]
     pub ubatch: Option<u32>,
 
+    /// How hard a reasoning model should think: `low`, `medium`, or `high`.
+    #[arg(long, value_name = "LEVEL", global = true)]
+    pub effort: Option<ozgent_core::ReasoningEffort>,
+
     /// Context length in tokens.
     #[arg(long, short = 'c', value_name = "N", global = true)]
     pub ctx: Option<u32>,
@@ -349,6 +353,7 @@ impl OptionFlags {
             max_tokens: self.max_tokens,
             system_prompt,
             thinking: if self.no_think { Some(ThinkingMode::Off) } else { self.think },
+            reasoning_effort: self.effort,
             tools: self.no_tools.then_some(false),
             speculative: match self.spec.as_deref() {
                 None => None,

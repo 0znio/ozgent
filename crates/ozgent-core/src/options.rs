@@ -114,6 +114,62 @@ pub enum ThinkingMode {
     Off,
 }
 
+/// How long a reasoning model may think before it must answer.
+///
+/// Enforced as a token budget on the reasoning block rather than asked for in
+/// the prompt: a model told to "think briefly" frequently does not, while a
+/// model whose `</think>` is written for it has no choice. Spending the budget
+/// ends the reasoning and the answer begins — nothing is truncated, because the
+/// block is closed properly rather than cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Enough to plan a couple of steps.
+    Low,
+    /// Room to work through a problem. The default.
+    #[default]
+    Medium,
+    /// Effectively unbounded; the model stops when it is done.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Tokens the reasoning block may spend.
+    ///
+    /// `High` is not infinite but is past the point where any of these models
+    /// keep making progress, so it behaves as "no limit" without letting a
+    /// loop consume the whole context.
+    pub fn budget(self) -> u32 {
+        match self {
+            Self::Low => 256,
+            Self::Medium => 1024,
+            Self::High => 8192,
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" | "min" | "minimal" => Ok(Self::Low),
+            "medium" | "med" | "default" => Ok(Self::Medium),
+            "high" | "max" => Ok(Self::High),
+            other => Err(format!("unknown reasoning effort {other:?}; expected low, medium, or high")),
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        })
+    }
+}
+
 impl std::str::FromStr for ThinkingMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -199,6 +255,8 @@ pub struct Options {
     pub system_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingMode>,
+    /// How long a reasoning model may think. Ignored when thinking is off.
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<bool>,
 }
@@ -211,12 +269,17 @@ impl Options {
                 if higher.$f.is_some() { self.$f = higher.$f.clone(); }
             )*};
         }
+        // Every field must be listed. One left out is silently dropped from
+        // every merge — the flag parses, the config accepts it, and nothing
+        // happens. `ubatch` and `reasoning_effort` were both added to the
+        // struct and forgotten here, and both looked like features that did
+        // not work rather than like a bug in this list.
         take!(
-            gpu_layers, context_length, batch_size, threads, main_gpu, use_mmap, use_mlock,
+            gpu_layers, context_length, batch_size, ubatch, threads, main_gpu, use_mmap, use_mlock,
             flash_attention, cpu_moe, control_vector, control_strength,
             cache_type_k, cache_type_v, speculative,
             speculative_tuning, prefix_reuse, temperature, top_p, top_k, min_p, repeat_penalty, repeat_last_n,
-            seed, max_tokens, system_prompt, thinking, tools,
+            seed, max_tokens, system_prompt, thinking, reasoning_effort, tools,
         );
         self
     }
@@ -262,6 +325,7 @@ impl Options {
             max_tokens: self.max_tokens.unwrap_or(0),
             system_prompt: self.system_prompt.clone(),
             thinking: self.thinking.unwrap_or_default(),
+            reasoning_effort: self.reasoning_effort.unwrap_or_default(),
             tools: self.tools.unwrap_or(true),
         }
     }
@@ -306,12 +370,32 @@ pub struct Resolved {
     pub max_tokens: u32,
     pub system_prompt: Option<String>,
     pub thinking: ThinkingMode,
+    pub reasoning_effort: ReasoningEffort,
     pub tools: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_option_survives_a_merge() {
+        // Guards the explicit field list in `merge`: a field added to Options
+        // and forgotten there is silently dropped, which looks exactly like a
+        // flag that does nothing.
+        let higher = Options {
+            ubatch: Some(256),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let merged = Options::default().merge(&higher);
+        assert_eq!(merged.ubatch, Some(256), "ubatch was dropped by merge");
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "reasoning_effort was dropped by merge"
+        );
+    }
 
     #[test]
     fn accel_defaults_are_the_fast_ones() {

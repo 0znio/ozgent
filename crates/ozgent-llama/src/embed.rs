@@ -93,9 +93,12 @@ impl Embedder {
 
             let mut used = Vec::with_capacity(group.len());
             for (seq, text) in group.iter().enumerate() {
+                // `Always` on a model that declares no BOS token yields an
+                // empty sequence, and an empty batch reaches llama.cpp as
+                // "n_tokens == 0" — an error that says nothing about the cause.
                 let mut tokens = self
                     .model
-                    .str_to_token(text, AddBos::Always)
+                    .str_to_token(text, AddBos::Never)
                     .map_err(|e| EngineError::Tokenize(e.to_string()))?;
                 tokens.truncate(self.n_ctx as usize);
                 if tokens.is_empty() {
@@ -103,13 +106,22 @@ impl Embedder {
                     continue;
                 }
                 for (pos, token) in tokens.iter().enumerate() {
+                    // Every token is marked as an output. Pooling averages over
+                    // the sequence's token outputs, so marking none leaves
+                    // llama.cpp with nothing to pool and it rejects the batch.
                     batch
-                        .add(*token, pos as i32, &[seq as i32], false)
+                        .add(*token, pos as i32, &[seq as i32], true)
                         .map_err(|e| EngineError::Batch(e.to_string()))?;
                 }
                 used.push(true);
             }
 
+            if used.iter().all(|ok| !ok) {
+                // Nothing tokenised; decoding would fail with an error that
+                // names the batch rather than the reason.
+                out.extend(group.iter().map(|_| vec![0.0; self.dimensions]));
+                continue;
+            }
             context
                 .decode(&mut batch)
                 .map_err(|e| EngineError::Decode(e.to_string()))?;

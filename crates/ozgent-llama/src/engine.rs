@@ -105,9 +105,57 @@ impl Engine {
             .with_use_mlock(opts.use_mlock)
             .with_main_gpu(opts.main_gpu as i32));
 
+        // `auto` was the default and did nothing: the planner in backend.rs was
+        // written and tested but never called, so the option documented as
+        // "search for the smallest offload that fits in VRAM" searched for
+        // nothing. Resolving it needs the per-layer and per-expert byte costs,
+        // which come from the file's tensor table rather than from llama.cpp.
+        let resolved_moe = match opts.cpu_moe {
+            MoeOffload::Keyword(MoeKeyword::Auto) => {
+                let layout = crate::layout::read(path).unwrap_or_default();
+                if layout.is_moe() {
+                    let device = crate::backend::best_gpu();
+                    // The KV cache and compute buffers have to stay resident,
+                    // so they come off the budget before any weight does.
+                    let overhead = ozgent_core::accel::kv_bytes(
+                        layout.kv_elements_per_token,
+                        opts.context_length,
+                        // Auto KV sizing happens later against the loaded
+                        // model; F16 is the conservative assumption here, so a
+                        // wrong guess leaves headroom rather than overcommitting.
+                        if opts.cache_type_k == ozgent_core::accel::CacheType::Auto {
+                            ozgent_core::accel::CacheType::F16
+                        } else {
+                            opts.cache_type_k
+                        },
+                    );
+                    let (_, moe) = crate::backend::resolve_auto(
+                        opts.gpu_layers,
+                        opts.cpu_moe,
+                        device.as_ref(),
+                        layout.layers,
+                        layout.bytes_per_layer,
+                        layout.expert_bytes_per_layer,
+                        overhead,
+                    );
+                    if moe > 0 {
+                        tracing::info!(
+                            "cpu-moe auto: evicting routed experts from {moe} of {} layers",
+                            layout.layers
+                        );
+                    }
+                    MoeOffload::Layers(moe)
+                } else {
+                    // Nothing to evict on a dense model.
+                    MoeOffload::Layers(0)
+                }
+            }
+            other => other,
+        };
+
         // Evicting routed experts frees far more VRAM per lost token/sec than
         // dropping whole layers, so it is applied before any layer reduction.
-        match opts.cpu_moe {
+        match resolved_moe {
             MoeOffload::Keyword(MoeKeyword::All) => params.as_mut().add_cpu_moe_override(),
             MoeOffload::Layers(n) if n > 0 => {
                 for layer in 0..n {
@@ -1203,6 +1251,28 @@ impl<'a> Session<'a> {
             }
         }
 
+        // Reasoning is only bounded when it is actually happening; with
+        // thinking suppressed the block never opens and the budget never fires.
+        let think_budget = if matches!(self.opts.thinking, ozgent_core::ThinkingMode::Off) {
+            0
+        } else {
+            self.opts.reasoning_effort.budget()
+        };
+        tracing::debug!(
+            "reasoning budget {think_budget}; prompt opens a block: {}; tail: {:?}",
+            crate::effort::ThinkBudget::opens_thinking(prompt),
+            &prompt[prompt.len().saturating_sub(60)..]
+        );
+        let mut think = if crate::effort::ThinkBudget::opens_thinking(prompt) {
+            crate::effort::ThinkBudget::resumed(think_budget)
+        } else {
+            crate::effort::ThinkBudget::new(think_budget)
+        };
+        let closing: Vec<LlamaToken> = self
+            .model
+            .str_to_token(crate::effort::CLOSE, AddBos::Never)
+            .unwrap_or_default();
+
         let gen_started = Instant::now();
         let mut decoder = Utf8Buffer::new();
         let limit = if max_tokens == 0 { u32::MAX } else { max_tokens };
@@ -1276,6 +1346,7 @@ impl<'a> Session<'a> {
                         model: &LlamaModel,
                         decoder: &mut Utf8Buffer,
                         gate: &mut ToolGate,
+                        budget: &mut crate::effort::ThinkBudget,
                         on_token: &mut dyn FnMut(&str) -> bool|
          -> Result<(bool, Option<String>), EngineError> {
             let started = std::time::Instant::now();
@@ -1286,6 +1357,7 @@ impl<'a> Session<'a> {
             // Checked before the callback so a slow consumer cannot delay the
             // constraint past the first token of the call body.
             let trigger = gate.observe(&text);
+            budget.observe(&text);
             let out = text.is_empty() || on_token(&text);
             callback_ns += started.elapsed().as_nanos();
             Ok((out, trigger))
@@ -1313,7 +1385,7 @@ impl<'a> Session<'a> {
             // twice — which double-counts repetition penalties, and drives a
             // grammar into a dead state that llama.cpp aborts on.
             let (keep_going, trigger) =
-                emit(pending, self.model, &mut decoder, &mut gate, &mut on_token)?;
+                emit(pending, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?;
             // The model has just committed to a call, so the body can be
             // constrained from here without forcing the turn to be one.
             if let Some(g) = trigger {
@@ -1336,6 +1408,40 @@ impl<'a> Session<'a> {
             produced += 1;
             stats.generated_tokens += 1;
             self.cached.push(pending);
+
+            // Out of thinking budget: close the block for the model rather
+            // than cut the stream. The closing tokens are decoded into the
+            // context alongside the token just emitted, so the model reads its
+            // own reasoning as finished and answers normally — where truncating
+            // would leave an unterminated block and waste what it already
+            // spent. Drafting is skipped this round; there is nothing to guess.
+            if think.exhausted() && !closing.is_empty() {
+                batch.clear();
+                batch
+                    .add(pending, self.n_past, &[0], false)
+                    .map_err(|e| EngineError::Batch(e.to_string()))?;
+                for (i, token) in closing.iter().enumerate() {
+                    batch
+                        .add(*token, self.n_past + 1 + i as i32, &[0], i + 1 == closing.len())
+                        .map_err(|e| EngineError::Batch(e.to_string()))?;
+                }
+                self.context
+                    .decode(&mut batch)
+                    .map_err(|e| EngineError::Decode(e.to_string()))?;
+                self.n_past += 1 + closing.len() as i32;
+
+                for token in &closing {
+                    if !emit(*token, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?.0 {
+                        reason = StopReason::Cancelled;
+                        break 'outer;
+                    }
+                    self.cached.push(*token);
+                }
+                think.closed();
+                tracing::info!("reasoning budget of {think_budget} spent; closed the block");
+                pending = self.sampler.sample(&self.context, -1);
+                continue;
+            }
 
             // The cache keeps its own copy of the sequence, so nothing is
             // copied per token here — this loop runs once per generated token
@@ -1433,7 +1539,7 @@ impl<'a> Session<'a> {
                 if produced >= limit {
                     break;
                 }
-                if !emit(chosen, self.model, &mut decoder, &mut gate, &mut on_token)?.0 {
+                if !emit(chosen, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?.0 {
                     reason = StopReason::Cancelled;
                     accepted = i + 1;
                     self.cached.push(chosen);
@@ -1462,6 +1568,9 @@ impl<'a> Session<'a> {
             pending = chosen;
         }
 
+        if think.spent() > 0 {
+            tracing::debug!("reasoning ran {} tokens (budget {think_budget})", think.spent());
+        }
         let tail = decoder.finish();
         if !tail.is_empty() {
             on_token(&tail);

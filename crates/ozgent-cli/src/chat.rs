@@ -771,6 +771,12 @@ impl<'a> Chat<'a> {
                 self.opts.thinking = mode;
                 layer.thinking = Some(mode);
             }
+            "effort" | "reasoning_effort" => {
+                let level: ozgent_core::ReasoningEffort =
+                    value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                self.opts.reasoning_effort = level;
+                layer.reasoning_effort = Some(level);
+            }
             "temperature" | "temp" => {
                 let t: f32 = value.parse().context("temperature must be a number")?;
                 self.opts.temperature = t;
@@ -782,7 +788,7 @@ impl<'a> Chat<'a> {
                 layer.tools = Some(on);
             }
             other => {
-                eprintln!("{}", dim(&format!("unknown setting {other:?}; try thinking, temperature, tools")));
+                eprintln!("{}", dim(&format!("unknown setting {other:?}; try thinking, effort, temperature, tools")));
                 return Ok(());
             }
         }

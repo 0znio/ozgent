@@ -5,8 +5,11 @@ pub mod backend;
 pub mod cvec;
 #[cfg(feature = "llama")]
 pub mod embed;
+pub mod effort;
 pub mod engine;
 pub mod grammar;
+#[cfg(feature = "llama")]
+pub mod layout;
 #[cfg(feature = "llama")]
 pub mod mtmd;
 pub mod ngram;

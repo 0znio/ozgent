@@ -651,3 +651,35 @@ body {
   .only-narrow { display: block; }
 }
 @media (prefers-reduced-motion: reduce) { .sidebar { transition: none; } }
+
+
+/* Segmented choice, for settings with named levels rather than a range. */
+.choice { display: flex; flex-direction: column; gap: .35rem; }
+.segmented {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface-2, rgba(127, 127, 127, .12));
+  border-radius: 7px;
+}
+.segmented button {
+  font: inherit;
+  font-size: .82rem;
+  text-transform: capitalize;
+  padding: .3rem .5rem;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  opacity: .65;
+  cursor: pointer;
+}
+.segmented button:hover { opacity: .9; }
+.segmented button[aria-pressed="true"] {
+  background: var(--surface, rgba(127, 127, 127, .25));
+  opacity: 1;
+  font-weight: 600;
+}
+.segmented button:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }

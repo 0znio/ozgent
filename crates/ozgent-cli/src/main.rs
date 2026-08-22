@@ -150,6 +150,7 @@ fn show_model(paths: &Paths, config: &Config, model: &str) -> Result<()> {
     println!("  flash attn    {}", resolved.flash_attention);
     println!("  temperature   {}", resolved.temperature);
     println!("  thinking      {:?}", resolved.thinking);
+    println!("  effort        {}", resolved.reasoning_effort);
     println!("  tools         {}", resolved.tools);
     Ok(())
 }
@@ -623,6 +624,17 @@ async fn doctor(paths: &Paths, config: &Config) -> Result<()> {
                         // rejected draft by trimming the cache, which is the
                         // single fact that decides how speculation behaves.
                         println!("  rollback safe {}", engine.rollback_safe());
+                        // What the expert-offload planner sees. Zero expert
+                        // bytes means a dense model and `cpu_moe = auto`
+                        // correctly does nothing.
+                        if let Some(l) = ozgent_llama::layout::read(&weights) {
+                            println!(
+                                "  per layer     {:.1} MiB ({:.1} MiB routed experts)",
+                                l.bytes_per_layer as f64 / 1048576.0,
+                                l.expert_bytes_per_layer as f64 / 1048576.0
+                            );
+                            println!("  mixture       {}", l.is_moe());
+                        }
                     }
                     Err(e) => println!("  cannot load   {e}"),
                 }
