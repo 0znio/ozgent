@@ -230,6 +230,9 @@ pub struct ChatRequest {
     /// ozgent extension: use the server's own Python tools.
     #[serde(default)]
     pub ozgent_tools: Option<bool>,
+    /// `{"type":"json_object"}`, or `{"type":"json_schema","json_schema":{...}}`.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
     /// ozgent extension: which built-in tools this request may use, by name.
     ///
     /// Absent offers all of them. Naming a subset is how a caller keeps, say,
@@ -408,6 +411,33 @@ pub fn to_messages(request: &ChatRequest) -> Vec<Message> {
         .collect()
 }
 
+/// The grammar `response_format` asks for, if any.
+///
+/// `Err` carries a message for the caller: a `response_format` that cannot be
+/// honoured has to be refused, because the alternative is returning prose to a
+/// client that will try to parse it as JSON.
+pub fn response_grammar(value: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    let Some(format) = value else { return Ok(None) };
+    match format.get("type").and_then(|t| t.as_str()) {
+        None | Some("text") => Ok(None),
+        Some("json_object") => Ok(Some(ozgent_llama::grammar::json_object_grammar())),
+        Some("json_schema") => {
+            // OpenAI nests the schema one level down; some clients put it at the
+            // top. Accepting only the documented spelling would reject requests
+            // that are otherwise perfectly clear.
+            let schema = format
+                .get("json_schema")
+                .and_then(|j| j.get("schema"))
+                .or_else(|| format.get("schema"))
+                .ok_or_else(|| {
+                    "response_format json_schema needs a `schema`".to_string()
+                })?;
+            Ok(Some(ozgent_llama::grammar::schema_grammar(schema)))
+        }
+        Some(other) => Err(format!("unsupported response_format type {other:?}")),
+    }
+}
+
 /// Tools the *caller* implements, taken from the request's `tools` array.
 ///
 /// These are not ozgent's Python tools: the server has no code for them. They
@@ -494,19 +524,45 @@ async fn chat_completions(
         images.extend(message.images().map_err(ApiError::bad_request)?);
     }
 
+    let response_grammar = response_grammar(request.response_format.as_ref())
+        .map_err(ApiError::bad_request)?;
+
+    // A schema grammar masks out every token that would break it, so the model
+    // physically cannot emit a tool-call marker. Honouring both would leave the
+    // caller's tools silently dead — the failure this whole area keeps
+    // producing — so the conflict is refused instead.
+    if response_grammar.is_some()
+        && (request.tools.is_some() || request.ozgent_tools == Some(true)
+            || request.native_tools.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "response_format and tools cannot be combined: a schema grammar makes a tool call \
+             unrepresentable, so the tools would never be used",
+        ));
+    }
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     state
         .worker
         .submit(Request {
             model: found.model.to_string(),
             messages: to_messages(&request),
-            thinking: thinking_from(request.reasoning.as_ref()),
+            // A reasoning model opens with `<think>`, which no schema admits —
+            // the grammar would mask the very first token it wants. Structured
+            // output and visible reasoning are not compatible, and discovering
+            // that as a stalled generation would be far worse than this.
+            thinking: if response_grammar.is_some() {
+                Some(ThinkingMode::Off)
+            } else {
+                thinking_from(request.reasoning.as_ref())
+            },
             max_tokens: request.max_tokens.or(request.max_completion_tokens),
             // Naming the built-ins is itself a request to use them, so a
             // caller does not have to set two fields that mean one thing.
             tools_enabled: request.ozgent_tools.unwrap_or(request.native_tools.is_some()),
             native_tools: request.native_tools.clone(),
             client_tools: client_tools(request.tools.as_ref()),
+            response_grammar,
             overrides: Some(options_from(&request)),
             images,
             out: tx,
@@ -732,6 +788,70 @@ mod tests {
 
     fn request(json: serde_json::Value) -> ChatRequest {
         serde_json::from_value(json).expect("should deserialise")
+    }
+
+    #[test]
+    fn a_json_schema_becomes_a_grammar_naming_its_fields() {
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "response_format": { "type": "json_schema", "json_schema": { "name": "person",
+                "schema": { "type": "object",
+                    "properties": { "name": { "type": "string" }, "age": { "type": "integer" } },
+                    "required": ["name", "age"] } } }
+        }));
+        let g = response_grammar(r.response_format.as_ref()).expect("valid").expect("some");
+        assert!(g.starts_with("root ::="), "must have a root rule:\n{g}");
+        assert!(g.contains("name"), "the schema's fields drive the grammar:\n{g}");
+        assert!(g.contains("integer"), "an integer field needs the integer rule:\n{g}");
+    }
+
+    #[test]
+    fn the_schema_may_sit_at_the_top_level_too() {
+        // OpenAI nests it; several clients do not. Rejecting the flat spelling
+        // would refuse a request whose intent is unambiguous.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "response_format": { "type": "json_schema",
+                "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } }
+        }));
+        assert!(response_grammar(r.response_format.as_ref()).unwrap().is_some());
+    }
+
+    #[test]
+    fn json_object_mode_allows_nesting() {
+        // Tool arguments do not nest arbitrarily, so the shared `value` rule is
+        // flat. A bare json_object does nest, and reusing that rule would
+        // forbid perfectly ordinary output.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "json_object" }
+        }));
+        let g = response_grammar(r.response_format.as_ref()).unwrap().unwrap();
+        assert!(g.contains("value ::= object | array"), "value must recurse:\n{g}");
+    }
+
+    #[test]
+    fn plain_text_asks_for_no_constraint() {
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "text" }
+        }));
+        assert!(response_grammar(r.response_format.as_ref()).unwrap().is_none());
+        let none = request(serde_json::json!({ "model": "m", "messages": [] }));
+        assert!(response_grammar(none.response_format.as_ref()).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unhonourable_response_format_is_refused_not_ignored() {
+        // Returning prose to a client that will parse it as JSON is worse than
+        // an error it can read.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "yaml" }
+        }));
+        assert!(response_grammar(r.response_format.as_ref()).is_err());
+
+        let missing = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "json_schema" }
+        }));
+        assert!(response_grammar(missing.response_format.as_ref()).is_err());
     }
 
     #[test]

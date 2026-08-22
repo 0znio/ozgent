@@ -385,6 +385,7 @@ async fn chat(
             tools_enabled: body.tools,
             native_tools: None,
             client_tools: Vec::new(),
+            response_grammar: None,
             overrides: None,
             images,
             out: tx,

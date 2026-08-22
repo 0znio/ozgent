@@ -45,6 +45,10 @@ pub struct Request {
     /// never executed here — when one is called the turn ends and the call is
     /// handed back, which is what an OpenAI client expects.
     pub client_tools: Vec<ozgent_core::ToolSpec>,
+    /// A GBNF grammar constraining the whole reply, from `response_format`.
+    /// Unlike the tool gate this applies from the first token, so the model
+    /// cannot produce anything the schema forbids.
+    pub response_grammar: Option<String>,
     /// Sampling overrides for this request only, as the API allows. Applied on
     /// top of the server's configuration rather than replacing it.
     pub overrides: Option<ozgent_core::Options>,
@@ -324,6 +328,22 @@ fn turn(
     // call is unreachable rather than emitted and then rejected.
     session.set_tools(&offered);
 
+    // The session outlives the request, so a grammar left installed by an
+    // earlier one would silently shape this reply. Cleared unconditionally
+    // before anything else decides to set it.
+    if let Err(e) = session.set_grammar(None) {
+        let _ = request.out.send(Event::Error { message: e.to_string() });
+        return Ok(());
+    }
+    if let Some(grammar) = &request.response_grammar {
+        if let Err(e) = session.set_grammar(Some(grammar)) {
+            let _ = request.out.send(Event::Error {
+                message: format!("response_format produced a grammar the model rejected: {e}"),
+            });
+            return Ok(());
+        }
+    }
+
     let mut messages = request.messages.clone();
     if !images.is_empty() {
         // Joined to the system prompt rather than replacing it, so a user's
@@ -497,6 +517,10 @@ fn turn(
             let budget = fit_budget(resolved.context_length);
             messages.push(Message::tool_result(call.id.clone(), fit(&payload, budget)));
         }
+    }
+
+    if request.response_grammar.is_some() {
+        let _ = session.set_grammar(None);
     }
 
     let seconds = elapsed_ms as f64 / 1000.0;
@@ -893,6 +917,7 @@ mod tests {
             tools_enabled: true,
             native_tools: None,
             client_tools: Vec::new(),
+            response_grammar: None,
             overrides: None,
             images: Vec::new(),
             out,

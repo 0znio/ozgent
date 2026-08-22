@@ -122,6 +122,46 @@ fn build(tools: &[ToolSpec], root_prefix: &str, root_suffix: &str) -> Option<Str
     Some(out)
 }
 
+/// A grammar admitting exactly one JSON value matching `schema`.
+///
+/// The same converter the tool path uses, rooted at the caller's schema rather
+/// than at a tool call. This is what makes `response_format` a guarantee rather
+/// than a request: a token that would break the schema is masked out of the
+/// distribution, so non-conforming output is unreachable instead of unlikely.
+pub fn schema_grammar(schema: &Value) -> String {
+    let mut body = String::new();
+    let mut needed = std::collections::BTreeSet::new();
+    let root = schema_rule(schema, "out", &mut body, &mut needed);
+
+    let mut out = format!("root ::= {root}\n");
+    out.push_str(&emit_primitives(&needed));
+    out.push('\n');
+    out.push_str(&body);
+    out
+}
+
+/// A grammar admitting any single JSON object, for `response_format`'s
+/// `json_object` mode where the caller gives no schema.
+///
+/// Written out rather than assembled from [`PRIMITIVES`], whose `value` rule is
+/// deliberately flat: tool arguments do not nest arbitrarily, but a bare
+/// `json_object` does, so this needs the recursive definition.
+pub fn json_object_grammar() -> String {
+    concat!(
+        "root ::= object\n",
+        "object ::= \"{\" ws ( string ws \":\" ws value ( ws \",\" ws string ws \":\" ws value )* )? ws \"}\" ws\n",
+        "array ::= \"[\" ws ( value ( ws \",\" ws value )* )? ws \"]\" ws\n",
+        "value ::= object | array | string | number | boolean | null\n",
+        "string ::= \"\\\"\" char* \"\\\"\" ws\n",
+        "char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])\n",
+        "number ::= \"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)? ws\n",
+        "boolean ::= (\"true\" | \"false\") ws\n",
+        "null ::= \"null\" ws\n",
+        "ws ::= [ \\t\\n]*\n",
+    )
+    .to_string()
+}
+
 /// Emit a rule for `schema` named `name`, returning the rule reference to use.
 fn schema_rule(
     schema: &Value,
