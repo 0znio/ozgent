@@ -332,6 +332,34 @@ impl Options {
 }
 
 impl Resolved {
+    /// Take the settings that belong to a single turn from `src`.
+    ///
+    /// A server holds one session across many requests, so the turn's own
+    /// sampling has to replace the previous turn's or the first caller's
+    /// temperature, seed and reasoning budget stand for everyone after them.
+    ///
+    /// Load-time settings are deliberately not among these. Layer placement,
+    /// context length, cache types, expert offload and the control vector are
+    /// fixed when the weights are loaded and cannot change under a live KV
+    /// cache; copying them here would claim a change that never happened.
+    pub fn adopt_per_turn(&mut self, src: &Self) {
+        self.temperature = src.temperature;
+        self.top_p = src.top_p;
+        self.top_k = src.top_k;
+        self.min_p = src.min_p;
+        self.repeat_penalty = src.repeat_penalty;
+        self.repeat_last_n = src.repeat_last_n;
+        self.seed = src.seed;
+        self.max_tokens = src.max_tokens;
+        self.system_prompt = src.system_prompt.clone();
+        self.thinking = src.thinking;
+        self.reasoning_effort = src.reasoning_effort;
+        self.tools = src.tools;
+        self.speculative = src.speculative.clone();
+        self.speculative_tuning = src.speculative_tuning.clone();
+        self.prefix_reuse = src.prefix_reuse;
+    }
+
     /// llama.cpp cannot use a quantised K cache without flash attention.
     /// Rather than fail at load time, report whether the combination the user
     /// asked for had to be adjusted.
@@ -475,5 +503,54 @@ mod tests {
             let s = toml::to_string(&W { v }).unwrap();
             assert_eq!(toml::from_str::<W>(&s).unwrap().v, v, "round trip failed for {s}");
         }
+    }
+
+    #[test]
+    fn every_per_turn_option_is_adopted() {
+        // The sibling of `every_option_survives_a_merge`. A per-turn field
+        // left out of `adopt_per_turn` means one client's request silently
+        // runs under another client's setting, which is invisible until two
+        // people share a model.
+        let mut dst = Options::default().resolve();
+        let src = Resolved {
+            temperature: 0.123,
+            top_p: 0.456,
+            top_k: 7,
+            min_p: 0.089,
+            repeat_penalty: 1.23,
+            repeat_last_n: 99,
+            seed: Some(4242),
+            max_tokens: 777,
+            system_prompt: Some("per turn".into()),
+            thinking: ThinkingMode::Off,
+            reasoning_effort: ReasoningEffort::High,
+            tools: !Options::default().resolve().tools,
+            ..Options::default().resolve()
+        };
+        dst.adopt_per_turn(&src);
+
+        assert_eq!(dst.temperature, 0.123, "temperature");
+        assert_eq!(dst.top_p, 0.456, "top_p");
+        assert_eq!(dst.top_k, 7, "top_k");
+        assert_eq!(dst.min_p, 0.089, "min_p");
+        assert_eq!(dst.repeat_penalty, 1.23, "repeat_penalty");
+        assert_eq!(dst.repeat_last_n, 99, "repeat_last_n");
+        assert_eq!(dst.seed, Some(4242), "seed");
+        assert_eq!(dst.max_tokens, 777, "max_tokens");
+        assert_eq!(dst.system_prompt.as_deref(), Some("per turn"), "system_prompt");
+        assert_eq!(dst.thinking, ThinkingMode::Off, "thinking");
+        assert_eq!(dst.reasoning_effort, ReasoningEffort::High, "reasoning_effort");
+        assert_eq!(dst.tools, src.tools, "tools");
+    }
+
+    #[test]
+    fn adopting_a_turn_leaves_load_time_settings_alone() {
+        // These cannot change under a live KV cache. Copying them would report
+        // a context length or layer split the loaded model does not have.
+        let mut dst = Resolved { context_length: 8192, threads: 6, ..Options::default().resolve() };
+        let src = Resolved { context_length: 32768, threads: 1, ..Options::default().resolve() };
+        dst.adopt_per_turn(&src);
+        assert_eq!(dst.context_length, 8192, "context length must survive");
+        assert_eq!(dst.threads, 6, "thread count must survive");
     }
 }
