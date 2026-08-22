@@ -213,7 +213,7 @@ impl NgramCache {
     /// hit saves, so it is suppressed — but only for a while. Every
     /// [`PROBE_AFTER`] rounds one draft is let through to test whether the
     /// text has become predictable again.
-    pub fn worth_drafting(&mut self, min_acceptance: f32) -> bool {
+    pub fn worth_drafting(&mut self, min_acceptance: f32, probe_every: u32) -> bool {
         match self.acceptance() {
             None => true,
             Some(rate) if rate >= min_acceptance => {
@@ -221,7 +221,7 @@ impl NgramCache {
                 true
             }
             Some(_) => {
-                if self.suppressed >= PROBE_AFTER {
+                if self.suppressed >= probe_every {
                     self.suppressed = 0;
                     true
                 } else {
@@ -331,11 +331,11 @@ mod tests {
     fn acceptance_needs_evidence_before_it_judges() {
         let mut c = NgramCache::new();
         assert!(c.acceptance().is_none(), "no verdict without data");
-        assert!(c.worth_drafting(0.2), "must not disable itself prematurely");
+        assert!(c.worth_drafting(0.2, PROBE_AFTER), "must not disable itself prematurely");
         c.observe(20, 2);
         c.observe(20, 2);
         assert_eq!(c.acceptance(), Some(0.1));
-        assert!(!c.worth_drafting(0.2), "a 10% hit rate is not worth verifying");
+        assert!(!c.worth_drafting(0.2, PROBE_AFTER), "a 10% hit rate is not worth verifying");
     }
 
     #[test]
@@ -343,7 +343,7 @@ mod tests {
         let mut c = NgramCache::new();
         c.observe(20, 15);
         c.observe(20, 15);
-        assert!(c.worth_drafting(0.2));
+        assert!(c.worth_drafting(0.2, PROBE_AFTER));
         assert_eq!(c.stats(), (40, 30));
     }
 
@@ -354,11 +354,11 @@ mod tests {
         let mut c = NgramCache::new();
         c.observe(20, 0);
         c.observe(20, 0);
-        assert!(!c.worth_drafting(0.2));
+        assert!(!c.worth_drafting(0.2, PROBE_AFTER));
 
         let mut probes = 0;
         for _ in 0..(PROBE_AFTER * 2 + 4) {
-            if c.worth_drafting(0.2) {
+            if c.worth_drafting(0.2, PROBE_AFTER) {
                 probes += 1;
             }
         }

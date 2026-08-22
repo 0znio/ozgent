@@ -60,6 +60,13 @@ pub struct Engine {
     weight_bytes: u64,
 }
 
+/// Draft length used while measuring whether drafting is worth it at all.
+///
+/// Only relevant on the snapshot rollback path, where a rejected draft costs an
+/// extra forward pass. Long speculative probes into unpredictable text were
+/// measurably slower than not speculating.
+const PROBE_DRAFT_TOKENS: usize = 3;
+
 /// Prefilled to close reasoning before it starts.
 ///
 /// A stream filter can only *hide* reasoning; the model still spends its token
@@ -818,6 +825,39 @@ impl<'a> Session<'a> {
         self.last_reused
     }
 
+    /// Put the sequence back to what was actually confirmed.
+    ///
+    /// With a trimmable cache this just drops the rejected entries. With a
+    /// snapshot it restores the state from before the batch — which undoes the
+    /// confirmed token and the accepted drafts as well, so those are decoded
+    /// again. That re-decode is one extra forward pass, and it is the entire
+    /// cost of speculating on a model whose cache cannot be trimmed.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_draft(
+        &mut self,
+        snapshot: Option<&SeqState>,
+        start: i32,
+        pending: LlamaToken,
+        draft: &[LlamaToken],
+        accepted: usize,
+        batch: &mut LlamaBatch,
+        n_batch: usize,
+    ) -> Result<(), EngineError> {
+        match snapshot {
+            // Everything was accepted: the state already reflects it.
+            Some(_) if accepted == draft.len() => Ok(()),
+            Some(state) => {
+                self.restore(state)?;
+                self.n_past = start;
+                let mut confirmed = Vec::with_capacity(1 + accepted);
+                confirmed.push(pending);
+                confirmed.extend_from_slice(&draft[..accepted]);
+                self.prefill(&confirmed, batch, n_batch, false)
+            }
+            None => self.trim_after_draft(start, accepted, batch, n_batch),
+        }
+    }
+
     /// Drop KV entries for drafted tokens that were rejected.
     ///
     /// After the batch the cache holds the confirmed token plus every drafted
@@ -1045,10 +1085,35 @@ impl<'a> Session<'a> {
         // against the wrong state — llama.cpp then aborts on an empty stack.
         // Rejecting a draft means dropping its KV entries, so speculation is
         // only possible on a cache that can trim.
-        let spec_on = !self.grammar_active
-            && self.rollback_safe
-            && self.can_trim
+        // Two ways to undo a rejected draft. Trimming the KV is free but only
+        // correct when nothing keeps state a trim cannot reach. Otherwise the
+        // whole sequence state is snapshotted and put back — measured at
+        // 0.71 ms on device against a ~17.8 ms token budget, and exact on
+        // Qwen3.5, whose cache refuses a partial trim outright.
+        let by_trim = self.rollback_safe && self.can_trim;
+        let mut spec_on = !self.grammar_active
             && matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto);
+        let mut use_snapshot = spec_on && !by_trim;
+        if use_snapshot && self.snapshot(false, true).is_err() {
+            // The device-resident path is what makes this affordable; without
+            // it, speculating would cost more than it saves.
+            tracing::info!("sequence state cannot be snapshotted; speculative decoding disabled");
+            spec_on = false;
+            use_snapshot = false;
+        }
+        // Rejection costs an extra forward pass on the snapshot path, because
+        // restoring undoes the confirmed token along with the rejected ones.
+        // Break-even is around two accepted tokens per rejecting round, so
+        // drafting has to land more often before it is worth starting.
+        // How long to stay quiet before testing the water again. A rejected
+        // probe costs an extra forward pass on the snapshot path, so probing
+        // has to be rarer there to stay cheap.
+        let probe_every = if use_snapshot { 96 } else { 24 };
+        let min_acceptance = if use_snapshot {
+            (self.opts.speculative_tuning.min_acceptance * 2.0).min(0.6)
+        } else {
+            self.opts.speculative_tuning.min_acceptance
+        };
         // Speculation and grammars cannot coexist (see above), and the gate
         // exists to install a grammar mid-turn — so it stays inert whenever
         // drafting is live. Nothing is lost on the models this matters for:
@@ -1144,11 +1209,26 @@ impl<'a> Session<'a> {
                     ngram.push_token(self.cached[ngram.len()].0);
                 }
             }
-            let draft: Vec<LlamaToken> = if spec_on && ngram.worth_drafting(tuning.min_acceptance) {
+            let draft: Vec<LlamaToken> = if spec_on && ngram.worth_drafting(min_acceptance, probe_every) {
                 let room = (n_ctx - self.n_past - 1).max(0) as usize;
                 // The verification batch is the confirmed token plus the
                 // draft, so it must also stay within n_batch.
-                let cap = (tuning.draft_tokens as usize)
+                // While acceptance is unknown or poor, this draft is a probe
+                // rather than a bet. On the snapshot path a rejected probe
+                // costs an extra forward pass, so a long one is pure waste: a
+                // short probe measures the same thing for a fraction of it.
+                // Known-poor acceptance means this draft is a probe into text
+                // that has not been paying. An *unknown* rate is the ramp-up on
+                // text that may well be predictable, where a full draft is
+                // exactly right — shortening it there measurably slowed the
+                // case speculation exists for.
+                let probing = ngram.acceptance().is_some_and(|rate| rate < min_acceptance);
+                let budget = if use_snapshot && probing {
+                    PROBE_DRAFT_TOKENS
+                } else {
+                    tuning.draft_tokens as usize
+                };
+                let cap = budget
                     .min(room)
                     .min(n_batch.saturating_sub(1));
                 // Draft longer while drafts are landing, shorter when they are
@@ -1162,6 +1242,12 @@ impl<'a> Session<'a> {
             // One batch carries the confirmed token plus the whole draft, and
             // asks for logits at every position so each can be verified.
             let start = self.n_past;
+            // Taken before the batch, because a restore returns the sequence to
+            // exactly this point. Skipped when there is nothing to undo.
+            let snapshot = match (use_snapshot, draft.is_empty()) {
+                (true, false) => Some(self.snapshot(false, true)?),
+                _ => None,
+            };
             batch.clear();
             batch
                 .add(pending, start, &[0], true)
@@ -1196,7 +1282,9 @@ impl<'a> Session<'a> {
                     reason = StopReason::Cancelled;
                     accepted = i + 1;
                     self.cached.push(chosen);
-                    self.trim_after_draft(start, accepted, &mut batch, n_batch)?;
+                    self.settle_draft(
+                        snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
+                    )?;
                     break 'outer;
                 }
                 produced += 1;
@@ -1213,8 +1301,9 @@ impl<'a> Session<'a> {
                 stats.proposed_drafts += draft.len();
             }
 
-            // Discard the KV entries belonging to rejected drafts.
-            self.trim_after_draft(start, accepted, &mut batch, n_batch)?;
+            self.settle_draft(
+                snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
+            )?;
             pending = chosen;
         }
 
