@@ -298,10 +298,32 @@ impl Engine {
                 .with_n_threads_batch(opts.threads as i32);
         }
 
-        let context = self
+        let mut context = self
             .model
             .new_context(backend, params)
             .map_err(|e| EngineError::Context(e.to_string()))?;
+
+        // Steering belongs to the context, not the turn: installed once here,
+        // it shapes every generation until the session ends. Loading it lazily
+        // per turn would pay the file read repeatedly and, worse, make the
+        // first turn behave differently from the rest.
+        if let Some(path) = &opts.control_vector {
+            let vector = crate::cvec::ControlVector::load(path, self.model.n_embd() as usize)
+                .map_err(|e| EngineError::ControlVector(e.to_string()))?;
+            // A strength of exactly zero is a request for no steering; applying
+            // a zero vector would work but wastes a copy per layer.
+            if opts.control_strength != 0.0 {
+                vector
+                    .scaled(opts.control_strength)
+                    .apply(&mut context)
+                    .map_err(|e| EngineError::ControlVector(e.to_string()))?;
+                tracing::info!(
+                    "control vector: {} directions at strength {}",
+                    vector.n_layers(),
+                    opts.control_strength
+                );
+            }
+        }
 
         Ok(Session {
             model: &self.model,
@@ -1065,6 +1087,8 @@ pub enum EngineError {
     Decode(String),
     #[error("invalid grammar: {0}")]
     Grammar(String),
+    #[error("control vector: {0}")]
+    ControlVector(String),
     #[error("the prompt is {tokens} tokens but the context holds {context}; raise --ctx or shorten it")]
     PromptTooLong { tokens: usize, context: usize },
 }

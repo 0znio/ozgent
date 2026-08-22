@@ -241,6 +241,14 @@ pub struct OptionFlags {
     #[arg(long, value_name = "N", global = true)]
     pub cpu_moe: Option<MoeOffload>,
 
+    /// Steer generation with a control-vector GGUF.
+    #[arg(long, value_name = "FILE", global = true)]
+    pub control_vector: Option<std::path::PathBuf>,
+
+    /// How hard to steer. 1.0 is the vector as trained; negative reverses it.
+    #[arg(long, value_name = "F", global = true)]
+    pub control_strength: Option<f32>,
+
     /// Context length in tokens.
     #[arg(long, short = 'c', value_name = "N", global = true)]
     pub ctx: Option<u32>,
@@ -322,6 +330,8 @@ impl OptionFlags {
         Ok(Options {
             gpu_layers: if self.no_gpu { Some(GpuLayers::OFF) } else { self.gpu_layers },
             cpu_moe: self.cpu_moe,
+            control_vector: self.control_vector.clone(),
+            control_strength: self.control_strength,
             context_length: self.ctx,
             cache_type_k: self.cache_type,
             cache_type_v: self.cache_type,

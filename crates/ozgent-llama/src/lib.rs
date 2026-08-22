@@ -1,6 +1,8 @@
 //! The inference engine.
 
 pub mod backend;
+#[cfg(feature = "llama")]
+pub mod cvec;
 pub mod engine;
 pub mod grammar;
 #[cfg(feature = "llama")]

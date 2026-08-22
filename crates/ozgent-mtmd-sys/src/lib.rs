@@ -6,3 +6,8 @@
 #![allow(clippy::all)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+/// Re-exported so crates that already depend on this one can reach the raw
+/// llama.cpp bindings without taking a second direct dependency — which would
+/// change feature resolution and force llama.cpp to rebuild.
+pub use llama_cpp_sys_2;

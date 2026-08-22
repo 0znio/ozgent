@@ -152,6 +152,12 @@ pub struct Options {
     /// Keep routed experts of the first N layers in system RAM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_moe: Option<MoeOffload>,
+    /// A control-vector GGUF to steer generation with, and how hard.
+    ///
+    /// Steering happens inside the forward pass, so unlike a system prompt it
+    /// costs no context and the model cannot decide to ignore it.
+    pub control_vector: Option<std::path::PathBuf>,
+    pub control_strength: Option<f32>,
     /// Quantisation of the K cache. Requires flash attention when quantised.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_type_k: Option<CacheType>,
@@ -205,7 +211,8 @@ impl Options {
         }
         take!(
             gpu_layers, context_length, batch_size, threads, main_gpu, use_mmap, use_mlock,
-            flash_attention, cpu_moe, cache_type_k, cache_type_v, speculative,
+            flash_attention, cpu_moe, control_vector, control_strength,
+            cache_type_k, cache_type_v, speculative,
             speculative_tuning, prefix_reuse, temperature, top_p, top_k, min_p, repeat_penalty, repeat_last_n,
             seed, max_tokens, system_prompt, thinking, tools,
         );
@@ -226,6 +233,13 @@ impl Options {
             use_mlock: self.use_mlock.unwrap_or(false),
             flash_attention: self.flash_attention.unwrap_or(true),
             cpu_moe: self.cpu_moe.unwrap_or(MoeOffload::AUTO),
+            control_vector: self.control_vector.clone(),
+            // 1.0 applies the vector as trained. Not clamped, because the
+            // usable range depends entirely on the vector: measured against a
+            // deliberately meaningless direction, output drifted at 0.02-0.05,
+            // restructured at 0.1 and collapsed by 0.3. A trained direction
+            // tolerates far more, so a fixed ceiling would be wrong either way.
+            control_strength: self.control_strength.unwrap_or(1.0),
             // q8_0 halves cache VRAM for no measurable quality cost, which is
             // the difference between a usable and an unusable context on a
             // small card. Flash attention (on by default) makes it legal.
@@ -271,6 +285,8 @@ pub struct Resolved {
     pub use_mlock: bool,
     pub flash_attention: bool,
     pub cpu_moe: MoeOffload,
+    pub control_vector: Option<std::path::PathBuf>,
+    pub control_strength: f32,
     pub cache_type_k: CacheType,
     pub cache_type_v: CacheType,
     pub speculative: Speculative,
