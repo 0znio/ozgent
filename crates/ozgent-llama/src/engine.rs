@@ -11,6 +11,7 @@ use crate::utf8::Utf8Buffer;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, Special};
@@ -587,6 +588,154 @@ impl<'a> Session<'a> {
         self.context.n_ctx()
     }
 
+    /// Capture the sequence state so it can be put back later.
+    ///
+    /// `ON_DEVICE` asks llama.cpp to keep the copy in VRAM instead of handing
+    /// back 50 MB of host memory. That is the difference between a snapshot
+    /// that can be taken on every draft step and one that cannot.
+    fn snapshot(&self, partial: bool, on_device: bool) -> Result<SeqState, EngineError> {
+        let mut bits = 0u32;
+        if partial {
+            bits |= LlamaStateSeqFlags::PARTIAL_ONLY.bits();
+        }
+        if on_device {
+            bits |= LlamaStateSeqFlags::ON_DEVICE.bits();
+        }
+        self.context
+            .state_seq_get(0, LlamaStateSeqFlags::from_bits(bits))
+            .map_err(|e| EngineError::State(e.to_string()))
+    }
+
+    fn restore(&mut self, state: &SeqState) -> Result<(), EngineError> {
+        self.context
+            .state_seq_set(state, 0)
+            .map_err(|e| EngineError::State(e.to_string()))
+    }
+
+    /// Check that a snapshot really can rewind this model mid-generation.
+    ///
+    /// Generates `k` tokens, rewinds, and generates `k` again. The two runs
+    /// must be identical. Speculating on a model whose cache cannot be trimmed
+    /// rests entirely on this holding, and the failure mode is silently wrong
+    /// output rather than an error — so it is measured, not assumed.
+    ///
+    /// Returns the two runs and the size of the snapshot taken.
+    pub fn probe_rewind(
+        &mut self,
+        prompt: &str,
+        k: u32,
+        partial: bool,
+        on_device: bool,
+    ) -> Result<(String, String, usize), EngineError> {
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+
+        self.reset();
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        let (head, tail) = tokens.split_at(tokens.len().saturating_sub(1));
+        self.prefill(head, &mut batch, n_batch, false)?;
+
+        // The snapshot is taken *before* the final prompt token, so each run
+        // can decode it again and regenerate its logits. Restoring state does
+        // not restore the logits buffer, so a run resumed straight after a
+        // restore would sample its first token from whatever the previous run
+        // left behind — which looks exactly like the rewind having failed.
+        let mark = self.n_past;
+        let state = self.snapshot(partial, on_device)?;
+        let size = state.byte_len();
+
+        self.prefill(tail, &mut batch, n_batch, true)?;
+        let first = self.run_greedy(k, &mut batch, n_batch)?;
+
+        self.restore(&state)?;
+        self.n_past = mark;
+        self.sampler.reset();
+        self.prefill(tail, &mut batch, n_batch, true)?;
+        let second = self.run_greedy(k, &mut batch, n_batch)?;
+
+        Ok((first, second, size))
+    }
+
+    /// Time a snapshot and a restore, which is what decides whether
+    /// speculation can afford one per draft step.
+    ///
+    /// Returns milliseconds per snapshot, per restore, and the host bytes used.
+    pub fn probe_snapshot_cost(
+        &mut self,
+        prompt: &str,
+        iterations: u32,
+        on_device: bool,
+    ) -> Result<(f64, f64, usize), EngineError> {
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+
+        self.reset();
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        self.prefill(&tokens, &mut batch, n_batch, true)?;
+
+        // One outside the loop, so allocation and any first-call setup are not
+        // charged to the average.
+        let warm = self.snapshot(false, on_device)?;
+        self.restore(&warm)?;
+
+        let start = Instant::now();
+        let mut states = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            states.push(self.snapshot(false, on_device)?);
+        }
+        let snap_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+
+        // Only the most recent device-held state stays valid: capturing with
+        // ON_DEVICE invalidates every earlier one for that sequence.
+        let last = states.last().expect("at least one iteration");
+        let start = Instant::now();
+        for _ in 0..iterations {
+            self.restore(last)?;
+        }
+        let restore_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+
+        Ok((snap_ms, restore_ms, last.byte_len()))
+    }
+
+    /// Greedily decode `k` tokens from the current position, returning the text.
+    fn run_greedy(
+        &mut self,
+        k: u32,
+        batch: &mut LlamaBatch,
+        _n_batch: usize,
+    ) -> Result<String, EngineError> {
+        let mut out = String::new();
+        let mut decoder = Utf8Buffer::new();
+        for _ in 0..k {
+            let token = self.sampler.sample(&self.context, -1);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+            let bytes = self
+                .model
+                .token_to_bytes(token, Special::Tokenize)
+                .map_err(|e| EngineError::Detokenize(e.to_string()))?;
+            out.push_str(&decoder.push(&bytes));
+
+            batch.clear();
+            batch
+                .add(token, self.n_past, &[0], true)
+                .map_err(|e| EngineError::Batch(e.to_string()))?;
+            self.context
+                .decode(batch)
+                .map_err(|e| EngineError::Decode(e.to_string()))?;
+            self.n_past += 1;
+        }
+        out.push_str(&decoder.finish());
+        Ok(out)
+    }
+
     /// Bytes needed to snapshot this sequence's state.
     ///
     /// `partial` asks only for the parts a KV trim cannot undo — recurrent and
@@ -1109,6 +1258,8 @@ pub enum EngineError {
     Grammar(String),
     #[error("control vector: {0}")]
     ControlVector(String),
+    #[error("sequence state: {0}")]
+    State(String),
     #[error("the prompt is {tokens} tokens but the context holds {context}; raise --ctx or shorten it")]
     PromptTooLong { tokens: usize, context: usize },
 }
