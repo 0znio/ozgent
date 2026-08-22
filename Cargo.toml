@@ -47,6 +47,11 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Chat templates are Jinja written for Python's Jinja2, so they lean on
+# Python string methods and on {% break %}; pycompat and loop_controls
+# supply both.
+minijinja = { version = "2", features = ["loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [profile.release]
 opt-level = 3
@@ -60,3 +65,6 @@ codegen-units = 1
 # llama.cpp from scratch.
 [patch.crates-io]
 llama-cpp-2 = { path = "vendor/llama-cpp-2" }
+# Backports bailingmoe3 (Ling 3.0) from upstream PR #26608; 0.1.154 is the
+# newest published crate and predates it. See vendor/llama-cpp-sys-2/OZGENT.md.
+llama-cpp-sys-2 = { path = "vendor/llama-cpp-sys-2" }

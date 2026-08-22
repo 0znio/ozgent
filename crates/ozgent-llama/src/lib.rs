@@ -15,6 +15,7 @@ pub mod llamalog;
 #[cfg(feature = "llama")]
 pub mod mtmd;
 pub mod ngram;
+pub mod template;
 pub mod thinking;
 pub mod toolcall;
 pub mod toolgate;

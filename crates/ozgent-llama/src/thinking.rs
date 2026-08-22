@@ -39,6 +39,23 @@ pub const DEFAULT_TAGS: &[TagPair] = &[
     TagPair { open: "<|channel|>analysis<|message|>", close: "<|end|>" },
 ];
 
+/// The close tag a prompt leaves open, if it ends inside a reasoning block.
+///
+/// Reasoning templates force a model to think by ending the generation prompt
+/// with the opening tag. Generation then starts *inside* the block, so the
+/// model writes the trace and the closing tag but never an opening one — and
+/// a filter waiting to see one reads the whole trace as the answer.
+///
+/// Counting rather than searching from the end: a conversation replays earlier
+/// assistant turns, each with its own complete block, so the question is
+/// whether one more was opened than closed.
+pub fn open_at_end(prompt: &str) -> Option<&'static str> {
+    DEFAULT_TAGS
+        .iter()
+        .find(|t| prompt.matches(t.open).count() > prompt.matches(t.close).count())
+        .map(|t| t.close)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Emitting answer text, watching for an opening tag.
@@ -382,5 +399,34 @@ mod tests {
         let _ = f.push("<think>x</think>y");
         assert!(f.saw_thinking(), "suppressed reasoning still counts as seen");
         assert!(!f.is_thinking(), "the span closed");
+    }
+
+
+
+
+    #[test]
+    fn a_prompt_ending_in_an_open_tag_starts_inside() {
+        assert_eq!(open_at_end("<|im_start|>assistant\n<think>\n"), Some("</think>"));
+    }
+
+    #[test]
+    fn a_prompt_ending_after_the_answer_does_not() {
+        assert_eq!(open_at_end("<|im_start|>assistant\n"), None);
+        // A closed block from an earlier turn is not an open one.
+        assert_eq!(open_at_end("<think>past</think>answer<|im_start|>assistant\n"), None);
+    }
+
+    #[test]
+    fn replayed_turns_do_not_confuse_the_count() {
+        // Two complete blocks from history, then one opened for this turn.
+        let p = "<think>a</think>x<think>b</think>y<|im_start|>assistant\n<think>\n";
+        assert_eq!(open_at_end(p), Some("</think>"));
+    }
+
+    #[test]
+    fn a_suppressed_block_reads_as_closed() {
+        // The `<think>\n\n</think>` prefill means "do not reason", and the
+        // stream that follows is answer text from its first character.
+        assert_eq!(open_at_end("<|im_start|>assistant\n<think>\n\n</think>\n\n"), None);
     }
 }

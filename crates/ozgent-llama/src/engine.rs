@@ -61,6 +61,8 @@ pub struct Engine {
     /// False when the model keeps state that cannot be rolled back, which
     /// makes draft rejection unsafe. See [`Engine::rollback_safe`].
     rollback_safe: bool,
+    /// The model's own chat template, when it could be compiled.
+    jinja: Option<crate::template::ChatTemplate>,
     /// KV elements stored per token across all layers, for cache sizing.
     kv_elements: u64,
     /// On-disk size of the weights, used as the denominator when deciding
@@ -158,16 +160,26 @@ impl Engine {
 
         // Evicting routed experts frees far more VRAM per lost token/sec than
         // dropping whole layers, so it is applied before any layer reduction.
+        //
+        // The pattern is bound here rather than inside the match because
+        // llama.cpp keeps the pointer, not a copy: it reads the string when
+        // the model loads, which is after this block ends.
+        let moe_pattern;
         match resolved_moe {
             MoeOffload::Keyword(MoeKeyword::All) => params.as_mut().add_cpu_moe_override(),
             MoeOffload::Layers(n) if n > 0 => {
-                for layer in 0..n {
-                    // Matches the routed-expert tensors of one block, which is
-                    // the same set llama.cpp's own --n-cpu-moe targets.
-                    let pattern = format!("blk\\.{layer}\\.ffn_(up|down|gate)_(ch|)exps");
-                    if let Ok(c) = std::ffi::CString::new(pattern) {
-                        params.as_mut().add_cpu_buft_override(&c);
-                    }
+                // One override covering every evicted layer, not one per
+                // layer. `add_cpu_buft_override` always fills slot zero, so a
+                // second call trips its own "last buft_override was not empty"
+                // assertion — which is why this panicked on the first real
+                // mixture-of-experts model to reach it. The alternation names
+                // the same tensors llama.cpp's own --n-cpu-moe targets.
+                let blocks = (0..n).map(|l| l.to_string()).collect::<Vec<_>>().join("|");
+                moe_pattern =
+                    std::ffi::CString::new(format!("blk\\.({blocks})\\.ffn_(up|down|gate)_(ch|)exps"))
+                        .ok();
+                if let Some(c) = moe_pattern.as_deref() {
+                    params.as_mut().add_cpu_buft_override(c);
                 }
             }
             _ => {}
@@ -211,15 +223,30 @@ impl Engine {
         }
         // The raw Jinja source tells us whether this model reasons; there is
         // no capability flag in GGUF for it.
-        let reasoning = model
-            .meta_val_str("tokenizer.chat_template")
-            .map(|t| t.contains("<think>"))
-            .unwrap_or(false);
+        let raw_template = model.meta_val_str("tokenizer.chat_template").unwrap_or_default();
+        let reasoning = raw_template.contains("<think>");
+        // The model's own Jinja, preferred over llama.cpp's approximation of
+        // it. Failing to compile is not an error: the built-in renderer is
+        // still there and is exactly right for most models.
+        let jinja = if raw_template.is_empty() {
+            None
+        } else {
+            let bos = model.token_to_str(model.token_bos(), Special::Tokenize).unwrap_or_default();
+            let eos = model.token_to_str(model.token_eos(), Special::Tokenize).unwrap_or_default();
+            match crate::template::ChatTemplate::new(&raw_template, bos, eos) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::debug!("using llama.cpp's built-in template instead: {e}");
+                    None
+                }
+            }
+        };
 
         Ok(Self {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
             reasoning,
+            jinja,
             n_layer,
             rollback_safe,
             kv_elements,
@@ -235,6 +262,16 @@ impl Engine {
     /// speculation works, so it is worth surfacing in diagnostics.
     pub fn rollback_safe(&self) -> bool {
         self.rollback_safe
+    }
+
+    /// The close tag a stream beginning from `prompt` starts inside.
+    ///
+    /// Read off the rendered prompt rather than guessed from the template,
+    /// because only the render knows whether this particular turn reasons. A
+    /// prompt that ends inside an open block means the model writes reasoning
+    /// first and never emits an opening tag of its own.
+    pub fn stream_starts_inside(prompt: &str) -> Option<&'static str> {
+        crate::thinking::open_at_end(prompt)
     }
 
     pub fn n_layer(&self) -> u32 {
@@ -275,6 +312,29 @@ impl Engine {
         thinking: ozgent_core::ThinkingMode,
     ) -> Result<String, EngineError> {
         let suppress = thinking == ozgent_core::ThinkingMode::Off && self.reasoning;
+
+        // The model's own template first. It is the only thing that knows
+        // whether this turn reasons, and so the only thing that can decide
+        // whether the prompt should end inside an open block.
+        if let Some(jinja) = &self.jinja {
+            let opts = crate::template::RenderOptions {
+                // Always stated, never left to the template's default. Qwen3.5
+                // reads an undefined `enable_thinking` as "off" and writes a
+                // closed empty block, so silence is not neutral — it is a
+                // decision, and the wrong one for a model whose whole point is
+                // that it reasons. "Auto" is ozgent's own rule: think if the
+                // model advertises the capability.
+                enable_thinking: Some(match thinking {
+                    ozgent_core::ThinkingMode::On => true,
+                    ozgent_core::ThinkingMode::Off => false,
+                    ozgent_core::ThinkingMode::Auto => self.reasoning,
+                }),
+            };
+            match jinja.render(messages, opts) {
+                Ok(prompt) => return Ok(prompt),
+                Err(e) => tracing::debug!("falling back to the built-in template: {e}"),
+            }
+        }
 
         let Some(template) = &self.template else {
             let mut p = fallback_prompt(messages);
