@@ -383,6 +383,8 @@ async fn chat(
             thinking,
             max_tokens: None,
             tools_enabled: body.tools,
+            native_tools: None,
+            client_tools: Vec::new(),
             overrides: None,
             images,
             out: tx,

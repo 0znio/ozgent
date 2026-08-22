@@ -37,6 +37,14 @@ pub struct Request {
     pub max_tokens: Option<u32>,
     /// Whether this turn may call tools. The user can switch it off per turn.
     pub tools_enabled: bool,
+    /// Which built-in tools this turn may use, by name. `None` offers all of
+    /// them; `Some(list)` offers only those named, so a caller can withhold a
+    /// tool rather than trusting the model not to reach for it.
+    pub native_tools: Option<Vec<String>>,
+    /// Tools the caller implements. Described to the model like any other, but
+    /// never executed here — when one is called the turn ends and the call is
+    /// handed back, which is what an OpenAI client expects.
+    pub client_tools: Vec<ozgent_core::ToolSpec>,
     /// Sampling overrides for this request only, as the API allows. Applied on
     /// top of the server's configuration rather than replacing it.
     pub overrides: Option<ozgent_core::Options>,
@@ -56,6 +64,9 @@ pub enum Event {
     Answer { text: String },
     /// The model asked for a tool. Emitted before the tool runs.
     ToolCall { name: String, arguments: serde_json::Value },
+    /// The model called a tool the *caller* owns. Nothing runs here; the turn
+    /// ends and the caller is expected to execute it and send the result back.
+    ClientToolCall { name: String, arguments: serde_json::Value },
     /// How that call turned out. `detail` is the tool's own result, so the
     /// browser can render it properly instead of showing raw JSON.
     ToolResult {
@@ -262,10 +273,52 @@ fn turn(
     };
 
     let media_turn = !images.is_empty();
-    let offered: Vec<ozgent_core::ToolSpec> = match tools {
-        Some(t) if request.tools_enabled => t.host.tools().to_vec(),
+    let mut offered: Vec<ozgent_core::ToolSpec> = match tools {
+        Some(t) if request.tools_enabled => match &request.native_tools {
+            None => t.host.tools().to_vec(),
+            Some(allowed) => {
+                // A name that matches nothing is a caller mistake worth
+                // reporting: silently dropping it would leave them believing a
+                // tool is available when the model was never told about it.
+                let available: Vec<&str> =
+                    t.host.tools().iter().map(|s| s.name.as_str()).collect();
+                if let Some(unknown) =
+                    allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str()))
+                {
+                    let _ = request.out.send(Event::Error {
+                        message: format!(
+                            "no built-in tool named {unknown:?}. Available: {}",
+                            available.join(", ")
+                        ),
+                    });
+                    return Ok(());
+                }
+                t.host
+                    .tools()
+                    .iter()
+                    .filter(|s| allowed.iter().any(|a| a == &s.name))
+                    .cloned()
+                    .collect()
+            }
+        },
         _ => Vec::new(),
     };
+    // Caller-supplied tools are additive: a request may use the server's
+    // Python tools, its own, or both. A name collision resolves in favour of
+    // the server's, because that is the one this process can actually run.
+    let server_names: std::collections::HashSet<String> =
+        offered.iter().map(|s| s.name.clone()).collect();
+    let client_owned: std::collections::HashSet<String> = request
+        .client_tools
+        .iter()
+        .map(|s| s.name.clone())
+        .filter(|n| !server_names.contains(n))
+        .collect();
+    for spec in &request.client_tools {
+        if client_owned.contains(&spec.name) {
+            offered.push(spec.clone());
+        }
+    }
 
     // Constrain the body of a tool call the moment one starts, so a malformed
     // call is unreachable rather than emitted and then rejected.
@@ -354,6 +407,9 @@ fn turn(
     let mut elapsed_ms = 0u128;
     let mut reused = 0usize;
     let mut stop = StopReason::EndOfText;
+    // The turn ended because the caller has a tool to run, which is a
+    // different thing from the model choosing to stop.
+    let mut handed_back = false;
 
     for round in 0..=max_rounds {
         let last = round == max_rounds || offered.is_empty();
@@ -377,9 +433,32 @@ fn turn(
         if last || !parsed.has_calls() {
             break;
         }
-        let Some(t) = tools else { break };
         // The visible part of the reply is whatever preceded the call.
         messages.push(Message::assistant(parsed.text.clone()));
+
+        // A call the caller owns ends the turn: this process has no code for
+        // it, so the call is handed back to be run there. Checked before the
+        // guard below, which would otherwise discard the call whenever the
+        // server has no Python tools of its own — the common case for a client
+        // that brought only its own.
+        //
+        // A batch mixing caller and server tools hands back only the caller's
+        // and runs none of the server's: the caller replies with its results,
+        // and the model reissues whatever it still wants.
+        let handing_back: Vec<_> =
+            parsed.calls.iter().filter(|c| client_owned.contains(&c.name)).collect();
+        if !handing_back.is_empty() {
+            for call in handing_back {
+                let _ = request.out.send(Event::ClientToolCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+            }
+            handed_back = true;
+            break;
+        }
+
+        let Some(t) = tools else { break };
 
         for call in &parsed.calls {
             let _ = request.out.send(Event::ToolCall {
@@ -425,7 +504,7 @@ fn turn(
         generated,
         tokens_per_second: if seconds > 0.0 { generated as f64 / seconds } else { 0.0 },
         reused,
-        stop: format!("{stop:?}"),
+        stop: if handed_back { "ToolCalls".to_string() } else { format!("{stop:?}") },
         prompt: prompt_tokens,
     });
     Ok(())
@@ -812,6 +891,8 @@ mod tests {
             thinking: None,
             max_tokens: None,
             tools_enabled: true,
+            native_tools: None,
+            client_tools: Vec::new(),
             overrides: None,
             images: Vec::new(),
             out,
