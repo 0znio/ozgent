@@ -92,6 +92,9 @@ pub enum Event {
         stop: String,
         /// Prompt tokens actually processed, for API usage accounting.
         prompt: u32,
+        /// Time spent on prefill. Reported so a caller can see prefix reuse
+        /// working: a turn that reuses its prefix pays almost nothing here.
+        prompt_ms: u64,
     },
     Error { message: String },
 }
@@ -200,9 +203,12 @@ fn serve_model(
         }
     };
 
-    let resolved = config
-        .options_for(&found.model.to_string())
-        .merge(&found.manifest.defaults)
+    // The layers under every request for this model. The first request's
+    // overrides are folded in too, because loading needs concrete numbers for
+    // context length and layer placement and this is the only request in hand.
+    let base = config.options_for(&found.model.to_string()).merge(&found.manifest.defaults);
+    let resolved = base
+        .clone()
         .merge(first.overrides.as_ref().unwrap_or(&Default::default()))
         .resolve();
 
@@ -224,7 +230,15 @@ fn serve_model(
 
     let mut request = first;
     loop {
-        let thinking = request.thinking.unwrap_or(resolved.thinking);
+        // Each request brings its own sampling. Re-resolving per turn is what
+        // keeps two clients on one model from inheriting each other's
+        // temperature, seed and reasoning budget.
+        let per_turn = base
+            .clone()
+            .merge(request.overrides.as_ref().unwrap_or(&Default::default()))
+            .resolve();
+        session.set_options(&per_turn);
+        let thinking = request.thinking.unwrap_or(per_turn.thinking);
         let _ = request.out.send(Event::Ready {
             model: found.model.to_string(),
             context: session.n_ctx(),
@@ -251,7 +265,7 @@ fn serve_model(
         if let Err(e) = turn(
             &engine,
             &mut session,
-            &resolved,
+            &per_turn,
             thinking,
             tools,
             projector.as_ref(),
@@ -503,6 +517,7 @@ fn turn(
     let mut generated = 0u32;
     let mut prompt_tokens = 0u32;
     let mut elapsed_ms = 0u128;
+    let mut prompt_ms = 0u128;
     let mut reused = 0usize;
     let mut stop = StopReason::EndOfText;
     // The turn ended because the caller has a tool to run, which is a
@@ -522,6 +537,7 @@ fn turn(
         generated += stats.generated_tokens as u32;
         prompt_tokens += stats.prompt_tokens as u32;
         elapsed_ms += stats.generation_ms;
+        prompt_ms += stats.prompt_ms;
         reused += stats.reused_tokens;
         stop = reason;
 
@@ -624,6 +640,7 @@ fn turn(
         reused,
         stop: if handed_back { "ToolCalls".to_string() } else { format!("{stop:?}") },
         prompt: prompt_tokens,
+        prompt_ms: prompt_ms as u64,
     });
     Ok(())
 }
@@ -908,6 +925,7 @@ mod tests {
             reused: 64,
             stop: "EndOfText".into(),
             prompt: 40,
+            prompt_ms: 210,
         })
         .unwrap();
         assert_eq!(json["type"], "done");

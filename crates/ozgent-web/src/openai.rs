@@ -51,6 +51,19 @@ struct ApiError {
     message: String,
 }
 
+/// Classify a worker failure by whose fault it is.
+///
+/// A prompt longer than the context is the caller sending too much, not the
+/// server breaking; answering 500 tells a client to retry something that will
+/// never succeed.
+fn from_worker(message: String) -> ApiError {
+    if message.contains("but the context holds") {
+        ApiError::bad_request(message)
+    } else {
+        ApiError::internal(message)
+    }
+}
+
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self { status: StatusCode::BAD_REQUEST, kind: "invalid_request_error", message: message.into() }
@@ -702,11 +715,17 @@ async fn collect(
                 "type": "function",
                 "function": { "name": name, "arguments": arguments.to_string() },
             })),
-            Event::Done { generated, tokens_per_second, reused, stop: reason, prompt } => {
+            Event::Done { generated, tokens_per_second, reused, stop: reason, prompt, prompt_ms } => {
                 timings.completion_tokens = generated;
                 timings.tokens_per_second = tokens_per_second;
                 timings.cached_prompt_tokens = reused;
                 timings.prompt_tokens = prompt;
+                timings.prompt_ms = prompt_ms;
+                timings.prompt_tokens_per_second = if prompt_ms > 0 {
+                    prompt as f64 * 1000.0 / prompt_ms as f64
+                } else {
+                    0.0
+                };
                 timings.completion_ms = if tokens_per_second > 0.0 {
                     (generated as f64 / tokens_per_second * 1000.0) as u64
                 } else {
@@ -714,7 +733,7 @@ async fn collect(
                 };
                 stop = finish_reason(&reason);
             }
-            Event::Error { message } => return Err(ApiError::internal(message)),
+            Event::Error { message } => return Err(from_worker(message)),
             Event::Ready { .. } | Event::ToolCall { .. } | Event::ToolResult { .. } => {}
         }
     }
@@ -805,7 +824,7 @@ fn stream_chunks(
                 // A server-side tool has already run; telling the client about
                 // it here would invite it to run the same call again.
                 Event::ToolCall { .. } => {}
-                Event::Done { generated, tokens_per_second, reused, stop, prompt } => {
+                Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms } => {
                     let usage = serde_json::json!({
                         "prompt_tokens": prompt,
                         "completion_tokens": generated,
@@ -815,6 +834,7 @@ fn stream_chunks(
                             "tokens_per_second": tokens_per_second,
                             "cached_prompt_tokens": reused,
                             "prompt_tokens": prompt,
+                            "prompt_ms": prompt_ms,
                         },
                     });
                     let mut final_chunk = chunk(serde_json::json!({}), Some(finish_reason(&stop)));

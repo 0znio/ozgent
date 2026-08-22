@@ -34,15 +34,15 @@ pub(crate) fn backend_handle() -> Result<&'static LlamaBackend, EngineError> {
 fn backend() -> Result<&'static LlamaBackend, EngineError> {
     static CELL: OnceLock<Option<LlamaBackend>> = OnceLock::new();
     CELL.get_or_init(|| {
-        let b = LlamaBackend::init().ok();
-        if b.is_some() {
-            // llama.cpp is chatty on stderr; ozgent does its own reporting.
-            // Captured rather than voided, because the one thing llama.cpp
-            // says that ozgent cannot work out for itself is why a call
-            // failed — it reports that through the log and then returns null.
-            crate::llamalog::capture();
-        }
-        b
+        // Installed before init, not after: ggml prints its device inventory
+        // while the backend comes up, so a callback set afterwards is already
+        // too late and the banner lands on the user's stderr.
+        //
+        // Captured rather than voided, because the one thing llama.cpp says
+        // that ozgent cannot work out for itself is why a call failed — it
+        // reports that through the log and then returns null.
+        crate::llamalog::capture();
+        LlamaBackend::init().ok()
     })
     .as_ref()
     .ok_or(EngineError::BackendInit)
@@ -1137,6 +1137,32 @@ impl<'a> Session<'a> {
     /// The grammar sampler goes first in the chain so it masks the logits
     /// before any temperature or top-p shaping sees them; applied afterwards
     /// it could only reject, and sampling would stall on a dead end.
+    /// Adopt the options of the turn about to run.
+    ///
+    /// A server holds one session across many requests, and each request
+    /// carries its own sampling. Without this the first caller's temperature,
+    /// seed and reasoning budget stand for every caller after it — two clients
+    /// sharing a model would silently share whichever settings arrived first.
+    ///
+    /// Only per-turn settings move. Layer placement, context length, cache
+    /// types and expert offload are decided when the weights are loaded and
+    /// cannot change under a live KV cache, so they are deliberately ignored
+    /// rather than half-applied.
+    pub fn set_options(&mut self, opts: &Resolved) {
+        self.opts.adopt_per_turn(opts);
+        // The sampler is built from these, so it has to be rebuilt with them.
+        // Any installed grammar is reapplied by the caller's `set_grammar`,
+        // which runs after this on every turn.
+        self.sampler = build_sampler(&self.opts);
+        self.grammar_active = false;
+    }
+
+    /// The options this session will generate under, for tests and callers
+    /// that need to know what actually took effect.
+    pub fn options(&self) -> &Resolved {
+        &self.opts
+    }
+
     pub fn set_grammar(&mut self, grammar: Option<&str>) -> Result<(), EngineError> {
         // One flat chain. Nesting a chain inside a chain does not reliably
         // propagate `accept`, so the grammar never advances past its root and
@@ -1278,6 +1304,11 @@ impl<'a> Session<'a> {
                     PrefixReuse::Off => 0,
                     PrefixReuse::Longest => common_prefix(&self.cached, &tokens),
                 };
+                tracing::debug!(
+                    "prefix reuse: {reuse} shared of {} prompt tokens; {} resident",
+                    tokens.len(),
+                    self.cached.len()
+                );
 
                 // The final token must always be decoded to produce logits, so
                 // never reuse the entire prompt.
