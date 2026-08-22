@@ -108,31 +108,97 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
 /// which would mis-size the cache by 60%.
 fn kv_elements(gguf: *mut sys::gguf_context, layers: u32) -> u64 {
     let Some(arch) = string_key(gguf, "general.architecture") else { return 0 };
-    let head_kv = u32_key(gguf, &format!("{arch}.attention.head_count_kv")).unwrap_or(0);
+    let heads_kv = u32_values(gguf, &format!("{arch}.attention.head_count_kv"));
     let embd = u32_key(gguf, &format!("{arch}.embedding_length")).unwrap_or(0);
     let heads = u32_key(gguf, &format!("{arch}.attention.head_count")).unwrap_or(0);
     let fallback = if heads > 0 { embd / heads } else { 0 };
     let k = u32_key(gguf, &format!("{arch}.attention.key_length")).unwrap_or(fallback);
     let v = u32_key(gguf, &format!("{arch}.attention.value_length")).unwrap_or(fallback);
-    if head_kv == 0 || k == 0 || v == 0 {
-        return 0;
-    }
-    ozgent_core::accel::kv_elements_per_token(layers, head_kv, k, v)
+    fold_kv(layers, &heads_kv, k, v)
 }
 
-fn u32_key(gguf: *mut sys::gguf_context, key: &str) -> Option<u32> {
+/// Turn declared KV-head counts into elements cached per token.
+///
+/// A hybrid model declares `head_count_kv` per layer rather than once: Ling
+/// 3.0 alternates three Kimi-Delta layers to every latent-attention one, so
+/// its array reads `[0, 0, 0, 1, ...]`. The zeros are not missing data. Those
+/// layers keep a fixed-size recurrent state instead of a cache, and a state
+/// that does not grow with the context contributes nothing to a per-token
+/// figure. Multiplying the layer count by any single entry would be wrong in
+/// both directions — 24x by the ones, zero by the zeros.
+fn fold_kv(layers: u32, heads_kv: &[u32], k: u32, v: u32) -> u64 {
+    if k == 0 || v == 0 {
+        return 0;
+    }
+    match heads_kv {
+        [] => 0,
+        // Uniform attention: every layer caches the same amount.
+        &[uniform] => ozgent_core::accel::kv_elements_per_token(layers, uniform, k, v),
+        per_layer => {
+            // Already summed across layers, so there is exactly one layer's
+            // worth of that many heads left to price.
+            let total: u32 = per_layer.iter().sum();
+            ozgent_core::accel::kv_elements_per_token(1, total, k, v)
+        }
+    }
+}
+
+/// Locate a metadata key by name.
+fn find(gguf: *mut sys::gguf_context, key: &str) -> Option<i64> {
     let c = CString::new(key).ok()?;
     let index = unsafe { sys::gguf_find_key(gguf, c.as_ptr()) };
-    if index < 0 {
-        return None;
+    (index >= 0).then_some(index)
+}
+
+/// Read one unsigned value, or `None` if the key is absent or not a scalar.
+///
+/// The type check is not defensive tidiness. `gguf_get_val_u32` asserts on a
+/// mismatch, and a failed `GGML_ASSERT` aborts the process — so reading a
+/// hybrid model's array-valued `head_count_kv` as a scalar core-dumped ozgent
+/// before llama.cpp ever saw the file. Nothing here is recoverable at the
+/// call site; it has to be avoided.
+fn u32_key(gguf: *mut sys::gguf_context, key: &str) -> Option<u32> {
+    let index = find(gguf, key)?;
+    scalar_u32(gguf, index)
+}
+
+/// Read a key that may be either one value or one per layer.
+///
+/// Returns an empty vector for a missing key or an element type this cannot
+/// read, both of which the caller treats as "unknown" rather than zero.
+fn u32_values(gguf: *mut sys::gguf_context, key: &str) -> Vec<u32> {
+    let Some(index) = find(gguf, key) else { return Vec::new() };
+    if unsafe { sys::gguf_get_kv_type(gguf, index) } != sys::GGUF_TYPE_ARRAY {
+        return scalar_u32(gguf, index).into_iter().collect();
     }
-    Some(unsafe { sys::gguf_get_val_u32(gguf, index) })
+    let element = unsafe { sys::gguf_get_arr_type(gguf, index) };
+    if !matches!(element, sys::GGUF_TYPE_UINT32 | sys::GGUF_TYPE_INT32) {
+        return Vec::new();
+    }
+    let n = unsafe { sys::gguf_get_arr_n(gguf, index) };
+    let data = unsafe { sys::gguf_get_arr_data(gguf, index) } as *const i32;
+    if n == 0 || data.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the array is `n` elements of a 4-byte integer type, checked
+    // above, and lives in the gguf context the caller still holds.
+    let raw = unsafe { std::slice::from_raw_parts(data, n) };
+    raw.iter().map(|&e| u32::try_from(e).unwrap_or(0)).collect()
+}
+
+fn scalar_u32(gguf: *mut sys::gguf_context, index: i64) -> Option<u32> {
+    match unsafe { sys::gguf_get_kv_type(gguf, index) } {
+        sys::GGUF_TYPE_UINT32 => Some(unsafe { sys::gguf_get_val_u32(gguf, index) }),
+        sys::GGUF_TYPE_INT32 => {
+            u32::try_from(unsafe { sys::gguf_get_val_i32(gguf, index) }).ok()
+        }
+        _ => None,
+    }
 }
 
 fn string_key(gguf: *mut sys::gguf_context, key: &str) -> Option<String> {
-    let c = CString::new(key).ok()?;
-    let index = unsafe { sys::gguf_find_key(gguf, c.as_ptr()) };
-    if index < 0 {
+    let index = find(gguf, key)?;
+    if unsafe { sys::gguf_get_kv_type(gguf, index) } != sys::GGUF_TYPE_STRING {
         return None;
     }
     let raw = unsafe { sys::gguf_get_val_str(gguf, index) };
@@ -187,5 +253,34 @@ mod tests {
     fn a_dense_layout_reports_no_experts() {
         let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, layers: 32, kv_elements_per_token: 0 };
         assert!(!l.is_moe());
+    }
+
+    #[test]
+    fn a_uniform_model_prices_every_layer() {
+        // 32 layers * 4 heads * (256 + 256).
+        assert_eq!(fold_kv(32, &[4], 256, 256), 65_536);
+    }
+
+    #[test]
+    fn a_hybrid_model_prices_only_its_caching_layers() {
+        // Ling 3.0 tiny: 24 layers, one latent-attention layer in every four,
+        // 576-wide keys against 128-wide values.
+        let per_layer: Vec<u32> = (0..24).map(|i| u32::from(i % 4 == 3)).collect();
+        assert_eq!(fold_kv(24, &per_layer, 576, 128), 6 * (576 + 128));
+    }
+
+    #[test]
+    fn the_layer_count_does_not_scale_a_per_layer_array() {
+        // The bug this guards: treating entry zero as uniform reads the whole
+        // model as cache-free, and treating a one as uniform overcounts 4x.
+        let per_layer = [0, 0, 0, 1];
+        assert_ne!(fold_kv(4, &per_layer, 64, 64), 0);
+        assert!(fold_kv(4, &per_layer, 64, 64) < fold_kv(4, &[1], 64, 64));
+    }
+
+    #[test]
+    fn an_unreadable_width_is_unknown_rather_than_zero_cost() {
+        assert_eq!(fold_kv(32, &[4], 0, 256), 0);
+        assert_eq!(fold_kv(32, &[], 256, 256), 0);
     }
 }

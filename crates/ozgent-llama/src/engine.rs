@@ -34,10 +34,13 @@ pub(crate) fn backend_handle() -> Result<&'static LlamaBackend, EngineError> {
 fn backend() -> Result<&'static LlamaBackend, EngineError> {
     static CELL: OnceLock<Option<LlamaBackend>> = OnceLock::new();
     CELL.get_or_init(|| {
-        let mut b = LlamaBackend::init().ok();
-        if let Some(backend) = b.as_mut() {
+        let b = LlamaBackend::init().ok();
+        if b.is_some() {
             // llama.cpp is chatty on stderr; ozgent does its own reporting.
-            backend.void_logs();
+            // Captured rather than voided, because the one thing llama.cpp
+            // says that ozgent cannot work out for itself is why a call
+            // failed — it reports that through the log and then returns null.
+            crate::llamalog::capture();
         }
         b
     })
@@ -170,8 +173,13 @@ impl Engine {
             _ => {}
         }
 
-        let model = LlamaModel::load_from_file(backend, path, &params)
-            .map_err(|e| EngineError::Load { path: path.display().to_string(), reason: e.to_string() })?;
+        crate::llamalog::clear();
+        let model = LlamaModel::load_from_file(backend, path, &params).map_err(|e| {
+            // `e` is "null result from llama cpp" for every kind of failure.
+            // The log holds the one that actually happened.
+            let reason = crate::llamalog::reason().unwrap_or_else(|| e.to_string());
+            EngineError::Load { path: path.display().to_string(), reason }
+        })?;
 
         let template = model.chat_template(None).ok();
         let n_layer = model.n_layer();

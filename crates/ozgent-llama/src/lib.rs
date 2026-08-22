@@ -11,6 +11,8 @@ pub mod grammar;
 #[cfg(feature = "llama")]
 pub mod layout;
 #[cfg(feature = "llama")]
+pub mod llamalog;
+#[cfg(feature = "llama")]
 pub mod mtmd;
 pub mod ngram;
 pub mod thinking;
