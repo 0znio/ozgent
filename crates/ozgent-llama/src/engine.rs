@@ -587,6 +587,26 @@ impl<'a> Session<'a> {
         self.context.n_ctx()
     }
 
+    /// Bytes needed to snapshot this sequence's state.
+    ///
+    /// `partial` asks only for the parts a KV trim cannot undo — recurrent and
+    /// sliding-window state. That is the figure that decides whether draft
+    /// rejection can be made safe on a hybrid model by snapshotting instead of
+    /// trimming.
+    pub fn state_bytes(&self, partial: bool, on_device: bool) -> usize {
+        let mut bits = 0u32;
+        if partial {
+            bits |= llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY.bits();
+        }
+        if on_device {
+            bits |= llama_cpp_2::context::session::LlamaStateSeqFlags::ON_DEVICE.bits();
+        }
+        self.context.state_seq_get_size_ext(
+            0,
+            llama_cpp_2::context::session::LlamaStateSeqFlags::from_bits(bits),
+        )
+    }
+
     /// Tokens currently held in the KV cache.
     pub fn used(&self) -> u32 {
         self.n_past.max(0) as u32
