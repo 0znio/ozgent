@@ -795,6 +795,9 @@ fn generate(
 ) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason)> {
     let prompt = engine.render_prompt_with(messages, thinking)?;
     let mut filter = ThinkingFilter::new(thinking);
+    if let Some(close) = engine.stream_starts_inside(thinking) {
+        filter = filter.starting_inside(close);
+    }
     // One gate per stream, not one shared between them. The gate latches shut
     // the moment a tool call begins — correct for the answer, where the call is
     // the last thing emitted, but fatal if shared: reasoning produced after the

@@ -39,6 +39,31 @@ pub const DEFAULT_TAGS: &[TagPair] = &[
     TagPair { open: "<|channel|>analysis<|message|>", close: "<|end|>" },
 ];
 
+/// Whether a chat template ends its generation prompt with an opening tag.
+///
+/// Qwen3.5 and Ling 3.0 both do: their Jinja emits a bare `'<think>\n'` after
+/// the assistant header, so the model is already inside the block and writes
+/// only the reasoning and the closing tag. llama.cpp's built-in renderers for
+/// both families omit that prefill, and the resulting stream — reasoning text
+/// with no opening tag — is indistinguishable from a plain answer. Detecting
+/// the intent in the template lets the prompt supply what the renderer drops.
+///
+/// The signal is a template literal that *ends* just after the open tag. A
+/// literal that continues into the matching close (`'<think>\n\n</think>'`,
+/// the way both templates spell "thinking off") means the opposite and must
+/// not match.
+pub fn prefilled_open(template: &str) -> Option<TagPair> {
+    DEFAULT_TAGS.iter().copied().find(|tag| {
+        template.match_indices(tag.open).any(|(at, _)| {
+            let rest = &template[at + tag.open.len()..];
+            // Step over the escape sequences a Jinja literal writes before its
+            // own closing quote; anything else means the literal carries on.
+            let tail = rest.trim_start_matches(['\\', 'n', 'r', ' ', '\t']);
+            tail.starts_with('\'') || tail.starts_with('"')
+        })
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Emitting answer text, watching for an opening tag.
@@ -382,5 +407,29 @@ mod tests {
         let _ = f.push("<think>x</think>y");
         assert!(f.saw_thinking(), "suppressed reasoning still counts as seen");
         assert!(!f.is_thinking(), "the span closed");
+    }
+
+    #[test]
+    fn a_template_that_prefills_the_open_tag_is_recognised() {
+        // Qwen3.5: the generation prompt ends inside the block.
+        let qwen = "{%- if add_generation_prompt %}\n{{- '<think>\\n' }}\n{%- endif %}";
+        assert_eq!(prefilled_open(qwen).map(|t| t.close), Some("</think>"));
+        // Ling 3.0 spells the same thing with the newline in front.
+        let ling = "{{- '\\n<think>' }}";
+        assert_eq!(prefilled_open(ling).map(|t| t.close), Some("</think>"));
+    }
+
+    #[test]
+    fn a_closed_empty_block_is_not_a_prefill() {
+        // Both templates use this to mean "thinking off". Treating it as a
+        // prefill would start the filter inside a block the model never opens.
+        let off = "{{- '<think>\\n\\n</think>\\n\\n' }}";
+        assert_eq!(prefilled_open(off), None);
+    }
+
+    #[test]
+    fn a_template_without_reasoning_prefills_nothing() {
+        let plain = "{{- '<|im_start|>assistant\\n' }}";
+        assert_eq!(prefilled_open(plain), None);
     }
 }

@@ -61,6 +61,8 @@ pub struct Engine {
     /// False when the model keeps state that cannot be rolled back, which
     /// makes draft rejection unsafe. See [`Engine::rollback_safe`].
     rollback_safe: bool,
+    /// The tag pair this model's template opens for it, if any.
+    think_prefill: Option<crate::thinking::TagPair>,
     /// KV elements stored per token across all layers, for cache sizing.
     kv_elements: u64,
     /// On-disk size of the weights, used as the denominator when deciding
@@ -158,16 +160,26 @@ impl Engine {
 
         // Evicting routed experts frees far more VRAM per lost token/sec than
         // dropping whole layers, so it is applied before any layer reduction.
+        //
+        // The pattern is bound here rather than inside the match because
+        // llama.cpp keeps the pointer, not a copy: it reads the string when
+        // the model loads, which is after this block ends.
+        let moe_pattern;
         match resolved_moe {
             MoeOffload::Keyword(MoeKeyword::All) => params.as_mut().add_cpu_moe_override(),
             MoeOffload::Layers(n) if n > 0 => {
-                for layer in 0..n {
-                    // Matches the routed-expert tensors of one block, which is
-                    // the same set llama.cpp's own --n-cpu-moe targets.
-                    let pattern = format!("blk\\.{layer}\\.ffn_(up|down|gate)_(ch|)exps");
-                    if let Ok(c) = std::ffi::CString::new(pattern) {
-                        params.as_mut().add_cpu_buft_override(&c);
-                    }
+                // One override covering every evicted layer, not one per
+                // layer. `add_cpu_buft_override` always fills slot zero, so a
+                // second call trips its own "last buft_override was not empty"
+                // assertion — which is why this panicked on the first real
+                // mixture-of-experts model to reach it. The alternation names
+                // the same tensors llama.cpp's own --n-cpu-moe targets.
+                let blocks = (0..n).map(|l| l.to_string()).collect::<Vec<_>>().join("|");
+                moe_pattern =
+                    std::ffi::CString::new(format!("blk\\.({blocks})\\.ffn_(up|down|gate)_(ch|)exps"))
+                        .ok();
+                if let Some(c) = moe_pattern.as_deref() {
+                    params.as_mut().add_cpu_buft_override(c);
                 }
             }
             _ => {}
@@ -211,15 +223,18 @@ impl Engine {
         }
         // The raw Jinja source tells us whether this model reasons; there is
         // no capability flag in GGUF for it.
-        let reasoning = model
-            .meta_val_str("tokenizer.chat_template")
-            .map(|t| t.contains("<think>"))
-            .unwrap_or(false);
+        let raw_template = model.meta_val_str("tokenizer.chat_template").unwrap_or_default();
+        let reasoning = raw_template.contains("<think>");
+        // llama.cpp renders these families with its own built-in templates,
+        // which drop the opening tag the real Jinja prefills. Remember what
+        // the model expects so the prompt can put it back.
+        let think_prefill = crate::thinking::prefilled_open(&raw_template);
 
         Ok(Self {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
             reasoning,
+            think_prefill,
             n_layer,
             rollback_safe,
             kv_elements,
@@ -235,6 +250,29 @@ impl Engine {
     /// speculation works, so it is worth surfacing in diagnostics.
     pub fn rollback_safe(&self) -> bool {
         self.rollback_safe
+    }
+
+    /// The reasoning tag pair this model's prompt opens on its behalf.
+    ///
+    /// A caller splitting the stream must start already inside the block, or
+    /// it will read the whole reasoning trace as the answer.
+    pub fn think_prefill(&self) -> Option<crate::thinking::TagPair> {
+        self.think_prefill
+    }
+
+    /// The close tag a stream would open inside, if the prompt carried this
+    /// model's own prefill.
+    ///
+    /// Currently always `None`: ozgent renders through llama.cpp's built-in
+    /// templates, which decide per turn whether reasoning is enabled and do
+    /// not report that decision. Supplying the opening tag without knowing it
+    /// swallows the answer of any turn that turns out not to reason. Wired up
+    /// once prompts are rendered from the model's real Jinja.
+    pub fn stream_starts_inside(
+        &self,
+        _thinking: ozgent_core::ThinkingMode,
+    ) -> Option<&'static str> {
+        None
     }
 
     pub fn n_layer(&self) -> u32 {

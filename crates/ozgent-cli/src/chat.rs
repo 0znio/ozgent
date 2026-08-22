@@ -591,6 +591,9 @@ impl<'a> Chat<'a> {
         let mut markdown =
             StreamRenderer::new(MarkdownRenderer::new(self.theme.clone(), self.width));
         let mut filter = ThinkingFilter::new(self.opts.thinking);
+        if let Some(close) = self.engine.stream_starts_inside(self.opts.thinking) {
+            filter = filter.starting_inside(close);
+        }
         let mut out = std::io::stdout();
 
         // Tool-call syntax is a request to the runtime, not output for the
@@ -980,6 +983,20 @@ impl<'a> Chat<'a> {
                 },
             },
 
+            "/effort" => match arg {
+                "" => eprintln!(
+                    "{}",
+                    dim(&format!("effort: {:?}", self.opts.reasoning_effort))
+                ),
+                other => match other.parse::<ozgent_core::ReasoningEffort>() {
+                    Ok(level) => {
+                        self.opts.reasoning_effort = level;
+                        eprintln!("{}", dim(&format!("· effort {other}")));
+                    }
+                    Err(e) => eprintln!("{}", dim(&e)),
+                },
+            },
+
             "/system" => {
                 if arg.is_empty() {
                     match &self.opts.system_prompt {
@@ -1232,6 +1249,7 @@ const HELP: &str = "\
 /exit              quit
 /clear             start a new conversation
 /think on|off|auto show or suppress reasoning
+/effort low|med|high how long the model may reason
 /system <text>     set the system prompt
 /remember <fact>   pin a fact for this and future chats
 /memory            what is remembered
@@ -1251,7 +1269,7 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/think", "/system", "/remember", "/memory", "/tools", "/stats"] {
+        for cmd in ["/help", "/exit", "/clear", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
         }
     }

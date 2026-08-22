@@ -60,3 +60,6 @@ codegen-units = 1
 # llama.cpp from scratch.
 [patch.crates-io]
 llama-cpp-2 = { path = "vendor/llama-cpp-2" }
+# Backports bailingmoe3 (Ling 3.0) from upstream PR #26608; 0.1.154 is the
+# newest published crate and predates it. See vendor/llama-cpp-sys-2/OZGENT.md.
+llama-cpp-sys-2 = { path = "vendor/llama-cpp-sys-2" }
