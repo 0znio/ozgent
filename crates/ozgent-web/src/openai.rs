@@ -36,6 +36,7 @@ pub fn router(state: State, key: ApiKey) -> Router {
         .route("/v1/models/{model}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/health", get(health))
         .layer(axum::Extension(key))
         .with_state(state)
@@ -595,7 +596,63 @@ async fn completions(
     chat_completions(state, key, headers, Json(request)).await
 }
 
-/// Everything ozgent measured about a turn.
+/// `/v1/embeddings`.
+///
+/// Reports rather than improvises. Serving embeddings from a chat model by
+/// pooling its hidden states produces vectors that look plausible and cluster
+/// badly, and a caller has no way to tell — so with no embedding model
+/// configured this refuses instead.
+async fn embeddings(
+    state: AxumState<State>,
+    key: axum::Extension<ApiKey>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    authorise(&headers, &key)?;
+
+    let inputs = match body.get("input") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|i| i.as_str().unwrap_or_default().to_string())
+            .collect(),
+        _ => return Err(ApiError::bad_request("input is required")),
+    };
+    if inputs.iter().all(|i| i.trim().is_empty()) {
+        return Err(ApiError::bad_request("input is empty"));
+    }
+
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let vectors = state
+        .worker
+        .embed(inputs.clone())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let data: Vec<serde_json::Value> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| serde_json::json!({ "object": "embedding", "index": i, "embedding": v }))
+        .collect();
+    // Token accounting is approximate here: embedding happens on the inference
+    // thread and the tokeniser is not reachable from this side, so a rough
+    // count is better than a fabricated exact one.
+    let approx_tokens: usize = inputs.iter().map(|i| i.split_whitespace().count()).sum();
+
+    Ok(Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": { "prompt_tokens": approx_tokens, "total_tokens": approx_tokens },
+    }))
+    .into_response())
+}
+
+/// Everything ozgent measured about a turn./// Everything ozgent measured about a turn.
 #[derive(Serialize, Default)]
 pub struct Timings {
     pub prompt_tokens: u32,

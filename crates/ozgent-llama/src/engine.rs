@@ -27,6 +27,10 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 /// llama.cpp's backend may only be initialised once per process.
+pub(crate) fn backend_handle() -> Result<&'static LlamaBackend, EngineError> {
+    backend()
+}
+
 fn backend() -> Result<&'static LlamaBackend, EngineError> {
     static CELL: OnceLock<Option<LlamaBackend>> = OnceLock::new();
     CELL.get_or_init(|| {
@@ -167,6 +171,14 @@ impl Engine {
             template,
             model,
         })
+    }
+
+    /// Whether a rejected draft can be undone by trimming the cache.
+    ///
+    /// False for hybrid and recurrent models, which decides how — and whether —
+    /// speculation works, so it is worth surfacing in diagnostics.
+    pub fn rollback_safe(&self) -> bool {
+        self.rollback_safe
     }
 
     pub fn n_layer(&self) -> u32 {

@@ -25,6 +25,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// A unit of work for the inference thread.
 pub enum Job {
     Generate(Box<Request>),
+    /// Embed texts and send the vectors straight back.
+    Embed {
+        texts: Vec<String>,
+        reply: std::sync::mpsc::Sender<Result<Vec<Vec<f32>>, String>>,
+    },
     /// Drop the loaded model and free its VRAM.
     Unload,
 }
@@ -127,6 +132,18 @@ impl Worker {
             .map_err(|_| "the inference thread is not running")
     }
 
+    /// Embed texts on the inference thread.
+    ///
+    /// Synchronous by design: an embedding request has nothing to stream, and
+    /// the caller wants the vectors or an error, not a channel.
+    pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Job::Embed { texts, reply: tx })
+            .map_err(|_| "the inference thread is not running".to_string())?;
+        rx.recv().map_err(|_| "the inference thread stopped".to_string())?
+    }
+
     pub fn unload(&self) {
         let _ = self.tx.send(Job::Unload);
     }
@@ -141,6 +158,11 @@ fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
             Some(r) => r,
             None => match rx.recv() {
                 Ok(Job::Generate(r)) => r,
+                Ok(Job::Embed { reply, .. }) => {
+                    // Refused rather than faked. See `embed_texts`.
+                    let _ = reply.send(Err(embedding_unavailable()));
+                    continue;
+                }
                 Ok(Job::Unload) => continue, // nothing loaded
                 Err(_) => return,            // all senders dropped
             },
@@ -235,16 +257,35 @@ fn serve_model(
         // Dropping the sender ends the SSE stream for this request.
         drop(request);
 
-        request = match rx.recv() {
-            Ok(Job::Generate(r)) => r,
-            // Unloading means returning so the engine is dropped with the scope.
-            Ok(Job::Unload) => return Ok(None),
-            Err(_) => return Ok(None),
+        // Keep waiting until something to generate arrives: an embedding
+        // request is answered here and does not end the turn loop.
+        request = loop {
+            match rx.recv() {
+                Ok(Job::Generate(r)) => break r,
+                Ok(Job::Embed { reply, .. }) => {
+                    let _ = reply.send(Err(embedding_unavailable()));
+                }
+                // Unloading means returning so the engine is dropped with the scope.
+                Ok(Job::Unload) => return Ok(None),
+                Err(_) => return Ok(None),
+            }
         };
         if request.model != wanted {
             return Ok(Some(request));
         }
     }
+}
+
+/// Why an embedding request cannot be served.
+///
+/// Deliberately an error rather than a fallback. Pooling a chat model's hidden
+/// states yields vectors that look plausible, cluster badly, and give the
+/// caller no way to tell — the same trap the memory layer fell into by shipping
+/// a lexical stand-in behind a semantic-sounding interface.
+fn embedding_unavailable() -> String {
+    "no embedding model is configured. Install one and set \
+     [embedding] model = \"<name>\" in config.toml"
+        .to_string()
 }
 
 /// One user turn: generate, run any tools the model asks for, generate again.

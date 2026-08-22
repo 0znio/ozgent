@@ -585,7 +585,51 @@ async fn doctor(paths: &Paths, config: &Config) -> Result<()> {
 
     println!();
     println!("backends");
-    println!("  not yet wired up; the engine lands next");
+    // This section used to say the engine had not landed yet, which stopped
+    // being true long ago. A diagnostic that reports a working subsystem as
+    // absent is worse than none, because it is the first thing anyone runs.
+    let devices = ozgent_llama::backend::devices();
+    if devices.is_empty() {
+        println!("  none found; ozgent will run on the CPU");
+    }
+    for d in &devices {
+        println!(
+            "  [{}] {:<8} {:<38} {:.1}/{:.1} GiB free  gpu={}",
+            d.index,
+            d.backend,
+            d.description,
+            d.free_gib(),
+            d.total_gib(),
+            d.is_gpu()
+        );
+    }
+    println!("  gpu offload   {}", ozgent_llama::backend::supports_gpu_offload());
+
+    // What the runtime concluded about the model it would actually load, which
+    // is the part that decides speed and whether speculation is even possible.
+    if let Some((first, _)) = models.first() {
+        println!();
+        println!("model check ({first})");
+        match ozgent_core::resolve(paths, &first.to_string()) {
+            Ok(found) => {
+                let resolved = config.options_for(&first.to_string()).resolve();
+                let weights = found.manifest.primary_weights(&found.dir);
+                match ozgent_llama::engine::Engine::load(&weights, &resolved) {
+                    Ok(engine) => {
+                        println!("  layers        {} ({} on gpu)", engine.n_layer(), engine.gpu_layers_used());
+                        println!("  trained ctx   {}", engine.n_ctx_train());
+                        println!("  reasoning     {}", engine.is_reasoning_model());
+                        // Hybrid and recurrent models cannot roll back a
+                        // rejected draft by trimming the cache, which is the
+                        // single fact that decides how speculation behaves.
+                        println!("  rollback safe {}", engine.rollback_safe());
+                    }
+                    Err(e) => println!("  cannot load   {e}"),
+                }
+            }
+            Err(e) => println!("  unresolved    {e}"),
+        }
+    }
     Ok(())
 }
 

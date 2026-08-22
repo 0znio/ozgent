@@ -3,6 +3,8 @@
 pub mod backend;
 #[cfg(feature = "llama")]
 pub mod cvec;
+#[cfg(feature = "llama")]
+pub mod embed;
 pub mod engine;
 pub mod grammar;
 #[cfg(feature = "llama")]
