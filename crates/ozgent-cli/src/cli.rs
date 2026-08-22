@@ -249,6 +249,10 @@ pub struct OptionFlags {
     #[arg(long, value_name = "F", global = true)]
     pub control_strength: Option<f32>,
 
+    /// Physical micro-batch size, e.g. 256.
+    #[arg(long, value_name = "N", global = true)]
+    pub ubatch: Option<u32>,
+
     /// Context length in tokens.
     #[arg(long, short = 'c', value_name = "N", global = true)]
     pub ctx: Option<u32>,
@@ -330,6 +334,7 @@ impl OptionFlags {
         Ok(Options {
             gpu_layers: if self.no_gpu { Some(GpuLayers::OFF) } else { self.gpu_layers },
             cpu_moe: self.cpu_moe,
+            ubatch: self.ubatch,
             control_vector: self.control_vector.clone(),
             control_strength: self.control_strength,
             context_length: self.ctx,

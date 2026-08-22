@@ -137,6 +137,8 @@ pub struct Options {
     pub context_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<u32>,
+    /// Physical micro-batch. `None` leaves llama.cpp's default.
+    pub ubatch: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +228,7 @@ impl Options {
             gpu_layers: self.gpu_layers.unwrap_or(GpuLayers::AUTO),
             context_length: self.context_length.unwrap_or(4096),
             batch_size: self.batch_size.unwrap_or(512),
+            ubatch: self.ubatch,
             // 0 lets llama.cpp pick based on the physical core count.
             threads: self.threads.unwrap_or(0),
             main_gpu: self.main_gpu.unwrap_or(0),
@@ -279,6 +282,7 @@ pub struct Resolved {
     pub gpu_layers: GpuLayers,
     pub context_length: u32,
     pub batch_size: u32,
+    pub ubatch: Option<u32>,
     pub threads: u32,
     pub main_gpu: u32,
     pub use_mmap: bool,

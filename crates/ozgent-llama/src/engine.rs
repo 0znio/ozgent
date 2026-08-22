@@ -17,6 +17,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
 use ozgent_core::accel::{CacheType, MoeKeyword, MoeOffload, PrefixReuse, Speculative};
 use ozgent_core::options::GpuKeyword;
 use ozgent_core::{GpuLayers, Message, Resolved, Role};
@@ -298,11 +299,29 @@ impl Engine {
             );
         }
 
+        // Flash attention was previously read only to pick the KV type and
+        // never actually set, so `--no-flash-attn` disabled nothing and the KV
+        // policy reasoned about a flag it did not control. llama.cpp defaults
+        // to AUTO, so the behaviour was probably right by accident; it is now
+        // asked for explicitly.
+        let flash = if opts.flash_attention {
+            sys::LLAMA_FLASH_ATTN_TYPE_AUTO
+        } else {
+            sys::LLAMA_FLASH_ATTN_TYPE_DISABLED
+        };
+
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(opts.batch_size)
+            .with_flash_attention_policy(flash)
             .with_type_k(ggml_type(type_k))
             .with_type_v(ggml_type(type_v));
+
+        // The physical micro-batch. Left at llama.cpp's default unless asked,
+        // since it trades prefill parallelism against working-set size.
+        if let Some(n) = opts.ubatch {
+            params = params.with_n_ubatch(n);
+        }
 
         if opts.threads > 0 {
             params = params
