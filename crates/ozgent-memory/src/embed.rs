@@ -16,6 +16,24 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// So a boxed embedder can be passed wherever an `&impl Embedder` is expected.
+///
+/// Without this, choosing the embedder at runtime forces every call site to
+/// name a concrete type, which is the opposite of what the trait is for.
+impl<T: Embedder + ?Sized> Embedder for Box<T> {
+    fn dimensions(&self) -> usize {
+        (**self).dimensions()
+    }
+
+    fn embed(&self, text: &str) -> Vec<f32> {
+        (**self).embed(text)
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        (**self).embed_batch(texts)
+    }
+}
+
 /// A lexical embedder using the hashing trick.
 ///
 /// Words are hashed into a fixed number of buckets and the resulting vector is

@@ -241,6 +241,22 @@ pub struct OptionFlags {
     #[arg(long, value_name = "N", global = true)]
     pub cpu_moe: Option<MoeOffload>,
 
+    /// Steer generation with a control-vector GGUF.
+    #[arg(long, value_name = "FILE", global = true)]
+    pub control_vector: Option<std::path::PathBuf>,
+
+    /// How hard to steer. 1.0 is the vector as trained; negative reverses it.
+    #[arg(long, value_name = "F", global = true)]
+    pub control_strength: Option<f32>,
+
+    /// Physical micro-batch size, e.g. 256.
+    #[arg(long, value_name = "N", global = true)]
+    pub ubatch: Option<u32>,
+
+    /// How hard a reasoning model should think: `low`, `medium`, or `high`.
+    #[arg(long, value_name = "LEVEL", global = true)]
+    pub effort: Option<ozgent_core::ReasoningEffort>,
+
     /// Context length in tokens.
     #[arg(long, short = 'c', value_name = "N", global = true)]
     pub ctx: Option<u32>,
@@ -322,6 +338,9 @@ impl OptionFlags {
         Ok(Options {
             gpu_layers: if self.no_gpu { Some(GpuLayers::OFF) } else { self.gpu_layers },
             cpu_moe: self.cpu_moe,
+            ubatch: self.ubatch,
+            control_vector: self.control_vector.clone(),
+            control_strength: self.control_strength,
             context_length: self.ctx,
             cache_type_k: self.cache_type,
             cache_type_v: self.cache_type,
@@ -334,6 +353,7 @@ impl OptionFlags {
             max_tokens: self.max_tokens,
             system_prompt,
             thinking: if self.no_think { Some(ThinkingMode::Off) } else { self.think },
+            reasoning_effort: self.effort,
             tools: self.no_tools.then_some(false),
             speculative: match self.spec.as_deref() {
                 None => None,
@@ -341,11 +361,21 @@ impl OptionFlags {
                 Some("ngram") => Some(Speculative::Ngram),
                 Some("mtp") => Some(Speculative::Mtp),
                 Some("auto") => Some(Speculative::Auto),
-                Some(other) => {
-                    return Err(anyhow::anyhow!(
-                        "unknown --spec {other:?}; expected auto, ngram, mtp, or off"
-                    ));
-                }
+                // `draft:<model>` names a second, smaller model to propose
+                // tokens. Spelled inside --spec rather than as its own flag so
+                // the strategies stay mutually exclusive by construction.
+                Some(other) => match other.strip_prefix("draft:") {
+                    Some(model) if !model.is_empty() => Some(Speculative::Draft {
+                        model: model.to_string(),
+                        gpu_layers: Some(99),
+                    }),
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "unknown --spec {other:?}; expected auto, ngram, mtp, off, \
+                             or draft:<model>"
+                        ));
+                    }
+                },
             },
             ..Default::default()
         })

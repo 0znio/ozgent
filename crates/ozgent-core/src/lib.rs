@@ -14,6 +14,7 @@ pub mod registry;
 pub use accel::{CacheType, MoeOffload, PrefixReuse, Speculative, SpeculativeTuning};
 pub use chat::{ImageSource, Message, Part, Role, ToolCall, ToolSpec};
 pub use config::Config;
+pub use options::ReasoningEffort;
 pub use datetime::DateTime;
 pub use manifest::{Capability, Manifest};
 pub use options::{GpuLayers, Options, Resolved, ThinkingMode};

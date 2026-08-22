@@ -25,6 +25,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// A unit of work for the inference thread.
 pub enum Job {
     Generate(Box<Request>),
+    /// Embed texts and send the vectors straight back.
+    Embed {
+        texts: Vec<String>,
+        reply: std::sync::mpsc::Sender<Result<Vec<Vec<f32>>, String>>,
+    },
     /// Drop the loaded model and free its VRAM.
     Unload,
 }
@@ -37,6 +42,18 @@ pub struct Request {
     pub max_tokens: Option<u32>,
     /// Whether this turn may call tools. The user can switch it off per turn.
     pub tools_enabled: bool,
+    /// Which built-in tools this turn may use, by name. `None` offers all of
+    /// them; `Some(list)` offers only those named, so a caller can withhold a
+    /// tool rather than trusting the model not to reach for it.
+    pub native_tools: Option<Vec<String>>,
+    /// Tools the caller implements. Described to the model like any other, but
+    /// never executed here — when one is called the turn ends and the call is
+    /// handed back, which is what an OpenAI client expects.
+    pub client_tools: Vec<ozgent_core::ToolSpec>,
+    /// A GBNF grammar constraining the whole reply, from `response_format`.
+    /// Unlike the tool gate this applies from the first token, so the model
+    /// cannot produce anything the schema forbids.
+    pub response_grammar: Option<String>,
     /// Sampling overrides for this request only, as the API allows. Applied on
     /// top of the server's configuration rather than replacing it.
     pub overrides: Option<ozgent_core::Options>,
@@ -56,6 +73,9 @@ pub enum Event {
     Answer { text: String },
     /// The model asked for a tool. Emitted before the tool runs.
     ToolCall { name: String, arguments: serde_json::Value },
+    /// The model called a tool the *caller* owns. Nothing runs here; the turn
+    /// ends and the caller is expected to execute it and send the result back.
+    ClientToolCall { name: String, arguments: serde_json::Value },
     /// How that call turned out. `detail` is the tool's own result, so the
     /// browser can render it properly instead of showing raw JSON.
     ToolResult {
@@ -112,6 +132,18 @@ impl Worker {
             .map_err(|_| "the inference thread is not running")
     }
 
+    /// Embed texts on the inference thread.
+    ///
+    /// Synchronous by design: an embedding request has nothing to stream, and
+    /// the caller wants the vectors or an error, not a channel.
+    pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Job::Embed { texts, reply: tx })
+            .map_err(|_| "the inference thread is not running".to_string())?;
+        rx.recv().map_err(|_| "the inference thread stopped".to_string())?
+    }
+
     pub fn unload(&self) {
         let _ = self.tx.send(Job::Unload);
     }
@@ -120,12 +152,19 @@ impl Worker {
 /// Outer loop: owns nothing but the channel, and loads a model on demand.
 fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
     let mut pending: Option<Box<Request>> = None;
+    // Held across model loads: the embedding model is independent of whichever
+    // chat model happens to be resident.
+    let mut embedder: Option<ozgent_llama::embed::Embedder> = None;
     loop {
         // Either carry over the job that forced a model switch, or wait.
         let request = match pending.take() {
             Some(r) => r,
             None => match rx.recv() {
                 Ok(Job::Generate(r)) => r,
+                Ok(Job::Embed { texts, reply }) => {
+                    let _ = reply.send(serve_embeddings(&paths, &config, &mut embedder, texts));
+                    continue;
+                }
                 Ok(Job::Unload) => continue, // nothing loaded
                 Err(_) => return,            // all senders dropped
             },
@@ -133,7 +172,7 @@ fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
 
         // Loading and the session that borrows it both live in this scope, so
         // the borrow checker is satisfied without any self-referential trick.
-        match serve_model(&paths, &config, tools.as_ref(), request, &rx) {
+        match serve_model(&paths, &config, tools.as_ref(), &mut embedder, request, &rx) {
             Ok(next) => pending = next,
             Err(e) => tracing::error!("inference thread: {e}"),
         }
@@ -146,6 +185,9 @@ fn serve_model(
     paths: &Paths,
     config: &Config,
     tools: Option<&Tools>,
+    // Threaded through rather than rebuilt: an embedding request that arrives
+    // mid-conversation should not reload the model it already has.
+    embedder: &mut Option<ozgent_llama::embed::Embedder>,
     first: Box<Request>,
     rx: &Receiver<Job>,
 ) -> anyhow::Result<Option<Box<Request>>> {
@@ -220,16 +262,67 @@ fn serve_model(
         // Dropping the sender ends the SSE stream for this request.
         drop(request);
 
-        request = match rx.recv() {
-            Ok(Job::Generate(r)) => r,
-            // Unloading means returning so the engine is dropped with the scope.
-            Ok(Job::Unload) => return Ok(None),
-            Err(_) => return Ok(None),
+        // Keep waiting until something to generate arrives: an embedding
+        // request is answered here and does not end the turn loop.
+        request = loop {
+            match rx.recv() {
+                Ok(Job::Generate(r)) => break r,
+                Ok(Job::Embed { texts, reply }) => {
+                    let _ = reply.send(serve_embeddings(paths, config, embedder, texts));
+                }
+                // Unloading means returning so the engine is dropped with the scope.
+                Ok(Job::Unload) => return Ok(None),
+                Err(_) => return Ok(None),
+            }
         };
         if request.model != wanted {
             return Ok(Some(request));
         }
     }
+}
+
+/// Why an embedding request cannot be served.
+///
+/// Deliberately an error rather than a fallback. Pooling a chat model's hidden
+/// states yields vectors that look plausible, cluster badly, and give the
+/// caller no way to tell — the same trap the memory layer fell into by shipping
+/// a lexical stand-in behind a semantic-sounding interface.
+/// Answer an embedding request, loading the model on first use.
+fn serve_embeddings(
+    paths: &Paths,
+    config: &Config,
+    slot: &mut Option<ozgent_llama::embed::Embedder>,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, String> {
+    if slot.is_none() {
+        *slot = Some(load_embedder(paths, config)?);
+    }
+    let embedder = slot.as_ref().expect("just loaded");
+    embedder.embed_batch(&texts).map_err(|e| e.to_string())
+}
+
+/// Load the configured embedding model, once.
+///
+/// Lazily, because most sessions never ask for an embedding and the model is
+/// another half-gigabyte of VRAM that a chat has better uses for.
+fn load_embedder(
+    paths: &Paths,
+    config: &Config,
+) -> Result<ozgent_llama::embed::Embedder, String> {
+    let Some(name) = config.embedding.model.as_deref() else {
+        return Err(embedding_unavailable());
+    };
+    let found = ozgent_core::resolve(paths, name)
+        .map_err(|e| format!("embedding model {name:?}: {e}"))?;
+    let weights = found.manifest.primary_weights(&found.dir);
+    ozgent_llama::embed::Embedder::load(&weights, 99)
+        .map_err(|e| format!("loading embedding model {name:?}: {e}"))
+}
+
+fn embedding_unavailable() -> String {
+    "no embedding model is configured. Install one and set \
+     [embedding] model = \"<name>\" in config.toml"
+        .to_string()
 }
 
 /// One user turn: generate, run any tools the model asks for, generate again.
@@ -262,10 +355,72 @@ fn turn(
     };
 
     let media_turn = !images.is_empty();
-    let offered: Vec<ozgent_core::ToolSpec> = match tools {
-        Some(t) if request.tools_enabled => t.host.tools().to_vec(),
+    let mut offered: Vec<ozgent_core::ToolSpec> = match tools {
+        Some(t) if request.tools_enabled => match &request.native_tools {
+            None => t.host.tools().to_vec(),
+            Some(allowed) => {
+                // A name that matches nothing is a caller mistake worth
+                // reporting: silently dropping it would leave them believing a
+                // tool is available when the model was never told about it.
+                let available: Vec<&str> =
+                    t.host.tools().iter().map(|s| s.name.as_str()).collect();
+                if let Some(unknown) =
+                    allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str()))
+                {
+                    let _ = request.out.send(Event::Error {
+                        message: format!(
+                            "no built-in tool named {unknown:?}. Available: {}",
+                            available.join(", ")
+                        ),
+                    });
+                    return Ok(());
+                }
+                t.host
+                    .tools()
+                    .iter()
+                    .filter(|s| allowed.iter().any(|a| a == &s.name))
+                    .cloned()
+                    .collect()
+            }
+        },
         _ => Vec::new(),
     };
+    // Caller-supplied tools are additive: a request may use the server's
+    // Python tools, its own, or both. A name collision resolves in favour of
+    // the server's, because that is the one this process can actually run.
+    let server_names: std::collections::HashSet<String> =
+        offered.iter().map(|s| s.name.clone()).collect();
+    let client_owned: std::collections::HashSet<String> = request
+        .client_tools
+        .iter()
+        .map(|s| s.name.clone())
+        .filter(|n| !server_names.contains(n))
+        .collect();
+    for spec in &request.client_tools {
+        if client_owned.contains(&spec.name) {
+            offered.push(spec.clone());
+        }
+    }
+
+    // Constrain the body of a tool call the moment one starts, so a malformed
+    // call is unreachable rather than emitted and then rejected.
+    session.set_tools(&offered);
+
+    // The session outlives the request, so a grammar left installed by an
+    // earlier one would silently shape this reply. Cleared unconditionally
+    // before anything else decides to set it.
+    if let Err(e) = session.set_grammar(None) {
+        let _ = request.out.send(Event::Error { message: e.to_string() });
+        return Ok(());
+    }
+    if let Some(grammar) = &request.response_grammar {
+        if let Err(e) = session.set_grammar(Some(grammar)) {
+            let _ = request.out.send(Event::Error {
+                message: format!("response_format produced a grammar the model rejected: {e}"),
+            });
+            return Ok(());
+        }
+    }
 
     let mut messages = request.messages.clone();
     if !images.is_empty() {
@@ -350,6 +505,9 @@ fn turn(
     let mut elapsed_ms = 0u128;
     let mut reused = 0usize;
     let mut stop = StopReason::EndOfText;
+    // The turn ended because the caller has a tool to run, which is a
+    // different thing from the model choosing to stop.
+    let mut handed_back = false;
 
     for round in 0..=max_rounds {
         let last = round == max_rounds || offered.is_empty();
@@ -373,19 +531,58 @@ fn turn(
         if last || !parsed.has_calls() {
             break;
         }
-        let Some(t) = tools else { break };
         // The visible part of the reply is whatever preceded the call.
         messages.push(Message::assistant(parsed.text.clone()));
 
+        // A call the caller owns ends the turn: this process has no code for
+        // it, so the call is handed back to be run there. Checked before the
+        // guard below, which would otherwise discard the call whenever the
+        // server has no Python tools of its own — the common case for a client
+        // that brought only its own.
+        //
+        // A batch mixing caller and server tools hands back only the caller's
+        // and runs none of the server's: the caller replies with its results,
+        // and the model reissues whatever it still wants.
+        let handing_back: Vec<_> =
+            parsed.calls.iter().filter(|c| client_owned.contains(&c.name)).collect();
+        if !handing_back.is_empty() {
+            for call in handing_back {
+                let _ = request.out.send(Event::ClientToolCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+            }
+            handed_back = true;
+            break;
+        }
+
+        let Some(t) = tools else { break };
+
+        // Independent calls run together. In series, a turn asking for three
+        // searches paid three network round trips end to end, and the tool
+        // timeout applied to each in turn rather than to the set.
+        //
+        // Every call is announced before any is awaited, so the transcript
+        // shows the whole batch as pending rather than appearing to work
+        // through them one at a time.
         for call in &parsed.calls {
             let _ = request.out.send(Event::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            let started = std::time::Instant::now();
-            let outcome = t.runtime.block_on(t.host.call(&call.name, call.arguments.clone()));
-            let ms = started.elapsed().as_millis() as u64;
+        }
+        let outcomes = t.runtime.block_on(futures_util::future::join_all(
+            parsed.calls.iter().map(|call| async {
+                let started = std::time::Instant::now();
+                let outcome = t.host.call(&call.name, call.arguments.clone()).await;
+                (outcome, started.elapsed().as_millis() as u64)
+            }),
+        ));
 
+        // Consumed in the model's original order, not completion order: the
+        // results become the next prompt, so letting a race decide their order
+        // would make the same turn produce different continuations.
+        for (call, (outcome, ms)) in parsed.calls.iter().zip(outcomes) {
             let (ok, summary, detail, payload) = match outcome {
                 Ok(value) => {
                     let text = serde_json::to_string(&value).unwrap_or_default();
@@ -416,12 +613,16 @@ fn turn(
         }
     }
 
+    if request.response_grammar.is_some() {
+        let _ = session.set_grammar(None);
+    }
+
     let seconds = elapsed_ms as f64 / 1000.0;
     let _ = request.out.send(Event::Done {
         generated,
         tokens_per_second: if seconds > 0.0 { generated as f64 / seconds } else { 0.0 },
         reused,
-        stop: format!("{stop:?}"),
+        stop: if handed_back { "ToolCalls".to_string() } else { format!("{stop:?}") },
         prompt: prompt_tokens,
     });
     Ok(())
@@ -808,6 +1009,9 @@ mod tests {
             thinking: None,
             max_tokens: None,
             tools_enabled: true,
+            native_tools: None,
+            client_tools: Vec::new(),
+            response_grammar: None,
             overrides: None,
             images: Vec::new(),
             out,

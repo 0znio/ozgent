@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::Stream;
-use ozgent_core::{Message, ThinkingMode};
+use ozgent_core::{Message, ThinkingMode, ToolSpec};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 
@@ -36,6 +36,7 @@ pub fn router(state: State, key: ApiKey) -> Router {
         .route("/v1/models/{model}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/health", get(health))
         .layer(axum::Extension(key))
         .with_state(state)
@@ -222,6 +223,9 @@ pub struct ChatRequest {
     /// `true`/`false`, or `"auto"`/`"on"`/`"off"` for models that reason.
     #[serde(default)]
     pub reasoning: Option<serde_json::Value>,
+    /// `"low"`, `"medium"` or `"high"`, spelled as OpenAI spells it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Off by default so a plain OpenAI client never gets a surprise tool call.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
@@ -230,6 +234,17 @@ pub struct ChatRequest {
     /// ozgent extension: use the server's own Python tools.
     #[serde(default)]
     pub ozgent_tools: Option<bool>,
+    /// `{"type":"json_object"}`, or `{"type":"json_schema","json_schema":{...}}`.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+    /// ozgent extension: which built-in tools this request may use, by name.
+    ///
+    /// Absent offers all of them. Naming a subset is how a caller keeps, say,
+    /// `write_file` out of reach for a request that has no business writing —
+    /// the model is never told the tool exists, so it cannot ask for it.
+    /// An empty list offers none.
+    #[serde(default)]
+    pub native_tools: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -245,9 +260,45 @@ pub struct ChatMessage {
     /// A string, or OpenAI's content-part array.
     #[serde(default)]
     pub content: Option<serde_json::Value>,
+    /// Present on an assistant turn that called tools.
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Present on a `tool` turn, naming the call it answers.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
+    /// The calls this assistant turn made, as ozgent records them.
+    pub fn tool_calls(&self) -> Vec<ozgent_core::ToolCall> {
+        let Some(serde_json::Value::Array(items)) = &self.tool_calls else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let function = item.get("function")?;
+                let name = function.get("name")?.as_str()?.to_string();
+                // OpenAI sends arguments as a *string* of JSON, not an object.
+                // Passing the string through would render the call with quoted
+                // arguments, which the model reads as a different call than the
+                // one it made.
+                let arguments = match function.get("arguments") {
+                    Some(serde_json::Value::String(raw)) => {
+                        serde_json::from_str(raw).unwrap_or(serde_json::Value::Null)
+                    }
+                    Some(other) => other.clone(),
+                    None => serde_json::Value::Null,
+                };
+                Some(ozgent_core::ToolCall {
+                    id: item.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+                    name,
+                    arguments,
+                })
+            })
+            .collect()
+    }
+
     /// Flatten OpenAI's content shapes into plain text.
     ///
     /// Both a bare string and the `[{type:"text",text:...}]` array are valid,
@@ -303,8 +354,18 @@ impl ChatMessage {
 ///
 /// Only what the caller actually set: an absent field must inherit the server's
 /// configuration rather than silently reset it to an OpenAI default.
+/// The effort level a request asked for, if it named a valid one.
+///
+/// An unrecognised level is ignored rather than refused: it narrows how long
+/// the model thinks and nothing else, so a client sending a level ozgent does
+/// not know should still get an answer.
+pub fn effort_from(value: Option<&String>) -> Option<ozgent_core::ReasoningEffort> {
+    value.and_then(|v| v.parse().ok())
+}
+
 pub fn options_from(request: &ChatRequest) -> ozgent_core::Options {
     ozgent_core::Options {
+        reasoning_effort: effort_from(request.reasoning_effort.as_ref()),
         temperature: request.temperature,
         top_p: request.top_p,
         top_k: request.top_k,
@@ -347,9 +408,99 @@ pub fn to_messages(request: &ChatRequest) -> Vec<Message> {
         .iter()
         .map(|m| match m.role.as_str() {
             "system" | "developer" => Message::system(m.text()),
-            "assistant" => Message::assistant(m.text()),
-            "tool" => Message::tool_result(String::new(), m.text()),
+            "assistant" => {
+                let mut message = Message::assistant(m.text());
+                // An assistant turn that called a tool has little or no text —
+                // the call *is* the content. Dropping it leaves the following
+                // tool result answering a question the model cannot see it
+                // asked, so the calls are carried back into the transcript.
+                message.tool_calls = m.tool_calls();
+                message
+            }
+            // The id ties the result to the call that asked for it. Without it
+            // a turn with two outstanding calls cannot say which is which.
+            "tool" => Message::tool_result(m.tool_call_id.clone().unwrap_or_default(), m.text()),
             _ => Message::user(m.text()),
+        })
+        .collect()
+}
+
+/// The grammar `response_format` asks for, if any.
+///
+/// `Err` carries a message for the caller: a `response_format` that cannot be
+/// honoured has to be refused, because the alternative is returning prose to a
+/// client that will try to parse it as JSON.
+pub fn response_grammar(value: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    let Some(format) = value else { return Ok(None) };
+    match format.get("type").and_then(|t| t.as_str()) {
+        None | Some("text") => Ok(None),
+        Some("json_object") => Ok(Some(ozgent_llama::grammar::json_object_grammar())),
+        Some("json_schema") => {
+            // OpenAI nests the schema one level down; some clients put it at the
+            // top. Accepting only the documented spelling would reject requests
+            // that are otherwise perfectly clear.
+            let schema = format
+                .get("json_schema")
+                .and_then(|j| j.get("schema"))
+                .or_else(|| format.get("schema"))
+                .ok_or_else(|| {
+                    "response_format json_schema needs a `schema`".to_string()
+                })?;
+            Ok(Some(ozgent_llama::grammar::schema_grammar(schema)))
+        }
+        Some(other) => Err(format!("unsupported response_format type {other:?}")),
+    }
+}
+
+/// Tools the *caller* implements, taken from the request's `tools` array.
+///
+/// These are not ozgent's Python tools: the server has no code for them. They
+/// are described to the model, and when the model calls one the turn stops and
+/// the call is handed back for the caller to run — which is what OpenAI's
+/// `finish_reason: "tool_calls"` means.
+///
+/// Entries that are not `type: "function"` name a capability this server
+/// cannot provide (OpenAI's hosted tools, say). Offering them would let the
+/// model call something that can never run, so they are skipped.
+pub fn client_tools(value: Option<&serde_json::Value>) -> Vec<ToolSpec> {
+    let Some(serde_json::Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            // The nesting under `function` is the documented shape, but enough
+            // clients send the inner object bare that both are worth accepting.
+            let body = match item.get("function") {
+                Some(f) => f,
+                None => item,
+            };
+            if let Some(kind) = item.get("type").and_then(|t| t.as_str()) {
+                if kind != "function" && item.get("function").is_some() {
+                    return None;
+                }
+            }
+            let name = body.get("name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            // An absent `parameters` means a function that takes none; the
+            // empty object schema says exactly that, and keeps the grammar
+            // builder on its normal path.
+            let input_schema = body
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+            Some(ToolSpec {
+                name: name.to_string(),
+                description: body
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                input_schema,
+                output_schema: None,
+            })
         })
         .collect()
 }
@@ -358,6 +509,9 @@ pub fn to_messages(request: &ChatRequest) -> Vec<Message> {
 pub fn finish_reason(stop: &str) -> &'static str {
     match stop {
         "EndOfText" => "stop",
+        // The caller owns a tool the model called; it must run it and come
+        // back, so this is not an ordinary stop.
+        "ToolCalls" => "tool_calls",
         "TokenLimit" | "ContextFull" => "length",
         "Cancelled" => "stop",
         _ => "stop",
@@ -384,15 +538,45 @@ async fn chat_completions(
         images.extend(message.images().map_err(ApiError::bad_request)?);
     }
 
+    let response_grammar = response_grammar(request.response_format.as_ref())
+        .map_err(ApiError::bad_request)?;
+
+    // A schema grammar masks out every token that would break it, so the model
+    // physically cannot emit a tool-call marker. Honouring both would leave the
+    // caller's tools silently dead — the failure this whole area keeps
+    // producing — so the conflict is refused instead.
+    if response_grammar.is_some()
+        && (request.tools.is_some() || request.ozgent_tools == Some(true)
+            || request.native_tools.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "response_format and tools cannot be combined: a schema grammar makes a tool call \
+             unrepresentable, so the tools would never be used",
+        ));
+    }
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     state
         .worker
         .submit(Request {
             model: found.model.to_string(),
             messages: to_messages(&request),
-            thinking: thinking_from(request.reasoning.as_ref()),
+            // A reasoning model opens with `<think>`, which no schema admits —
+            // the grammar would mask the very first token it wants. Structured
+            // output and visible reasoning are not compatible, and discovering
+            // that as a stalled generation would be far worse than this.
+            thinking: if response_grammar.is_some() {
+                Some(ThinkingMode::Off)
+            } else {
+                thinking_from(request.reasoning.as_ref())
+            },
             max_tokens: request.max_tokens.or(request.max_completion_tokens),
-            tools_enabled: request.ozgent_tools.unwrap_or(false),
+            // Naming the built-ins is itself a request to use them, so a
+            // caller does not have to set two fields that mean one thing.
+            tools_enabled: request.ozgent_tools.unwrap_or(request.native_tools.is_some()),
+            native_tools: request.native_tools.clone(),
+            client_tools: client_tools(request.tools.as_ref()),
+            response_grammar,
             overrides: Some(options_from(&request)),
             images,
             out: tx,
@@ -425,7 +609,63 @@ async fn completions(
     chat_completions(state, key, headers, Json(request)).await
 }
 
-/// Everything ozgent measured about a turn.
+/// `/v1/embeddings`.
+///
+/// Reports rather than improvises. Serving embeddings from a chat model by
+/// pooling its hidden states produces vectors that look plausible and cluster
+/// badly, and a caller has no way to tell — so with no embedding model
+/// configured this refuses instead.
+async fn embeddings(
+    state: AxumState<State>,
+    key: axum::Extension<ApiKey>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    authorise(&headers, &key)?;
+
+    let inputs = match body.get("input") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|i| i.as_str().unwrap_or_default().to_string())
+            .collect(),
+        _ => return Err(ApiError::bad_request("input is required")),
+    };
+    if inputs.iter().all(|i| i.trim().is_empty()) {
+        return Err(ApiError::bad_request("input is empty"));
+    }
+
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let vectors = state
+        .worker
+        .embed(inputs.clone())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let data: Vec<serde_json::Value> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| serde_json::json!({ "object": "embedding", "index": i, "embedding": v }))
+        .collect();
+    // Token accounting is approximate here: embedding happens on the inference
+    // thread and the tokeniser is not reachable from this side, so a rough
+    // count is better than a fabricated exact one.
+    let approx_tokens: usize = inputs.iter().map(|i| i.split_whitespace().count()).sum();
+
+    Ok(Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": { "prompt_tokens": approx_tokens, "total_tokens": approx_tokens },
+    }))
+    .into_response())
+}
+
+/// Everything ozgent measured about a turn./// Everything ozgent measured about a turn.
 #[derive(Serialize, Default)]
 pub struct Timings {
     pub prompt_tokens: u32,
@@ -452,7 +692,12 @@ async fn collect(
         match event {
             Event::Answer { text } => answer.push_str(&text),
             Event::Thinking { text } => reasoning.push_str(&text),
-            Event::ToolCall { name, arguments } => calls.push(serde_json::json!({
+            // Only calls the *caller* must run belong in `tool_calls`. A
+            // server-side tool has already executed by the time the turn ends,
+            // and reporting it here would tell a compliant client to run
+            // something it has no code for — and to send back a result the
+            // model already has.
+            Event::ClientToolCall { name, arguments } => calls.push(serde_json::json!({
                 "id": id("call"),
                 "type": "function",
                 "function": { "name": name, "arguments": arguments.to_string() },
@@ -470,7 +715,7 @@ async fn collect(
                 stop = finish_reason(&reason);
             }
             Event::Error { message } => return Err(ApiError::internal(message)),
-            Event::Ready { .. } | Event::ToolResult { .. } => {}
+            Event::Ready { .. } | Event::ToolCall { .. } | Event::ToolResult { .. } => {}
         }
     }
 
@@ -480,6 +725,10 @@ async fn collect(
     }
     if !calls.is_empty() {
         message["tool_calls"] = calls.into();
+        // The turn stopped because the caller has work to do, which OpenAI
+        // spells this way; the generation's own stop reason is not the reason
+        // the client should act on.
+        stop = "tool_calls";
     }
 
     Ok(serde_json::json!({
@@ -542,7 +791,7 @@ fn stream_chunks(
                 Event::Thinking { text } => {
                     delta.insert("reasoning_content".into(), text.into());
                 }
-                Event::ToolCall { name, arguments } => {
+                Event::ClientToolCall { name, arguments } => {
                     delta.insert(
                         "tool_calls".into(),
                         serde_json::json!([{
@@ -553,6 +802,9 @@ fn stream_chunks(
                         }]),
                     );
                 }
+                // A server-side tool has already run; telling the client about
+                // it here would invite it to run the same call again.
+                Event::ToolCall { .. } => {}
                 Event::Done { generated, tokens_per_second, reused, stop, prompt } => {
                     let usage = serde_json::json!({
                         "prompt_tokens": prompt,
@@ -606,6 +858,208 @@ mod tests {
 
     fn request(json: serde_json::Value) -> ChatRequest {
         serde_json::from_value(json).expect("should deserialise")
+    }
+
+    #[test]
+    fn a_json_schema_becomes_a_grammar_naming_its_fields() {
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "response_format": { "type": "json_schema", "json_schema": { "name": "person",
+                "schema": { "type": "object",
+                    "properties": { "name": { "type": "string" }, "age": { "type": "integer" } },
+                    "required": ["name", "age"] } } }
+        }));
+        let g = response_grammar(r.response_format.as_ref()).expect("valid").expect("some");
+        assert!(g.starts_with("root ::="), "must have a root rule:\n{g}");
+        assert!(g.contains("name"), "the schema's fields drive the grammar:\n{g}");
+        assert!(g.contains("integer"), "an integer field needs the integer rule:\n{g}");
+    }
+
+    #[test]
+    fn the_schema_may_sit_at_the_top_level_too() {
+        // OpenAI nests it; several clients do not. Rejecting the flat spelling
+        // would refuse a request whose intent is unambiguous.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "response_format": { "type": "json_schema",
+                "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } }
+        }));
+        assert!(response_grammar(r.response_format.as_ref()).unwrap().is_some());
+    }
+
+    #[test]
+    fn json_object_mode_allows_nesting() {
+        // Tool arguments do not nest arbitrarily, so the shared `value` rule is
+        // flat. A bare json_object does nest, and reusing that rule would
+        // forbid perfectly ordinary output.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "json_object" }
+        }));
+        let g = response_grammar(r.response_format.as_ref()).unwrap().unwrap();
+        assert!(g.contains("value ::= object | array"), "value must recurse:\n{g}");
+    }
+
+    #[test]
+    fn plain_text_asks_for_no_constraint() {
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "text" }
+        }));
+        assert!(response_grammar(r.response_format.as_ref()).unwrap().is_none());
+        let none = request(serde_json::json!({ "model": "m", "messages": [] }));
+        assert!(response_grammar(none.response_format.as_ref()).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unhonourable_response_format_is_refused_not_ignored() {
+        // Returning prose to a client that will parse it as JSON is worse than
+        // an error it can read.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "yaml" }
+        }));
+        assert!(response_grammar(r.response_format.as_ref()).is_err());
+
+        let missing = request(serde_json::json!({
+            "model": "m", "messages": [], "response_format": { "type": "json_schema" }
+        }));
+        assert!(response_grammar(missing.response_format.as_ref()).is_err());
+    }
+
+    #[test]
+    fn naming_native_tools_is_enough_to_enable_them() {
+        // Requiring `ozgent_tools: true` as well would be two fields for one
+        // intention, and the omission would look like the tools being ignored.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [], "native_tools": ["read_file"]
+        }));
+        assert_eq!(r.native_tools.as_deref(), Some(&["read_file".to_string()][..]));
+        assert!(r.ozgent_tools.unwrap_or(r.native_tools.is_some()));
+    }
+
+    #[test]
+    fn an_empty_native_tools_list_is_not_the_same_as_absent() {
+        // `[]` withholds every built-in; absent offers all of them. Collapsing
+        // the two would silently hand back the tools a caller just excluded.
+        let none_named = request(serde_json::json!({
+            "model": "m", "messages": [], "native_tools": []
+        }));
+        assert_eq!(none_named.native_tools.as_deref(), Some(&[][..]));
+
+        let unset = request(serde_json::json!({ "model": "m", "messages": [] }));
+        assert!(unset.native_tools.is_none());
+        assert!(!unset.ozgent_tools.unwrap_or(unset.native_tools.is_some()));
+    }
+
+    #[test]
+    fn caller_tools_are_read_from_the_documented_shape() {
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Look up the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    }
+                }
+            }]
+        }));
+        let tools = client_tools(r.tools.as_ref());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_weather");
+        assert_eq!(tools[0].description, "Look up the weather");
+        assert_eq!(tools[0].input_schema["properties"]["city"]["type"], "string");
+    }
+
+    #[test]
+    fn a_bare_function_object_is_also_accepted() {
+        // Enough clients omit the `function` nesting that refusing it would
+        // look like ozgent silently ignoring their tools — the exact failure
+        // this replaces.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "tools": [{ "name": "flat", "parameters": { "type": "object", "properties": {} } }]
+        }));
+        assert_eq!(client_tools(r.tools.as_ref())[0].name, "flat");
+    }
+
+    #[test]
+    fn a_function_without_parameters_gets_an_empty_object_schema() {
+        // `None` would reach the grammar builder as an absent schema; the empty
+        // object is what "takes no arguments" actually means.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "tools": [{ "type": "function", "function": { "name": "ping" } }]
+        }));
+        let tools = client_tools(r.tools.as_ref());
+        assert_eq!(tools[0].input_schema["type"], "object");
+    }
+
+    #[test]
+    fn a_tool_this_server_cannot_run_is_not_offered() {
+        // Offering a hosted tool would let the model call something that can
+        // never execute, and the turn would stall waiting for a result.
+        let r = request(serde_json::json!({
+            "model": "m", "messages": [],
+            "tools": [
+                { "type": "web_search_preview" },
+                { "type": "function", "function": { "name": "real" } }
+            ]
+        }));
+        let tools = client_tools(r.tools.as_ref());
+        assert_eq!(tools.len(), 1, "only the function survives");
+        assert_eq!(tools[0].name, "real");
+    }
+
+    #[test]
+    fn no_tools_field_means_no_caller_tools() {
+        let r = request(serde_json::json!({ "model": "m", "messages": [] }));
+        assert!(client_tools(r.tools.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn a_calls_arguments_come_back_as_an_object_not_a_string() {
+        // OpenAI sends arguments as a JSON *string*. Left as one, the call
+        // renders with quoted arguments and the model reads it as a different
+        // call than the one it made.
+        let r = request(serde_json::json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Oslo\"}" }
+                }]
+            }]
+        }));
+        let calls = r.messages[0].tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].arguments["city"], "Oslo");
+    }
+
+    #[test]
+    fn a_tool_result_keeps_the_id_of_the_call_it_answers() {
+        // With two calls outstanding, an empty id makes the results
+        // indistinguishable.
+        let r = request(serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "tool", "tool_call_id": "call_7", "content": "18C" }]
+        }));
+        let messages = to_messages(&r);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_7"));
+    }
+
+    #[test]
+    fn handing_a_call_back_is_not_an_ordinary_stop() {
+        // A client that reads "stop" here will treat an unfinished turn as
+        // finished and never run the tool.
+        assert_eq!(finish_reason("ToolCalls"), "tool_calls");
+        assert_eq!(finish_reason("EndOfText"), "stop");
     }
 
     #[test]

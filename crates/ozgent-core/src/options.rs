@@ -114,6 +114,62 @@ pub enum ThinkingMode {
     Off,
 }
 
+/// How long a reasoning model may think before it must answer.
+///
+/// Enforced as a token budget on the reasoning block rather than asked for in
+/// the prompt: a model told to "think briefly" frequently does not, while a
+/// model whose `</think>` is written for it has no choice. Spending the budget
+/// ends the reasoning and the answer begins — nothing is truncated, because the
+/// block is closed properly rather than cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Enough to plan a couple of steps.
+    Low,
+    /// Room to work through a problem. The default.
+    #[default]
+    Medium,
+    /// Effectively unbounded; the model stops when it is done.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Tokens the reasoning block may spend.
+    ///
+    /// `High` is not infinite but is past the point where any of these models
+    /// keep making progress, so it behaves as "no limit" without letting a
+    /// loop consume the whole context.
+    pub fn budget(self) -> u32 {
+        match self {
+            Self::Low => 256,
+            Self::Medium => 1024,
+            Self::High => 8192,
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" | "min" | "minimal" => Ok(Self::Low),
+            "medium" | "med" | "default" => Ok(Self::Medium),
+            "high" | "max" => Ok(Self::High),
+            other => Err(format!("unknown reasoning effort {other:?}; expected low, medium, or high")),
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        })
+    }
+}
+
 impl std::str::FromStr for ThinkingMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -137,6 +193,8 @@ pub struct Options {
     pub context_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<u32>,
+    /// Physical micro-batch. `None` leaves llama.cpp's default.
+    pub ubatch: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +210,12 @@ pub struct Options {
     /// Keep routed experts of the first N layers in system RAM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_moe: Option<MoeOffload>,
+    /// A control-vector GGUF to steer generation with, and how hard.
+    ///
+    /// Steering happens inside the forward pass, so unlike a system prompt it
+    /// costs no context and the model cannot decide to ignore it.
+    pub control_vector: Option<std::path::PathBuf>,
+    pub control_strength: Option<f32>,
     /// Quantisation of the K cache. Requires flash attention when quantised.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_type_k: Option<CacheType>,
@@ -191,6 +255,8 @@ pub struct Options {
     pub system_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingMode>,
+    /// How long a reasoning model may think. Ignored when thinking is off.
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<bool>,
 }
@@ -203,11 +269,17 @@ impl Options {
                 if higher.$f.is_some() { self.$f = higher.$f.clone(); }
             )*};
         }
+        // Every field must be listed. One left out is silently dropped from
+        // every merge — the flag parses, the config accepts it, and nothing
+        // happens. `ubatch` and `reasoning_effort` were both added to the
+        // struct and forgotten here, and both looked like features that did
+        // not work rather than like a bug in this list.
         take!(
-            gpu_layers, context_length, batch_size, threads, main_gpu, use_mmap, use_mlock,
-            flash_attention, cpu_moe, cache_type_k, cache_type_v, speculative,
+            gpu_layers, context_length, batch_size, ubatch, threads, main_gpu, use_mmap, use_mlock,
+            flash_attention, cpu_moe, control_vector, control_strength,
+            cache_type_k, cache_type_v, speculative,
             speculative_tuning, prefix_reuse, temperature, top_p, top_k, min_p, repeat_penalty, repeat_last_n,
-            seed, max_tokens, system_prompt, thinking, tools,
+            seed, max_tokens, system_prompt, thinking, reasoning_effort, tools,
         );
         self
     }
@@ -219,6 +291,7 @@ impl Options {
             gpu_layers: self.gpu_layers.unwrap_or(GpuLayers::AUTO),
             context_length: self.context_length.unwrap_or(4096),
             batch_size: self.batch_size.unwrap_or(512),
+            ubatch: self.ubatch,
             // 0 lets llama.cpp pick based on the physical core count.
             threads: self.threads.unwrap_or(0),
             main_gpu: self.main_gpu.unwrap_or(0),
@@ -226,6 +299,13 @@ impl Options {
             use_mlock: self.use_mlock.unwrap_or(false),
             flash_attention: self.flash_attention.unwrap_or(true),
             cpu_moe: self.cpu_moe.unwrap_or(MoeOffload::AUTO),
+            control_vector: self.control_vector.clone(),
+            // 1.0 applies the vector as trained. Not clamped, because the
+            // usable range depends entirely on the vector: measured against a
+            // deliberately meaningless direction, output drifted at 0.02-0.05,
+            // restructured at 0.1 and collapsed by 0.3. A trained direction
+            // tolerates far more, so a fixed ceiling would be wrong either way.
+            control_strength: self.control_strength.unwrap_or(1.0),
             // q8_0 halves cache VRAM for no measurable quality cost, which is
             // the difference between a usable and an unusable context on a
             // small card. Flash attention (on by default) makes it legal.
@@ -245,6 +325,7 @@ impl Options {
             max_tokens: self.max_tokens.unwrap_or(0),
             system_prompt: self.system_prompt.clone(),
             thinking: self.thinking.unwrap_or_default(),
+            reasoning_effort: self.reasoning_effort.unwrap_or_default(),
             tools: self.tools.unwrap_or(true),
         }
     }
@@ -265,12 +346,15 @@ pub struct Resolved {
     pub gpu_layers: GpuLayers,
     pub context_length: u32,
     pub batch_size: u32,
+    pub ubatch: Option<u32>,
     pub threads: u32,
     pub main_gpu: u32,
     pub use_mmap: bool,
     pub use_mlock: bool,
     pub flash_attention: bool,
     pub cpu_moe: MoeOffload,
+    pub control_vector: Option<std::path::PathBuf>,
+    pub control_strength: f32,
     pub cache_type_k: CacheType,
     pub cache_type_v: CacheType,
     pub speculative: Speculative,
@@ -286,12 +370,32 @@ pub struct Resolved {
     pub max_tokens: u32,
     pub system_prompt: Option<String>,
     pub thinking: ThinkingMode,
+    pub reasoning_effort: ReasoningEffort,
     pub tools: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_option_survives_a_merge() {
+        // Guards the explicit field list in `merge`: a field added to Options
+        // and forgotten there is silently dropped, which looks exactly like a
+        // flag that does nothing.
+        let higher = Options {
+            ubatch: Some(256),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let merged = Options::default().merge(&higher);
+        assert_eq!(merged.ubatch, Some(256), "ubatch was dropped by merge");
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "reasoning_effort was dropped by merge"
+        );
+    }
 
     #[test]
     fn accel_defaults_are_the_fast_ones() {

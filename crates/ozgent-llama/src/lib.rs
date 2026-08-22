@@ -1,13 +1,21 @@
 //! The inference engine.
 
 pub mod backend;
+#[cfg(feature = "llama")]
+pub mod cvec;
+#[cfg(feature = "llama")]
+pub mod embed;
+pub mod effort;
 pub mod engine;
 pub mod grammar;
+#[cfg(feature = "llama")]
+pub mod layout;
 #[cfg(feature = "llama")]
 pub mod mtmd;
 pub mod ngram;
 pub mod thinking;
 pub mod toolcall;
+pub mod toolgate;
 pub mod utf8;
 pub mod vision;
 

@@ -17,11 +17,64 @@ use crate::input::{Input, Prompt};
 use std::io::Write;
 
 /// Everything one chat session needs.
+/// The engine's embedder, adapted to the memory layer's trait.
+///
+/// A newtype because both the trait and the type are foreign here; the
+/// alternative is a dependency from ozgent-llama on ozgent-memory, which would
+/// pull SQLite into the inference crate for one interface.
+struct ModelEmbedder(ozgent_llama::embed::Embedder);
+
+impl ozgent_memory::Embedder for ModelEmbedder {
+    fn dimensions(&self) -> usize {
+        self.0.dimensions()
+    }
+
+    fn embed(&self, text: &str) -> Vec<f32> {
+        // A failure here must not take the turn down with it: retrieval
+        // degrades to the keyword half rather than the conversation ending.
+        self.0.embed(text).unwrap_or_else(|e| {
+            tracing::warn!("embedding failed, falling back to no vector: {e}");
+            vec![0.0; self.0.dimensions()]
+        })
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        self.0.embed_batch(texts).unwrap_or_else(|e| {
+            tracing::warn!("batch embedding failed: {e}");
+            texts.iter().map(|_| vec![0.0; self.0.dimensions()]).collect()
+        })
+    }
+}
+
+/// The configured embedding model, or the lexical fallback.
+///
+/// Falling back is deliberate and logged: memory still works without an
+/// embedding model, it just loses the half of retrieval that finds a note
+/// whose words differ from the query's.
+fn build_embedder(paths: &Paths, config: &Config) -> Box<dyn ozgent_memory::Embedder> {
+    let Some(name) = config.embedding.model.as_deref() else {
+        return Box::new(HashingEmbedder::default());
+    };
+    let loaded = ozgent_core::resolve(paths, name)
+        .map_err(|e| e.to_string())
+        .and_then(|found| {
+            let weights = found.manifest.primary_weights(&found.dir);
+            ozgent_llama::embed::Embedder::load(&weights, 99).map_err(|e| e.to_string())
+        });
+    match loaded {
+        Ok(e) => Box::new(ModelEmbedder(e)),
+        Err(e) => {
+            tracing::warn!("embedding model {name:?} unavailable; memory falls back to lexical matching: {e}");
+            Box::new(HashingEmbedder::default())
+        }
+    }
+}
+
 pub struct Chat<'a> {
     engine: &'a Engine,
     session: Session<'a>,
     store: Store,
-    embedder: HashingEmbedder,
+    embedder: Box<dyn ozgent_memory::Embedder>,
     tools: Option<ToolHost>,
     conversation: i64,
     opts: Resolved,
@@ -148,7 +201,7 @@ async fn run_one(
         engine: &engine,
         session,
         store,
-        embedder: HashingEmbedder::default(),
+        embedder: build_embedder(paths, config),
         tools,
         conversation: conversation_id,
         theme: if plain { Theme::plain() } else { Theme::default() },
@@ -166,6 +219,14 @@ async fn run_one(
         paths: paths.clone(),
         config: config.clone(),
     };
+
+    // Constrain the body of a tool call once one starts. This is the cheap
+    // half of the pair below: the retry path in `turn` fixes a malformed call
+    // after paying for it, while gating stops it being generated at all.
+    if let Some(host) = &chat.tools {
+        let specs = host.tools().to_vec();
+        chat.session.set_tools(&specs);
+    }
 
     chat.banner();
     let outcome = chat.repl(prompt).await;
@@ -263,7 +324,7 @@ impl<'a> Chat<'a> {
         self.store.put_embedding(
             OwnerKind::Message,
             user_id,
-            &<HashingEmbedder as ozgent_memory::Embedder>::embed(&self.embedder, &extracted.text),
+            &self.embedder.embed(&extracted.text),
         )?;
 
         // Name the conversation after its first line, so `ozgent web` has
@@ -357,7 +418,7 @@ impl<'a> Chat<'a> {
         self.store.put_embedding(
             OwnerKind::Message,
             assistant_id,
-            &<HashingEmbedder as ozgent_memory::Embedder>::embed(&self.embedder, &reply.text),
+            &self.embedder.embed(&reply.text),
         )?;
         Ok(())
     }
@@ -763,6 +824,12 @@ impl<'a> Chat<'a> {
                 self.opts.thinking = mode;
                 layer.thinking = Some(mode);
             }
+            "effort" | "reasoning_effort" => {
+                let level: ozgent_core::ReasoningEffort =
+                    value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                self.opts.reasoning_effort = level;
+                layer.reasoning_effort = Some(level);
+            }
             "temperature" | "temp" => {
                 let t: f32 = value.parse().context("temperature must be a number")?;
                 self.opts.temperature = t;
@@ -774,7 +841,7 @@ impl<'a> Chat<'a> {
                 layer.tools = Some(on);
             }
             other => {
-                eprintln!("{}", dim(&format!("unknown setting {other:?}; try thinking, temperature, tools")));
+                eprintln!("{}", dim(&format!("unknown setting {other:?}; try thinking, effort, temperature, tools")));
                 return Ok(());
             }
         }
@@ -942,7 +1009,7 @@ impl<'a> Chat<'a> {
                     self.store.put_embedding(
                         OwnerKind::Fact,
                         id,
-                        &<HashingEmbedder as ozgent_memory::Embedder>::embed(&self.embedder, arg),
+                        &self.embedder.embed(arg),
                     )?;
                     eprintln!("{}", dim("· remembered"));
                 }

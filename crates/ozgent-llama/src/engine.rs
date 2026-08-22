@@ -6,15 +6,18 @@
 //! use — while a one-shot `run` just drops the session afterwards.
 
 use crate::ngram::NgramCache;
+use crate::toolgate::ToolGate;
 use crate::utf8::Utf8Buffer;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
 use ozgent_core::accel::{CacheType, MoeKeyword, MoeOffload, PrefixReuse, Speculative};
 use ozgent_core::options::GpuKeyword;
 use ozgent_core::{GpuLayers, Message, Resolved, Role};
@@ -24,6 +27,10 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 /// llama.cpp's backend may only be initialised once per process.
+pub(crate) fn backend_handle() -> Result<&'static LlamaBackend, EngineError> {
+    backend()
+}
+
 fn backend() -> Result<&'static LlamaBackend, EngineError> {
     static CELL: OnceLock<Option<LlamaBackend>> = OnceLock::new();
     CELL.get_or_init(|| {
@@ -58,6 +65,17 @@ pub struct Engine {
     weight_bytes: u64,
 }
 
+/// How far an n-gram match must extend behind the key before it is drafted,
+/// on the rollback path where a wrong guess costs an extra forward pass.
+const MIN_DRAFT_REACH: usize = 4;
+
+/// Draft length used while measuring whether drafting is worth it at all.
+///
+/// Only relevant on the snapshot rollback path, where a rejected draft costs an
+/// extra forward pass. Long speculative probes into unpredictable text were
+/// measurably slower than not speculating.
+const PROBE_DRAFT_TOKENS: usize = 3;
+
 /// Prefilled to close reasoning before it starts.
 ///
 /// A stream filter can only *hide* reasoning; the model still spends its token
@@ -87,9 +105,57 @@ impl Engine {
             .with_use_mlock(opts.use_mlock)
             .with_main_gpu(opts.main_gpu as i32));
 
+        // `auto` was the default and did nothing: the planner in backend.rs was
+        // written and tested but never called, so the option documented as
+        // "search for the smallest offload that fits in VRAM" searched for
+        // nothing. Resolving it needs the per-layer and per-expert byte costs,
+        // which come from the file's tensor table rather than from llama.cpp.
+        let resolved_moe = match opts.cpu_moe {
+            MoeOffload::Keyword(MoeKeyword::Auto) => {
+                let layout = crate::layout::read(path).unwrap_or_default();
+                if layout.is_moe() {
+                    let device = crate::backend::best_gpu();
+                    // The KV cache and compute buffers have to stay resident,
+                    // so they come off the budget before any weight does.
+                    let overhead = ozgent_core::accel::kv_bytes(
+                        layout.kv_elements_per_token,
+                        opts.context_length,
+                        // Auto KV sizing happens later against the loaded
+                        // model; F16 is the conservative assumption here, so a
+                        // wrong guess leaves headroom rather than overcommitting.
+                        if opts.cache_type_k == ozgent_core::accel::CacheType::Auto {
+                            ozgent_core::accel::CacheType::F16
+                        } else {
+                            opts.cache_type_k
+                        },
+                    );
+                    let (_, moe) = crate::backend::resolve_auto(
+                        opts.gpu_layers,
+                        opts.cpu_moe,
+                        device.as_ref(),
+                        layout.layers,
+                        layout.bytes_per_layer,
+                        layout.expert_bytes_per_layer,
+                        overhead,
+                    );
+                    if moe > 0 {
+                        tracing::info!(
+                            "cpu-moe auto: evicting routed experts from {moe} of {} layers",
+                            layout.layers
+                        );
+                    }
+                    MoeOffload::Layers(moe)
+                } else {
+                    // Nothing to evict on a dense model.
+                    MoeOffload::Layers(0)
+                }
+            }
+            other => other,
+        };
+
         // Evicting routed experts frees far more VRAM per lost token/sec than
         // dropping whole layers, so it is applied before any layer reduction.
-        match opts.cpu_moe {
+        match resolved_moe {
             MoeOffload::Keyword(MoeKeyword::All) => params.as_mut().add_cpu_moe_override(),
             MoeOffload::Layers(n) if n > 0 => {
                 for layer in 0..n {
@@ -153,6 +219,14 @@ impl Engine {
             template,
             model,
         })
+    }
+
+    /// Whether a rejected draft can be undone by trimming the cache.
+    ///
+    /// False for hybrid and recurrent models, which decides how — and whether —
+    /// speculation works, so it is worth surfacing in diagnostics.
+    pub fn rollback_safe(&self) -> bool {
+        self.rollback_safe
     }
 
     pub fn n_layer(&self) -> u32 {
@@ -285,11 +359,29 @@ impl Engine {
             );
         }
 
+        // Flash attention was previously read only to pick the KV type and
+        // never actually set, so `--no-flash-attn` disabled nothing and the KV
+        // policy reasoned about a flag it did not control. llama.cpp defaults
+        // to AUTO, so the behaviour was probably right by accident; it is now
+        // asked for explicitly.
+        let flash = if opts.flash_attention {
+            sys::LLAMA_FLASH_ATTN_TYPE_AUTO
+        } else {
+            sys::LLAMA_FLASH_ATTN_TYPE_DISABLED
+        };
+
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(opts.batch_size)
+            .with_flash_attention_policy(flash)
             .with_type_k(ggml_type(type_k))
             .with_type_v(ggml_type(type_v));
+
+        // The physical micro-batch. Left at llama.cpp's default unless asked,
+        // since it trades prefill parallelism against working-set size.
+        if let Some(n) = opts.ubatch {
+            params = params.with_n_ubatch(n);
+        }
 
         if opts.threads > 0 {
             params = params
@@ -297,10 +389,32 @@ impl Engine {
                 .with_n_threads_batch(opts.threads as i32);
         }
 
-        let context = self
+        let mut context = self
             .model
             .new_context(backend, params)
             .map_err(|e| EngineError::Context(e.to_string()))?;
+
+        // Steering belongs to the context, not the turn: installed once here,
+        // it shapes every generation until the session ends. Loading it lazily
+        // per turn would pay the file read repeatedly and, worse, make the
+        // first turn behave differently from the rest.
+        if let Some(path) = &opts.control_vector {
+            let vector = crate::cvec::ControlVector::load(path, self.model.n_embd() as usize)
+                .map_err(|e| EngineError::ControlVector(e.to_string()))?;
+            // A strength of exactly zero is a request for no steering; applying
+            // a zero vector would work but wastes a copy per layer.
+            if opts.control_strength != 0.0 {
+                vector
+                    .scaled(opts.control_strength)
+                    .apply(&mut context)
+                    .map_err(|e| EngineError::ControlVector(e.to_string()))?;
+                tracing::info!(
+                    "control vector: {} directions at strength {}",
+                    vector.n_layers(),
+                    opts.control_strength
+                );
+            }
+        }
 
         Ok(Session {
             model: &self.model,
@@ -314,6 +428,8 @@ impl Engine {
             can_trim: true,
             rollback_safe: self.rollback_safe,
             media_dirty: false,
+            tool_grammars: Vec::new(),
+            gate_applied: false,
             opts: opts.clone(),
         })
     }
@@ -547,6 +663,12 @@ pub struct Session<'a> {
     /// Set after a turn that evaluated images: the cache then holds embeddings
     /// no token sequence describes, so it must be rebuilt before the next turn.
     media_dirty: bool,
+    /// Per-opener tool grammars, compiled once when tools are configured.
+    /// Empty when no tools are offered, which leaves the gate inert.
+    tool_grammars: Vec<(&'static str, String)>,
+    /// Set while the *gate* owns the installed grammar, so it can be lifted
+    /// again without disturbing a grammar set deliberately by a caller.
+    gate_applied: bool,
     /// Kept so the sampler can be rebuilt when a grammar is set or cleared.
     opts: Resolved,
 }
@@ -554,6 +676,253 @@ pub struct Session<'a> {
 impl<'a> Session<'a> {
     pub fn n_ctx(&self) -> u32 {
         self.context.n_ctx()
+    }
+
+    /// Capture the sequence state so it can be put back later.
+    ///
+    /// `ON_DEVICE` asks llama.cpp to keep the copy in VRAM instead of handing
+    /// back 50 MB of host memory. That is the difference between a snapshot
+    /// that can be taken on every draft step and one that cannot.
+    fn snapshot(&self, partial: bool, on_device: bool) -> Result<SeqState, EngineError> {
+        let mut bits = 0u32;
+        if partial {
+            bits |= LlamaStateSeqFlags::PARTIAL_ONLY.bits();
+        }
+        if on_device {
+            bits |= LlamaStateSeqFlags::ON_DEVICE.bits();
+        }
+        self.context
+            .state_seq_get(0, LlamaStateSeqFlags::from_bits(bits))
+            .map_err(|e| EngineError::State(e.to_string()))
+    }
+
+    fn restore(&mut self, state: &SeqState) -> Result<(), EngineError> {
+        self.context
+            .state_seq_set(state, 0)
+            .map_err(|e| EngineError::State(e.to_string()))
+    }
+
+    /// Check that a snapshot really can rewind this model mid-generation.
+    ///
+    /// Generates `k` tokens, rewinds, and generates `k` again. The two runs
+    /// must be identical. Speculating on a model whose cache cannot be trimmed
+    /// rests entirely on this holding, and the failure mode is silently wrong
+    /// output rather than an error — so it is measured, not assumed.
+    ///
+    /// Returns the two runs and the size of the snapshot taken.
+    pub fn probe_rewind(
+        &mut self,
+        prompt: &str,
+        k: u32,
+        partial: bool,
+        on_device: bool,
+    ) -> Result<(String, String, usize), EngineError> {
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+
+        self.reset();
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        let (head, tail) = tokens.split_at(tokens.len().saturating_sub(1));
+        self.prefill(head, &mut batch, n_batch, false)?;
+
+        // The snapshot is taken *before* the final prompt token, so each run
+        // can decode it again and regenerate its logits. Restoring state does
+        // not restore the logits buffer, so a run resumed straight after a
+        // restore would sample its first token from whatever the previous run
+        // left behind — which looks exactly like the rewind having failed.
+        let mark = self.n_past;
+        let state = self.snapshot(partial, on_device)?;
+        let size = state.byte_len();
+
+        self.prefill(tail, &mut batch, n_batch, true)?;
+        let first = self.run_greedy(k, &mut batch, n_batch)?;
+
+        self.restore(&state)?;
+        self.n_past = mark;
+        self.sampler.reset();
+        self.prefill(tail, &mut batch, n_batch, true)?;
+        let second = self.run_greedy(k, &mut batch, n_batch)?;
+
+        Ok((first, second, size))
+    }
+
+    /// Propose `n` tokens continuing `context`, as a draft for another model
+    /// to verify.
+    ///
+    /// This session is left exactly as it was found: the proposal is generated
+    /// behind a snapshot and rolled back, so the drafter never drifts from the
+    /// confirmed transcript. Tokens of `context` this session has not seen are
+    /// prefilled first, which after the opening turn is only the handful the
+    /// target just confirmed.
+    ///
+    /// Greedy, because a draft is a guess at what the *target* will do, not a
+    /// sample in its own right — and the target re-samples every token anyway,
+    /// so a drafter's randomness would only lower the acceptance rate.
+    pub fn propose(
+        &mut self,
+        context: &[LlamaToken],
+        n: usize,
+    ) -> Result<Vec<LlamaToken>, EngineError> {
+        if n == 0 || context.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n_ctx = self.context.n_ctx() as i32;
+        if context.len() as i32 + n as i32 >= n_ctx {
+            return Ok(Vec::new());
+        }
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+
+        // Anything the drafter has not absorbed yet. A divergence means the
+        // target went somewhere this session never saw, so start over rather
+        // than draft from a transcript that never happened.
+        let shared = common_prefix(&self.cached, context);
+        if shared < self.cached.len() {
+            self.reset();
+        }
+        let fresh: Vec<LlamaToken> = context[self.cached.len()..].to_vec();
+        if !fresh.is_empty() {
+            self.prefill(&fresh, &mut batch, n_batch, true)?;
+            self.cached.extend_from_slice(&fresh);
+        }
+
+        let mark = self.n_past;
+        let cached_len = self.cached.len();
+        let state = self.snapshot(false, true)?;
+
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let token = self.sampler.sample(&self.context, -1);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+            out.push(token);
+            batch.clear();
+            batch
+                .add(token, self.n_past, &[0], true)
+                .map_err(|e| EngineError::Batch(e.to_string()))?;
+            self.context
+                .decode(&mut batch)
+                .map_err(|e| EngineError::Decode(e.to_string()))?;
+            self.n_past += 1;
+        }
+
+        // Put the drafter back where it started, so the next call resumes from
+        // what the target actually confirmed rather than from its own guesses.
+        self.restore(&state)?;
+        self.n_past = mark;
+        self.cached.truncate(cached_len);
+        self.sampler.reset();
+        Ok(out)
+    }
+
+    /// Time a snapshot and a restore, which is what decides whether
+    /// speculation can afford one per draft step.
+    ///
+    /// Returns milliseconds per snapshot, per restore, and the host bytes used.
+    pub fn probe_snapshot_cost(
+        &mut self,
+        prompt: &str,
+        iterations: u32,
+        on_device: bool,
+    ) -> Result<(f64, f64, usize), EngineError> {
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+
+        self.reset();
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        self.prefill(&tokens, &mut batch, n_batch, true)?;
+
+        // One outside the loop, so allocation and any first-call setup are not
+        // charged to the average.
+        let warm = self.snapshot(false, on_device)?;
+        self.restore(&warm)?;
+
+        let start = Instant::now();
+        let mut states = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            states.push(self.snapshot(false, on_device)?);
+        }
+        let snap_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+
+        // Only the most recent device-held state stays valid: capturing with
+        // ON_DEVICE invalidates every earlier one for that sequence.
+        let last = states.last().expect("at least one iteration");
+        let start = Instant::now();
+        for _ in 0..iterations {
+            self.restore(last)?;
+        }
+        let restore_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+
+        Ok((snap_ms, restore_ms, last.byte_len()))
+    }
+
+    /// Greedily decode `k` tokens from the current position, returning the text.
+    fn run_greedy(
+        &mut self,
+        k: u32,
+        batch: &mut LlamaBatch,
+        _n_batch: usize,
+    ) -> Result<String, EngineError> {
+        let mut out = String::new();
+        let mut decoder = Utf8Buffer::new();
+        for _ in 0..k {
+            let token = self.sampler.sample(&self.context, -1);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+            let bytes = self
+                .model
+                .token_to_bytes(token, Special::Tokenize)
+                .map_err(|e| EngineError::Detokenize(e.to_string()))?;
+            out.push_str(&decoder.push(&bytes));
+
+            batch.clear();
+            batch
+                .add(token, self.n_past, &[0], true)
+                .map_err(|e| EngineError::Batch(e.to_string()))?;
+            self.context
+                .decode(batch)
+                .map_err(|e| EngineError::Decode(e.to_string()))?;
+            self.n_past += 1;
+        }
+        out.push_str(&decoder.finish());
+        Ok(out)
+    }
+
+    /// Size of this model's vocabulary.
+    ///
+    /// A drafter and its target must agree on this, or a proposed token id
+    /// means a different word to each of them and verification compares
+    /// unrelated things.
+    pub fn n_vocab(&self) -> i32 {
+        self.model.n_vocab()
+    }
+
+    /// Bytes needed to snapshot this sequence's state.
+    ///
+    /// `partial` asks only for the parts a KV trim cannot undo — recurrent and
+    /// sliding-window state. That is the figure that decides whether draft
+    /// rejection can be made safe on a hybrid model by snapshotting instead of
+    /// trimming.
+    pub fn state_bytes(&self, partial: bool, on_device: bool) -> usize {
+        let mut bits = 0u32;
+        if partial {
+            bits |= llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY.bits();
+        }
+        if on_device {
+            bits |= llama_cpp_2::context::session::LlamaStateSeqFlags::ON_DEVICE.bits();
+        }
+        self.context.state_seq_get_size_ext(
+            0,
+            llama_cpp_2::context::session::LlamaStateSeqFlags::from_bits(bits),
+        )
     }
 
     /// Tokens currently held in the KV cache.
@@ -618,6 +987,39 @@ impl<'a> Session<'a> {
         self.last_reused
     }
 
+    /// Put the sequence back to what was actually confirmed.
+    ///
+    /// With a trimmable cache this just drops the rejected entries. With a
+    /// snapshot it restores the state from before the batch — which undoes the
+    /// confirmed token and the accepted drafts as well, so those are decoded
+    /// again. That re-decode is one extra forward pass, and it is the entire
+    /// cost of speculating on a model whose cache cannot be trimmed.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_draft(
+        &mut self,
+        snapshot: Option<&SeqState>,
+        start: i32,
+        pending: LlamaToken,
+        draft: &[LlamaToken],
+        accepted: usize,
+        batch: &mut LlamaBatch,
+        n_batch: usize,
+    ) -> Result<(), EngineError> {
+        match snapshot {
+            // Everything was accepted: the state already reflects it.
+            Some(_) if accepted == draft.len() => Ok(()),
+            Some(state) => {
+                self.restore(state)?;
+                self.n_past = start;
+                let mut confirmed = Vec::with_capacity(1 + accepted);
+                confirmed.push(pending);
+                confirmed.extend_from_slice(&draft[..accepted]);
+                self.prefill(&confirmed, batch, n_batch, false)
+            }
+            None => self.trim_after_draft(start, accepted, batch, n_batch),
+        }
+    }
+
     /// Drop KV entries for drafted tokens that were rejected.
     ///
     /// After the batch the cache holds the confirmed token plus every drafted
@@ -668,7 +1070,6 @@ impl<'a> Session<'a> {
     /// before any temperature or top-p shaping sees them; applied afterwards
     /// it could only reject, and sampling would stall on a dead end.
     pub fn set_grammar(&mut self, grammar: Option<&str>) -> Result<(), EngineError> {
-        self.grammar_active = grammar.is_some();
         // One flat chain. Nesting a chain inside a chain does not reliably
         // propagate `accept`, so the grammar never advances past its root and
         // the next `apply` finds no live stacks — which llama.cpp turns into a
@@ -680,8 +1081,21 @@ impl<'a> Session<'a> {
                     .map_err(|e| EngineError::Grammar(e.to_string()))?,
             ),
         };
+        // Only once the grammar is known good: set before, a rejected grammar
+        // would leave the flag claiming a constraint that was never installed,
+        // which silently disables speculation for the rest of the session.
+        self.grammar_active = grammar.is_some();
         self.sampler = build_sampler_with(&self.opts, constraint);
         Ok(())
+    }
+
+    /// Precompile the tool grammars used to constrain a call once it starts.
+    ///
+    /// Compiling here rather than per turn keeps schema-to-GBNF conversion —
+    /// which does not depend on the conversation — off the generation path.
+    /// Passing an empty slice disables gating.
+    pub fn set_tools(&mut self, tools: &[ozgent_core::ToolSpec]) {
+        self.tool_grammars = ToolGate::compile(tools);
     }
 
     /// Generate a completion, calling `on_token` with each decoded fragment.
@@ -709,7 +1123,32 @@ impl<'a> Session<'a> {
         max_tokens: u32,
         on_token: impl FnMut(&str) -> bool,
     ) -> Result<(Stats, StopReason), EngineError> {
+        self.generate_drafted(prompt, media, max_tokens, None, on_token)
+    }
+
+    /// Generate, optionally with a second model proposing tokens.
+    ///
+    /// `drafter` is a session over a much smaller model sharing this one's
+    /// vocabulary. It proposes; this model verifies every token and keeps only
+    /// what it would have produced anyway, so the answer is identical to
+    /// generating without it. The drafter buys latency, never a different
+    /// answer.
+    pub fn generate_drafted(
+        &mut self,
+        prompt: &str,
+        media: Option<(&crate::mtmd::Projector<'_>, &[crate::mtmd::Media], &[ozgent_core::ImageSource])>,
+        max_tokens: u32,
+        mut drafter: Option<&mut Session<'_>>,
+        on_token: impl FnMut(&str) -> bool,
+    ) -> Result<(Stats, StopReason), EngineError> {
         let mut on_token = on_token;
+        // A turn that returned early through `?` can leave the gate's grammar
+        // installed. Lifting it here rather than only on the way out means a
+        // failed tool call cannot constrain the next answer into being one.
+        if self.gate_applied {
+            self.set_grammar(None)?;
+            self.gate_applied = false;
+        }
         let n_ctx = self.context.n_ctx() as i32;
         let mut stats = Stats::default();
         let started = Instant::now();
@@ -812,6 +1251,28 @@ impl<'a> Session<'a> {
             }
         }
 
+        // Reasoning is only bounded when it is actually happening; with
+        // thinking suppressed the block never opens and the budget never fires.
+        let think_budget = if matches!(self.opts.thinking, ozgent_core::ThinkingMode::Off) {
+            0
+        } else {
+            self.opts.reasoning_effort.budget()
+        };
+        tracing::debug!(
+            "reasoning budget {think_budget}; prompt opens a block: {}; tail: {:?}",
+            crate::effort::ThinkBudget::opens_thinking(prompt),
+            &prompt[prompt.len().saturating_sub(60)..]
+        );
+        let mut think = if crate::effort::ThinkBudget::opens_thinking(prompt) {
+            crate::effort::ThinkBudget::resumed(think_budget)
+        } else {
+            crate::effort::ThinkBudget::new(think_budget)
+        };
+        let closing: Vec<LlamaToken> = self
+            .model
+            .str_to_token(crate::effort::CLOSE, AddBos::Never)
+            .unwrap_or_default();
+
         let gen_started = Instant::now();
         let mut decoder = Utf8Buffer::new();
         let limit = if max_tokens == 0 { u32::MAX } else { max_tokens };
@@ -826,10 +1287,53 @@ impl<'a> Session<'a> {
         // against the wrong state — llama.cpp then aborts on an empty stack.
         // Rejecting a draft means dropping its KV entries, so speculation is
         // only possible on a cache that can trim.
-        let spec_on = !self.grammar_active
-            && self.rollback_safe
-            && self.can_trim
-            && matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto);
+        // Two ways to undo a rejected draft. Trimming the KV is free but only
+        // correct when nothing keeps state a trim cannot reach. Otherwise the
+        // whole sequence state is snapshotted and put back — measured at
+        // 0.71 ms on device against a ~17.8 ms token budget, and exact on
+        // Qwen3.5, whose cache refuses a partial trim outright.
+        let by_trim = self.rollback_safe && self.can_trim;
+        let mut spec_on = !self.grammar_active
+            && (drafter.is_some()
+                || matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto));
+        let mut use_snapshot = spec_on && !by_trim;
+        if use_snapshot && self.snapshot(false, true).is_err() {
+            // The device-resident path is what makes this affordable; without
+            // it, speculating would cost more than it saves.
+            tracing::info!("sequence state cannot be snapshotted; speculative decoding disabled");
+            spec_on = false;
+            use_snapshot = false;
+        }
+        // Rejection costs an extra forward pass on the snapshot path, because
+        // restoring undoes the confirmed token along with the rejected ones.
+        // Break-even is around two accepted tokens per rejecting round, so
+        // drafting has to land more often before it is worth starting.
+        // How long to stay quiet before testing the water again. A rejected
+        // probe costs an extra forward pass on the snapshot path, so probing
+        // has to be rarer there to stay cheap.
+        let probe_every = if use_snapshot { 96 } else { 24 };
+        // How far a match must extend behind the key before it is worth
+        // betting on. Zero keeps the trim path exactly as it was; on the
+        // snapshot path a wrong bet costs an extra forward pass, so a bare
+        // two-token coincidence is not enough evidence to pay that.
+        let min_reach = if use_snapshot { MIN_DRAFT_REACH } else { 0 };
+        let min_acceptance = if use_snapshot {
+            (self.opts.speculative_tuning.min_acceptance * 2.0).min(0.6)
+        } else {
+            self.opts.speculative_tuning.min_acceptance
+        };
+        // Speculation and grammars cannot coexist (see above), and the gate
+        // exists to install a grammar mid-turn — so it stays inert whenever
+        // drafting is live. Nothing is lost on the models this matters for:
+        // hybrid and recurrent models already have speculation disabled.
+        // A caller-set grammar (a forced call, or a retry after a malformed
+        // one) already constrains the whole turn; the gate must not swap it
+        // out underneath.
+        let mut gate = if spec_on || self.grammar_active {
+            ToolGate::inert()
+        } else {
+            ToolGate::new(self.tool_grammars.clone())
+        };
         let tuning = self.opts.speculative_tuning.clone();
         // Seeded lazily from `self.cached` on the first pass through the
         // generation loop, which is authoritative and avoids copying the
@@ -841,16 +1345,22 @@ impl<'a> Session<'a> {
         let mut emit = |token: LlamaToken,
                         model: &LlamaModel,
                         decoder: &mut Utf8Buffer,
+                        gate: &mut ToolGate,
+                        budget: &mut crate::effort::ThinkBudget,
                         on_token: &mut dyn FnMut(&str) -> bool|
-         -> Result<bool, EngineError> {
+         -> Result<(bool, Option<String>), EngineError> {
             let started = std::time::Instant::now();
             let bytes = model
                 .token_to_bytes(token, Special::Tokenize)
                 .map_err(|e| EngineError::Detokenize(e.to_string()))?;
             let text = decoder.push(&bytes);
+            // Checked before the callback so a slow consumer cannot delay the
+            // constraint past the first token of the call body.
+            let trigger = gate.observe(&text);
+            budget.observe(&text);
             let out = text.is_empty() || on_token(&text);
             callback_ns += started.elapsed().as_nanos();
-            Ok(out)
+            Ok((out, trigger))
         };
 
         // The token to decode next, sampled from the prefill's final logits.
@@ -874,7 +1384,24 @@ impl<'a> Session<'a> {
             // token it returns. Accepting again advances stateful samplers
             // twice — which double-counts repetition penalties, and drives a
             // grammar into a dead state that llama.cpp aborts on.
-            if !emit(pending, self.model, &mut decoder, &mut on_token)? {
+            let (keep_going, trigger) =
+                emit(pending, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?;
+            // The model has just committed to a call, so the body can be
+            // constrained from here without forcing the turn to be one.
+            if let Some(g) = trigger {
+                // Never fatal: a grammar the model's vocabulary happens to
+                // reject should cost the constraint, not the whole answer.
+                match self.set_grammar(Some(&g)) {
+                    Ok(()) => {
+                        tracing::debug!("tool call started; constraining the body under grammar");
+                        self.gate_applied = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("tool grammar rejected; continuing unconstrained: {e}")
+                    }
+                }
+            }
+            if !keep_going {
                 reason = StopReason::Cancelled;
                 break;
             }
@@ -882,26 +1409,92 @@ impl<'a> Session<'a> {
             stats.generated_tokens += 1;
             self.cached.push(pending);
 
+            // Out of thinking budget: close the block for the model rather
+            // than cut the stream. The closing tokens are decoded into the
+            // context alongside the token just emitted, so the model reads its
+            // own reasoning as finished and answers normally — where truncating
+            // would leave an unterminated block and waste what it already
+            // spent. Drafting is skipped this round; there is nothing to guess.
+            if think.exhausted() && !closing.is_empty() {
+                batch.clear();
+                batch
+                    .add(pending, self.n_past, &[0], false)
+                    .map_err(|e| EngineError::Batch(e.to_string()))?;
+                for (i, token) in closing.iter().enumerate() {
+                    batch
+                        .add(*token, self.n_past + 1 + i as i32, &[0], i + 1 == closing.len())
+                        .map_err(|e| EngineError::Batch(e.to_string()))?;
+                }
+                self.context
+                    .decode(&mut batch)
+                    .map_err(|e| EngineError::Decode(e.to_string()))?;
+                self.n_past += 1 + closing.len() as i32;
+
+                for token in &closing {
+                    if !emit(*token, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?.0 {
+                        reason = StopReason::Cancelled;
+                        break 'outer;
+                    }
+                    self.cached.push(*token);
+                }
+                think.closed();
+                tracing::info!("reasoning budget of {think_budget} spent; closed the block");
+                pending = self.sampler.sample(&self.context, -1);
+                continue;
+            }
+
             // The cache keeps its own copy of the sequence, so nothing is
             // copied per token here — this loop runs once per generated token
             // and collecting the whole context into a fresh Vec each time made
             // it quadratic in the length of the turn.
             let spec_started = std::time::Instant::now();
-            if spec_on {
+            // Pure overhead when a draft model is doing the proposing.
+            if spec_on && drafter.is_none() {
                 while ngram.len() < self.cached.len() {
                     ngram.push_token(self.cached[ngram.len()].0);
                 }
             }
-            let draft: Vec<LlamaToken> = if spec_on && ngram.worth_drafting(tuning.min_acceptance) {
+            let draft: Vec<LlamaToken> = if spec_on && ngram.worth_drafting(min_acceptance, probe_every) {
                 let room = (n_ctx - self.n_past - 1).max(0) as usize;
                 // The verification batch is the confirmed token plus the
                 // draft, so it must also stay within n_batch.
-                let cap = (tuning.draft_tokens as usize)
+                // While acceptance is unknown or poor, this draft is a probe
+                // rather than a bet. On the snapshot path a rejected probe
+                // costs an extra forward pass, so a long one is pure waste: a
+                // short probe measures the same thing for a fraction of it.
+                // Known-poor acceptance means this draft is a probe into text
+                // that has not been paying. An *unknown* rate is the ramp-up on
+                // text that may well be predictable, where a full draft is
+                // exactly right — shortening it there measurably slowed the
+                // case speculation exists for.
+                let probing = ngram.acceptance().is_some_and(|rate| rate < min_acceptance);
+                let budget = if use_snapshot && probing {
+                    PROBE_DRAFT_TOKENS
+                } else {
+                    tuning.draft_tokens as usize
+                };
+                let cap = budget
                     .min(room)
                     .min(n_batch.saturating_sub(1));
-                // Draft longer while drafts are landing, shorter when they are
-                // not: a rejected draft wastes the whole batch slot.
-                ngram.draft(ngram.suggest_len(cap)).into_iter().map(LlamaToken).collect()
+                match drafter.as_mut() {
+                    // A draft model proposes from the whole distribution rather
+                    // than from repetition, so it needs neither the reach
+                    // filter nor the probe shortening — both exist to stop
+                    // n-grams betting on coincidences.
+                    Some(d) => {
+                        let want = (tuning.draft_tokens as usize)
+                            .min(room)
+                            .min(n_batch.saturating_sub(1));
+                        d.propose(&self.cached, want)?
+                    }
+                    // Draft longer while drafts are landing, shorter when they
+                    // are not: a rejected draft wastes the whole batch slot.
+                    None => ngram
+                        .draft(ngram.suggest_len(cap), min_reach)
+                        .into_iter()
+                        .map(LlamaToken)
+                        .collect(),
+                }
             } else {
                 Vec::new()
             };
@@ -910,6 +1503,12 @@ impl<'a> Session<'a> {
             // One batch carries the confirmed token plus the whole draft, and
             // asks for logits at every position so each can be verified.
             let start = self.n_past;
+            // Taken before the batch, because a restore returns the sequence to
+            // exactly this point. Skipped when there is nothing to undo.
+            let snapshot = match (use_snapshot, draft.is_empty()) {
+                (true, false) => Some(self.snapshot(false, true)?),
+                _ => None,
+            };
             batch.clear();
             batch
                 .add(pending, start, &[0], true)
@@ -940,11 +1539,13 @@ impl<'a> Session<'a> {
                 if produced >= limit {
                     break;
                 }
-                if !emit(chosen, self.model, &mut decoder, &mut on_token)? {
+                if !emit(chosen, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?.0 {
                     reason = StopReason::Cancelled;
                     accepted = i + 1;
                     self.cached.push(chosen);
-                    self.trim_after_draft(start, accepted, &mut batch, n_batch)?;
+                    self.settle_draft(
+                        snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
+                    )?;
                     break 'outer;
                 }
                 produced += 1;
@@ -961,14 +1562,24 @@ impl<'a> Session<'a> {
                 stats.proposed_drafts += draft.len();
             }
 
-            // Discard the KV entries belonging to rejected drafts.
-            self.trim_after_draft(start, accepted, &mut batch, n_batch)?;
+            self.settle_draft(
+                snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
+            )?;
             pending = chosen;
         }
 
+        if think.spent() > 0 {
+            tracing::debug!("reasoning ran {} tokens (budget {think_budget})", think.spent());
+        }
         let tail = decoder.finish();
         if !tail.is_empty() {
             on_token(&tail);
+        }
+        // The constraint belongs to the call that has now finished; leaving it
+        // installed would force the next turn to be another tool call.
+        if self.gate_applied {
+            self.set_grammar(None)?;
+            self.gate_applied = false;
         }
         stats.generation_ms = gen_started.elapsed().as_millis();
         stats.callback_ms = callback_ns / 1_000_000;
@@ -998,6 +1609,10 @@ pub enum EngineError {
     Decode(String),
     #[error("invalid grammar: {0}")]
     Grammar(String),
+    #[error("control vector: {0}")]
+    ControlVector(String),
+    #[error("sequence state: {0}")]
+    State(String),
     #[error("the prompt is {tokens} tokens but the context holds {context}; raise --ctx or shorten it")]
     PromptTooLong { tokens: usize, context: usize },
 }
