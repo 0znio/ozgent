@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Store {
     db: Connection,
@@ -82,8 +82,35 @@ pub struct Fact {
     pub source_message_id: Option<i64>,
     /// Pinned facts are always in context, never subject to retrieval.
     pub pinned: bool,
+    /// The statement decomposed, when it decomposes: who, which property,
+    /// what value. Present together or not at all. This is what makes
+    /// supersession decidable — two facts about the same subject and relation
+    /// state the same property, so the later one replaces the earlier.
+    pub triple: Option<Triple>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A fact reduced to the property it asserts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Triple {
+    pub subject: String,
+    pub relation: String,
+    pub value: String,
+}
+
+impl Triple {
+    /// The key two facts must share to be about the same thing.
+    ///
+    /// Compared case- and space-insensitively, because an extractor writes
+    /// "Editor" one turn and "editor" the next and means the same property.
+    pub fn key(&self) -> (String, String) {
+        (normalise_key(&self.subject), normalise_key(&self.relation))
+    }
+}
+
+fn normalise_key(s: &str) -> String {
+    s.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What an embedding belongs to.
@@ -149,6 +176,9 @@ impl Store {
         }
         if current < 3 {
             self.db.execute_batch(SCHEMA_V3)?;
+        }
+        if current < 4 {
+            self.db.execute_batch(SCHEMA_V4)?;
         }
 
         self.db
@@ -370,14 +400,67 @@ impl Store {
         text: &str,
         source_message_id: Option<i64>,
     ) -> Result<i64, StoreError> {
+        self.add_fact_with_triple(conversation_id, scope, text, source_message_id, None)
+    }
+
+    /// Store a fact, optionally with the property it asserts.
+    pub fn add_fact_with_triple(
+        &self,
+        conversation_id: Option<i64>,
+        scope: Scope,
+        text: &str,
+        source_message_id: Option<i64>,
+        triple: Option<&Triple>,
+    ) -> Result<i64, StoreError> {
         let now = now();
         self.db.execute(
             "INSERT INTO facts
-               (conversation_id, scope, text, source_message_id, pinned, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
-            params![conversation_id, scope.as_str(), text, source_message_id, now],
+               (conversation_id, scope, text, source_message_id, pinned, created_at, updated_at,
+                subject, relation, value)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?6, ?7, ?8)",
+            params![
+                conversation_id,
+                scope.as_str(),
+                text,
+                source_message_id,
+                now,
+                triple.map(|t| t.subject.as_str()),
+                triple.map(|t| t.relation.as_str()),
+                triple.map(|t| t.value.as_str()),
+            ],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// The live fact stating the same property of the same subject, if any.
+    ///
+    /// This is the whole of conflict detection, and it is deliberately not a
+    /// similarity test. A contradiction and a duplicate read almost alike, so
+    /// similarity cannot separate them; an exact match on subject and relation
+    /// can. Whether the new statement agrees with the old one does not matter
+    /// — either way the later one is what the user last said.
+    pub fn live_fact_for_property(
+        &self,
+        conversation_id: Option<i64>,
+        triple: &Triple,
+    ) -> Result<Option<Fact>, StoreError> {
+        let (subject, relation) = triple.key();
+        let mut stmt = self.db.prepare(
+            "SELECT id, conversation_id, scope, text, source_message_id, pinned,
+                    created_at, updated_at, subject, relation, value
+             FROM facts
+             WHERE superseded_by IS NULL
+               AND subject IS NOT NULL
+               AND lower(trim(subject))  = ?1
+               AND lower(trim(relation)) = ?2
+               AND (conversation_id IS ?3 OR scope = 'user')
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_map(params![subject, relation, conversation_id], row_to_fact)?
+            .next()
+            .transpose()?)
     }
 
     /// Facts visible to a conversation: its own, plus every user-scoped fact.
@@ -385,7 +468,7 @@ impl Store {
     pub fn facts_for(&self, conversation_id: i64) -> Result<Vec<Fact>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT id, conversation_id, scope, text, source_message_id, pinned,
-                    created_at, updated_at
+                    created_at, updated_at, subject, relation, value
              FROM facts
              WHERE superseded_by IS NULL
                AND (conversation_id = ?1 OR scope = 'user')
@@ -425,7 +508,7 @@ impl Store {
             .db
             .query_row(
                 "SELECT id, conversation_id, scope, text, source_message_id, pinned,
-                        created_at, updated_at
+                        created_at, updated_at, subject, relation, value
                  FROM facts WHERE id = ?1",
                 params![id],
                 row_to_fact,
@@ -565,6 +648,16 @@ fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         pinned: r.get::<_, i64>(5)? != 0,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        triple: match (
+            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+            r.get::<_, Option<String>>(10)?,
+        ) {
+            (Some(subject), Some(relation), Some(value)) => {
+                Some(Triple { subject, relation, value })
+            }
+            _ => None,
+        },
     })
 }
 
@@ -702,6 +795,24 @@ pub enum StoreError {
 /// stored here, because a database is a poor place for megabytes of PNG.
 const SCHEMA_V3: &str = "
 ALTER TABLE messages ADD COLUMN media TEXT;
+";
+
+/// The v4 step: facts may carry a subject-relation-value triple.
+///
+/// Two things need this and they are the same thing. Supersession needs a key
+/// that says "this states the same property of the same entity as that one",
+/// which similarity cannot decide — a contradiction and a duplicate look
+/// alike. And a knowledge graph needs edges, which is what a triple is.
+///
+/// The columns are nullable on purpose. Not every fact decomposes, and one
+/// that does not is still worth keeping as prose; it simply does not
+/// participate in supersession or traversal.
+const SCHEMA_V4: &str = "
+ALTER TABLE facts ADD COLUMN subject  TEXT;
+ALTER TABLE facts ADD COLUMN relation TEXT;
+ALTER TABLE facts ADD COLUMN value    TEXT;
+CREATE INDEX idx_facts_triple ON facts(subject, relation) WHERE subject IS NOT NULL;
+CREATE INDEX idx_facts_value  ON facts(value)             WHERE value   IS NOT NULL;
 ";
 
 const SCHEMA_V2: &str = "
