@@ -167,12 +167,19 @@ async def _duckduckgo(query: str, category: str, count: int, settings: dict[str,
     return {"results": results}
 
 
+# DuckDuckGo's lite markup quotes attributes with single quotes and orders
+# them href-before-class, which is the opposite of what the previous patterns
+# assumed — they required double quotes and class first, so they silently
+# matched nothing and every search came back empty. Both patterns therefore
+# accept either quote character and do not care about attribute order.
 _DDG_LINK = re.compile(
-    r'<a[^>]+class="result-link"[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    r"<a\b(?=[^>]*class=['\"][^'\"]*result-link)[^>]*href=['\"](?P<url>[^'\"]+)['\"][^>]*>"
+    r"(?P<title>.*?)</a>",
     re.IGNORECASE | re.DOTALL,
 )
 _DDG_SNIPPET = re.compile(
-    r'<td[^>]+class="result-snippet"[^>]*>(?P<snippet>.*?)</td>', re.IGNORECASE | re.DOTALL
+    r"<td\b[^>]*class=['\"][^'\"]*result-snippet[^'\"]*['\"][^>]*>(?P<snippet>.*?)</td>",
+    re.IGNORECASE | re.DOTALL,
 )
 
 

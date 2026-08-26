@@ -513,7 +513,7 @@ fn turn(
     // from an accurate reading of the image rather than a guess at it. This is
     // the grounding-before-response pattern the vision-language literature
     // settles on for the same failure.
-    let max_rounds = 4;
+    let max_rounds = MAX_TOOL_ROUNDS;
     let mut generated = 0u32;
     let mut prompt_tokens = 0u32;
     let mut elapsed_ms = 0u128;
@@ -526,6 +526,14 @@ fn turn(
 
     for round in 0..=max_rounds {
         let last = round == max_rounds || offered.is_empty();
+        // Out of rounds, with tools still on the table. Left there, the model
+        // spends this turn on one more call, and the visible text before that
+        // call — nothing — becomes the answer. Taking them away and asking for
+        // an answer is what turns an exhausted loop into a reply.
+        if last && round > 0 && !offered.is_empty() {
+            session.set_tools(&[]);
+            messages.push(Message::system(OUT_OF_ROUNDS));
+        }
         let media = (round == 0 && !images.is_empty())
             .then(|| projector.map(|p| (p, &images[..], &request.images[..])))
             .flatten();
@@ -644,6 +652,24 @@ fn turn(
     });
     Ok(())
 }
+
+/// How many times a turn may call tools before it must answer.
+///
+/// Each round is a full generation, so this is a latency budget as much as a
+/// capability one. Four was not enough for an ordinary three-step request —
+/// read a file, pick something out of it, read what that pointed at — which
+/// spent every round and answered nothing.
+const MAX_TOOL_ROUNDS: usize = 8;
+
+/// Said to the model once its tool rounds are spent.
+///
+/// The instruction to admit a shortfall is deliberate. A model told only to
+/// answer will invent the part it never managed to look up, which is worse
+/// than the loop running out.
+const OUT_OF_ROUNDS: &str = "\
+You have no tool calls left. Answer now, using only what the tool results \
+above actually contain. If they did not give you enough, say what you found \
+and what is still missing — do not fill the gap with a guess.";
 
 /// Tokens the grounding pass may spend. Enough for a faithful description,
 /// short enough that it costs a fraction of a second.
