@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# Release bundles: hundreds of megabytes, rebuilt by scripts/package.sh.
+/dist/
