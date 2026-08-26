@@ -38,12 +38,19 @@ pub enum TemplateError {
 }
 
 /// What the caller wants of this turn, in the vocabulary templates expect.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderOptions {
     /// `None` leaves `enable_thinking` undefined so the template's own default
     /// applies — which is what "auto" means. Forcing it either way overrides a
     /// model that has a considered opinion about when to reason.
     pub enable_thinking: Option<bool>,
+    /// How hard to think, in the vocabulary templates use: "low", "medium",
+    /// "high". Asking is better than interrupting — a model that decides for
+    /// itself to reason briefly still finishes its thought, where a token
+    /// budget stops it mid-argument and makes it answer from an unfinished
+    /// one. Only some templates read this; for the rest it is inert and the
+    /// budget remains the only control.
+    pub reasoning_effort: Option<String>,
 }
 
 impl ChatTemplate {
@@ -92,6 +99,9 @@ impl ChatTemplate {
         };
         if let Some(on) = opts.enable_thinking {
             ctx = context! { enable_thinking => on, ..ctx };
+        }
+        if let Some(effort) = opts.reasoning_effort.as_deref() {
+            ctx = context! { reasoning_effort => effort, ..ctx };
         }
 
         tmpl.render(ctx).map_err(|e| TemplateError::Render(chain(&e)))
@@ -159,14 +169,27 @@ mod tests {
                    {% else %}default{% endif %}";
         assert_eq!(render(src, RenderOptions::default()), "default");
         assert_eq!(
-            render(src, RenderOptions { enable_thinking: Some(false) }),
+            render(src, RenderOptions { enable_thinking: Some(false), ..Default::default() }),
             // Capitalised, because Python's Jinja2 renders booleans that way
             // and a template that prints one must read the same here.
             "forced:False"
         );
         assert_eq!(
-            render(src, RenderOptions { enable_thinking: Some(true) }),
+            render(src, RenderOptions { enable_thinking: Some(true), ..Default::default() }),
             "forced:True"
+        );
+    }
+
+    #[test]
+    fn effort_reaches_a_template_that_asks_for_it() {
+        // Ling 3.0's shape: the template decides what each level means, which
+        // is the point — the model author knows better than a token count.
+        let src = "{% if reasoning_effort is defined %}effort={{ reasoning_effort }}\
+                   {% else %}unset{% endif %}";
+        assert_eq!(render(src, RenderOptions::default()), "unset");
+        assert_eq!(
+            render(src, RenderOptions { reasoning_effort: Some("high".into()), ..Default::default() }),
+            "effort=high"
         );
     }
 

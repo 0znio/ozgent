@@ -687,6 +687,7 @@ fn ground(
                 Message::user(question),
             ],
             ThinkingMode::Off,
+            Default::default(),
         )
         .ok()?;
 
@@ -810,7 +811,7 @@ fn generate(
     media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media], &[ozgent_core::ImageSource])>,
     request: &Request,
 ) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason)> {
-    let prompt = engine.render_prompt_with(messages, thinking)?;
+    let prompt = engine.render_prompt_with(messages, thinking, resolved.reasoning_effort)?;
     let mut filter = ThinkingFilter::new(thinking);
     if let Some(close) = Engine::stream_starts_inside(&prompt) {
         filter = filter.starting_inside(close);
