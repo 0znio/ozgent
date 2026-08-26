@@ -63,6 +63,13 @@ pub struct Engine {
     rollback_safe: bool,
     /// The model's own chat template, when it could be compiled.
     jinja: Option<crate::template::ChatTemplate>,
+    /// Tokens the template appends to open the assistant's turn.
+    ///
+    /// The one part of a prompt the next turn does not repeat: next time round
+    /// the assistant's actual reply stands where these were. A saved state
+    /// that includes them describes tokens the new prompt does not contain,
+    /// so it can never be reused — which is why the checkpoint stops short.
+    gen_prompt_tokens: usize,
     /// KV elements stored per token across all layers, for cache sizing.
     kv_elements: u64,
     /// On-disk size of the weights, used as the denominator when deciding
@@ -246,6 +253,7 @@ impl Engine {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
             reasoning,
+            gen_prompt_tokens: Self::measure_generation_prompt(&model, &jinja, template.as_ref()),
             jinja,
             n_layer,
             rollback_safe,
@@ -305,6 +313,57 @@ impl Engine {
         self.render_prompt_with(messages, ozgent_core::ThinkingMode::Auto, Default::default())
     }
 
+    /// How many tokens the template adds to open the assistant's turn.
+    ///
+    /// Measured once, by rendering a throwaway exchange with and without the
+    /// generation prompt and taking the difference. A template whose opening
+    /// varies with the request will be measured slightly wrong, which costs
+    /// the checkpoint optimisation on those turns and nothing else — the
+    /// prefix check still has to pass before a saved state is used.
+    fn measure_generation_prompt(
+        model: &LlamaModel,
+        jinja: &Option<crate::template::ChatTemplate>,
+        template: Option<&llama_cpp_2::model::LlamaChatTemplate>,
+    ) -> usize {
+        let probe = [Message::user("x")];
+        let count = |text: &str| {
+            model.str_to_token(text, AddBos::Never).map(|t| t.len()).unwrap_or(0)
+        };
+        let (with, without) = match jinja {
+            Some(j) => {
+                let opts = crate::template::RenderOptions::default();
+                let bare = crate::template::RenderOptions {
+                    add_generation_prompt: false,
+                    ..Default::default()
+                };
+                match (j.render(&probe, opts), j.render(&probe, bare)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => return 0,
+                }
+            }
+            None => {
+                let Some(template) = template else { return 0 };
+                let chat = match LlamaChatMessage::new("user".into(), "x".into()) {
+                    Ok(m) => vec![m],
+                    Err(_) => return 0,
+                };
+                match (
+                    model.apply_chat_template(template, &chat, true),
+                    model.apply_chat_template(template, &chat, false),
+                ) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => return 0,
+                }
+            }
+        };
+        count(&with).saturating_sub(count(&without))
+    }
+
+    /// See [`Engine::gen_prompt_tokens`].
+    pub fn generation_prompt_tokens(&self) -> usize {
+        self.gen_prompt_tokens
+    }
+
     /// Render, optionally suppressing reasoning at the prompt level.
     pub fn render_prompt_with(
         &self,
@@ -337,6 +396,7 @@ impl Engine {
                     ozgent_core::ThinkingMode::Off => false,
                     ozgent_core::ThinkingMode::Auto => self.reasoning,
                 }),
+                ..Default::default()
             };
             match jinja.render(messages, opts) {
                 Ok(prompt) => return Ok(prompt),
@@ -503,7 +563,9 @@ impl Engine {
             grammar_active: false,
             can_trim: true,
             rollback_safe: self.rollback_safe,
+            gen_prompt_tokens: self.gen_prompt_tokens,
             media_dirty: false,
+            checkpoint: None,
             tool_grammars: Vec::new(),
             gate_applied: false,
             opts: opts.clone(),
@@ -713,6 +775,38 @@ pub enum StopReason {
     Cancelled,
 }
 
+/// Ceiling on a saved prompt state, as a share of free memory.
+///
+/// The copy is held for the whole conversation, so it has to leave room for
+/// the turn it is meant to speed up.
+const CHECKPOINT_VRAM_SHARE: usize = 4;
+
+/// Below this many tokens, a full prefill is cheaper than the state copy.
+const CHECKPOINT_MIN_TOKENS: usize = 256;
+
+/// A prompt boundary the cache can be returned to.
+///
+/// A conversation resends its whole history, so almost every prompt is the
+/// previous one plus a reply and a new question — and almost all of it is
+/// already in the cache. Reusing it means dropping whatever sits *after* the
+/// shared prefix, which for a plain attention cache is a `seq_rm` away.
+///
+/// A hybrid model cannot do that. Its recurrent layers hold a state that was
+/// folded forward token by token and cannot be unwound, so llama.cpp refuses
+/// the partial removal and the only correct answer is to clear the cache and
+/// prefill the whole conversation again. On a 9,000-token chat that is 4.7
+/// seconds per turn, every turn, growing as the conversation does.
+///
+/// Saving the state at the end of the prompt sidesteps it. There is nothing to
+/// unwind next turn because the checkpoint predates the generated tokens: put
+/// the state back and the cache holds exactly the prompt, ready to be extended
+/// by whatever the new turn adds.
+struct PromptCheckpoint {
+    /// Exactly the tokens the saved state was built from.
+    tokens: Vec<LlamaToken>,
+    state: SeqState,
+}
+
 /// One conversation against one KV cache.
 pub struct Session<'a> {
     model: &'a LlamaModel,
@@ -739,6 +833,11 @@ pub struct Session<'a> {
     /// Set after a turn that evaluated images: the cache then holds embeddings
     /// no token sequence describes, so it must be rebuilt before the next turn.
     media_dirty: bool,
+    /// The sequence state as it stood at a prompt boundary, with the tokens
+    /// that produced it. See [`PromptCheckpoint`].
+    checkpoint: Option<PromptCheckpoint>,
+    /// Mirrors [`Engine::gen_prompt_tokens`].
+    gen_prompt_tokens: usize,
     /// Per-opener tool grammars, compiled once when tools are configured.
     /// Empty when no tools are offered, which leaves the gate inert.
     tool_grammars: Vec<(&'static str, String)>,
@@ -776,6 +875,104 @@ impl<'a> Session<'a> {
         self.context
             .state_seq_set(state, 0)
             .map_err(|e| EngineError::State(e.to_string()))
+    }
+
+    /// Save the cache as it stands, which the caller guarantees is exactly
+    /// `tokens`.
+    ///
+    /// Only for models whose cache cannot be trimmed. Everywhere else a
+    /// `seq_rm` already reuses the prefix for free, and copying the state
+    /// would be pure cost.
+    fn save_checkpoint(&mut self, tokens: &[LlamaToken]) {
+        if self.rollback_safe && self.can_trim {
+            return;
+        }
+        if tokens.len() < CHECKPOINT_MIN_TOKENS {
+            return;
+        }
+        // Already holding exactly this boundary — usually because it was just
+        // restored from. Copying the same state again buys nothing.
+        if self.checkpoint.as_ref().is_some_and(|c| c.tokens == tokens) {
+            return;
+        }
+        self.checkpoint = None;
+
+        let bytes = self.state_bytes(false, false);
+        if let Some(budget) = self.checkpoint_budget() {
+            if bytes > budget {
+                tracing::debug!(
+                    "checkpoint skipped: {} MiB of state against a {} MiB budget",
+                    bytes / (1024 * 1024),
+                    budget / (1024 * 1024)
+                );
+                return;
+            }
+        }
+        // Host-side, not ON_DEVICE. A device-held state is a list of views
+        // into the cache as it stood, and restoring one rebuilds that list
+        // from the cache as it stands now: generation has appended tokens
+        // since, the two lists disagree, and llama.cpp answers a mismatch by
+        // aborting the process. Serialising to host bytes is layout
+        // independent, and ~185 MiB each way costs a few tens of
+        // milliseconds against the seconds of prefill it saves.
+        match self.snapshot(false, false) {
+            Ok(state) => {
+                tracing::debug!(
+                    "checkpoint saved: {} tokens, {} MiB",
+                    tokens.len(),
+                    bytes / (1024 * 1024)
+                );
+                self.checkpoint = Some(PromptCheckpoint { tokens: tokens.to_vec(), state });
+            }
+            // Not fatal: without a checkpoint the next turn prefills in full,
+            // which is what happened before this existed.
+            Err(e) => tracing::debug!("checkpoint not saved: {e}"),
+        }
+    }
+
+    /// Bytes a checkpoint may occupy, or `None` when free memory is unknown.
+    fn checkpoint_budget(&self) -> Option<usize> {
+        let free = crate::backend::devices()
+            .into_iter()
+            .find(|d| !d.is_gpu())
+            .map(|d| d.memory_free)?;
+        Some(free / CHECKPOINT_VRAM_SHARE)
+    }
+
+    /// Put the cache back to a saved prompt boundary, if that boundary starts
+    /// `tokens`. Returns how many tokens are then resident.
+    ///
+    /// Asked only once a trim has been refused, because until then the live
+    /// cache is the cheaper answer. The checkpoint has to be a *whole* prefix
+    /// of the new prompt: restoring a state that disagrees partway through
+    /// would leave the cache describing tokens that are not there.
+    fn restore_checkpoint(&mut self, tokens: &[LlamaToken]) -> Option<usize> {
+        if matches!(self.reuse, PrefixReuse::Off) {
+            return None;
+        }
+        let checkpoint = self.checkpoint.take()?;
+        let n = checkpoint.tokens.len();
+        // Strictly shorter, so at least one token is left to decode for logits.
+        if n >= tokens.len() || common_prefix(&checkpoint.tokens, tokens) != n {
+            self.checkpoint = Some(checkpoint);
+            return None;
+        }
+        if let Err(e) = self.restore(&checkpoint.state) {
+            tracing::debug!("checkpoint restore failed: {e}");
+            // The cache is now of unknown shape; force a clean prefill.
+            self.context.clear_kv_cache();
+            self.cached.clear();
+            self.n_past = 0;
+            return None;
+        }
+        self.n_past = n as i32;
+        self.cached = checkpoint.tokens.clone();
+        // Kept, not consumed. A turn that adds nothing before the boundary —
+        // the same question asked twice, say — saves no new checkpoint, and
+        // dropping this one would send the turn after it back to a cold
+        // prefill. Restoring does not spend it.
+        self.checkpoint = Some(checkpoint);
+        Some(n)
     }
 
     /// Check that a snapshot really can rewind this model mid-generation.
@@ -1312,11 +1509,6 @@ impl<'a> Session<'a> {
                     PrefixReuse::Off => 0,
                     PrefixReuse::Longest => common_prefix(&self.cached, &tokens),
                 };
-                tracing::debug!(
-                    "prefix reuse: {reuse} shared of {} prompt tokens; {} resident",
-                    tokens.len(),
-                    self.cached.len()
-                );
 
                 // The final token must always be decoded to produce logits, so
                 // never reuse the entire prompt.
@@ -1324,6 +1516,7 @@ impl<'a> Session<'a> {
                 self.last_reused = reuse;
 
                 let mut reuse = reuse;
+                let mut restored = false;
                 if reuse < self.cached.len() {
                     // Drop everything after the shared prefix; those positions
                     // are about to be occupied by different tokens.
@@ -1341,18 +1534,44 @@ impl<'a> Session<'a> {
                         self.can_trim = false;
                     }
                     if !self.can_trim {
-                        self.context.clear_kv_cache();
-                        self.cached.clear();
-                        reuse = 0;
+                        // The trim was refused, so everything resident past the
+                        // shared prefix is stuck there and the cache is no use.
+                        // A checkpoint is the way back: it was taken before any
+                        // of those tokens existed, so there is nothing to undo.
+                        match self.restore_checkpoint(&tokens) {
+                            Some(n) => {
+                                reuse = n;
+                                restored = true;
+                            }
+                            None => {
+                                self.context.clear_kv_cache();
+                                self.cached.clear();
+                                reuse = 0;
+                            }
+                        }
                     }
                 }
+                tracing::debug!(
+                    "prefix reuse: {reuse} of {} prompt tokens{}",
+                    tokens.len(),
+                    if restored { " (restored from checkpoint)" } else { "" }
+                );
                 self.n_past = reuse as i32;
                 self.last_reused = reuse;
 
-                let fresh = tokens[reuse..].to_vec();
-                self.prefill(&fresh, &mut batch, n_batch, true)?;
+                // Prefill stops at the history boundary first so the state can
+                // be captured there. Everything up to that point is what the
+                // next turn will resend verbatim; the generation prompt after
+                // it is replaced by the reply the model is about to write.
+                let boundary = tokens.len().saturating_sub(self.gen_prompt_tokens).max(reuse);
+                if boundary > reuse {
+                    self.prefill(&tokens[reuse..boundary], &mut batch, n_batch, false)?;
+                    self.cached = tokens[..boundary].to_vec();
+                    self.save_checkpoint(&tokens[..boundary]);
+                }
+                self.prefill(&tokens[boundary..], &mut batch, n_batch, true)?;
                 self.cached = tokens.clone();
-                stats.prompt_tokens = fresh.len();
+                stats.prompt_tokens = tokens.len() - reuse;
                 stats.reused_tokens = reuse;
                 stats.prompt_ms = started.elapsed().as_millis();
             }

@@ -38,12 +38,15 @@ pub enum TemplateError {
 }
 
 /// What the caller wants of this turn, in the vocabulary templates expect.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RenderOptions {
     /// `None` leaves `enable_thinking` undefined so the template's own default
     /// applies — which is what "auto" means. Forcing it either way overrides a
     /// model that has a considered opinion about when to reason.
     pub enable_thinking: Option<bool>,
+    /// Whether to append the assistant's opening. Cleared only to measure how
+    /// long that opening is; every real render wants it.
+    pub add_generation_prompt: bool,
     /// How hard to think, in the vocabulary templates use: "low", "medium",
     /// "high". Asking is better than interrupting — a model that decides for
     /// itself to reason briefly still finishes its thought, where a token
@@ -51,6 +54,12 @@ pub struct RenderOptions {
     /// one. Only some templates read this; for the rest it is inert and the
     /// budget remains the only control.
     pub reasoning_effort: Option<String>,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self { add_generation_prompt: true, enable_thinking: None, reasoning_effort: None }
+    }
 }
 
 impl ChatTemplate {
@@ -93,7 +102,7 @@ impl ChatTemplate {
 
         let mut ctx = context! {
             messages => turns,
-            add_generation_prompt => true,
+            add_generation_prompt => opts.add_generation_prompt,
             bos_token => self.bos,
             eos_token => self.eos,
         };
