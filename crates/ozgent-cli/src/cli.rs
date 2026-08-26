@@ -9,6 +9,37 @@ use ozgent_core::accel::{CacheType, MoeOffload, Speculative};
 use ozgent_core::{GpuLayers, Options, ThinkingMode};
 use std::path::PathBuf;
 
+/// Shown under `ozgent --help`.
+///
+/// The command list alone answers "what exists" but not "what do I type", and
+/// the two that need an address — the web interface and the API — are useless
+/// without one. Anyone reading `--help` is usually looking for exactly this.
+const GETTING_STARTED: &str = "\
+Getting started:
+  ozgent pull unsloth/Qwen3.5-4B-GGUF:Q4_K_M   download a model
+  ozgent list                                  see what is installed
+  ozgent                                       chat with the last model used
+  ozgent chat <model>                          chat with a specific one
+
+Running as a server:
+  ozgent web                                   web interface, opens a browser
+                                               http://127.0.0.1:7333
+  ozgent serve                                 OpenAI-compatible HTTP API
+                                               http://127.0.0.1:7337/v1
+  ozgent serve --host 0.0.0.0                  reachable from other machines
+  ozgent serve --api-key SECRET                require a bearer token
+
+  Point any OpenAI client at the API: set the base URL to
+  http://127.0.0.1:7337/v1 and use any model name `ozgent list` shows.
+
+When something is wrong:
+  ozgent doctor                                hardware, backends, misconfiguration
+  ozgent logs --follow                         watch what ozgent is doing
+  ozgent logs --path                           where the log file lives
+  ozgent -v ...                                more detail on the terminal
+
+Full docs for the HTTP API are in docs/api.md.";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "ozgent",
@@ -17,7 +48,8 @@ use std::path::PathBuf;
     // Bare `ozgent` opens a chat, matching what users expect from the name
     // alone; every other behaviour is an explicit subcommand.
     args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
+    subcommand_negates_reqs = true,
+    after_help = GETTING_STARTED
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -191,6 +223,27 @@ pub enum Command {
 
     /// Report hardware, backends, and what is misconfigured.
     Doctor,
+
+    /// Show the log file every part of ozgent writes to.
+    ///
+    /// The same file whether ozgent was started as `chat`, `web`, `serve` or
+    /// a one-shot command, which is what makes it useful when the server has
+    /// been running under systemd and something went wrong hours ago.
+    ///
+    ///   ozgent logs --lines 200   the last 200 lines
+    ///   ozgent logs --follow      keep printing as they arrive
+    ///   ozgent logs --path        print the path and exit, e.g. for tail
+    Logs {
+        /// Lines to show from the end. (`-n` is taken by max_tokens.)
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing new lines until interrupted.
+        #[arg(short, long)]
+        follow: bool,
+        /// Print the path to the log file and exit.
+        #[arg(long)]
+        path: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

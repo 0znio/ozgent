@@ -3,6 +3,7 @@
 mod chat;
 mod input;
 mod cli;
+mod logging;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -14,12 +15,14 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
 
+    // Paths first, because the log file lives under them. Anything that fails
+    // before this point still reports itself through the error return.
     let paths = match &cli.root {
         Some(dir) => Paths::with_root(dir),
         None => Paths::discover().context("locating the ozgent directory")?,
     };
+    logging::init(cli.verbose, Some(&paths.logs_dir()));
     let config = Config::load(&paths).context("loading config.toml")?;
 
     match cli.command {
@@ -50,23 +53,77 @@ async fn main() -> Result<()> {
         Some(Command::Tools { command }) => tools(&paths, &config, command).await,
         Some(Command::Config { command }) => config_cmd(&paths, &config, command),
         Some(Command::Doctor) => doctor(&paths, &config).await,
+        Some(Command::Logs { lines, follow, path }) => show_logs(&paths, lines, follow, path),
     }
 }
 
-fn init_logging(verbose: u8) {
-    let level = match verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
-    };
-    let filter = std::env::var("OZGENT_LOG").unwrap_or_else(|_| format!("ozgent={level}"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .init();
+/// Print the tail of the shared log, optionally following it.
+///
+/// Deliberately not a log viewer. It answers "what happened" without making
+/// the user remember where the file lives, and `--path` hands it to whatever
+/// they would rather use.
+fn show_logs(paths: &Paths, lines: usize, follow: bool, path_only: bool) -> Result<()> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+
+    let file_path = paths.logs_dir().join("ozgent.log");
+    if path_only {
+        println!("{}", file_path.display());
+        return Ok(());
+    }
+    if !file_path.exists() {
+        println!("No log yet at {}.", file_path.display());
+        println!("It is written as soon as ozgent runs anything.");
+        return Ok(());
+    }
+
+    let file = std::fs::File::open(&file_path)
+        .with_context(|| format!("opening {}", file_path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    // Keep only the last `lines`: a rolled log is up to 8 MiB and printing all
+    // of it is never what was wanted.
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut line = String::new();
+    while reader.read_line(&mut line)? > 0 {
+        if tail.len() == lines {
+            tail.pop_front();
+        }
+        tail.push_back(std::mem::take(&mut line));
+    }
+    let mut out = std::io::stdout().lock();
+    for l in &tail {
+        out.write_all(l.as_bytes())?;
+    }
+    out.flush()?;
+
+    if !follow {
+        return Ok(());
+    }
+    // Resume from where the tail ended rather than re-reading the file.
+    let mut at = reader.stream_position()?;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let Ok(file) = std::fs::File::open(&file_path) else { continue };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // Rotation replaces the file under us and the new one is shorter.
+        if len < at {
+            at = 0;
+        }
+        if len == at {
+            continue;
+        }
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(at))?;
+        let mut chunk = String::new();
+        while reader.read_line(&mut chunk)? > 0 {
+            out.write_all(chunk.as_bytes())?;
+            chunk.clear();
+        }
+        out.flush()?;
+        at = len;
+    }
 }
+
 
 // --------------------------------------------------------------- models
 
