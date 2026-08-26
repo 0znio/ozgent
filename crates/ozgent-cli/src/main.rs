@@ -746,7 +746,7 @@ async fn run_once(
     };
     messages.push(Message::user(user_text));
 
-    let rendered_prompt = engine.render_prompt_with(&messages, resolved.thinking)?;
+    let rendered_prompt = engine.render_prompt_with(&messages, resolved.thinking, resolved.reasoning_effort)?;
     if !engine.has_chat_template() {
         eprintln!("note: this GGUF carries no chat template; using a generic format");
     }

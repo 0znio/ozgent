@@ -118,9 +118,17 @@ pub enum ThinkingMode {
 ///
 /// Enforced as a token budget on the reasoning block rather than asked for in
 /// the prompt: a model told to "think briefly" frequently does not, while a
-/// model whose `</think>` is written for it has no choice. Spending the budget
-/// ends the reasoning and the answer begins — nothing is truncated, because the
-/// block is closed properly rather than cut.
+/// model whose `</think>` is written for it has no choice.
+///
+/// The block is closed properly rather than cut, so the output stays
+/// well-formed — but the *thought* is still interrupted, and a model stopped
+/// halfway answers from an argument it had not finished making. The budgets
+/// below are therefore backstops against a reasoning loop, not a style
+/// control. Measured against Qwen3.5-4B on a two-train word problem, the old
+/// budgets bound on every single run: low stopped it at 257 tokens of 256,
+/// medium at 1025 of 1024. Left alone the same model wanted 1177, and ollama
+/// on the same weights ran past 4000. Medium is the default, so out of the box
+/// ozgent was cutting every answer's reasoning roughly in half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -134,17 +142,26 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Tokens the reasoning block may spend.
+    /// Tokens the reasoning block may spend; zero means no limit at all.
     ///
-    /// `High` is not infinite but is past the point where any of these models
-    /// keep making progress, so it behaves as "no limit" without letting a
-    /// loop consume the whole context.
+    /// `High` is genuinely unbounded — the model stops when it is done, and
+    /// the only remaining limits are `max_tokens` and the context window. A
+    /// number here, however large, is a promise to interrupt a model that was
+    /// still making progress.
+    ///
+    /// `Low` still means low, but 256 tokens was not "brief", it was
+    /// mid-sentence. These leave room to finish a thought.
     pub fn budget(self) -> u32 {
         match self {
-            Self::Low => 256,
-            Self::Medium => 1024,
-            Self::High => 8192,
+            Self::Low => 2048,
+            Self::Medium => 8192,
+            Self::High => 0,
         }
+    }
+
+    /// Whether this level lets the model decide for itself when to stop.
+    pub fn is_unbounded(self) -> bool {
+        self.budget() == 0
     }
 }
 
@@ -552,5 +569,21 @@ mod tests {
         dst.adopt_per_turn(&src);
         assert_eq!(dst.context_length, 8192, "context length must survive");
         assert_eq!(dst.threads, 6, "thread count must survive");
+    }
+
+    #[test]
+    fn high_effort_never_interrupts_the_model() {
+        // A budget is a promise to cut a model off. At the level whose whole
+        // meaning is "think as long as you need", there must not be one.
+        assert!(ReasoningEffort::High.is_unbounded());
+        assert_eq!(ReasoningEffort::High.budget(), 0);
+    }
+
+    #[test]
+    fn the_lower_levels_still_bound_and_still_rank() {
+        assert!(ReasoningEffort::Low.budget() > 0);
+        assert!(ReasoningEffort::Medium.budget() > ReasoningEffort::Low.budget());
+        // Room to finish a sentence: the old 256 stopped Qwen3.5 mid-clause.
+        assert!(ReasoningEffort::Low.budget() >= 1024);
     }
 }

@@ -531,6 +531,7 @@ impl<'a> Chat<'a> {
                     Message::user(question),
                 ],
                 ozgent_core::ThinkingMode::Off,
+                Default::default(),
             )
             .ok()?;
 
@@ -575,7 +576,7 @@ impl<'a> Chat<'a> {
     }
 
     fn generate_inner(&mut self, messages: &[Message]) -> Result<Reply> {
-        let prompt = self.engine.render_prompt_with(messages, self.opts.thinking)?;
+        let prompt = self.engine.render_prompt_with(messages, self.opts.thinking, self.opts.reasoning_effort)?;
         // Images belong to this turn only: once evaluated they are resident in
         // the cache, and re-sending them would duplicate them in the context.
         let pending_images = std::mem::take(&mut self.pending_images);

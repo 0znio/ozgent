@@ -302,7 +302,7 @@ impl Engine {
     /// than it sounds — the model will not recognise the turn markers — so the
     /// fallback is deliberately plain and the caller is told.
     pub fn render_prompt(&self, messages: &[Message]) -> Result<String, EngineError> {
-        self.render_prompt_with(messages, ozgent_core::ThinkingMode::Auto)
+        self.render_prompt_with(messages, ozgent_core::ThinkingMode::Auto, Default::default())
     }
 
     /// Render, optionally suppressing reasoning at the prompt level.
@@ -310,6 +310,7 @@ impl Engine {
         &self,
         messages: &[Message],
         thinking: ozgent_core::ThinkingMode,
+        effort: ozgent_core::ReasoningEffort,
     ) -> Result<String, EngineError> {
         let suppress = thinking == ozgent_core::ThinkingMode::Off && self.reasoning;
 
@@ -318,6 +319,13 @@ impl Engine {
         // whether the prompt should end inside an open block.
         if let Some(jinja) = &self.jinja {
             let opts = crate::template::RenderOptions {
+                // Asked for only when the caller has not overridden thinking
+                // itself. Templates that read `reasoning_effort` treat it as
+                // the higher authority — Ling 3.0 turns reasoning *off* at
+                // "low" — so letting it through under an explicit `--think on`
+                // would quietly contradict the flag the user just set.
+                reasoning_effort: (thinking == ozgent_core::ThinkingMode::Auto)
+                    .then(|| effort.to_string()),
                 // Always stated, never left to the template's default. Qwen3.5
                 // reads an undefined `enable_thinking` as "off" and writes a
                 // closed empty block, so silence is not neutral — it is a
