@@ -523,6 +523,8 @@ fn turn(
     // The turn ended because the caller has a tool to run, which is a
     // different thing from the model choosing to stop.
     let mut handed_back = false;
+    // One retry only, so a model that answers with silence twice cannot spin.
+    let mut nudged = false;
 
     for round in 0..=max_rounds {
         let last = round == max_rounds || offered.is_empty();
@@ -551,6 +553,17 @@ fn turn(
 
         let parsed = ozgent_llama::extract_tool_calls(&reply);
         tracing::debug!(calls = parsed.calls.len(), "tool round {round}");
+
+        // Reasoning, then nothing. A model can close its thought and stop
+        // without either answering or calling anything, and the turn then
+        // returns an empty string — which reads to the user as ozgent being
+        // broken. Ask once for the answer it was about to give; if it stays
+        // silent the second time, that is its reply and the loop ends.
+        if !parsed.has_calls() && parsed.text.trim().is_empty() && !nudged {
+            nudged = true;
+            messages.push(Message::system(ANSWER_NOW));
+            continue;
+        }
 
         if last || !parsed.has_calls() {
             break;
@@ -660,6 +673,16 @@ fn turn(
 /// read a file, pick something out of it, read what that pointed at — which
 /// spent every round and answered nothing.
 const MAX_TOOL_ROUNDS: usize = 8;
+
+/// Said to the model when it stops without answering.
+///
+/// Its own reasoning is the best prompt available here: it usually ends
+/// mid-plan, and repeating that back is more likely to produce the answer
+/// than a generic instruction to try again.
+const ANSWER_NOW: &str = "\
+You stopped without answering. Give the user your answer now, based on what \
+you already know and whatever the tools have returned. If you cannot answer, \
+say so plainly and say what is missing.";
 
 /// Said to the model once its tool rounds are spent.
 ///

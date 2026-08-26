@@ -38,7 +38,7 @@ When something is wrong:
   ozgent logs --path                           where the log file lives
   ozgent -v ...                                more detail on the terminal
 
-Full docs for the HTTP API are in docs/api.md.";
+Full docs: docs/api.md (HTTP API), docs/tools.md (tools and permissions).";
 
 #[derive(Debug, Parser)]
 #[command(

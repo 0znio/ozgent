@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION, __version__
+from . import base
 from .base import REGISTRY, Tool, ToolError
 from .validate import ValidationError, coerce
 
@@ -208,10 +209,16 @@ class Worker:
         disabled = list(params.get("disabled", []))
         errors = self.load_tools(paths, disabled)
 
-        # Per-tool settings arrive as opaque data from config.toml.
+        # Per-tool settings arrive as opaque data from config.toml. A section
+        # naming no tool is kept rather than dropped: `permissions` is shared
+        # by several tools and belongs to none of them.
         for name, cfg in (params.get("config") or {}).items():
-            if name in REGISTRY and isinstance(cfg, dict):
+            if not isinstance(cfg, dict):
+                continue
+            if name in REGISTRY:
                 REGISTRY[name].config = cfg
+            else:
+                base.SHARED_CONFIG[name] = cfg
 
         self.initialized = True
         return {

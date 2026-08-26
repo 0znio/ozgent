@@ -1,30 +1,23 @@
-"""Reading and writing files.
+"""Reading a file, or the parts of it that matter.
 
-``read_file`` is the interesting one. A model asking to read a 6,000-line file
-cannot be given 6,000 lines, and truncating at line 200 usually returns the
-imports. When a query is supplied the file is instead split into definitions,
-scored, and — the part that matters — expanded along its dependencies, so the
-helper a relevant function calls arrives with it. See
-:mod:`ozgent_tools.relevance`.
+A model asking to read a 6,000-line file cannot be given 6,000 lines, and
+truncating at line 200 usually returns the imports. When a query is supplied
+the file is split into definitions, scored, and — the part that matters —
+expanded along its dependencies, so the helper a relevant function calls
+arrives with it. See :mod:`ozgent_tools.relevance`.
 
-Configure in ``~/ozgent/configs/config.toml``::
-
-    [tools.config.read_file]
-    root = "/home/you/code"     # refuse anything outside this
-    max_lines = 400             # per read
-
-    [tools.config.write_file]
-    root = "/home/you/code"
-    enabled = true              # writing is off unless turned on
+The directory reads are confined to is set once, under
+``[tools.config.permissions] root``. A ``[tools.config.read_file] root``
+overrides it for this tool alone.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Annotated, Any
 
 from ..base import ToolError, get_config, tool
+from ..permissions import resolve_within
 from ..relevance import expand_dependencies, score_chunks, split_definitions
 
 #: Files above this are never read whole, even without a query.
@@ -38,39 +31,6 @@ SKIP_SUFFIXES = frozenset(
     .exe .dll .so .dylib .a .o .class .jar .pyc .pyo .wasm .bin .dat .db .sqlite
     .mp3 .mp4 .avi .mov .mkv .wav .flac .ttf .otf .woff .woff2 .gguf .safetensors""".split()
 )
-
-
-def _root(settings: dict[str, Any]) -> Path:
-    """The directory reads and writes are confined to.
-
-    Defaults to the working directory ozgent was started in, which is the least
-    surprising boundary: a model asked about "this project" should not be able
-    to reach the rest of the disk.
-    """
-    return Path(settings.get("root") or os.getcwd()).expanduser().resolve()
-
-
-def _resolve(path: str, settings: dict[str, Any]) -> Path:
-    """Resolve `path` and refuse anything outside the configured root.
-
-    Resolution happens before the check so `../` and symlinks cannot be used to
-    step outside — comparing the strings first would be trivially defeated.
-    """
-    root = _root(settings)
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    try:
-        resolved = candidate.resolve()
-    except OSError as exc:
-        raise ToolError(f"cannot resolve {path!r}: {exc}") from exc
-
-    if resolved != root and root not in resolved.parents:
-        raise ToolError(
-            f"{path!r} is outside the permitted directory ({root}). "
-            "Set [tools.config.read_file] root in config.toml to widen it."
-        )
-    return resolved
 
 
 def _read_text(path: Path) -> str:
@@ -119,7 +79,7 @@ async def read_file(
     with its line numbers, and a list of what was left out.
     """
     settings = get_config("read_file")
-    target = _resolve(path, settings)
+    target = resolve_within(path, "read_file")
     text = _read_text(target)
     lines = text.splitlines()
     max_lines = int(settings.get("max_lines") or DEFAULT_MAX_LINES)
@@ -224,52 +184,4 @@ async def read_file(
         "matched": [chunks[i].name or f"lines {chunks[i].start}-{chunks[i].end}" for i in matched],
         "pulled_in": pulled_in,
         "outline": outline,
-    }
-
-
-@tool
-async def write_file(
-    path: Annotated[str, "Path to write, absolute or relative to the project root."],
-    content: Annotated[str, "The full text to write."],
-    mode: Annotated[str, "'create' fails if the file exists, 'overwrite' replaces it, 'append' adds to the end."] = "create",
-) -> dict[str, Any]:
-    """Write a file.
-
-    Disabled unless turned on in config, and confined to the configured root.
-    """
-    settings = get_config("write_file")
-    if not settings.get("enabled", False):
-        raise ToolError(
-            "writing is disabled. Set [tools.config.write_file] enabled = true "
-            "in ~/ozgent/configs/config.toml to allow it."
-        )
-    if mode not in {"create", "overwrite", "append"}:
-        raise ToolError(f"unknown mode {mode!r}: use create, overwrite, or append")
-
-    target = _resolve(path, settings)
-    if target.exists() and mode == "create":
-        raise ToolError(f"{target} already exists; pass mode='overwrite' to replace it")
-    if target.is_dir():
-        raise ToolError(f"{target} is a directory")
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if mode == "append":
-            with target.open("a", encoding="utf-8") as fh:
-                fh.write(content)
-        else:
-            # Written beside the target and renamed, so an interrupted write
-            # cannot leave a half-written file in place of a good one.
-            temporary = target.with_name(target.name + ".ozgent-tmp")
-            temporary.write_text(content, encoding="utf-8")
-            temporary.replace(target)
-    except OSError as exc:
-        raise ToolError(f"cannot write {target}: {exc}") from exc
-
-    written = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-    return {
-        "path": str(target),
-        "mode": mode,
-        "lines_written": written,
-        "bytes": len(content.encode("utf-8")),
     }

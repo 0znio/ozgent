@@ -101,10 +101,22 @@ def tool(
     return wrap(_fn) if _fn is not None else wrap
 
 
+#: Config sections that are not tools, such as ``permissions``. They arrive
+#: through the same transport and would otherwise be dropped for having no
+#: tool of that name.
+SHARED_CONFIG: dict[str, dict[str, Any]] = {}
+
+
 def get_config(tool_name: str) -> dict[str, Any]:
-    """Settings for one tool, from ``[tools.config.<name>]`` in config.toml."""
+    """Settings for one tool, from ``[tools.config.<name>]`` in config.toml.
+
+    Falls back to the shared sections, so ``permissions`` resolves even though
+    nothing registers a tool by that name.
+    """
     entry = REGISTRY.get(tool_name)
-    return entry.config if entry else {}
+    if entry is not None:
+        return entry.config
+    return SHARED_CONFIG.get(tool_name, {})
 
 
 class ToolError(Exception):
