@@ -310,12 +310,12 @@ class WorkerTests(unittest.TestCase):
         )
         self.assertIn("web_search", {t["name"] for t in result["tools"]})
         # An unconfigured provider must fail with a clear, actionable message
-        # rather than a network error.
-        msg = self.w.call(
-            "call",
-            {"name": "web_search", "arguments": {"query": "test", "provider": "brave"}},
-        )
-        self.assertEqual(msg["error"]["code"], -32000)
+        # rather than a network error. The provider comes from the config sent
+        # at initialize, not from the arguments — passing it as an argument
+        # fails schema validation before the provider is ever consulted, which
+        # is what this test used to do and why it stopped testing anything.
+        msg = self.w.call("call", {"name": "web_search", "arguments": {"query": "test"}})
+        self.assertEqual(msg["error"]["code"], -32000, msg["error"])
         self.assertIn("BRAVE_API_KEY", msg["error"]["message"])
 
     def test_a_broken_tool_file_is_reported_but_others_still_load(self):
