@@ -347,7 +347,11 @@ impl<'a> Chat<'a> {
         // A tool call is a request, not an answer: run it, hand the result
         // back, and let the model continue. Bounded so a model that keeps
         // calling cannot loop forever.
-        let max_calls = 4;
+        // The same budget the server gives a turn. Four was enough for a
+        // lookup and not for a question worth asking an agent: two searches
+        // and two pages, which a research prompt spends before it has read
+        // anything, and the turn then answers from what it half-saw.
+        let max_calls = ozgent_web::worker::MAX_TOOL_ROUNDS;
         for round in 0..max_calls {
             let mut parsed = toolcall::extract(&reply.text);
 
@@ -394,7 +398,11 @@ impl<'a> Chat<'a> {
                             call.name, call.arguments
                         ),
                     }],
-                    thinking: None,
+                    // The reasoning that led to this call, so the next round
+                    // sees why it was made. Dropped, the template writes an
+                    // empty `<think></think>` for the turn and the model
+                    // continues from a history saying it never reasoned.
+                    thinking: reply.thinking.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -691,14 +699,23 @@ impl<'a> Chat<'a> {
         if crate::input::interrupted() {
             eprintln!("{}", self.theme.style(Style::dim(), "· interrupted"));
         }
-        if answer.trim().is_empty() && stats.generated_tokens > 0 && !crate::input::interrupted() {
-            eprintln!(
-                "{}",
-                self.theme.style(
-                    Style::dim(),
-                    "· no answer produced; the budget went on reasoning. Try /think off",
-                )
-            );
+        // Three different situations used to share one message, and it was
+        // wrong for two of them.
+        if stats.generated_tokens > 0 && !crate::input::interrupted() {
+            let note = if filter.is_thinking() && !thinking.trim().is_empty() {
+                // The text is above, styled as reasoning, because that is how
+                // it arrived. Say why rather than leave it looking unanswered.
+                Some("· the model never closed its reasoning tag; the text above is its reply")
+            } else if answer.trim().is_empty() && !thinking.trim().is_empty() {
+                Some("· reasoning finished with no reply. Try /think off, or a longer /effort")
+            } else if answer.trim().is_empty() {
+                Some("· the model produced nothing")
+            } else {
+                None
+            };
+            if let Some(note) = note {
+                eprintln!("{}", self.theme.style(Style::dim(), note));
+            }
         }
         if reason == StopReason::ContextFull {
             eprintln!("{}", self.theme.style(Style::dim(), "· context full"));
@@ -720,17 +737,32 @@ impl<'a> Chat<'a> {
             );
         }
 
+        // A reasoning block the model never closed was not a reasoning block.
+        // It reached the end of its turn still inside `<think>`, so the words
+        // in there are its reply, mislabelled by a tag it did not emit.
+        // Treating them as reasoning and returning an empty answer loses a
+        // complete response and writes an empty assistant message into the
+        // conversation, which then poisons every later turn.
+        let unclosed = filter.is_thinking() && !thinking.trim().is_empty();
+
+        let (text, reasoning) = if toolcall::extract(&answer).has_calls() {
+            (answer, Some(thinking))
+        } else if unclosed {
+            (format!("{answer}{thinking}"), None)
+        } else if think_gate.suppressing() {
+            // Closed its reasoning, but the call was inside it. The parser has
+            // to see the call; the reasoning is still reasoning.
+            (format!("{answer}{thinking}"), Some(thinking))
+        } else {
+            (answer, Some(thinking))
+        };
+
         Ok(Reply {
-            // An unclosed `</think>` leaves the call in the reasoning stream;
-            // the parser has to see it either way.
-            text: if toolcall::extract(&answer).has_calls() || !think_gate.suppressing() {
-                answer
-            } else {
-                format!("{answer}{thinking}")
-            },
+            text,
             // An empty reasoning block is not a reasoning trace.
-            thinking: (!thinking.trim().is_empty()).then_some(thinking),
+            thinking: reasoning.filter(|t| !t.trim().is_empty()),
             attempted_call: gate.suppressing() || think_gate.suppressing(),
+            unclosed_reasoning: unclosed,
         })
     }
 
@@ -1331,6 +1363,10 @@ impl<'a> Chat<'a> {
 struct Reply {
     text: String,
     thinking: Option<String>,
+    /// The model ended its turn without closing `</think>`, so what it wrote
+    /// was recovered from the reasoning stream rather than read from the
+    /// answer stream.
+    unclosed_reasoning: bool,
     /// The model began a tool call, whether or not it parsed. Used to decide
     /// when a grammar-constrained retry is worth attempting.
     attempted_call: bool,

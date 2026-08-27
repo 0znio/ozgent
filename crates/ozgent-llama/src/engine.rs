@@ -399,7 +399,14 @@ impl Engine {
                 ..Default::default()
             };
             match jinja.render(messages, opts) {
-                Ok(prompt) => return Ok(prompt),
+                Ok(prompt) => {
+                    // The whole prompt, at trace level. Whether a turn reasons
+                    // depends on what the template wrote, and reading it is
+                    // the only way to tell a model that would not close
+                    // `</think>` from one that was never told to open it.
+                    tracing::trace!(target: "ozgent::prompt", "{prompt}");
+                    return Ok(prompt);
+                }
                 Err(e) => tracing::debug!("falling back to the built-in template: {e}"),
             }
         }

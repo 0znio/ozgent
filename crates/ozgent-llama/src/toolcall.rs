@@ -79,8 +79,30 @@ pub fn extract(output: &str) -> Parsed {
             None => (rest, rest.len()),
         };
 
+        // Qwen 3.5 nests the two markers: `<tool_call>` wrapping
+        // `<function=name>`. The outer opener wins the scan above, so unwrap
+        // here or the name never reaches the parameter parser.
+        let (name, body) = match explicit_name.clone() {
+            Some(n) => (Some(n), body),
+            None => match unwrap_function(body) {
+                Some((n, inner)) => (Some(n), inner),
+                None => (None, body),
+            },
+        };
+
         let before = calls.len();
-        harvest(body, explicit_name.as_deref(), &mut calls);
+        // A `<function=` body is `<parameter=x>` blocks rather than JSON.
+        // Tried first when the marker named the function, because a value can
+        // itself contain a brace and the JSON scan would then harvest a
+        // fragment of prose as if it were the arguments.
+        if let Some(name) = name.as_deref() {
+            if let Some(call) = from_parameters(body, name) {
+                calls.push(call);
+            }
+        }
+        if calls.len() == before {
+            harvest(body, name.as_deref(), &mut calls);
+        }
         if calls.len() == before {
             // Nothing parseable: keep the text rather than silently dropping it.
             text.push_str(opener);
@@ -114,6 +136,92 @@ fn next_opener(text: &str) -> Option<(usize, &'static str, Option<&'static str>)
 }
 
 /// Pull every JSON object or array of objects out of a tool-call body.
+/// Split `<function=name>…</function>` into its name and its body.
+///
+/// Returns `None` when there is no function marker, leaving the body to be
+/// read as JSON.
+fn unwrap_function(body: &str) -> Option<(String, &str)> {
+    const OPEN: &str = "<function=";
+    let start = body.find(OPEN)?;
+    let after = &body[start + OPEN.len()..];
+    let name_end = after.find('>')?;
+    let name = after[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let inner = &after[name_end + 1..];
+    let inner = match inner.find("</function>") {
+        Some(end) => &inner[..end],
+        None => inner,
+    };
+    Some((name.to_string(), inner))
+}
+
+/// Parse `<parameter=name>value</parameter>` blocks into arguments.
+///
+/// The format Qwen 3.5 is trained on and describes in its own template:
+///
+/// ```text
+/// <tool_call>
+/// <function=web_search>
+/// <parameter=query>
+/// stocks to watch
+/// </parameter>
+/// </function>
+/// </tool_call>
+/// ```
+///
+/// Returns `None` when there is no parameter block at all, so a body that is
+/// really JSON falls through to `harvest` rather than becoming a call with no
+/// arguments.
+fn from_parameters(body: &str, name: &str) -> Option<ToolCall> {
+    const OPEN: &str = "<parameter=";
+    const CLOSE: &str = "</parameter>";
+
+    let mut arguments = serde_json::Map::new();
+    let mut rest = body;
+    let mut found = false;
+
+    while let Some(start) = rest.find(OPEN) {
+        let after = &rest[start + OPEN.len()..];
+        let Some(name_end) = after.find('>') else { break };
+        let key = after[..name_end].trim().to_string();
+        let value_part = &after[name_end + 1..];
+
+        // An unclosed final parameter still carries its value; a truncated
+        // call is better read than discarded.
+        let (raw, consumed) = match value_part.find(CLOSE) {
+            Some(end) => (&value_part[..end], end + CLOSE.len()),
+            None => (value_part, value_part.len()),
+        };
+
+        if !key.is_empty() {
+            found = true;
+            arguments.insert(key, coerce(raw.trim()));
+        }
+        rest = &value_part[consumed..];
+    }
+
+    found.then(|| ToolCall {
+        id: String::new(),
+        name: name.to_string(),
+        arguments: Value::Object(arguments),
+    })
+}
+
+/// Read a parameter value as the type it is written as.
+///
+/// The format carries no types, so `5` and `true` arrive as text where the
+/// schema wants a number and a boolean. Only whole scalars are converted:
+/// anything else — including `5 stocks`, which is prose that begins with a
+/// digit — stays the string it was written as.
+fn coerce(raw: &str) -> Value {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v @ (Value::Bool(_) | Value::Number(_) | Value::Null)) => v,
+        _ => Value::String(raw.to_string()),
+    }
+}
+
 fn harvest(body: &str, explicit_name: Option<&str>, out: &mut Vec<ToolCall>) {
     let mut cursor = 0;
     while cursor < body.len() {
@@ -526,6 +634,100 @@ fn partial_suffix(haystack: &str, tag: &str) -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod native_format_tests {
+    use super::*;
+
+    const CALL: &str = concat!(
+        "<tool_call>\n<function=web_search>\n",
+        "<parameter=query>\nIndian stock market\n</parameter>\n",
+        "<parameter=count>\n5\n</parameter>\n",
+        "</function>\n</tool_call>"
+    );
+
+    #[test]
+    fn qwens_own_format_is_parsed() {
+        // The format Qwen 3.5's template describes to the model. Unparsed, it
+        // read as a malformed call, cost a grammar retry every round, and left
+        // the model off-contract for the rest of the turn.
+        let p = extract(CALL);
+        assert_eq!(p.calls.len(), 1, "{:?}", p);
+        assert_eq!(p.calls[0].name, "web_search");
+        assert_eq!(p.calls[0].arguments["query"], "Indian stock market");
+    }
+
+    #[test]
+    fn numbers_and_booleans_come_back_as_themselves() {
+        let p = extract(CALL);
+        assert_eq!(p.calls[0].arguments["count"], 5, "a count is a number");
+
+        let flags = "<function=t>\n<parameter=on>\ntrue</parameter>\n</function>";
+        assert_eq!(extract(flags).calls[0].arguments["on"], true);
+    }
+
+    #[test]
+    fn prose_beginning_with_a_digit_stays_a_string() {
+        // `5 best stocks` must not become the number 5.
+        let call = "<function=t>\n<parameter=q>\n5 best stocks</parameter>\n</function>";
+        assert_eq!(extract(call).calls[0].arguments["q"], "5 best stocks");
+    }
+
+    #[test]
+    fn a_value_containing_braces_survives_intact() {
+        // The reason parameters are tried before the JSON scan: this body
+        // would otherwise be harvested as a JSON fragment.
+        let call = concat!(
+            "<function=write_file>\n<parameter=content>\n",
+            "fn main() { println!(\"hi\"); }\n</parameter>\n</function>"
+        );
+        let p = extract(call);
+        assert_eq!(p.calls.len(), 1, "{:?}", p);
+        assert!(
+            p.calls[0].arguments["content"].as_str().unwrap().contains("println!"),
+            "{:?}",
+            p.calls[0].arguments
+        );
+    }
+
+    #[test]
+    fn a_multiline_value_keeps_its_lines() {
+        let call = "<function=t>\n<parameter=body>\nline one\nline two\n</parameter>\n</function>";
+        assert_eq!(extract(call).calls[0].arguments["body"], "line one\nline two");
+    }
+
+    #[test]
+    fn a_truncated_final_parameter_is_still_read() {
+        // The generation ran out mid-call; the arguments are all there.
+        let call = "<function=t>\n<parameter=q>\nsomething";
+        let p = extract(call);
+        assert_eq!(p.calls.len(), 1, "{:?}", p);
+        assert_eq!(p.calls[0].arguments["q"], "something");
+    }
+
+    #[test]
+    fn the_json_format_still_works() {
+        // Adding one format must not cost the other; most models use this one.
+        let p = extract(r#"<tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_call>"#);
+        assert_eq!(p.calls.len(), 1, "{:?}", p);
+        assert_eq!(p.calls[0].name, "web_search");
+        assert_eq!(p.calls[0].arguments["query"], "x");
+    }
+
+    #[test]
+    fn a_function_marker_with_a_json_body_still_parses() {
+        let p = extract("<function=web_search>{\"query\": \"x\"}</function>");
+        assert_eq!(p.calls.len(), 1, "{:?}", p);
+        assert_eq!(p.calls[0].arguments["query"], "x");
+    }
+
+    #[test]
+    fn prose_around_a_call_is_kept_and_the_call_is_not() {
+        let p = extract(&format!("Let me look that up.\n{CALL}"));
+        assert!(p.text.contains("Let me look that up"), "{:?}", p.text);
+        assert!(!p.text.contains("<parameter="), "{:?}", p.text);
+    }
 }
 
 #[cfg(test)]

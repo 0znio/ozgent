@@ -672,7 +672,7 @@ fn turn(
 /// capability one. Four was not enough for an ordinary three-step request —
 /// read a file, pick something out of it, read what that pointed at — which
 /// spent every round and answered nothing.
-const MAX_TOOL_ROUNDS: usize = 8;
+pub const MAX_TOOL_ROUNDS: usize = 8;
 
 /// Said to the model when it stops without answering.
 ///
@@ -871,6 +871,9 @@ fn generate(
     // call would be withheld for the rest of the round and never shown.
     let mut answer_gate = ozgent_llama::toolcall::StreamGate::new();
     let mut thinking_gate = ozgent_llama::toolcall::StreamGate::new();
+    // Kept so an unclosed reasoning block can be handed back as the reply.
+    let mut reasoning = String::new();
+    let mut answered = false;
     let out = request.out.clone();
     let mut raw = String::new();
 
@@ -879,8 +882,18 @@ fn generate(
         raw.push_str(piece);
         for chunk in filter.push(piece) {
             let event = match chunk {
-                Chunk::Thinking(text) => Event::Thinking { text: thinking_gate.push(&text) },
-                Chunk::Answer(text) => Event::Answer { text: answer_gate.push(&text) },
+                Chunk::Thinking(text) => {
+                    let text = thinking_gate.push(&text);
+                    reasoning.push_str(&text);
+                    Event::Thinking { text }
+                }
+                Chunk::Answer(text) => {
+                    let text = answer_gate.push(&text);
+                    if !text.is_empty() {
+                        answered = true;
+                    }
+                    Event::Answer { text }
+                }
             };
             let empty = match &event {
                 Event::Thinking { text } | Event::Answer { text } => text.is_empty(),
@@ -902,9 +915,18 @@ fn generate(
         if let Chunk::Answer(text) = chunk {
             let text = answer_gate.push(&text);
             if !text.is_empty() {
+                answered = true;
                 let _ = out.send(Event::Answer { text });
             }
         }
+    }
+
+    // A reasoning block the model never closed was not a reasoning block: it
+    // ended its turn still inside `<think>`, so what it wrote there is its
+    // reply. Left as reasoning, an OpenAI-compatible client gets a response
+    // with no content at all, and the browser shows an empty message.
+    if !answered && filter.is_thinking() && !reasoning.trim().is_empty() {
+        let _ = out.send(Event::Answer { text: std::mem::take(&mut reasoning) });
     }
 
     Ok((raw, stats, reason))

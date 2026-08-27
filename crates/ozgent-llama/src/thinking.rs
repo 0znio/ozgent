@@ -341,6 +341,27 @@ mod tests {
     }
 
     #[test]
+    fn an_unclosed_block_is_still_open_after_finish() {
+        // The signal the CLI uses to decide whether a reasoning block was ever
+        // a reasoning block. A model that ends its turn inside `<think>` wrote
+        // its reply there, and returning an empty answer throws it away.
+        let mut f = ThinkingFilter::new(ozgent_core::ThinkingMode::On)
+            .starting_inside("</think>");
+        f.push("Here is the whole answer, never closed.");
+        f.finish();
+        assert!(f.is_thinking(), "a block with no close tag has not ended");
+    }
+
+    #[test]
+    fn a_closed_block_is_not_open_after_finish() {
+        let mut f = ThinkingFilter::new(ozgent_core::ThinkingMode::On)
+            .starting_inside("</think>");
+        f.push("reasoning</think>the answer");
+        f.finish();
+        assert!(!f.is_thinking(), "the close tag ended it");
+    }
+
+    #[test]
     fn prefilled_open_tag_means_starting_inside() {
         // DeepSeek-R1 style: we prefill `<think>`, so only the close arrives.
         let mut f = ThinkingFilter::new(ThinkingMode::On).starting_inside("</think>");

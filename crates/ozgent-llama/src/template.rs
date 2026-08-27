@@ -96,6 +96,17 @@ impl ChatTemplate {
                 let mut turn = BTreeMap::new();
                 turn.insert("role", role_name(m.role).to_string());
                 turn.insert("content", m.text_content());
+                // The model's own reasoning, under the name every template
+                // that supports one uses. Qwen 3.5 reads `reasoning_content`
+                // and, finding none, writes an empty `<think></think>` for
+                // the turn — which tells the model it did not reason on a
+                // turn where it did. Across a tool-calling loop that erases
+                // its whole chain of thought.
+                if let Some(reasoning) = &m.thinking {
+                    if !reasoning.trim().is_empty() {
+                        turn.insert("reasoning_content", reasoning.clone());
+                    }
+                }
                 turn
             })
             .collect();
@@ -170,6 +181,52 @@ mod tests {
                    {% if add_generation_prompt %}<|assistant|>\n<think>\n{% endif %}";
         let out = render(src, RenderOptions::default());
         assert!(out.ends_with("<think>\n"), "{out:?}");
+    }
+
+    #[test]
+    fn a_turns_reasoning_reaches_the_template() {
+        // Qwen 3.5 reads `reasoning_content` and, finding none, writes an
+        // empty `<think></think>` for the turn. Across a tool-calling loop
+        // that tells the model it never reasoned on turns where it did.
+        let src = concat!(
+            "{% for m in messages %}",
+            "[{{ m.role }}:{{ m.reasoning_content if m.reasoning_content is defined else 'none' }}]",
+            "{% endfor %}"
+        );
+        let tmpl = ChatTemplate::new(src, String::new(), String::new()).unwrap();
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ozgent_core::Part::Text { text: "answer".into() }],
+            thinking: Some("the reasoning".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+
+        let out = tmpl.render(&messages, RenderOptions::default()).unwrap();
+        assert!(out.contains("[assistant:the reasoning]"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_reasoning_block_is_not_passed_as_one() {
+        let src = concat!(
+            "{% for m in messages %}",
+            "{{ 'yes' if m.reasoning_content is defined else 'no' }}",
+            "{% endfor %}"
+        );
+        let tmpl = ChatTemplate::new(src, String::new(), String::new()).unwrap();
+
+        for thinking in [None, Some(String::new()), Some("   
+".to_string())] {
+            let messages = vec![Message {
+                role: Role::Assistant,
+                content: vec![ozgent_core::Part::Text { text: "a".into() }],
+                thinking,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }];
+            assert_eq!(tmpl.render(&messages, RenderOptions::default()).unwrap(), "no");
+        }
     }
 
     #[test]
