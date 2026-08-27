@@ -357,6 +357,31 @@ impl Options {
 }
 
 impl Resolved {
+    /// Whether `other` needs the weights reloaded to take effect.
+    ///
+    /// The exact complement of [`Self::adopt_per_turn`]: those settings can
+    /// change under a live session, and these cannot. A server that answers
+    /// "applied" to a context-length change and then keeps serving from the
+    /// model it already loaded is telling the user something untrue, so the
+    /// two lists have to stay complementary — `every_setting_is_either_live_or_load`
+    /// fails if a field is added to neither.
+    pub fn needs_reload(&self, other: &Self) -> bool {
+        self.gpu_layers != other.gpu_layers
+            || self.context_length != other.context_length
+            || self.batch_size != other.batch_size
+            || self.ubatch != other.ubatch
+            || self.threads != other.threads
+            || self.main_gpu != other.main_gpu
+            || self.use_mmap != other.use_mmap
+            || self.use_mlock != other.use_mlock
+            || self.flash_attention != other.flash_attention
+            || self.cpu_moe != other.cpu_moe
+            || self.control_vector != other.control_vector
+            || self.control_strength != other.control_strength
+            || self.cache_type_k != other.cache_type_k
+            || self.cache_type_v != other.cache_type_v
+    }
+
     /// Take the settings that belong to a single turn from `src`.
     ///
     /// A server holds one session across many requests, so the turn's own
@@ -430,6 +455,96 @@ pub struct Resolved {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_setting_is_either_live_or_load() {
+        // The invariant that keeps `adopt_per_turn` and `needs_reload`
+        // complementary. A field added to the struct and to neither list is
+        // a setting the user can change and nothing will ever apply — which
+        // is exactly the bug this pair exists to prevent.
+        let base = Options::default().resolve();
+        let mut changed = Options::default().resolve();
+
+        // Move every field away from its default.
+        changed.gpu_layers = GpuLayers::Count(7);
+        changed.context_length = 12_345;
+        changed.batch_size = 111;
+        changed.ubatch = Some(222);
+        changed.threads = 3;
+        changed.main_gpu = 1;
+        changed.use_mmap = !base.use_mmap;
+        changed.use_mlock = !base.use_mlock;
+        changed.flash_attention = !base.flash_attention;
+        changed.cpu_moe = MoeOffload::Layers(9);
+        changed.control_vector = Some("/tmp/v.gguf".into());
+        changed.control_strength = 0.5;
+        changed.cache_type_k = CacheType::Q4_0;
+        changed.cache_type_v = CacheType::Q4_0;
+        changed.temperature = 0.123;
+        changed.top_p = 0.456;
+        changed.top_k = 77;
+        changed.min_p = 0.089;
+        changed.repeat_penalty = 1.23;
+        changed.repeat_last_n = 99;
+        changed.seed = Some(4);
+        changed.max_tokens = 555;
+        changed.system_prompt = Some("be terse".into());
+        changed.thinking = ThinkingMode::Off;
+        changed.reasoning_effort = ReasoningEffort::High;
+        changed.tools = !base.tools;
+        changed.speculative = Speculative::Ngram;
+        changed.prefix_reuse = PrefixReuse::Off;
+
+        // Everything live is adopted; whatever still differs must be a
+        // load-time setting, and `needs_reload` has to say so.
+        let mut adopted = base.clone();
+        adopted.adopt_per_turn(&changed);
+        assert!(
+            adopted.needs_reload(&changed),
+            "a changed setting is neither adopted per turn nor reported as needing a reload"
+        );
+
+        // And the converse: adopting the live half of an otherwise identical
+        // set must not claim a reload is needed.
+        let mut live_only = base.clone();
+        live_only.adopt_per_turn(&changed);
+        let mut expected = changed.clone();
+        // Put the load-time half back to what the session already has.
+        expected.gpu_layers = base.gpu_layers;
+        expected.context_length = base.context_length;
+        expected.batch_size = base.batch_size;
+        expected.ubatch = base.ubatch;
+        expected.threads = base.threads;
+        expected.main_gpu = base.main_gpu;
+        expected.use_mmap = base.use_mmap;
+        expected.use_mlock = base.use_mlock;
+        expected.flash_attention = base.flash_attention;
+        expected.cpu_moe = base.cpu_moe;
+        expected.control_vector = base.control_vector.clone();
+        expected.control_strength = base.control_strength;
+        expected.cache_type_k = base.cache_type_k;
+        expected.cache_type_v = base.cache_type_v;
+        assert!(
+            !live_only.needs_reload(&expected),
+            "changing only live settings must not force a reload"
+        );
+    }
+
+    #[test]
+    fn a_context_change_needs_a_reload() {
+        let a = Options::default().resolve();
+        let mut b = a.clone();
+        b.context_length = a.context_length * 2;
+        assert!(a.needs_reload(&b), "context length is fixed when the weights load");
+    }
+
+    #[test]
+    fn a_temperature_change_does_not() {
+        let a = Options::default().resolve();
+        let mut b = a.clone();
+        b.temperature = a.temperature + 0.3;
+        assert!(!a.needs_reload(&b), "sampling changes apply to the next turn");
+    }
 
     #[test]
     fn every_option_survives_a_merge() {

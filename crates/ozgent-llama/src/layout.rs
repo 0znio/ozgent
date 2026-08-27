@@ -27,6 +27,10 @@ pub struct Layout {
     /// KV elements stored per token across all layers, for sizing the cache
     /// that has to stay resident whatever else is evicted.
     pub kv_elements_per_token: u64,
+    /// The context the model was trained for, from its own metadata. Zero
+    /// when the file does not say. Asking for more than this is not a longer
+    /// memory, it is a model reading positions it has never seen.
+    pub context_train: u32,
 }
 
 impl Layout {
@@ -52,6 +56,7 @@ pub fn read(path: &Path) -> Option<Layout> {
     let mut layout = scan(gguf);
     if let Some(l) = layout.as_mut() {
         l.kv_elements_per_token = kv_elements(gguf, l.layers);
+        l.context_train = context_train(gguf);
     }
     unsafe { sys::gguf_free(gguf) };
     layout
@@ -98,7 +103,18 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         expert_bytes_per_layer: expert_bytes / layers as u64,
         layers,
         kv_elements_per_token: 0,
+        context_train: 0,
     })
+}
+
+/// The context length the model was trained for.
+///
+/// Read from the file rather than from a loaded handle so a caller can ask
+/// before paying to load twenty gigabytes — which is exactly what a settings
+/// page needs in order to bound its slider.
+fn context_train(gguf: *mut sys::gguf_context) -> u32 {
+    let Some(arch) = string_key(gguf, "general.architecture") else { return 0 };
+    u32_key(gguf, &format!("{arch}.context_length")).unwrap_or(0)
 }
 
 /// KV elements per token, from the architecture's own declared widths.
@@ -251,7 +267,7 @@ mod tests {
 
     #[test]
     fn a_dense_layout_reports_no_experts() {
-        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, layers: 32, kv_elements_per_token: 0 };
+        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, layers: 32, kv_elements_per_token: 0, context_train: 0 };
         assert!(!l.is_moe());
     }
 

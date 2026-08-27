@@ -4,7 +4,7 @@ use ozgent_core::{Config, Paths};
 use ozgent_memory::{HashingEmbedder, Store};
 use std::sync::{Arc, Mutex};
 
-use crate::worker::{Tools, Worker};
+use crate::worker::{SharedConfig, SharedTools, Tools, Worker};
 
 /// One tool as the settings page shows it.
 #[derive(serde::Serialize)]
@@ -51,7 +51,12 @@ pub async fn discover_tools(
 /// server.
 pub struct App {
     pub paths: Paths,
-    pub config: Mutex<Config>,
+    /// The Python tool host, shared so a settings change can replace it.
+    pub tools: SharedTools,
+    /// Shared with the inference thread, which re-reads it whenever it loads
+    /// a model. A clone handed over at start-up meant the settings page could
+    /// save a change, report it applied, and have it never reach the model.
+    pub config: SharedConfig,
     pub store: Mutex<Store>,
     pub embedder: HashingEmbedder,
     pub worker: Worker,
@@ -84,10 +89,13 @@ impl App {
         } else {
             None
         };
-        let worker = Worker::spawn(paths.clone(), config.clone(), tools);
+        let config: SharedConfig = Arc::new(Mutex::new(config));
+        let tools: SharedTools = Arc::new(Mutex::new(tools));
+        let worker = Worker::spawn(paths.clone(), Arc::clone(&config), Arc::clone(&tools));
         Ok(Arc::new(App {
             paths,
-            config: Mutex::new(config),
+            config,
+            tools,
             store: Mutex::new(store),
             embedder: HashingEmbedder::default(),
             worker,
@@ -96,7 +104,7 @@ impl App {
 }
 
 /// Start the Python tool worker for the server's lifetime.
-async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools> {
+pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools> {
     let host_config = ozgent_tools::HostConfig::from_config(&config.tools, paths)?;
     let host = ozgent_tools::ToolHost::start(host_config).await?;
     tracing::info!("tools ready: {} available", host.tools().len());

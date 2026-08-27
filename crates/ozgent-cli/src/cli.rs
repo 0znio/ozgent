@@ -23,7 +23,9 @@ Getting started:
 
 Running as a server:
   ozgent web                                   web interface, opens a browser
-                                               http://127.0.0.1:7333
+                                               http://localhost:7333, and
+                                               reachable from your network
+  ozgent web --host 127.0.0.1                  this machine only
   ozgent serve                                 OpenAI-compatible HTTP API
                                                http://127.0.0.1:7337/v1
   ozgent serve --host 0.0.0.0                  reachable from other machines
@@ -99,12 +101,18 @@ pub enum Command {
         options: OptionFlags,
     },
 
-    /// Serve the web interface.
+    /// Serve the web interface, reachable from your local network.
+    ///
+    /// Binds every interface so a phone or another machine on the same network
+    /// can use it. There is no password: anyone who can reach the port can
+    /// chat, read past conversations and change settings. Use
+    /// `--host 127.0.0.1` on a network you do not trust.
     Web {
         #[arg(long, default_value_t = 7333)]
         port: u16,
-        /// Address to bind. Defaults to loopback only.
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Address to bind. Every interface by default; 127.0.0.1 for this
+        /// machine only.
+        #[arg(long, default_value = "0.0.0.0")]
         host: String,
         /// Don't open a browser on start.
         #[arg(long)]
@@ -698,7 +706,9 @@ mod tests {
         match parse(&["ozgent", "web", "--port", "9000"]).command {
             Some(Command::Web { port, host, .. }) => {
                 assert_eq!(port, 9000);
-                assert_eq!(host, "127.0.0.1", "must not bind publicly by default");
+                // Deliberate: the web interface is meant to be reachable from
+                // a phone on the same network. The API below is not.
+                assert_eq!(host, "0.0.0.0");
             }
             other => panic!("expected web, got {other:?}"),
         }
@@ -712,6 +722,24 @@ mod tests {
                 assert_eq!(prompt.join(" "), "explain MoE routing");
             }
             other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_api_still_binds_to_loopback_only() {
+        // `web` is opened to the network on purpose; `serve` is an API that
+        // may carry a key and must stay opt-in.
+        match parse(&["ozgent", "serve"]).command {
+            Some(Command::Serve { host, .. }) => assert_eq!(host, "127.0.0.1"),
+            other => panic!("expected serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_web_interface_can_be_restricted_again() {
+        match parse(&["ozgent", "web", "--host", "127.0.0.1"]).command {
+            Some(Command::Web { host, .. }) => assert_eq!(host, "127.0.0.1"),
+            other => panic!("expected web, got {other:?}"),
         }
     }
 

@@ -67,7 +67,16 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-.layout { display: grid; grid-template-columns: 260px 1fr; height: 100vh; }
+/* `dvh` tracks the viewport as a mobile browser's toolbars slide away; `vh`
+   is the largest it ever gets, so a `100vh` layout is permanently taller than
+   the screen on a phone and the composer sits below the fold. `vh` stays as
+   the fallback for browsers without `dvh`. */
+.layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  height: 100vh;
+  height: 100dvh;
+}
 
 /* ------------------------------------------------------------- sidebar */
 
@@ -121,7 +130,26 @@ body {
 .conv:hover .del { opacity: 1; }
 .conv .del:hover { color: var(--danger); }
 
-.sidebar-foot { padding: 10px; border-top: 1px solid var(--line); }
+.sidebar-foot {
+  padding: 10px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  /* Keeps the last row clear of a phone's home indicator. */
+  padding-bottom: max(10px, env(safe-area-inset-bottom));
+}
+.sidebar-foot .ghost-btn { width: auto; flex: 1; }
+
+/* The theme control: an icon and a word, so its state is readable rather than
+   inferred from which of two shapes is showing. */
+.ghost-btn.theme {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.theme-icon { font-size: 14px; line-height: 1; }
 
 /* ---------------------------------------------------------------- main */
 
@@ -644,13 +672,109 @@ body {
 
 .only-narrow { display: none; }
 
-@media (max-width: 760px) {
+/* A dim layer behind the drawer, so tapping the page closes it and the thread
+   underneath reads as inactive rather than merely half-covered. */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 9;
+  background: rgba(0, 0, 0, 0.42);
+  border: 0;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+.scrim.show { opacity: 1; }
+
+/* ------------------------------------------------------- narrow screens
+
+   Three steps rather than one. A tablet only needs the sidebar out of the
+   way; a phone needs the horizontal padding back for the text; a small phone
+   needs the topbar to stop competing with itself for width. */
+
+@media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
-  .sidebar { position: fixed; inset: 0 auto 0 0; width: 260px; z-index: 10; transform: translateX(-100%); transition: transform 0.18s ease; }
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(300px, 82vw);
+    z-index: 10;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    box-shadow: 0 0 40px rgba(0, 0, 0, 0.35);
+  }
   .sidebar.open { transform: none; }
   .only-narrow { display: block; }
+  /* Touch targets: 24px of icon is a miss on a phone. */
+  .icon-btn { padding: 8px 11px; }
+  .conv { padding: 11px 10px; }
+  /* No hover on touch, so the delete control has to be permanently visible
+     or it cannot be reached at all. */
+  .conv .del { opacity: 0.55; padding: 4px 6px; }
 }
-@media (prefers-reduced-motion: reduce) { .sidebar { transition: none; } }
+
+@media (max-width: 620px) {
+  .msg { padding: 0 14px; gap: 10px; }
+  .composer { padding: 8px 12px max(14px, env(safe-area-inset-bottom)); }
+  .thread { padding-top: 16px; }
+  .topbar { padding: 8px 10px; gap: 6px; }
+  .select { max-width: 44vw; font-size: 12.5px; padding: 6px 8px; }
+  .empty { margin: 8vh auto; }
+  .empty h1 { font-size: 22px; }
+  /* The running commentary is the first thing to go: the model name and the
+     controls are what the row is for. */
+  .stat { display: none; }
+  /* The badge shrinks rather than vanishing: it is the only thing marking
+     who is speaking, but 26px of it is a lot on a 360px screen. */
+  .msg .who { width: 20px; height: 20px; font-size: 9px; border-radius: 6px; }
+  /* Attachments and images should never widen the column. */
+  .msg img { max-width: 100%; }
+  .quick { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 400px) {
+  .msg { padding: 0 10px; }
+  .composer { padding: 6px 8px max(12px, env(safe-area-inset-bottom)); }
+  .select { max-width: 40vw; }
+  .hint.inline { display: none; }
+}
+
+/* The settings dialog takes the whole screen on a phone. A centred card with
+   94vw of width and 88vh of height is neither a dialog nor a page, and its
+   scrolling body ends up shorter than the tab strip above it. */
+@media (max-width: 620px) {
+  .settings {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    border: 0;
+    border-radius: 0;
+    margin: 0;
+  }
+  .settings-head { padding: 14px 16px 10px; padding-top: max(14px, env(safe-area-inset-top)); }
+  .tabs { padding: 0 10px; overflow-x: auto; }
+  .settings-foot { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  /* Two columns of number inputs do not fit; one does. */
+  .params { grid-template-columns: 1fr; }
+}
+
+/* Short and wide — a laptop in landscape, or a phone on its side. Vertical
+   space is the scarce dimension there, not horizontal. */
+@media (max-height: 520px) {
+  .thread { padding-top: 10px; }
+  .empty { margin: 4vh auto; }
+  .composer { padding-top: 6px; padding-bottom: 10px; }
+}
+
+/* Very wide screens: let the column breathe rather than stranding it in the
+   middle of a 4K display. */
+@media (min-width: 1600px) {
+  .msg, .composer { max-width: 900px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar, .scrim { transition: none; }
+}
 
 
 /* Segmented choice, for settings with named levels rather than a range. */

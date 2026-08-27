@@ -31,7 +31,12 @@ async fn main() -> Result<()> {
         Some(Command::Run { model, prompt, options }) => {
             run_once(&paths, &config, &model, &prompt.join(" "), &options).await
         }
-        Some(Command::Web { port, host, .. }) => {
+        Some(Command::Web { port, host, no_open, .. }) => {
+            // `--no-open` had no effect and nothing ever opened a browser,
+            // though `--help` said one would.
+            if !no_open {
+                open_browser(port);
+            }
             ozgent_web::serve(paths, config, &host, port).await
         }
         Some(Command::Serve { port, host, api_key, .. }) => {
@@ -55,6 +60,33 @@ async fn main() -> Result<()> {
         Some(Command::Doctor) => doctor(&paths, &config).await,
         Some(Command::Logs { lines, follow, path }) => show_logs(&paths, lines, follow, path),
     }
+}
+
+/// Open the web interface once the server is listening.
+///
+/// Spawned rather than awaited: the browser is launched a moment later, from
+/// another thread, because `serve` does not return until the server stops and
+/// opening first would race the port being bound. `localhost` regardless of
+/// the bind address — a browser on this machine reaches it either way, and
+/// `0.0.0.0` is not a destination.
+fn open_browser(port: u16) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let url = format!("http://localhost:{port}");
+        // Whichever of these exists; a machine with no browser is not an
+        // error, the address was printed either way.
+        for opener in ["xdg-open", "open", "wslview"] {
+            if std::process::Command::new(opener)
+                .arg(&url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+    });
 }
 
 /// Print the tail of the shared log, optionally following it.

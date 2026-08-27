@@ -112,14 +112,28 @@ pub type LoadedProjector<'a> = ozgent_llama::mtmd::Projector<'a>;
 ///
 /// The host is async and this thread is not, so calls are driven through a
 /// runtime handle rather than blocking the executor that serves HTTP.
+#[derive(Clone)]
 pub struct Tools {
     pub host: Arc<ToolHost>,
     pub runtime: tokio::runtime::Handle,
 }
 
+/// The Python tool host, shared so the settings page can replace it.
+///
+/// The host reads its configuration once, when the interpreter starts. Held
+/// as a plain value it meant changing the search provider or its key was
+/// saved to `config.toml`, reported as saved, and ignored until the server
+/// was restarted — the same shape of bug as a stale `Config`.
+pub type SharedTools = std::sync::Arc<std::sync::Mutex<Option<Tools>>>;
+
+/// The tool host as it stands now.
+pub fn current_tools(tools: &SharedTools) -> Option<Tools> {
+    tools.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 impl Worker {
     /// Start the thread. It lives for the process.
-    pub fn spawn(paths: Paths, config: Config, tools: Option<Tools>) -> Self {
+    pub fn spawn(paths: Paths, config: SharedConfig, tools: SharedTools) -> Self {
         let (tx, rx) = channel::<Job>();
         std::thread::Builder::new()
             .name("ozgent-inference".into())
@@ -153,7 +167,20 @@ impl Worker {
 }
 
 /// Outer loop: owns nothing but the channel, and loads a model on demand.
-fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
+/// The server's configuration, shared with the HTTP handlers that edit it.
+///
+/// A clone taken at start-up is the bug this replaces: the settings page wrote
+/// `config.toml`, asked for an unload, and the reload read the copy the thread
+/// had been holding since boot — so a context-length change was saved,
+/// reported back as applied, and never once reached the model.
+pub type SharedConfig = std::sync::Arc<std::sync::Mutex<Config>>;
+
+/// Read the configuration as it stands now.
+fn snapshot(config: &SharedConfig) -> Config {
+    config.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn run(paths: Paths, config: SharedConfig, tools: SharedTools, rx: Receiver<Job>) {
     let mut pending: Option<Box<Request>> = None;
     // Held across model loads: the embedding model is independent of whichever
     // chat model happens to be resident.
@@ -165,7 +192,7 @@ fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
             None => match rx.recv() {
                 Ok(Job::Generate(r)) => r,
                 Ok(Job::Embed { texts, reply }) => {
-                    let _ = reply.send(serve_embeddings(&paths, &config, &mut embedder, texts));
+                    let _ = reply.send(serve_embeddings(&paths, &snapshot(&config), &mut embedder, texts));
                     continue;
                 }
                 Ok(Job::Unload) => continue, // nothing loaded
@@ -175,7 +202,7 @@ fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
 
         // Loading and the session that borrows it both live in this scope, so
         // the borrow checker is satisfied without any self-referential trick.
-        match serve_model(&paths, &config, tools.as_ref(), &mut embedder, request, &rx) {
+        match serve_model(&paths, &config, &tools, &mut embedder, request, &rx) {
             Ok(next) => pending = next,
             Err(e) => tracing::error!("inference thread: {e}"),
         }
@@ -186,8 +213,8 @@ fn run(paths: Paths, config: Config, tools: Option<Tools>, rx: Receiver<Job>) {
 /// for, returning that job so the caller can load its model.
 fn serve_model(
     paths: &Paths,
-    config: &Config,
-    tools: Option<&Tools>,
+    shared: &SharedConfig,
+    tools: &SharedTools,
     // Threaded through rather than rebuilt: an embedding request that arrives
     // mid-conversation should not reload the model it already has.
     embedder: &mut Option<ozgent_llama::embed::Embedder>,
@@ -206,6 +233,9 @@ fn serve_model(
     // The layers under every request for this model. The first request's
     // overrides are folded in too, because loading needs concrete numbers for
     // context length and layer placement and this is the only request in hand.
+    // Read now, not at start-up: the settings page may have written the file
+    // since, and this load is usually the direct consequence of that.
+    let config = snapshot(shared);
     let base = config.options_for(&found.model.to_string()).merge(&found.manifest.defaults);
     let resolved = base
         .clone()
@@ -233,10 +263,21 @@ fn serve_model(
         // Each request brings its own sampling. Re-resolving per turn is what
         // keeps two clients on one model from inheriting each other's
         // temperature, seed and reasoning budget.
+        let live = snapshot(shared);
+        let base = live.options_for(&found.model.to_string()).merge(&found.manifest.defaults);
         let per_turn = base
             .clone()
             .merge(request.overrides.as_ref().unwrap_or(&Default::default()))
             .resolve();
+
+        // Context length, layer placement and the rest are fixed when the
+        // weights load. Returning the request sends it back to be served
+        // against a freshly loaded model, which is what "applies on your next
+        // message" has to mean if it is to be true.
+        if resolved.needs_reload(&per_turn) {
+            tracing::info!("a load-time setting changed; reloading {}", found.model);
+            return Ok(Some(request));
+        }
         session.set_options(&per_turn);
         let thinking = request.thinking.unwrap_or(per_turn.thinking);
         let _ = request.out.send(Event::Ready {
@@ -282,7 +323,7 @@ fn serve_model(
             match rx.recv() {
                 Ok(Job::Generate(r)) => break r,
                 Ok(Job::Embed { texts, reply }) => {
-                    let _ = reply.send(serve_embeddings(paths, config, embedder, texts));
+                    let _ = reply.send(serve_embeddings(paths, &snapshot(shared), embedder, texts));
                 }
                 // Unloading means returning so the engine is dropped with the scope.
                 Ok(Job::Unload) => return Ok(None),
@@ -349,7 +390,7 @@ fn turn(
     session: &mut ozgent_llama::engine::Session<'_>,
     resolved: &ozgent_core::options::Resolved,
     thinking: ThinkingMode,
-    tools: Option<&Tools>,
+    tools: &SharedTools,
     projector: Option<&LoadedProjector<'_>>,
     request: &Request,
 ) -> anyhow::Result<()> {
@@ -369,7 +410,10 @@ fn turn(
     };
 
     let media_turn = !images.is_empty();
-    let mut offered: Vec<ozgent_core::ToolSpec> = match tools {
+    // Read per turn, so switching the search provider or disabling a tool in
+    // Settings reaches the very next message rather than the next restart.
+    let tools = current_tools(tools);
+    let mut offered: Vec<ozgent_core::ToolSpec> = match &tools {
         Some(t) if request.tools_enabled => match &request.native_tools {
             None => t.host.tools().to_vec(),
             Some(allowed) => {
@@ -629,7 +673,7 @@ fn turn(
             break;
         }
 
-        let Some(t) = tools else { break };
+        let Some(t) = tools.as_ref() else { break };
 
         // Independent calls run together. In series, a turn asking for three
         // searches paid three network round trips end to end, and the tool

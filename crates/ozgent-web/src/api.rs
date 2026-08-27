@@ -126,7 +126,10 @@ async fn list_conversations(
 ) -> ApiResult<Json<Vec<ConversationInfo>>> {
     let store = state.store.lock().unwrap();
     let mut out = Vec::new();
-    for c in store.list_conversations(200)? {
+    // Only conversations that hold something. One with no messages is a
+    // placeholder nobody filled, and offering to reopen nothing is what filled
+    // this sidebar with rows called "New chat".
+    for c in store.list_active_conversations(200)? {
         let messages = store.message_count(c.id)?;
         out.push(ConversationInfo {
             id: c.id,
@@ -151,8 +154,10 @@ async fn new_conversation(
     Json(body): Json<NewConversation>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let store = state.store.lock().unwrap();
+    // Untitled by default, not "New chat": the first message names it, and a
+    // placeholder title outlives its usefulness the moment that happens.
     let id = store.create_conversation(
-        body.title.as_deref().unwrap_or("New chat"),
+        body.title.as_deref().unwrap_or(""),
         body.model.as_deref(),
     )?;
     let uuid = store.get_conversation(id)?.map(|c| c.uuid).unwrap_or_default();
@@ -492,6 +497,10 @@ struct ModelOptions {
     effective: serde_json::Value,
     /// Only the keys set for this model in `config.toml`.
     overrides: serde_json::Value,
+    /// Bounds the page should not let the user exceed, read from the model
+    /// itself. Without these the settings page invents its own, and a model
+    /// trained for 256k gets a slider that stops at 32k.
+    limits: serde_json::Value,
 }
 
 async fn model_options(
@@ -506,10 +515,20 @@ async fn model_options(
     let resolved = merged.resolve();
     let overrides = config.models.get(&key).cloned().unwrap_or_default();
 
+    // Read from the GGUF header only — the weights are never mapped, so this
+    // costs no more than opening the file.
+    let layout = ozgent_llama::layout::read(&found.manifest.primary_weights(&found.dir));
+    let context_max = layout.map(|l| l.context_train).filter(|c| *c > 0);
+
     Ok(Json(ModelOptions {
         model: key,
         effective: serde_json::to_value(resolved_view(&resolved))?,
         overrides: serde_json::to_value(&overrides)?,
+        limits: serde_json::json!({
+            "context_length": context_max,
+            // Output cannot exceed the window it has to fit inside.
+            "max_tokens": context_max.unwrap_or(resolved.context_length),
+        }),
     }))
 }
 
@@ -650,25 +669,63 @@ async fn set_tool_config(
     AxumState(state): AxumState<State>,
     Json(body): Json<ToolUpdate>,
 ) -> ApiResult<StatusCode> {
-    let mut config = state.config.lock().unwrap();
+    // Scoped so the guard is provably gone before the await below: held
+    // across one, the handler's future is not `Send` and axum rejects it.
+    let snapshot = {
+        let mut config = state.config.lock().unwrap();
 
-    if let Some(enabled) = body.enabled {
-        config.tools.enabled = enabled;
-    }
-    if let Some(disabled) = body.disabled {
-        config.tools.disabled = disabled;
-    }
-    if let Some(provider) = &body.search_provider {
-        if !SEARCH_PROVIDERS.iter().any(|(n, _)| n == provider) {
-            return Err(ApiError(anyhow::anyhow!("unknown search provider {provider:?}")));
+        if let Some(enabled) = body.enabled {
+            config.tools.enabled = enabled;
         }
-        set_search_provider(&mut config, provider, body.api_key.as_deref());
-    }
+        if let Some(disabled) = body.disabled {
+            config.tools.disabled = disabled;
+        }
+        if let Some(provider) = &body.search_provider {
+            if !SEARCH_PROVIDERS.iter().any(|(n, _)| n == provider) {
+                return Err(ApiError(anyhow::anyhow!("unknown search provider {provider:?}")));
+            }
+            set_search_provider(&mut config, provider, body.api_key.as_deref());
+        }
 
-    config.save(&state.paths)?;
-    // The key lives in this file; it must not be world-readable.
-    harden(&state.paths.config_file());
+        config.save(&state.paths)?;
+        // The key lives in this file; it must not be world-readable.
+        harden(&state.paths.config_file());
+        config.clone()
+    };
+
+    // The host read its configuration when its interpreter started, so a new
+    // provider or key reaches it only through a new interpreter. Without this
+    // the page said "saved" and the old provider went on answering until the
+    // server was restarted.
+    restart_tools(&state, snapshot).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Replace the running tool host with one built from `config`.
+///
+/// A failure leaves the previous host in place rather than none at all: tools
+/// that were working should not stop because a new setting was rejected.
+async fn restart_tools(state: &State, config: ozgent_core::Config) {
+    // Each guard is bound and dropped before the next await: held across one,
+    // the handler's future stops being `Send` and axum will not take it.
+    let previous = if config.tools.enabled {
+        match crate::state::start_tools(&state.paths, &config).await {
+            Ok(fresh) => state.tools.lock().unwrap().replace(fresh),
+            Err(e) => {
+                tracing::warn!("keeping the running tools: restarting them failed: {e}");
+                return;
+            }
+        }
+    } else {
+        let taken = state.tools.lock().unwrap().take();
+        taken
+    };
+
+    // Shut the old interpreter down in the background: waiting for it to exit
+    // would add that delay to the request that asked for the change.
+    if let Some(old) = previous {
+        tokio::spawn(async move { old.host.shutdown().await });
+    }
 }
 
 /// Write the provider choice, and its key when one was supplied.

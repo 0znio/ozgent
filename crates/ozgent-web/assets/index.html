@@ -1,9 +1,22 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
   <title>ozgent</title>
+  <!-- Before the stylesheet, so the stored theme is in place for the first
+       paint. Deferred to app.js it would land a frame later, as a flash of the
+       other theme. The page used to carry a hard-coded data-theme="dark" here,
+       which made the light palette unreachable however the desktop was set. -->
+  <script>
+    try {
+      var saved = localStorage.getItem("ozgent-theme");
+      if (saved === "light" || saved === "dark") {
+        document.documentElement.setAttribute("data-theme", saved);
+      }
+    } catch (e) { /* private browsing; fall back to the system preference */ }
+  </script>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -16,6 +29,9 @@
       <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
       <div class="sidebar-foot">
         <button class="ghost-btn" id="open-settings">Settings</button>
+        <button class="ghost-btn theme" id="theme-toggle" aria-label="Colour theme">
+          <span class="theme-icon" aria-hidden="true"></span><span class="theme-name"></span>
+        </button>
       </div>
     </aside>
 
