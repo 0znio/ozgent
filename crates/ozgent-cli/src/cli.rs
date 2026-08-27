@@ -32,13 +32,24 @@ Running as a server:
   Point any OpenAI client at the API: set the base URL to
   http://127.0.0.1:7337/v1 and use any model name `ozgent list` shows.
 
+Tuning a run (all work on any command, and with `ozgent chat`):
+  ozgent chat coder --ctx 32k                  context length, or 8192, or 128k
+  ozgent chat coder --temp 0.2 --top-p 0.9     sampling
+  ozgent chat coder --top-k 40 --min-p 0.05
+  ozgent chat coder --think off --effort high  reasoning
+  ozgent chat coder -c 8k -t 0.7 -n 2k         short forms
+
+  Inside a chat, /config shows the same settings and changes them for good:
+  `/config ctx 32k`, `/config temp 0.2`, `/config top_p 0.9`.
+
 When something is wrong:
   ozgent doctor                                hardware, backends, misconfiguration
   ozgent logs --follow                         watch what ozgent is doing
   ozgent logs --path                           where the log file lives
   ozgent -v ...                                more detail on the terminal
 
-Full docs: docs/api.md (HTTP API), docs/tools.md (tools and permissions).";
+Full docs: docs/settings.md (every setting), docs/api.md (HTTP API),
+           docs/tools.md (tools and permissions).";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -310,8 +321,15 @@ pub struct OptionFlags {
     #[arg(long, value_name = "LEVEL", global = true)]
     pub effort: Option<ozgent_core::ReasoningEffort>,
 
-    /// Context length in tokens.
-    #[arg(long, short = 'c', value_name = "N", global = true)]
+    /// Context length in tokens. Accepts `8192`, `8k`, or `128k`.
+    #[arg(
+        long,
+        short = 'c',
+        visible_alias = "context",
+        value_name = "N",
+        global = true,
+        value_parser = ozgent_core::parse_count
+    )]
     pub ctx: Option<u32>,
 
     /// KV cache quantisation, e.g. `q8_0` or `f16`.
@@ -326,22 +344,38 @@ pub struct OptionFlags {
     #[arg(long, global = true)]
     pub no_flash_attn: bool,
 
-    /// Sampling temperature.
-    #[arg(long, short = 't', value_name = "T", global = true)]
+    /// Sampling temperature. Lower is more focused, higher more varied.
+    #[arg(long, short = 't', visible_alias = "temp", value_name = "T", global = true)]
     pub temperature: Option<f32>,
 
+    /// Nucleus sampling: consider tokens up to this cumulative probability.
     #[arg(long, value_name = "P", global = true)]
     pub top_p: Option<f32>,
 
+    /// Consider only the K most likely tokens. 0 disables the cutoff.
     #[arg(long, value_name = "K", global = true)]
     pub top_k: Option<u32>,
+
+    /// Penalise tokens by how often they have already appeared.
+    #[arg(long, value_name = "P", global = true)]
+    pub repeat_penalty: Option<f32>,
+
+    /// Minimum probability, relative to the most likely token.
+    #[arg(long, value_name = "P", global = true)]
+    pub min_p: Option<f32>,
 
     /// Seed, for reproducible output.
     #[arg(long, value_name = "N", global = true)]
     pub seed: Option<u32>,
 
-    /// Maximum tokens to generate. 0 means until the model stops.
-    #[arg(long, short = 'n', value_name = "N", global = true)]
+    /// Maximum tokens to generate. Accepts `2k`; 0 means until the model stops.
+    #[arg(
+        long,
+        short = 'n',
+        value_name = "N",
+        global = true,
+        value_parser = ozgent_core::parse_count
+    )]
     pub max_tokens: Option<u32>,
 
     /// System prompt text.
@@ -402,6 +436,8 @@ impl OptionFlags {
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,
+            min_p: self.min_p,
+            repeat_penalty: self.repeat_penalty,
             seed: self.seed,
             max_tokens: self.max_tokens,
             system_prompt,
@@ -545,6 +581,79 @@ mod tests {
         let opts = parse(&["ozgent", "--cache-type", "q4_0"]).options.to_options().unwrap();
         assert_eq!(opts.cache_type_k, Some(CacheType::Q4_0));
         assert_eq!(opts.cache_type_v, Some(CacheType::Q4_0));
+    }
+
+    #[test]
+    fn context_length_accepts_human_sizes() {
+        for (arg, expected) in [("8192", 8192), ("8k", 8192), ("128k", 131_072)] {
+            let opts = parse(&["ozgent", "--ctx", arg]).options.to_options().unwrap();
+            assert_eq!(opts.context_length, Some(expected), "for --ctx {arg}");
+        }
+    }
+
+    #[test]
+    fn max_tokens_accepts_human_sizes_too() {
+        // Both counts are token counts; accepting `k` on one and not the
+        // other is the kind of inconsistency users trip over once each.
+        let opts = parse(&["ozgent", "--max-tokens", "2k"]).options.to_options().unwrap();
+        assert_eq!(opts.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn a_bad_size_is_refused_at_parse_time() {
+        assert!(Cli::try_parse_from(["ozgent", "--ctx", "enormous"]).is_err());
+    }
+
+    #[test]
+    fn temp_is_accepted_as_well_as_temperature() {
+        let short = parse(&["ozgent", "--temp", "0.2"]).options.to_options().unwrap();
+        let long = parse(&["ozgent", "--temperature", "0.2"]).options.to_options().unwrap();
+        assert_eq!(short.temperature, Some(0.2));
+        assert_eq!(short.temperature, long.temperature);
+    }
+
+    #[test]
+    fn context_is_accepted_as_well_as_ctx() {
+        let a = parse(&["ozgent", "--context", "8k"]).options.to_options().unwrap();
+        let b = parse(&["ozgent", "-c", "8k"]).options.to_options().unwrap();
+        assert_eq!(a.context_length, Some(8192));
+        assert_eq!(a.context_length, b.context_length);
+    }
+
+    #[test]
+    fn every_sampling_knob_reaches_the_options_layer() {
+        let opts = parse(&[
+            "ozgent", "--temp", "0.3", "--top-p", "0.85", "--top-k", "40", "--min-p", "0.02",
+            "--repeat-penalty", "1.15",
+        ])
+        .options
+        .to_options()
+        .unwrap();
+        assert_eq!(opts.temperature, Some(0.3));
+        assert_eq!(opts.top_p, Some(0.85));
+        assert_eq!(opts.top_k, Some(40));
+        assert_eq!(opts.min_p, Some(0.02));
+        assert_eq!(opts.repeat_penalty, Some(1.15));
+    }
+
+    #[test]
+    fn the_new_flags_stay_absent_when_unused() {
+        // Same trap as `unset_flags_produce_an_empty_layer`: a default here
+        // would overwrite the config file for every user who never asked.
+        let opts = parse(&["ozgent"]).options.to_options().unwrap();
+        assert!(opts.min_p.is_none());
+        assert!(opts.repeat_penalty.is_none());
+        assert!(opts.context_length.is_none());
+        assert!(opts.max_tokens.is_none());
+    }
+
+    #[test]
+    fn help_shows_how_to_tune_a_run() {
+        // The flags existed before and were undiscoverable; that is what this
+        // guards, not their implementation.
+        for text in ["--ctx", "--temp", "--top-p", "--top-k", "/config"] {
+            assert!(GETTING_STARTED.contains(text), "{text} is missing from --help");
+        }
     }
 
     #[test]

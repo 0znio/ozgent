@@ -433,7 +433,11 @@ async fn writing_is_refused_unless_it_is_switched_on() {
         .call("write_file", json!({ "path": "new.txt", "content": "hi" }))
         .await
         .expect_err("writing must be opt-in");
-    assert!(err.for_model().contains("disabled"), "{}", err.for_model());
+    // The refusal has to say how to lift it; a bare "no" sends the user
+    // hunting through docs for a setting they cannot name.
+    let message = err.for_model();
+    assert!(message.contains("not permitted"), "{message}");
+    assert!(message.contains("write = true"), "must name the setting: {message}");
     assert!(!dir.0.join("new.txt").exists(), "nothing may be written");
     host.shutdown().await;
 }

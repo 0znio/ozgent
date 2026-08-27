@@ -206,7 +206,11 @@ pub struct Options {
     // --- model loading ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_layers: Option<GpuLayers>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accepts `8192` or `"8k"`; see `crate::tokens`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::tokens::deserialize_optional"
+    )]
     pub context_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<u32>,
@@ -264,7 +268,11 @@ pub struct Options {
     pub repeat_last_n: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accepts `2048` or `"2k"`; 0 means until the model stops.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::tokens::deserialize_optional"
+    )]
     pub max_tokens: Option<u32>,
 
     // --- session ---

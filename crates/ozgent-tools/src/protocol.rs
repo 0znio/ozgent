@@ -93,6 +93,10 @@ pub struct ToolManifest {
     pub input_schema: Value,
     #[serde(default)]
     pub output_schema: Option<Value>,
+    /// The Python file the tool was defined in. Empty when the worker is an
+    /// older build that did not report one, which is not worth an error.
+    #[serde(default)]
+    pub source: String,
 }
 
 impl From<ToolManifest> for ozgent_core::ToolSpec {

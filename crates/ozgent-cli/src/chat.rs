@@ -799,6 +799,9 @@ impl<'a> Chat<'a> {
     }
 
     /// Show or change settings for the current model, persisting them.
+    ///
+    /// The same names as the command-line flags, minus their dashes, so that
+    /// `--top-p 0.9` and `/config top_p 0.9` are one thing to learn.
     fn configure(&mut self, arg: &str) -> Result<()> {
         let dim = |t: &str| self.theme.style(Style::dim(), t);
         let mut parts = arg.split_whitespace();
@@ -807,12 +810,20 @@ impl<'a> Chat<'a> {
 
         if key.is_empty() {
             eprintln!("{}", dim(&format!("settings for {}:", self.model)));
-            eprintln!("{}", dim(&format!("  thinking     {:?}", self.opts.thinking)));
-            eprintln!("{}", dim(&format!("  temperature  {}", self.opts.temperature)));
-            eprintln!("{}", dim(&format!("  context      {}", self.opts.context_length)));
-            eprintln!("{}", dim(&format!("  gpu layers   {}", self.opts.gpu_layers)));
-            eprintln!("{}", dim(&format!("  tools        {}", self.opts.tools)));
-            eprintln!("{}", dim("set with /config <key> <value>; keys: thinking, temperature, tools"));
+            eprintln!("{}", dim(&format!("  thinking        {:?}", self.opts.thinking)));
+            eprintln!("{}", dim(&format!("  effort          {:?}", self.opts.reasoning_effort)));
+            eprintln!("{}", dim(&format!("  temperature     {}", self.opts.temperature)));
+            eprintln!("{}", dim(&format!("  top_p           {}", self.opts.top_p)));
+            eprintln!("{}", dim(&format!("  top_k           {}", self.opts.top_k)));
+            eprintln!("{}", dim(&format!("  min_p           {}", self.opts.min_p)));
+            eprintln!("{}", dim(&format!("  repeat_penalty  {}", self.opts.repeat_penalty)));
+            eprintln!("{}", dim(&format!("  max_tokens      {}", self.opts.max_tokens)));
+            let seed = self.opts.seed.map_or("random".to_string(), |s| s.to_string());
+            eprintln!("{}", dim(&format!("  seed            {seed}")));
+            eprintln!("{}", dim(&format!("  ctx             {}", self.opts.context_length)));
+            eprintln!("{}", dim(&format!("  gpu layers      {}", self.opts.gpu_layers)));
+            eprintln!("{}", dim(&format!("  tools           {}", self.opts.tools)));
+            eprintln!("{}", dim(&format!("set with /config <key> <value>; keys: {SETTABLE}")));
             return Ok(());
         }
         if value.is_empty() {
@@ -839,16 +850,71 @@ impl<'a> Chat<'a> {
                 self.opts.temperature = t;
                 layer.temperature = Some(t);
             }
+            "top_p" | "top-p" => {
+                let p: f32 = value.parse().context("top_p must be a number")?;
+                self.opts.top_p = p;
+                layer.top_p = Some(p);
+            }
+            "top_k" | "top-k" => {
+                let k: u32 = value.parse().context("top_k must be a whole number")?;
+                self.opts.top_k = k;
+                layer.top_k = Some(k);
+            }
+            "min_p" | "min-p" => {
+                let p: f32 = value.parse().context("min_p must be a number")?;
+                self.opts.min_p = p;
+                layer.min_p = Some(p);
+            }
+            "repeat_penalty" | "repeat-penalty" => {
+                let p: f32 = value.parse().context("repeat_penalty must be a number")?;
+                self.opts.repeat_penalty = p;
+                layer.repeat_penalty = Some(p);
+            }
+            "max_tokens" | "max-tokens" => {
+                let n = ozgent_core::parse_count(&value).map_err(|e| anyhow::anyhow!(e))?;
+                self.opts.max_tokens = n;
+                layer.max_tokens = Some(n);
+            }
+            "seed" => {
+                let n: u32 = value.parse().context("seed must be a whole number")?;
+                self.opts.seed = Some(n);
+                layer.seed = Some(n);
+            }
+            // Context length is fixed when the weights are loaded, so this
+            // one is saved but deliberately not applied to the live session:
+            // claiming a change the KV cache never saw would be a lie the
+            // user only discovers when the model runs out of room.
+            "ctx" | "context" | "context_length" => {
+                let n = ozgent_core::parse_count(&value).map_err(|e| anyhow::anyhow!(e))?;
+                layer.context_length = Some(n);
+                let entry = self.config.models.entry(self.model.to_string()).or_default();
+                *entry = entry.clone().merge(&layer);
+                self.config.save(&self.paths)?;
+                eprintln!(
+                    "{}",
+                    dim(&format!(
+                        "· ctx = {n} (saved; applies when the model is next loaded, \
+                         currently {})",
+                        self.opts.context_length
+                    ))
+                );
+                return Ok(());
+            }
             "tools" => {
                 let on = matches!(value.as_str(), "on" | "true" | "yes" | "1");
                 self.opts.tools = on;
                 layer.tools = Some(on);
             }
             other => {
-                eprintln!("{}", dim(&format!("unknown setting {other:?}; try thinking, effort, temperature, tools")));
+                eprintln!("{}", dim(&format!("unknown setting {other:?}; try {SETTABLE}")));
                 return Ok(());
             }
         }
+
+        // Sampling changes only reach generation through the sampler, which is
+        // rebuilt from these options; without this the value is printed as set
+        // and every following turn still uses the old one.
+        self.session.set_options(&self.opts);
 
         let entry = self.config.models.entry(self.model.to_string()).or_default();
         *entry = entry.clone().merge(&layer);
@@ -1245,6 +1311,12 @@ fn truncate_result(s: &str) -> String {
 
 
 
+/// Setting names `/config` accepts, listed for the user in one place so the
+/// listing, the error and `/help` cannot drift apart.
+const SETTABLE: &str =
+    "thinking, effort, temperature, top_p, top_k, min_p, repeat_penalty, max_tokens, seed, \
+     ctx, tools";
+
 const HELP: &str = "\
 /help              this list
 /exit              quit
@@ -1255,7 +1327,10 @@ const HELP: &str = "\
 /remember <fact>   pin a fact for this and future chats
 /memory            what is remembered
 /models [name]     list models, or switch to one
-/config [k] [v]    show or change this model's settings
+/config [k] [v]    show or change this model's settings, saved for next time
+                   temperature, top_p, top_k, min_p, repeat_penalty, max_tokens,
+                   seed, thinking, effort, tools, and ctx (applies on next load)
+                   sizes take k/m: /config ctx 32k
 /tools             list available tools
 /tools <t> <prov>  point a tool at a provider, e.g. /tools web_search brave
 /call <request>    force a tool call, constrained by grammar

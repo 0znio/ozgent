@@ -36,6 +36,9 @@ class Tool:
     is_async: bool = False
     # Settings from ``[tools.config.<name>]``, injected before the first call.
     config: dict[str, Any] = field(default_factory=dict)
+    #: The file this tool was defined in. Reported to the user so that
+    #: "where does this tool come from" has an answer without grepping.
+    source: str = ""
 
     async def invoke(self, arguments: dict[str, Any]) -> Any:
         """Run the tool, off the event loop if it is synchronous.
@@ -54,10 +57,24 @@ class Tool:
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema,
+            "source": self.source,
         }
         if self.output_schema is not None:
             out["output_schema"] = self.output_schema
         return out
+
+
+def _source_of(fn: Callable[..., Any]) -> str:
+    """The file a tool function was defined in, or "" if it has none.
+
+    ``inspect.getfile`` raises for anything without one — a function built at
+    the REPL or by ``exec`` — and a tool that declines to say where it lives
+    is not a reason to refuse to register it.
+    """
+    try:
+        return inspect.getfile(fn)
+    except (TypeError, OSError):
+        return ""
 
 
 def tool(
@@ -91,6 +108,7 @@ def tool(
             input_schema=schema_from_signature(fn),
             output_schema=output_schema,
             is_async=inspect.iscoroutinefunction(fn),
+            source=_source_of(fn),
         )
         REGISTRY[tool_name] = entry
         # The function stays directly callable so tools can be unit-tested

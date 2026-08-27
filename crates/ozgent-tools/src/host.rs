@@ -126,6 +126,10 @@ pub struct ToolHost {
     pending: Pending,
     next_id: AtomicU64,
     tools: Vec<ToolSpec>,
+    /// Where each tool was defined, by name. Kept beside the specs rather
+    /// than inside them: a `ToolSpec` is what the model is shown, and a
+    /// filesystem path is neither useful nor safe to put there.
+    sources: HashMap<String, String>,
     /// Tool files that failed to import, reported once at startup.
     load_errors: Vec<String>,
     timeout: Duration,
@@ -167,6 +171,7 @@ impl ToolHost {
             pending,
             next_id: AtomicU64::new(1),
             tools: Vec::new(),
+            sources: HashMap::new(),
             load_errors: Vec::new(),
             timeout: cfg.timeout,
             worker_version: String::new(),
@@ -203,6 +208,12 @@ impl ToolHost {
             warn!(target: "ozgent::tools", "tool failed to load: {err}");
         }
 
+        self.sources = init
+            .tools
+            .iter()
+            .filter(|t| !t.source.is_empty())
+            .map(|t| (t.name.clone(), t.source.clone()))
+            .collect();
         self.tools = init.tools.into_iter().map(Into::into).collect();
         self.load_errors = init.errors;
         self.worker_version = init.worker_version;
@@ -225,6 +236,11 @@ impl ToolHost {
 
     pub fn worker_version(&self) -> &str {
         &self.worker_version
+    }
+
+    /// The Python file a tool was defined in, if the worker reported one.
+    pub fn source_of(&self, name: &str) -> Option<&str> {
+        self.sources.get(name).map(String::as_str)
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {

@@ -337,3 +337,40 @@ class WorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_every_builtin_lives_in_its_own_file():
+    """One tool per file, and the file is the tool's name.
+
+    The layout is only worth anything if it holds: a second tool quietly
+    added to an existing file is exactly the drift this prevents.
+    """
+    from ozgent_tools import builtin
+    from ozgent_tools.base import REGISTRY
+    import importlib
+    from pathlib import Path
+
+    modules = builtin.discover()
+    for mod in modules:
+        importlib.import_module(f"ozgent_tools.builtin.{mod}")
+
+    builtin_dir = Path(builtin.__file__).parent
+    defined_here = {
+        name: Path(t.source)
+        for name, t in REGISTRY.items()
+        if t.source and Path(t.source).parent == builtin_dir
+    }
+
+    assert set(defined_here) == set(modules), (
+        f"tool names {sorted(defined_here)} must match files {sorted(modules)}"
+    )
+    for name, path in defined_here.items():
+        assert path.stem == name, f"{name} is defined in {path.name}, not {name}.py"
+
+
+def test_a_tool_reports_the_file_it_came_from():
+    from ozgent_tools.base import REGISTRY
+    import ozgent_tools.builtin.read_file  # noqa: F401
+
+    assert REGISTRY["read_file"].source.endswith("read_file.py")
+    assert "source" in REGISTRY["read_file"].spec()

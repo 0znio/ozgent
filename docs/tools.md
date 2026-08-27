@@ -19,6 +19,32 @@ grant is one people disable wholesale.
 | `fetch_url` | read a web page | **`network = true`** |
 | `get_temperature` | example tool | — |
 
+## Where they live
+
+One tool per file, and the file is named after the tool. The six built-ins are
+in `python/ozgent_tools/builtin/` — `read_file.py`, `list_dir.py`,
+`web_search.py`, `write_file.py`, `run_command.py`, `fetch_url.py`. The
+seventh, `get_temperature`, is the example in `~/ozgent/tools/`, which is where
+your own go.
+
+`ozgent tools list` prints the file each tool came from, so the two are never
+in doubt:
+
+```
+$ ozgent tools list
+7 tools · python 3.14.6 · worker 0.1.0
+
+read_file
+  ~/ozgent/lib/python/ozgent_tools/builtin/read_file.py
+  Read a file, or the parts of it relevant to a query.
+...
+get_temperature
+  ~/ozgent/tools/demo.py
+  Get the current temperature for a city.
+```
+
+Adding one is adding a file to `~/ozgent/tools/`; see [Adding your own tool](#adding-your-own-tool).
+
 ## Configuring
 
 All of it lives in `~/ozgent/configs/config.toml`:

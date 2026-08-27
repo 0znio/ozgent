@@ -51,8 +51,11 @@ log "copying python tools"
 
 cp "$REPO/scripts/install.sh" "$STAGE/install.sh"
 chmod 755 "$STAGE/install.sh"
+# The whole directory, not a named list: a list silently ships nothing when a
+# doc is added and nobody remembers to add it here.
 mkdir -p "$STAGE/docs"
-cp "$REPO/docs/api.md" "$REPO/docs/tools.md" "$STAGE/docs/" 2>/dev/null || true
+cp "$REPO"/docs/*.md "$STAGE/docs/"
+log "docs: $(ls "$STAGE/docs" | tr '\n' ' ')"
 
 # What the target has to provide. Read by install.sh, and by anyone wondering
 # why it refused.

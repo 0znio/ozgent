@@ -522,6 +522,12 @@ async fn tools(paths: &Paths, config: &Config, command: ToolsCommand) -> Result<
             );
             for t in host.tools() {
                 println!("\n{}", t.name);
+                // One tool per file is the layout; saying which file makes
+                // that visible, and tells anyone adding their own where the
+                // built-ins live to copy from.
+                if let Some(source) = host.source_of(&t.name) {
+                    println!("  {}", shorten_home(source));
+                }
                 if !t.description.is_empty() {
                     for line in t.description.lines() {
                         println!("  {line}");
@@ -973,6 +979,19 @@ fn b_total(bar: &ozgent_hub::Bar) -> u64 {
     bar.total()
 }
 
+/// Replace the home directory with `~`, so a path fits on one line.
+///
+/// Purely cosmetic, and deliberately conservative: anything not under home is
+/// printed as it is rather than shortened by guesswork.
+fn shorten_home(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else { return path.to_string() };
+    let home = home.to_string_lossy().into_owned();
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
@@ -990,6 +1009,19 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_path_outside_home_is_left_alone() {
+        assert_eq!(super::shorten_home("/usr/lib/ozgent/x.py"), "/usr/lib/ozgent/x.py");
+    }
+
+    #[test]
+    fn home_itself_is_not_mistaken_for_a_prefix() {
+        // `/home/alice-backup` starts with `/home/alice` but is not inside it.
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let sibling = format!("{}-backup/x.py", home.to_string_lossy());
+        assert_eq!(super::shorten_home(&sibling), sibling);
+    }
+
     use super::*;
 
     #[test]
