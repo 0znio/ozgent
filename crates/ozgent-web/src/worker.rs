@@ -418,7 +418,14 @@ fn turn(
 
     // Constrain the body of a tool call the moment one starts, so a malformed
     // call is unreachable rather than emitted and then rejected.
-    session.set_tools(&offered);
+    // Same reasoning as the terminal client: the gate's grammar is for the
+    // JSON body ozgent's preamble describes, so it is withheld from a model
+    // that was given its own format instead.
+    if engine.template_handles_tools() {
+        session.set_tools(&[]);
+    } else {
+        session.set_tools(&offered);
+    }
 
     // The session outlives the request, so a grammar left installed by an
     // earlier one would silently shape this reply. Cleared unconditionally
@@ -454,7 +461,12 @@ fn turn(
             *last = Message::user(text);
         }
     }
-    if !offered.is_empty() {
+    // A template with its own tools block tells the model the call format it
+    // was trained on; ozgent's generic description would be a second one, in
+    // a different syntax, and the model splits the difference.
+    let native_tools = engine.template_handles_tools();
+
+    if !offered.is_empty() && !native_tools {
         // The tool description joins the system prompt rather than replacing
         // it, so a user-set persona survives.
         let preamble = ozgent_tools::tool_preamble(&offered);
@@ -540,7 +552,7 @@ fn turn(
             .then(|| projector.map(|p| (p, &images[..], &request.images[..])))
             .flatten();
         let (reply, stats, reason) =
-            generate(engine, session, resolved, thinking, &messages, media, request)?;
+            generate(engine, session, resolved, thinking, &messages, media, request, &offered)?;
         // A turn can span several generations; the client is told once, at the
         // end, with the totals. Sending `Done` per round ended the SSE stream
         // before the first tool had even run.
@@ -568,8 +580,32 @@ fn turn(
         if last || !parsed.has_calls() {
             break;
         }
-        // The visible part of the reply is whatever preceded the call.
-        messages.push(Message::assistant(parsed.text.clone()));
+        // The visible part of the reply is whatever preceded the call — and
+        // the call itself, which used to be dropped. The model was handed a
+        // tool result with no record of having asked for it.
+        messages.push(if native_tools {
+            Message {
+                role: ozgent_core::Role::Assistant,
+                content: vec![ozgent_core::Part::Text { text: parsed.text.clone() }],
+                thinking: None,
+                tool_calls: parsed.calls.clone(),
+                tool_call_id: None,
+            }
+        } else {
+            // The fallback renderers read only `content`, so the call has to
+            // be spelt out — in the format the preamble described.
+            let calls: String = parsed
+                .calls
+                .iter()
+                .map(|c| {
+                    format!(
+                        "<tool_call>{{\"name\": \"{}\", \"arguments\": {}}}</tool_call>",
+                        c.name, c.arguments
+                    )
+                })
+                .collect();
+            Message::assistant(format!("{}{calls}", parsed.text))
+        });
 
         // A call the caller owns ends the turn: this process has no code for
         // it, so the call is handed back to be run there. Checked before the
@@ -859,8 +895,10 @@ fn generate(
     messages: &[Message],
     media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media], &[ozgent_core::ImageSource])>,
     request: &Request,
+    tools: &[ozgent_core::ToolSpec],
 ) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason)> {
-    let prompt = engine.render_prompt_with(messages, thinking, resolved.reasoning_effort)?;
+    let prompt =
+        engine.render_prompt_full(messages, thinking, resolved.reasoning_effort, tools)?;
     let mut filter = ThinkingFilter::new(thinking);
     if let Some(close) = Engine::stream_starts_inside(&prompt) {
         filter = filter.starting_inside(close);

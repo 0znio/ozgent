@@ -227,7 +227,12 @@ async fn run_one(
     // after paying for it, while gating stops it being generated at all.
     if let Some(host) = &chat.tools {
         let specs = host.tools().to_vec();
-        chat.session.set_tools(&specs);
+        // Withheld from a model whose template writes calls in its own
+        // syntax: the grammar describes the JSON body ozgent's preamble asks
+        // for, and that preamble was not sent.
+        if !engine.template_handles_tools() {
+            chat.session.set_tools(&specs);
+        }
     }
 
     chat.banner();
@@ -390,20 +395,34 @@ impl<'a> Chat<'a> {
                     Err(e) => e.for_model(),
                 };
 
+                // Structured when the template can render a call itself, so
+                // it writes the syntax this model was trained on. Spelt out
+                // as text when it cannot: the fallback renderers read only
+                // `content`, and a structured call would vanish from the
+                // history entirely — and the text form is the one ozgent's
+                // preamble described to the model in that case anyway.
+                let (content, tool_calls) = if self.engine.template_handles_tools() {
+                    (Vec::new(), vec![call.clone()])
+                } else {
+                    (
+                        vec![ozgent_core::Part::Text {
+                            text: format!(
+                                "<tool_call>{{\"name\": \"{}\", \"arguments\": {}}}</tool_call>",
+                                call.name, call.arguments
+                            ),
+                        }],
+                        Vec::new(),
+                    )
+                };
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: vec![ozgent_core::Part::Text {
-                        text: format!(
-                            "<tool_call>{{\"name\": \"{}\", \"arguments\": {}}}</tool_call>",
-                            call.name, call.arguments
-                        ),
-                    }],
+                    content,
                     // The reasoning that led to this call, so the next round
                     // sees why it was made. Dropped, the template writes an
                     // empty `<think></think>` for the turn and the model
                     // continues from a history saying it never reasoned.
                     thinking: reply.thinking.clone(),
-                    tool_calls: Vec::new(),
+                    tool_calls,
                     tool_call_id: None,
                 });
                 messages.push(Message::tool_result(call.id.clone(), truncate_result(&result)));
@@ -483,8 +502,13 @@ impl<'a> Chat<'a> {
         // were the last thing read and the model reached for a search anyway.
         let media_note = self.media_observation.as_deref().map(grounded_note);
 
+        // A template with its own tools block already tells the model the
+        // format it was trained on. Adding ozgent's generic description then
+        // gives it two, in different syntaxes, and it splits the difference.
+        let native_tools = self.engine.template_handles_tools();
+
         let system = match (&dated, &self.tools) {
-            (base, Some(host)) if !host.tools().is_empty() => {
+            (base, Some(host)) if !host.tools().is_empty() && !native_tools => {
                 let mut text = base.clone().unwrap_or_default();
                 if !text.is_empty() {
                     text.push_str("\n\n");
@@ -593,7 +617,14 @@ impl<'a> Chat<'a> {
     }
 
     fn generate_inner(&mut self, messages: &[Message]) -> Result<Reply> {
-        let prompt = self.engine.render_prompt_with(messages, self.opts.thinking, self.opts.reasoning_effort)?;
+        let offered: &[ozgent_core::ToolSpec] =
+            self.tools.as_ref().map(|h| h.tools()).unwrap_or(&[]);
+        let prompt = self.engine.render_prompt_full(
+            messages,
+            self.opts.thinking,
+            self.opts.reasoning_effort,
+            offered,
+        )?;
         // Images belong to this turn only: once evaluated they are resident in
         // the cache, and re-sending them would duplicate them in the context.
         let pending_images = std::mem::take(&mut self.pending_images);

@@ -100,6 +100,14 @@ pub fn extract(output: &str) -> Parsed {
                 calls.push(call);
             }
         }
+        // Ling 3.0 names the function on the opener's own line and then
+        // lists `<arg_key>`/`<arg_value>` pairs — a third format again, and
+        // the reason its calls used to cost a grammar retry every round.
+        if calls.len() == before {
+            if let Some(call) = from_arg_pairs(body, name.as_deref()) {
+                calls.push(call);
+            }
+        }
         if calls.len() == before {
             harvest(body, name.as_deref(), &mut calls);
         }
@@ -136,6 +144,70 @@ fn next_opener(text: &str) -> Option<(usize, &'static str, Option<&'static str>)
 }
 
 /// Pull every JSON object or array of objects out of a tool-call body.
+/// Parse `<arg_key>k</arg_key><arg_value>v</arg_value>` pairs.
+///
+/// Ling 3.0's format, which puts the function name directly after the opener:
+///
+/// ```text
+/// <tool_call>web_search
+/// <arg_key>query</arg_key>
+/// <arg_value>llama.cpp</arg_value>
+/// </tool_call>
+/// ```
+///
+/// `name` is used when the marker already carried one; otherwise the first
+/// line of the body is the name. Returns `None` when there is no `<arg_key>`
+/// at all, so a JSON body falls through to `harvest`.
+fn from_arg_pairs(body: &str, name: Option<&str>) -> Option<ToolCall> {
+    const KEY_OPEN: &str = "<arg_key>";
+    const KEY_CLOSE: &str = "</arg_key>";
+    const VAL_OPEN: &str = "<arg_value>";
+    const VAL_CLOSE: &str = "</arg_value>";
+
+    let first_key = body.find(KEY_OPEN)?;
+    let name = match name {
+        Some(n) => n.to_string(),
+        // Everything before the first key, which is the name on its own line.
+        None => {
+            let head = body[..first_key].trim();
+            let head = head.lines().next().unwrap_or("").trim();
+            if head.is_empty() {
+                return None;
+            }
+            head.to_string()
+        }
+    };
+
+    let mut arguments = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(k) = rest.find(KEY_OPEN) {
+        let after_key = &rest[k + KEY_OPEN.len()..];
+        let Some(k_end) = after_key.find(KEY_CLOSE) else { break };
+        let key = after_key[..k_end].trim().to_string();
+
+        let after = &after_key[k_end + KEY_CLOSE.len()..];
+        let Some(v) = after.find(VAL_OPEN) else { break };
+        let after_val = &after[v + VAL_OPEN.len()..];
+        // An unclosed final value still carries its text; a call cut off by
+        // the token limit is better read than thrown away.
+        let (raw, consumed) = match after_val.find(VAL_CLOSE) {
+            Some(end) => (&after_val[..end], end + VAL_CLOSE.len()),
+            None => (after_val, after_val.len()),
+        };
+
+        if !key.is_empty() {
+            arguments.insert(key, coerce(raw.trim()));
+        }
+        rest = &after_val[consumed..];
+    }
+
+    (!arguments.is_empty()).then(|| ToolCall {
+        id: String::new(),
+        name,
+        arguments: Value::Object(arguments),
+    })
+}
+
 /// Split `<function=name>…</function>` into its name and its body.
 ///
 /// Returns `None` when there is no function marker, leaving the body to be
@@ -704,6 +776,53 @@ mod native_format_tests {
         let p = extract(call);
         assert_eq!(p.calls.len(), 1, "{:?}", p);
         assert_eq!(p.calls[0].arguments["q"], "something");
+    }
+
+    const LING_CALL: &str = concat!(
+        "<tool_call>web_search\n",
+        "<arg_key>query</arg_key>\n<arg_value>llama.cpp</arg_value>\n",
+        "<arg_key>count</arg_key>\n<arg_value>5</arg_value>\n",
+        "</tool_call>"
+    );
+
+    #[test]
+    fn lings_own_format_is_parsed() {
+        // Ling names the function on the opener's line. Unparsed, every call
+        // it made cost a grammar retry and pushed it off its own format.
+        let p = extract(LING_CALL);
+        assert_eq!(p.calls.len(), 1, "{p:?}");
+        assert_eq!(p.calls[0].name, "web_search");
+        assert_eq!(p.calls[0].arguments["query"], "llama.cpp");
+        assert_eq!(p.calls[0].arguments["count"], 5);
+    }
+
+    #[test]
+    fn a_ling_call_with_no_arguments_is_not_a_call() {
+        // `<tool_call>` around prose must not become a call named after the
+        // first line of that prose.
+        assert!(extract("<tool_call>I was thinking about this</tool_call>").calls.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_ling_value_is_still_read() {
+        let call = "<tool_call>web_search\n<arg_key>query</arg_key>\n<arg_value>llama";
+        let p = extract(call);
+        assert_eq!(p.calls.len(), 1, "{p:?}");
+        assert_eq!(p.calls[0].arguments["query"], "llama");
+    }
+
+    #[test]
+    fn all_three_formats_coexist() {
+        // One parser, three vocabularies; adding one must not cost another.
+        for (label, text) in [
+            ("qwen", CALL),
+            ("ling", LING_CALL),
+            ("json", r#"<tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_call>"#),
+        ] {
+            let p = extract(text);
+            assert_eq!(p.calls.len(), 1, "{label}: {p:?}");
+            assert_eq!(p.calls[0].name, "web_search", "{label}");
+        }
     }
 
     #[test]

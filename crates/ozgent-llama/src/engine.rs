@@ -371,6 +371,30 @@ impl Engine {
         thinking: ozgent_core::ThinkingMode,
         effort: ozgent_core::ReasoningEffort,
     ) -> Result<String, EngineError> {
+        self.render_prompt_full(messages, thinking, effort, &[])
+    }
+
+    /// Whether the model's template describes tools to the model itself.
+    ///
+    /// Callers use this to decide whether to add ozgent's generic preamble:
+    /// when the template has its own tools block, the model is told its own
+    /// call format, and a second description of a different one is worse than
+    /// either alone.
+    pub fn template_handles_tools(&self) -> bool {
+        self.jinja.as_ref().is_some_and(|j| j.handles_tools())
+    }
+
+    /// Render, offering `tools` to a template that can describe them.
+    ///
+    /// Passing tools a template cannot use is harmless — the key is simply
+    /// unread — so the caller does not have to check first.
+    pub fn render_prompt_full(
+        &self,
+        messages: &[Message],
+        thinking: ozgent_core::ThinkingMode,
+        effort: ozgent_core::ReasoningEffort,
+        tools: &[ozgent_core::ToolSpec],
+    ) -> Result<String, EngineError> {
         let suppress = thinking == ozgent_core::ThinkingMode::Off && self.reasoning;
 
         // The model's own template first. It is the only thing that knows
@@ -396,6 +420,7 @@ impl Engine {
                     ozgent_core::ThinkingMode::Off => false,
                     ozgent_core::ThinkingMode::Auto => self.reasoning,
                 }),
+                tools: tools.iter().map(crate::template::tool_json).collect(),
                 ..Default::default()
             };
             match jinja.render(messages, opts) {
@@ -1400,6 +1425,13 @@ impl<'a> Session<'a> {
     /// Compiling here rather than per turn keeps schema-to-GBNF conversion —
     /// which does not depend on the conversation — off the generation path.
     /// Passing an empty slice disables gating.
+    /// Constrain the body of a tool call once one starts.
+    ///
+    /// Pass an empty slice for a model whose template writes tool calls
+    /// itself. The gate's grammar describes a JSON body, which is the format
+    /// ozgent's own preamble asks for — applied to a model emitting its
+    /// native `<function=…><parameter=…>` syntax it would force the wrong
+    /// language at exactly the moment the call begins.
     pub fn set_tools(&mut self, tools: &[ozgent_core::ToolSpec]) {
         self.tool_grammars = ToolGate::compile(tools);
     }

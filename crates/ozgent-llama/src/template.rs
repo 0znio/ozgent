@@ -17,8 +17,8 @@
 //! back to llama.cpp's built-in, which is what ozgent used before and is still
 //! right for the many models whose templates the built-ins render exactly.
 
-use std::collections::BTreeMap;
 
+use minijinja::value::Kwargs;
 use minijinja::{Environment, Value, context};
 use ozgent_core::{Message, Role};
 
@@ -27,6 +27,13 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     bos: String,
     eos: String,
+    /// Whether this template documents tools to the model itself.
+    ///
+    /// Probed once at compile time rather than guessed from the source, and
+    /// it decides something important: a template with a `tools` block tells
+    /// the model its *own* call format, so ozgent's generic preamble would be
+    /// a second, contradictory instruction. See [`Self::handles_tools`].
+    handles_tools: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,12 +61,38 @@ pub struct RenderOptions {
     /// one. Only some templates read this; for the rest it is inert and the
     /// budget remains the only control.
     pub reasoning_effort: Option<String>,
+    /// Tools to describe, in the shape `apply_chat_template` passes them:
+    /// `{"type": "function", "function": {name, description, parameters}}`.
+    /// Empty leaves `tools` undefined, which every template treats as "none".
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl Default for RenderOptions {
     fn default() -> Self {
-        Self { add_generation_prompt: true, enable_thinking: None, reasoning_effort: None }
+        Self {
+            add_generation_prompt: true,
+            enable_thinking: None,
+            reasoning_effort: None,
+            tools: Vec::new(),
+        }
     }
+}
+
+/// One tool in the form templates expect.
+///
+/// The OpenAI wrapper, not the bare schema: it is what `apply_chat_template`
+/// passes and therefore what the model saw during training. Qwen's template
+/// renders each entry with `| tojson` straight into its `<tools>` block, so
+/// the shape reaches the model verbatim.
+pub fn tool_json(spec: &ozgent_core::ToolSpec) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.input_schema,
+        }
+    })
 }
 
 impl ChatTemplate {
@@ -70,13 +103,57 @@ impl ChatTemplate {
         // methods on their values — `.split()`, `.rstrip()`, `.startswith()`.
         // Without this every one of them is an unknown-method error.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // Python's `json.dumps` keywords, which real templates pass and
+        // minijinja's own `tojson` rejects as unknown. Ling 3.0 calls
+        // `tojson(ensure_ascii=False)`, and the error aborted the whole
+        // template — silently, into llama.cpp's built-in, which does not open
+        // the reasoning block Ling's own template ends inside.
+        env.add_filter("tojson", tojson);
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
         env.set_lstrip_blocks(true);
         env.set_trim_blocks(true);
         env.add_template_owned("chat", source.to_string())
             .map_err(|e| TemplateError::Compile(e.to_string()))?;
-        Ok(Self { env, bos, eos })
+        let mut tmpl = Self { env, bos, eos, handles_tools: false };
+        tmpl.handles_tools = tmpl.probe_tools();
+        Ok(tmpl)
+    }
+
+    /// Whether the template documents tools to the model.
+    ///
+    /// When true, passing tools makes the template write the model's *own*
+    /// call format, and ozgent's generic preamble must be left out — two
+    /// descriptions of two different formats is worse than either alone.
+    pub fn handles_tools(&self) -> bool {
+        self.handles_tools
+    }
+
+    /// Detect a `tools` block by rendering one and looking for it.
+    ///
+    /// Probed rather than pattern-matched on the source: the word "tools"
+    /// appears in the prose of templates that have no tool support at all,
+    /// and a false positive here silently removes the only instructions a
+    /// model would have received.
+    fn probe_tools(&self) -> bool {
+        const SENTINEL: &str = "ozgent_probe_tool_name";
+        let probe = [Message::user("x")];
+        let opts = RenderOptions {
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": SENTINEL,
+                    "description": "probe",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            })],
+            ..Default::default()
+        };
+        match self.render(&probe, opts) {
+            Ok(out) => out.contains(SENTINEL),
+            // A template that cannot render with tools cannot be given them.
+            Err(_) => false,
+        }
     }
 
     /// Render a conversation into a prompt the model should continue.
@@ -90,33 +167,17 @@ impl ChatTemplate {
             .get_template("chat")
             .map_err(|e| TemplateError::Render(e.to_string()))?;
 
-        let turns: Vec<BTreeMap<&str, String>> = messages
-            .iter()
-            .map(|m| {
-                let mut turn = BTreeMap::new();
-                turn.insert("role", role_name(m.role).to_string());
-                turn.insert("content", m.text_content());
-                // The model's own reasoning, under the name every template
-                // that supports one uses. Qwen 3.5 reads `reasoning_content`
-                // and, finding none, writes an empty `<think></think>` for
-                // the turn — which tells the model it did not reason on a
-                // turn where it did. Across a tool-calling loop that erases
-                // its whole chain of thought.
-                if let Some(reasoning) = &m.thinking {
-                    if !reasoning.trim().is_empty() {
-                        turn.insert("reasoning_content", reasoning.clone());
-                    }
-                }
-                turn
-            })
-            .collect();
+        let turns: Vec<serde_json::Value> = messages.iter().map(turn_json).collect();
 
         let mut ctx = context! {
-            messages => turns,
+            messages => Value::from_serialize(&turns),
             add_generation_prompt => opts.add_generation_prompt,
             bos_token => self.bos,
             eos_token => self.eos,
         };
+        if !opts.tools.is_empty() {
+            ctx = context! { tools => Value::from_serialize(&opts.tools), ..ctx };
+        }
         if let Some(on) = opts.enable_thinking {
             ctx = context! { enable_thinking => on, ..ctx };
         }
@@ -128,6 +189,55 @@ impl ChatTemplate {
     }
 }
 
+/// One message in the shape templates read it.
+///
+/// Deliberately omits any key the message does not carry: templates test with
+/// `is defined` and `if message.tool_calls`, so a present-but-empty key is not
+/// the same as an absent one.
+fn turn_json(m: &Message) -> serde_json::Value {
+    let mut turn = serde_json::Map::new();
+    turn.insert("role".into(), role_name(m.role).into());
+    turn.insert("content".into(), m.text_content().into());
+
+    // The model's own reasoning, under the name every template that supports
+    // one uses. Qwen 3.5 reads `reasoning_content` and, finding none, writes
+    // an empty `<think></think>` for the turn — which tells the model it did
+    // not reason on a turn where it did. Across a tool-calling loop that
+    // erases its whole chain of thought.
+    if let Some(reasoning) = &m.thinking {
+        if !reasoning.trim().is_empty() {
+            turn.insert("reasoning_content".into(), reasoning.clone().into());
+        }
+    }
+
+    if !m.tool_calls.is_empty() {
+        // `arguments` stays an object rather than a JSON string. Qwen's
+        // template iterates it to write one `<parameter=name>` block per
+        // entry; handed a string it renders nothing and the call is silently
+        // dropped from the history.
+        let calls: Vec<serde_json::Value> = m
+            .tool_calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        turn.insert("tool_calls".into(), calls.into());
+    }
+
+    if let Some(id) = &m.tool_call_id {
+        turn.insert("tool_call_id".into(), id.clone().into());
+        // Some templates key the response off the name instead of the id.
+        turn.insert("name".into(), id.clone().into());
+    }
+
+    serde_json::Value::Object(turn)
+}
+
 fn role_name(role: Role) -> &'static str {
     match role {
         Role::System => "system",
@@ -135,6 +245,50 @@ fn role_name(role: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     }
+}
+
+/// `tojson`, accepting the keywords `json.dumps` takes.
+///
+/// `ensure_ascii` is honoured rather than merely tolerated: a template that
+/// asks for escaped output and receives raw UTF-8 is being given something
+/// other than what it asked for, and the difference reaches the model.
+fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent").unwrap_or(None);
+    let ensure_ascii: bool = kwargs.get("ensure_ascii").unwrap_or(Some(true)).unwrap_or(true);
+    kwargs.assert_all_used()?;
+
+    let json = serde_json::to_value(&value).map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+    })?;
+    let text = match indent {
+        // Python indents with spaces; serde's pretty printer uses two, which
+        // is what every template that asks for indent=2 expects.
+        Some(_) => serde_json::to_string_pretty(&json),
+        None => serde_json::to_string(&json),
+    }
+    .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
+
+    Ok(Value::from(if ensure_ascii { escape_non_ascii(&text) } else { text }))
+}
+
+/// Rewrite non-ASCII characters as `\uXXXX`, the way `json.dumps` does.
+fn escape_non_ascii(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            // Astral-plane characters need the surrogate pair JSON uses.
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
 }
 
 /// Templates call this to reject a conversation they cannot represent.
@@ -181,6 +335,190 @@ mod tests {
                    {% if add_generation_prompt %}<|assistant|>\n<think>\n{% endif %}";
         let out = render(src, RenderOptions::default());
         assert!(out.ends_with("<think>\n"), "{out:?}");
+    }
+
+    /// The real Qwen 3.5 template, as shipped in the GGUF.
+    fn qwen_template() -> Option<ChatTemplate> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen3.5.j2");
+        let src = std::fs::read_to_string(path).ok()?;
+        ChatTemplate::new(&src, String::new(), "<|im_end|>".into()).ok()
+    }
+
+    fn spec(name: &str) -> ozgent_core::ToolSpec {
+        ozgent_core::ToolSpec {
+            name: name.into(),
+            description: "Look something up.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }),
+            output_schema: None,
+        }
+    }
+
+    fn ling_template() -> Option<ChatTemplate> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ling3.0.j2");
+        let src = std::fs::read_to_string(path).ok()?;
+        ChatTemplate::new(&src, String::new(), String::new()).ok()
+    }
+
+    #[test]
+    fn ling_writes_its_own_call_format_too() {
+        // A third vocabulary again: Ling names the function on the opener's
+        // line and lists arg_key/arg_value pairs. The point of letting the
+        // template write the call is that ozgent never has to know this.
+        let Some(t) = ling_template() else { return };
+        let messages = vec![
+            Message::user("look it up"),
+            Message {
+                role: Role::Assistant,
+                content: Vec::new(),
+                thinking: Some("I should search.".into()),
+                tool_calls: vec![ozgent_core::ToolCall {
+                    id: "call_0".into(),
+                    name: "web_search".into(),
+                    arguments: serde_json::json!({"query": "llama.cpp"}),
+                }],
+                tool_call_id: None,
+            },
+        ];
+
+        let out = t
+            .render(&messages, RenderOptions { tools: vec![tool_json(&spec("web_search"))], ..Default::default() })
+            .unwrap();
+
+        assert!(out.contains("<arg_key>"), "{out}");
+        assert!(out.contains("llama.cpp"), "{out}");
+        assert!(!out.contains("<parameter="), "that is Qwen's format, not Ling's: {out}");
+    }
+
+    #[test]
+    fn tojson_accepts_the_keywords_json_dumps_takes() {
+        // Ling calls `tojson(ensure_ascii=False)`. minijinja's own filter
+        // rejects the keyword, and the failure is silent: the whole template
+        // is abandoned for llama.cpp's built-in, which does not open the
+        // reasoning block Ling's template ends inside.
+        let t = ChatTemplate::new(
+            "{{ {'a': 1} | tojson(ensure_ascii=False) }}",
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(t.render(&[Message::user("x")], RenderOptions::default()).unwrap(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn ensure_ascii_is_honoured_in_both_directions() {
+        let raw = ChatTemplate::new(
+            "{{ ['né'] | tojson(ensure_ascii=False) }}",
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        let escaped =
+            ChatTemplate::new("{{ ['né'] | tojson }}", String::new(), String::new()).unwrap();
+
+        let probe = [Message::user("x")];
+        assert_eq!(raw.render(&probe, RenderOptions::default()).unwrap(), "[\"né\"]");
+        // Python's default is to escape, and a template relying on it must
+        // get what it asked for.
+        assert_eq!(escaped.render(&probe, RenderOptions::default()).unwrap(), "[\"n\\u00e9\"]");
+    }
+
+    #[test]
+    fn ling_is_detected_as_handling_tools() {
+        let Some(t) = ling_template() else { return };
+        assert!(t.handles_tools());
+    }
+
+    #[test]
+    fn qwen_is_detected_as_handling_tools() {
+        let Some(t) = qwen_template() else { return };
+        assert!(t.handles_tools(), "Qwen documents tools itself");
+    }
+
+    #[test]
+    fn a_template_without_a_tools_block_is_not_claimed_to_have_one() {
+        // The check that keeps the preamble in place for the many models
+        // whose templates cannot describe a tool at all.
+        let plain = ChatTemplate::new(
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}",
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        assert!(!plain.handles_tools());
+    }
+
+    #[test]
+    fn the_word_tools_in_prose_is_not_a_tools_block() {
+        // Why this is probed rather than grepped: a false positive removes the
+        // only tool instructions the model would have received.
+        let prose = ChatTemplate::new(
+            "You may use tools.{% for m in messages %}{{ m.content }}{% endfor %}",
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        assert!(!prose.handles_tools());
+    }
+
+    #[test]
+    fn qwen_writes_its_own_call_format_from_structured_calls() {
+        // The whole point of passing tool_calls: the template emits the format
+        // the model was trained on, instead of ozgent hand-building a
+        // different one and hoping the model imitates it.
+        let Some(t) = qwen_template() else { return };
+        let messages = vec![
+            Message::user("what is up"),
+            Message {
+                role: Role::Assistant,
+                content: Vec::new(),
+                thinking: Some("I should search.".into()),
+                tool_calls: vec![ozgent_core::ToolCall {
+                    id: "call_0".into(),
+                    name: "web_search".into(),
+                    arguments: serde_json::json!({"query": "stocks", "count": 5}),
+                }],
+                tool_call_id: None,
+            },
+            Message::tool_result("call_0", "{\"results\": []}"),
+        ];
+
+        let out = t
+            .render(&messages, RenderOptions { tools: vec![tool_json(&spec("web_search"))], ..Default::default() })
+            .unwrap();
+
+        assert!(out.contains("<function=web_search>"), "{out}");
+        assert!(out.contains("<parameter=query>"), "{out}");
+        assert!(out.contains("stocks"), "{out}");
+        assert!(out.contains("<parameter=count>"), "arguments must stay an object: {out}");
+        assert!(out.contains("<tool_response>"), "the result needs its own wrapper: {out}");
+        assert!(out.contains("I should search."), "reasoning must survive: {out}");
+    }
+
+    #[test]
+    fn the_tool_schema_reaches_the_model() {
+        let Some(t) = qwen_template() else { return };
+        let out = t
+            .render(
+                &[Message::user("hi")],
+                RenderOptions { tools: vec![tool_json(&spec("web_search"))], ..Default::default() },
+            )
+            .unwrap();
+        assert!(out.contains("web_search"), "{out}");
+        assert!(out.contains("Look something up."), "the description too: {out}");
+        assert!(out.contains("query"), "and the parameters: {out}");
+    }
+
+    #[test]
+    fn no_tools_means_no_tools_block() {
+        let Some(t) = qwen_template() else { return };
+        let out = t.render(&[Message::user("hi")], RenderOptions::default()).unwrap();
+        assert!(!out.contains("# Tools"), "an empty list must leave `tools` undefined: {out}");
     }
 
     #[test]

@@ -50,7 +50,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Chat templates are Jinja written for Python's Jinja2, so they lean on
 # Python string methods and on {% break %}; pycompat and loop_controls
 # supply both.
-minijinja = { version = "2", features = ["loop_controls"] }
+# `json` supplies the `tojson` filter, which every template with a tools block
+# uses to write the schema out. Without it Qwen's tool branch is a render
+# error, the whole template is abandoned for llama.cpp's built-in, and the
+# model is never told its own call format.
+minijinja = { version = "2", features = ["loop_controls", "json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [profile.release]
