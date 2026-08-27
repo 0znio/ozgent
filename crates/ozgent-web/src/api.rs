@@ -417,11 +417,11 @@ async fn chat(
             match &event {
                 Event::Answer { text } => answer.push_str(text),
                 Event::Thinking { text } => thinking.push_str(text),
-                Event::ToolCall { name, arguments } => activity.push(serde_json::json!({
+                Event::ToolCall { name, arguments, .. } => activity.push(serde_json::json!({
                     "name": name,
                     "arguments": arguments,
                 })),
-                Event::ToolResult { name, ok, summary, ms, detail } => {
+                Event::ToolResult { name, ok, summary, ms, detail, .. } => {
                     // Attach to the call this answers, so a reload replays the
                     // pair rather than two loose halves.
                     let slot = activity

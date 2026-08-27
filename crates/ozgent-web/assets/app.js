@@ -60,10 +60,15 @@ const state = {
 // desktop for good. The stylesheet already reads these stamps; all this does
 // is set them and remember which.
 const THEMES = [
-  { id: "system", icon: "◐", name: "System" },
-  { id: "light", icon: "☀", name: "Light" },
-  { id: "dark", icon: "☾", name: "Dark" },
+  { id: "system", icon: "i-monitor", name: "System" },
+  { id: "light", icon: "i-sun", name: "Light" },
+  { id: "dark", icon: "i-moon", name: "Dark" },
 ];
+
+/// Point an inline icon at a different symbol in the sprite.
+function setIcon(svg, symbol) {
+  svg?.querySelector("use")?.setAttribute("href", `#${symbol}`);
+}
 
 function applyTheme(id) {
   const theme = THEMES.find((t) => t.id === id) ?? THEMES[0];
@@ -74,7 +79,7 @@ function applyTheme(id) {
 
   const button = $("theme-toggle");
   if (button) {
-    button.querySelector(".theme-icon").textContent = theme.icon;
+    setIcon(button.querySelector(".theme-icon"), theme.icon);
     button.querySelector(".theme-name").textContent = theme.name;
     button.title = `Theme: ${theme.name} (click to change)`;
   }
@@ -101,6 +106,21 @@ async function api(path, options = {}) {
     throw new Error(detail);
   }
   return res.status === 204 ? null : res.json();
+}
+
+/// A coarse "when", accurate enough to tell two threads apart in a list.
+///
+/// Matches the terminal client's wording, so the same conversation reads the
+/// same in both. A clock ahead of the database lands on "just now" rather than
+/// a negative duration.
+function ago(seconds) {
+  const now = Math.floor(Date.now() / 1000);
+  const d = Math.max(0, now - (seconds || 0));
+  if (d < 60) return "just now";
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  if (d < 86400 * 30) return `${Math.floor(d / 86400)}d ago`;
+  return `${Math.floor(d / (86400 * 30))}mo ago`;
 }
 
 const escapeHtml = (s) =>
@@ -326,7 +346,8 @@ function dressCode(root) {
     const head = document.createElement("div");
     head.className = "code-head";
     head.innerHTML = '<span class="nm"></span><span class="spacer"></span>' +
-      '<button type="button" class="copy-btn">Copy</button>';
+      '<button type="button" class="copy-btn" aria-label="Copy this code">' +
+      '<svg class="ic"><use href="#i-copy"></use></svg><span>Copy</span></button>';
     head.querySelector(".nm").textContent = lang;
     if (open) {
       block.classList.add("unterminated");
@@ -345,10 +366,12 @@ function dressCode(root) {
       const button = e.currentTarget;
       const ok = await copyText(code?.textContent ?? pre.textContent ?? "");
       // The label is the feedback; a toast for something this small is noise.
-      button.textContent = ok ? "Copied" : "Press Ctrl+C";
+      button.querySelector("span").textContent = ok ? "Copied" : "Press Ctrl+C";
+      setIcon(button.querySelector(".ic"), ok ? "i-check" : "i-copy");
       button.classList.toggle("done", ok);
       setTimeout(() => {
-        button.textContent = "Copy";
+        button.querySelector("span").textContent = "Copy";
+        setIcon(button.querySelector(".ic"), "i-copy");
         button.classList.remove("done");
       }, 1600);
     });
@@ -476,7 +499,7 @@ function syncToLatest() {
 function setStreaming(on) {
   state.streaming = on;
   el.send.classList.toggle("is-stop", on);
-  el.send.textContent = on ? "\u25A0" : "\u2191";
+  setIcon(el.send.querySelector(".ic"), on ? "i-stop" : "i-send");
   el.send.setAttribute("aria-label", on ? "Stop generating" : "Send");
   el.send.type = on ? "button" : "submit";
 }
@@ -612,8 +635,16 @@ async function loadConversations() {
     row.setAttribute("role", "button");
     row.tabIndex = 0;
     if (c.id === state.conversation) row.setAttribute("aria-current", "true");
-    row.innerHTML = '<span class="title"></span><button class="del" title="Delete">&times;</button>';
+    row.innerHTML =
+      '<span class="conv-text"><span class="title"></span><span class="when"></span></span>' +
+      '<button class="del" title="Delete" aria-label="Delete conversation">' +
+      '<svg class="ic"><use href="#i-trash"></use></svg></button>';
     row.querySelector(".title").textContent = c.title || "Untitled";
+    // When it was last touched, and how long it ran. Enough to tell two
+    // similar-sounding threads apart without opening either.
+    const parts = [ago(c.created_at)];
+    if (c.messages) parts.push(`${c.messages} msg`);
+    row.querySelector(".when").textContent = parts.join(" · ");
     row.addEventListener("click", (e) => {
       if (e.target.classList.contains("del")) return;
       openConversation(c.id);
@@ -768,7 +799,12 @@ async function send(text) {
   let answer = "";
   let reasoning = "";
   let thinkBox = null;
-  let toolCard = null;
+  // Keyed by call id, not a single "current card". A batch is announced in
+  // full before any of it is awaited, so with one variable the first result
+  // closed the last card and every other card stayed running for good. A
+  // model that issues several calls per round — Ling does, Qwen usually does
+  // not — hit that on every turn.
+  const toolCards = new Map();
   const controller = new AbortController();
   state.abort = controller;
 
@@ -835,11 +871,11 @@ async function send(text) {
           dressCode(answerEl);
           scrollToTail();
         } else if (event.type === "tool_call") {
-          toolCard = openToolCard(answerEl, event);
+          toolCards.set(event.id, openToolCard(answerEl, event));
           scrollToTail();
         } else if (event.type === "tool_result") {
-          closeToolCard(toolCard, event);
-          toolCard = null;
+          closeToolCard(toolCards.get(event.id), event);
+          toolCards.delete(event.id);
           scrollToTail();
         } else if (event.type === "done") {
           body.querySelector(".think")?.classList.remove("streaming");
@@ -868,6 +904,15 @@ async function send(text) {
       answerEl.insertAdjacentHTML("beforeend", `<p class="error">${escapeHtml(e.message)}</p>`);
     }
   } finally {
+    // Anything still marked running never got its result: the stream ended
+    // first. A card that spins for good is worse than one that says so.
+    for (const card of toolCards.values()) {
+      card.classList.remove("running");
+      card.classList.add("bad");
+      const ms = card.querySelector(".ms");
+      if (ms) ms.textContent = "no result";
+    }
+    toolCards.clear();
     body.querySelector(".think")?.classList.remove("streaming");
     answerEl.classList.remove("cursor");
     setStreaming(false);
@@ -1205,7 +1250,8 @@ async function renderFacts() {
     row.className = "fact";
     row.innerHTML =
       `<button class="pin" aria-pressed="${f.pinned}" title="Always keep in context">${f.pinned ? "★" : "☆"}</button>` +
-      `<span class="t"></span><button class="del" title="Forget">&times;</button>`;
+      '<span class="t"></span><button class="del" title="Forget" aria-label="Forget this fact">' +
+      '<svg class="ic"><use href="#i-trash"></use></svg></button>';
     row.querySelector(".t").textContent = f.text;
     row.querySelector(".pin").addEventListener("click", async () => {
       await api(`/api/facts/${f.id}`, { method: "PATCH", body: JSON.stringify({ pinned: !f.pinned }) });

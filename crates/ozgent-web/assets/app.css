@@ -155,10 +155,23 @@ body {
 .mark {
   font-family: var(--mono);
   font-weight: 700;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  text-transform: lowercase;
   color: var(--ink);
   font-size: var(--t-small);
+  user-select: none;
+}
+/* A single amber pip after the name: the one place the accent appears when
+   nothing is happening, so the palette is introduced before it is used to
+   mean something. */
+.mark::after {
+  content: "";
+  display: inline-block;
+  width: 4px; height: 4px;
+  margin-left: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 3px;
 }
 
 .conversations { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
@@ -187,10 +200,31 @@ body {
   color: var(--ink);
   font-weight: 600;
 }
-.conv .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv .del { opacity: 0; color: var(--ink-faint); border: 0; background: none; cursor: pointer; font-size: 15px; padding: 0 2px; }
-.conv:hover .del { opacity: 1; }
-.conv .del:hover { color: var(--danger); }
+.conv-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.conv .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* When it was started and how long it ran, so two similar-sounding threads
+   can be told apart without opening either. */
+.conv .when {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  letter-spacing: .02em;
+}
+.conv .del {
+  opacity: 0;
+  flex: none;
+  display: grid; place-items: center;
+  width: 26px; height: 26px;
+  color: var(--ink-faint);
+  border: 0; border-radius: var(--radius-sm);
+  background: none; cursor: pointer; padding: 0;
+  transition: opacity var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+.conv .del .ic { width: 15px; height: 15px; }
+.conv:hover .del, .conv .del:focus-visible { opacity: 1; }
+.conv .del:hover { color: var(--danger); background: var(--panel); }
+/* No hover on a touch screen, so the control has to be reachable without it. */
+@media (hover: none) { .conv .del { opacity: .5; } }
 
 .sidebar-foot {
   padding: 10px;
@@ -200,7 +234,8 @@ body {
   /* Keeps the last row clear of a phone's home indicator. */
   padding-bottom: max(10px, env(safe-area-inset-bottom));
 }
-.sidebar-foot .ghost-btn { width: auto; flex: 1; }
+.sidebar-foot .ghost-btn { width: auto; flex: 1; justify-content: flex-start; padding-left: var(--s3); }
+.sidebar-foot .ghost-btn.theme { flex: 0 0 auto; justify-content: center; padding: 7px var(--s3); }
 
 /* The theme control: an icon and a word, so its state is readable rather than
    inferred from which of two shapes is showing. */
@@ -298,6 +333,53 @@ body {
 }
 .select:hover { border-color: var(--ink-faint); }
 
+/* ------------------------------------------------------------- icons
+
+   One size class, inheriting colour, so an icon always matches the text it
+   sits beside and a disabled control dims both together. */
+.ic {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  display: block;
+  color: inherit;
+}
+.ic use { pointer-events: none; }
+
+/* ----------------------------------------------------------- tooltips
+
+   Built from a data attribute rather than `title`, which waits a second and
+   then renders in the desktop's own style. These are instant and belong to
+   the page. Pointer-events off, so the tip can never intercept the click on
+   the control it describes. */
+[data-tip] { position: relative; }
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translate(-50%, 3px);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--ink);
+  color: var(--bg);
+  font-family: var(--sans);
+  font-size: var(--t-micro);
+  line-height: 1.4;
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+  z-index: 20;
+}
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after { opacity: 1; transform: translate(-50%, 0); }
+@media (prefers-reduced-motion: reduce) { [data-tip]::after { transition: none; } }
+/* A touch screen has no hover, so a tip that appears on tap would sit over
+   the thing just tapped. */
+@media (hover: none) { [data-tip]::after { display: none; } }
+
 .icon-btn, .ghost-btn, .primary-btn {
   border-radius: var(--radius-sm);
   font: inherit;
@@ -306,12 +388,59 @@ body {
   transition: background var(--fast) var(--ease), color var(--fast) var(--ease),
               border-color var(--fast) var(--ease);
 }
-.icon-btn { background: transparent; color: var(--ink-soft); font-size: 17px; line-height: 1; padding: var(--s1) 9px; }
-.icon-btn:hover { background: var(--raised); color: var(--ink); }
+/* A square target with the icon centred in it, so a row of them is evenly
+   spaced whatever each glyph's own proportions are. */
+.icon-btn {
+  background: transparent;
+  color: var(--ink-soft);
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
+.icon-btn.small { width: 30px; height: 30px; }
+.icon-btn.small .ic { width: 16px; height: 16px; }
+.icon-btn:hover { background: var(--panel); color: var(--ink); }
+.icon-btn:active { background: var(--line-soft); }
+/* Pressed reads as on, for the controls that toggle something. */
+.icon-btn[aria-expanded="true"] { background: var(--panel); color: var(--ink); }
+
+/* ------------------------------------------------------- pill toggle
+
+   For a setting with two states that both matter. Filled when the model may
+   reach the network and the filesystem, outlined when it may not — a state
+   worth being able to read at a glance before pressing send. */
+.pill-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 var(--s3) 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: var(--t-small);
+  cursor: pointer;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease),
+              border-color var(--fast) var(--ease);
+}
+.pill-toggle .ic { width: 15px; height: 15px; }
+.pill-toggle:hover { color: var(--ink-soft); border-color: var(--ink-faint); }
+.pill-toggle[aria-pressed="true"] {
+  background: var(--panel);
+  border-color: transparent;
+  color: var(--ink);
+}
+.pill-toggle[aria-pressed="true"]:hover { background: var(--line-soft); }
 .ghost-btn {
   background: transparent; color: var(--ink-soft); border-color: var(--line);
   padding: 7px var(--s3); font-size: var(--t-small); width: 100%;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
 }
+.ghost-btn .ic { width: 15px; height: 15px; }
 .ghost-btn:hover { color: var(--ink); background: var(--raised); border-color: var(--ink-faint); }
 /* The primary button is ink, not amber. It is a control, and controls are
    chrome; the accent is reserved for state. */
@@ -332,7 +461,20 @@ body {
 
 .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 28px 0 12px; }
 
-.empty { max-width: 620px; margin: 16vh auto; text-align: center; color: var(--ink-faint); padding: 0 var(--s5); }
+.empty {
+  max-width: 460px;
+  margin: 18vh auto;
+  text-align: center;
+  color: var(--ink-faint);
+  padding: 0 var(--s5);
+  display: flex; flex-direction: column; align-items: center; gap: var(--s2);
+}
+.empty-mark {
+  width: 28px; height: 28px;
+  color: var(--ink-faint);
+  opacity: .6;
+  margin-bottom: var(--s1);
+}
 .empty h1 {
   font-family: var(--mono);
   font-size: var(--t-display);
@@ -440,6 +582,9 @@ body {
 }
 .code-head .spacer { flex: 1; }
 .copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--ink-faint);
@@ -450,6 +595,7 @@ body {
   cursor: pointer;
   transition: color var(--fast) var(--ease), background var(--fast) var(--ease);
 }
+.copy-btn .ic { width: 13px; height: 13px; }
 .copy-btn:hover { color: var(--ink); background: var(--raised); }
 .copy-btn.done { color: var(--ok); }
 
@@ -682,6 +828,7 @@ body {
   pointer-events: none;
   transition: opacity var(--mid) var(--ease), transform var(--mid) var(--ease);
 }
+.to-latest .ic { width: 14px; height: 14px; }
 .to-latest.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
 .to-latest:hover { color: var(--ink); border-color: var(--ink-faint); }
 
@@ -729,7 +876,24 @@ body {
 }
 #input:focus { outline: none; }
 
-.composer-actions { display: flex; align-items: center; gap: 8px; }
+/* Controls on the left, send on the right, everything on one baseline. The
+   hint sits next to send rather than in the middle of the controls, where it
+   read as a fourth button. */
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-top: 2px;
+}
+.composer-actions .hint.inline {
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  margin: 0 var(--s2) 0 0;
+  white-space: nowrap;
+}
+/* It is a reminder, not an instruction; it goes once there is anything more
+   interesting to look at. */
+.composer-box:focus-within .hint.inline { opacity: 0; transition: opacity var(--fast) var(--ease); }
 .composer-actions .spacer { flex: 1; }
 .icon-btn.small { font-size: 16px; padding: 2px 8px; border: 1px solid var(--line); }
 /* A toggle reads its state from its own styling, not from a tooltip: off is
@@ -743,6 +907,7 @@ body {
   flex: none;
   width: 32px; height: 32px;
   display: grid; place-items: center;
+  padding: 0;
   border: 0; border-radius: var(--radius-sm);
   /* Ink, not amber: sending is a control, and the accent is kept for state
      that is changing on its own. */

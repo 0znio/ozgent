@@ -20,149 +20,247 @@
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <div class="layout">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <span class="mark">oz</span>
-        <button class="icon-btn" id="new-chat" title="New chat" aria-label="New chat">+</button>
-      </div>
-      <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
-      <div class="sidebar-foot">
-        <button class="ghost-btn" id="open-settings">Settings</button>
-        <button class="ghost-btn theme" id="theme-toggle" aria-label="Colour theme">
-          <span class="theme-icon" aria-hidden="true"></span><span class="theme-name"></span>
-        </button>
-      </div>
-    </aside>
 
-    <main class="main">
-      <header class="topbar">
-        <button class="icon-btn only-narrow" id="toggle-sidebar" aria-label="Toggle sidebar">☰</button>
-        <select id="model" class="select" aria-label="Model"></select>
-        <select id="thinking" class="select" aria-label="Reasoning">
-          <option value="auto">Reasoning: auto</option>
-          <option value="on">Reasoning: on</option>
-          <option value="off">Reasoning: off</option>
-        </select>
-        <span class="spacer"></span>
-        <span class="stat" id="stat"></span>
-        <!-- The window this model is running with, and how much of it the
-             conversation has used. Hidden until a turn reports its cost. -->
-        <span class="gauge" id="gauge" title="Context used">
-          <span class="track"><span class="fill" id="gauge-fill"></span></span>
-          <span class="used" id="gauge-used"></span><span id="gauge-total"></span>
-        </span>
-      </header>
+<!-- Icons, drawn once and referenced by <use>. Inline rather than fetched:
+     the page is compiled into the binary and has to render with no network,
+     and a font of glyphs (+ ☰ ↑ ⚙) renders differently on every platform and
+     reads as a placeholder. One 24-unit grid, 1.75 stroke, round joins, so a
+     row of them looks like one set rather than a collection. -->
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+  <defs>
+    <g id="i-base" fill="none" stroke="currentColor" stroke-width="1.75"
+       stroke-linecap="round" stroke-linejoin="round"></g>
+  </defs>
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <path d="M12 5v14M5 12h14"/>
+  </symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <path d="M4 7h16M4 12h16M4 17h10"/>
+  </symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 19V6M6 12l6-6 6 6"/>
+  </symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24" fill="currentColor">
+    <rect x="7" y="7" width="10" height="10" rx="2"/>
+  </symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <path d="M6 6l12 12M18 6L6 18"/>
+  </symbol>
+  <!-- Sliders, not a gear: this control opens the model's numbers. -->
+  <symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <path d="M5 8h9M18 8h1M5 16h3M12 16h7"/>
+    <circle cx="16" cy="8" r="2"/><circle cx="10" cy="16" r="2"/>
+  </symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/>
+  </symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <circle cx="12" cy="12" r="8.5"/>
+    <path d="M3.5 12h17M12 3.5c2.2 2.4 3.3 5.4 3.3 8.5s-1.1 6.1-3.3 8.5c-2.2-2.4-3.3-5.4-3.3-8.5S9.8 5.9 12 3.5z"/>
+  </symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/>
+  </symbol>
+  <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 5v13M6 12l6 6 6-6"/>
+  </symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/>
+  </symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 14.2A8.2 8.2 0 0 1 9.8 4 8.4 8.4 0 1 0 20 14.2z"/>
+  </symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/>
+  </symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4.5 12.5l5 5 10-11"/>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 7h16M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7M6.5 7l.8 12A1.5 1.5 0 0 0 8.8 20h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12"/>
+  </symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3l1.9 5.3L19 10l-5.1 1.7L12 17l-1.9-5.3L5 10l5.1-1.7z"/>
+    <path d="M18.5 15.5l.7 1.9 1.8.6-1.8.6-.7 1.9-.7-1.9-1.8-.6 1.8-.6z"/>
+  </symbol>
+</svg>
 
-      <div class="thread" id="thread">
-        <div class="empty" id="empty">
-          <h1>ozgent</h1>
-          <p>Local models, your machine. Pick a model and start typing.</p>
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="mark">ozgent</span>
+      <button class="icon-btn" id="new-chat" data-tip="New chat" aria-label="New chat">
+        <svg class="ic"><use href="#i-plus"></use></svg>
+      </button>
+    </div>
+
+    <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
+
+    <div class="sidebar-foot">
+      <button class="ghost-btn" id="open-settings">
+        <svg class="ic"><use href="#i-settings"></use></svg><span>Settings</span>
+      </button>
+      <button class="ghost-btn theme" id="theme-toggle" data-tip="Colour theme" aria-label="Colour theme">
+        <svg class="ic theme-icon"><use href="#i-monitor"></use></svg>
+        <span class="theme-name"></span>
+      </button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-narrow" id="toggle-sidebar" aria-label="Show conversations">
+        <svg class="ic"><use href="#i-menu"></use></svg>
+      </button>
+      <select id="model" class="select" aria-label="Model"></select>
+      <select id="thinking" class="select" aria-label="Reasoning">
+        <option value="auto">Reasoning: auto</option>
+        <option value="on">Reasoning: on</option>
+        <option value="off">Reasoning: off</option>
+      </select>
+      <span class="spacer"></span>
+      <span class="stat" id="stat"></span>
+      <!-- The window this model is running with, and how much of it the
+           conversation has used. Hidden until a turn reports its cost. -->
+      <span class="gauge" id="gauge" title="Context used">
+        <span class="track"><span class="fill" id="gauge-fill"></span></span>
+        <span class="used" id="gauge-used"></span><span id="gauge-total"></span>
+      </span>
+    </header>
+
+    <div class="thread" id="thread">
+      <div class="empty" id="empty">
+        <svg class="ic empty-mark"><use href="#i-spark"></use></svg>
+        <h1>ozgent</h1>
+        <p>Models running on your machine. Nothing leaves it unless a tool asks.</p>
+      </div>
+    </div>
+
+    <form class="composer" id="composer">
+      <button type="button" class="to-latest" id="to-latest" hidden>
+        <svg class="ic"><use href="#i-down"></use></svg><span>Latest</span>
+      </button>
+      <div class="quick" id="quick" hidden></div>
+
+      <div class="composer-box" id="composer-box">
+        <div class="attachments" id="attachments" hidden></div>
+        <textarea id="input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
+        <div class="composer-actions">
+          <button type="button" id="attach" class="icon-btn small" data-tip="Attach an image" aria-label="Attach an image">
+            <svg class="ic"><use href="#i-clip"></use></svg>
+          </button>
+          <button type="button" id="quick-toggle" class="icon-btn small" aria-expanded="false"
+                  data-tip="Model settings" aria-label="Model settings">
+            <svg class="ic"><use href="#i-sliders"></use></svg>
+          </button>
+          <!-- A state, so it is drawn as one: filled when the model may reach
+               the network and the filesystem, outlined when it may not. -->
+          <button type="button" id="tools-toggle" class="pill-toggle" aria-pressed="true"
+                  data-tip="Let the model search and read files" aria-label="Toggle tools">
+            <svg class="ic"><use href="#i-globe"></use></svg><span>Tools</span>
+          </button>
+          <span class="spacer"></span>
+          <span class="hint inline" id="attach-hint">paste or drop to attach</span>
+          <button type="submit" id="send" class="send-btn" aria-label="Send">
+            <svg class="ic"><use href="#i-send"></use></svg>
+          </button>
         </div>
       </div>
 
-      <form class="composer" id="composer">
-        <button type="button" class="to-latest" id="to-latest" hidden>↓ Latest</button>
-        <div class="quick" id="quick" hidden></div>
-        <div class="composer-box" id="composer-box">
-          <div class="attachments" id="attachments" hidden></div>
-          <textarea id="input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
-          <div class="composer-actions">
-            <button type="button" id="attach" class="icon-btn small" title="Attach a file" aria-label="Attach a file">+</button>
-            <button type="button" id="quick-toggle" class="icon-btn small" aria-expanded="false"
-                    title="Quick model settings" aria-label="Quick model settings">&#9881;</button>
-            <button type="button" id="tools-toggle" class="icon-btn small toggle" aria-pressed="true"
-                    title="Tools: web search and file access" aria-label="Toggle tools">search</button>
-            <span class="hint inline" id="attach-hint">paste, drop, or attach</span>
-            <span class="spacer"></span>
-            <button type="submit" id="send" class="send-btn" aria-label="Send">↑</button>
-          </div>
-        </div>
-        <input type="file" id="file-input" multiple hidden>
-        <div class="drop-veil" id="drop-veil" hidden><span>Drop to attach</span></div>
-      </form>
-    </main>
+      <input type="file" id="file-input" multiple hidden>
+      <div class="drop-veil" id="drop-veil" hidden><span>Drop to attach</span></div>
+    </form>
+  </main>
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lightbox-close" id="lightbox-close" aria-label="Close">
+    <svg class="ic"><use href="#i-close"></use></svg>
+  </button>
+  <img id="lightbox-img" alt="">
+</div>
+
+<dialog id="settings" class="settings">
+  <div class="settings-head">
+    <h2 id="settings-title">Settings</h2>
+    <button class="icon-btn" id="close-settings" aria-label="Close">
+      <svg class="ic"><use href="#i-close"></use></svg>
+    </button>
+  </div>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="general" aria-selected="true">General</button>
+    <button class="tab" role="tab" data-tab="params" aria-selected="false">Model</button>
+    <button class="tab" role="tab" data-tab="tools" aria-selected="false">Tools</button>
+    <button class="tab" role="tab" data-tab="memory" aria-selected="false">Memory</button>
   </div>
 
-  <div class="lightbox" id="lightbox" hidden>
-    <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
-    <img id="lightbox-img" alt="">
-  </div>
+  <section class="panel" data-panel="general">
+    <label class="row"><span>Render markdown</span><span class="switch"><input type="checkbox" id="set-markdown"><span class="track"></span></span></label>
+    <label class="row"><span>Show reasoning</span><span class="switch"><input type="checkbox" id="set-thinking"><span class="track"></span></span></label>
+    <label class="row"><span>Tell the model today's date</span><span class="switch"><input type="checkbox" id="set-date"><span class="track"></span></span></label>
+    <p class="hint">Saved to <code>~/ozgent/configs/config.toml</code>, the same file the terminal reads.</p>
+  </section>
 
-  <dialog id="settings" class="settings">
-    <div class="settings-head">
-      <h2 id="settings-title">Settings</h2>
-      <button class="icon-btn" id="close-settings" aria-label="Close">&times;</button>
+  <section class="panel" data-panel="params" hidden>
+    <p class="hint" id="params-for"></p>
+    <div class="params" id="params"></div>
+    <p class="hint">
+      A blank field inherits the default. Changing anything here reloads the
+      model on your next message.
+    </p>
+  </section>
+
+  <section class="panel" data-panel="tools" hidden>
+    <label class="row"><span>Enable tools</span><span class="switch"><input type="checkbox" id="set-tools"><span class="track"></span></span></label>
+    <div class="row">
+      <span>Web search provider</span>
+      <select class="select" id="search-provider"></select>
     </div>
-    <div class="tabs" role="tablist">
-      <button class="tab" role="tab" data-tab="general" aria-selected="true">General</button>
-      <button class="tab" role="tab" data-tab="params" aria-selected="false">Model</button>
-      <button class="tab" role="tab" data-tab="tools" aria-selected="false">Tools</button>
-      <button class="tab" role="tab" data-tab="memory" aria-selected="false">Memory</button>
-    </div>
+    <label class="row" id="key-row">
+      <span>API key</span>
+      <input type="password" id="search-key" class="text-input" placeholder="unchanged" autocomplete="off">
+    </label>
+    <p class="hint" id="key-hint"></p>
+    <h3 class="sub">Available tools</h3>
+    <div id="tool-list" class="tool-list"></div>
+  </section>
 
-    <section class="panel" data-panel="general">
-      <label class="row"><span>Render markdown</span><span class="switch"><input type="checkbox" id="set-markdown"><span class="track"></span></span></label>
-      <label class="row"><span>Show reasoning</span><span class="switch"><input type="checkbox" id="set-thinking"><span class="track"></span></span></label>
-      <label class="row"><span>Tell the model today's date</span><span class="switch"><input type="checkbox" id="set-date"><span class="track"></span></span></label>
-      <p class="hint">Saved to <code>~/ozgent/configs/config.toml</code>, the same file the terminal reads.</p>
-    </section>
+  <section class="panel" data-panel="memory" hidden>
+    <h3 class="sub">Facts</h3>
+    <p class="hint">
+      Pinned facts are always in context. Everything else is retrieved only
+      when it is relevant to what you asked.
+    </p>
+    <div id="fact-list" class="fact-list"></div>
+    <form class="fact-add" id="fact-add">
+      <input type="text" id="fact-text" class="text-input" placeholder="Remember that..." autocomplete="off">
+      <button type="submit" class="primary-btn">Add</button>
+    </form>
 
-    <section class="panel" data-panel="params" hidden>
-      <p class="hint" id="params-for"></p>
-      <div class="params" id="params"></div>
-      <p class="hint">
-        A blank field inherits the default. Changing anything here reloads the
-        model on your next message.
-      </p>
-    </section>
+    <h3 class="sub">What would be recalled?</h3>
+    <p class="hint">
+      Retrieval is invisible during a chat. Try a question here to see exactly
+      what memory would put in front of the model.
+    </p>
+    <form class="fact-add" id="recall-form">
+      <input type="text" id="recall-query" class="text-input" placeholder="Ask something..." autocomplete="off">
+      <button type="submit" class="ghost-btn auto">Preview</button>
+    </form>
+    <div id="recall-out" class="recall-out"></div>
+  </section>
 
-    <section class="panel" data-panel="tools" hidden>
-      <label class="row"><span>Enable tools</span><span class="switch"><input type="checkbox" id="set-tools"><span class="track"></span></span></label>
-      <div class="row">
-        <span>Web search provider</span>
-        <select class="select" id="search-provider"></select>
-      </div>
-      <label class="row" id="key-row">
-        <span>API key</span>
-        <input type="password" id="search-key" class="text-input" placeholder="unchanged" autocomplete="off">
-      </label>
-      <p class="hint" id="key-hint"></p>
-      <h3 class="sub">Available tools</h3>
-      <div id="tool-list" class="tool-list"></div>
-    </section>
+  <menu class="settings-foot">
+    <span class="hint" id="save-note"></span>
+    <button class="ghost-btn auto" id="cancel-settings">Close</button>
+    <button class="primary-btn" id="save-settings">Save</button>
+  </menu>
+</dialog>
 
-    <section class="panel" data-panel="memory" hidden>
-      <h3 class="sub">Facts</h3>
-      <p class="hint">
-        Pinned facts are always in context. Everything else is retrieved only
-        when it is relevant to what you asked.
-      </p>
-      <div id="fact-list" class="fact-list"></div>
-      <form class="fact-add" id="fact-add">
-        <input type="text" id="fact-text" class="text-input" placeholder="Remember that..." autocomplete="off">
-        <button type="submit" class="primary-btn">Add</button>
-      </form>
-
-      <h3 class="sub">What would be recalled?</h3>
-      <p class="hint">
-        Retrieval is invisible during a chat. Try a question here to see exactly
-        what memory would put in front of the model.
-      </p>
-      <form class="fact-add" id="recall-form">
-        <input type="text" id="recall-query" class="text-input" placeholder="Ask something..." autocomplete="off">
-        <button type="submit" class="ghost-btn auto">Preview</button>
-      </form>
-      <div id="recall-out" class="recall-out"></div>
-    </section>
-
-    <menu class="settings-foot">
-      <span class="hint" id="save-note"></span>
-      <button class="ghost-btn auto" id="cancel-settings">Close</button>
-      <button class="primary-btn" id="save-settings">Save</button>
-    </menu>
-  </dialog>
-
-  <script type="module" src="/app.js"></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>

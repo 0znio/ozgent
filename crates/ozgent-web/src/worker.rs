@@ -72,13 +72,20 @@ pub enum Event {
     Thinking { text: String },
     Answer { text: String },
     /// The model asked for a tool. Emitted before the tool runs.
-    ToolCall { name: String, arguments: serde_json::Value },
+    ///
+    /// `id` matches the `ToolResult` that answers it. A batch is announced in
+    /// full before any of it is awaited, so a client that tracks only "the
+    /// current call" leaves every card but the last stuck running and lands
+    /// the first result on the wrong one.
+    ToolCall { id: String, name: String, arguments: serde_json::Value },
     /// The model called a tool the *caller* owns. Nothing runs here; the turn
     /// ends and the caller is expected to execute it and send the result back.
     ClientToolCall { name: String, arguments: serde_json::Value },
     /// How that call turned out. `detail` is the tool's own result, so the
     /// browser can render it properly instead of showing raw JSON.
     ToolResult {
+        /// The `ToolCall` this answers.
+        id: String,
         name: String,
         ok: bool,
         summary: String,
@@ -581,6 +588,8 @@ fn turn(
     let mut handed_back = false;
     // One retry only, so a model that answers with silence twice cannot spin.
     let mut nudged = false;
+    // Counts every call made in this turn, so no two share an id.
+    let mut next_call_id = 0usize;
 
     for round in 0..=max_rounds {
         let last = round == max_rounds || offered.is_empty();
@@ -607,7 +616,15 @@ fn turn(
         reused += stats.reused_tokens;
         stop = reason;
 
-        let parsed = ozgent_llama::extract_tool_calls(&reply);
+        let mut parsed = ozgent_llama::extract_tool_calls(&reply);
+        // The parser numbers calls from zero each time it runs, so round two
+        // reissues `call_0`. Within a turn that has to be unique: it is how a
+        // client pairs a result with the card that asked for it, and how the
+        // conversation pairs a result with its call.
+        for call in parsed.calls.iter_mut() {
+            call.id = format!("call_{next_call_id}");
+            next_call_id += 1;
+        }
         tracing::debug!(calls = parsed.calls.len(), "tool round {round}");
 
         // Reasoning, then nothing. A model can close its thought and stop
@@ -684,6 +701,7 @@ fn turn(
         // through them one at a time.
         for call in &parsed.calls {
             let _ = request.out.send(Event::ToolCall {
+                id: call.id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
@@ -715,6 +733,7 @@ fn turn(
                 }
             };
             let _ = request.out.send(Event::ToolResult {
+                id: call.id.clone(),
                 name: call.name.clone(),
                 ok,
                 summary,
@@ -1052,6 +1071,7 @@ mod tests {
     #[test]
     fn tool_events_carry_what_the_transcript_row_shows() {
         let call = serde_json::to_value(Event::ToolCall {
+            id: "call_1".into(),
             name: "web_search".into(),
             arguments: serde_json::json!({ "query": "nse" }),
         })
@@ -1061,6 +1081,7 @@ mod tests {
         assert_eq!(call["arguments"]["query"], "nse");
 
         let result = serde_json::to_value(Event::ToolResult {
+            id: "call_1".into(),
             name: "web_search".into(),
             ok: false,
             summary: "rate limited".into(),
@@ -1071,6 +1092,14 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["ok"], false);
         assert_eq!(result["ms"], 42);
+
+        // A batch is announced in full before any of it is awaited, so the
+        // client can only pair a result with its card by id. Without this the
+        // first result closed the last card and every other card stayed
+        // running for good — which is what a model issuing several calls per
+        // round, as Ling does, produces on every turn.
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(result["id"], call["id"]);
     }
 
     #[test]
