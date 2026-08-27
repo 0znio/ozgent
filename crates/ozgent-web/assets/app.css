@@ -1,48 +1,101 @@
-/* ozgent web — a terminal's restraint, in a browser.
-   Palette is warm-neutral rather than blue-grey, so the accent (amber, taken
-   from the CLI's own highlight) sits on it without fighting. */
+/* ozgent web — an instrument for a model running on your own machine.
+ *
+ * Two decisions carry the design.
+ *
+ * Neutrals are cool graphite, not the warm cream this kind of page usually
+ * lands on. That is what lets amber work as a *signal*: it appears on state
+ * that is changing or worth watching — a filling context window, a running
+ * tool, live reasoning — and never on chrome. Buttons, headers and links are
+ * neutral. The one coloured thing on screen is the thing that is happening.
+ *
+ * Type is system-only, and that is a constraint rather than a shortcut: the
+ * page is compiled into the binary and has to render with no network at all,
+ * so a webfont would break the offline case ozgent exists for. The character
+ * comes instead from a strict division of labour — every machine fact is set
+ * in mono (model, quantisation, tokens, milliseconds, context), every human
+ * sentence in sans. You can tell what the machine said from the shape of it.
+ */
 
 :root {
-  --bg: #faf9f7;
-  --panel: #f1efec;
+  /* --- light ------------------------------------------------------------ */
+  --bg: #fbfcfc;
+  --panel: #f1f4f5;
   --raised: #ffffff;
-  --line: #e0dcd6;
-  --ink: #1c1a17;
-  --ink-soft: #6b655d;
-  --ink-faint: #97918a;
-  --accent: #b4690e;
-  --accent-soft: #fdf3e3;
-  --danger: #a03232;
+  --line: #dfe5e8;
+  --line-soft: #eaeff1;
+  --ink: #10151a;
+  --ink-soft: #5a656d;
+  --ink-faint: #8a949b;
+  --accent: #b26a05;
+  --accent-soft: #fdf1de;
+  --ok: #2f8f68;
+  --danger: #b03b3b;
+  --shadow: 0 1px 2px rgb(16 21 26 / .06), 0 8px 24px rgb(16 21 26 / .06);
+  --shadow-lift: 0 2px 4px rgb(16 21 26 / .08), 0 16px 40px rgb(16 21 26 / .12);
+
+  /* --- scale ------------------------------------------------------------
+     One 4px rhythm for everything, so spacing is chosen from a set rather
+     than typed. */
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 24px; --s6: 32px; --s7: 48px; --s8: 64px;
+
+  /* Type scale, 1.2 from a 15px body. Named for the job, not the size. */
+  --t-micro: 11px;
+  --t-small: 12.5px;
+  --t-body: 15px;
+  --t-lead: 17px;
+  --t-title: 21px;
+  --t-display: 28px;
+
   --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 16px;
+
+  /* A single easing, so nothing on the page moves to a different rhythm. */
+  --ease: cubic-bezier(.32, .72, 0, 1);
+  --fast: 120ms;
+  --mid: 200ms;
+
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
+/* Dark is the default: this is an instrument, and it is usually open beside a
+   terminal. Only the tokens are redefined — every component below reads them,
+   so nothing needs a second definition. */
 :root:not([data-theme="light"]) {
-  --bg: #171614;
-  --panel: #1e1d1a;
-  --raised: #252320;
-  --line: #34312c;
-  --ink: #ece8e1;
-  --ink-soft: #a49d92;
-  --ink-faint: #736c62;
-  --accent: #e0a75e;
-  --accent-soft: #2a2318;
-  --danger: #d97070;
+  --bg: #0e1113;
+  --panel: #14181b;
+  --raised: #1a1f23;
+  --line: #262c31;
+  --line-soft: #1e2429;
+  --ink: #e6eaed;
+  --ink-soft: #97a1a8;
+  --ink-faint: #626c73;
+  --accent: #f0a22e;
+  --accent-soft: #2a2013;
+  --ok: #4fb286;
+  --danger: #e06c6c;
+  --shadow: 0 1px 2px rgb(0 0 0 / .4), 0 8px 24px rgb(0 0 0 / .3);
+  --shadow-lift: 0 2px 4px rgb(0 0 0 / .5), 0 16px 40px rgb(0 0 0 / .45);
 }
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --bg: #faf9f7;
-    --panel: #f1efec;
+    --bg: #fbfcfc;
+    --panel: #f1f4f5;
     --raised: #ffffff;
-    --line: #e0dcd6;
-    --ink: #1c1a17;
-    --ink-soft: #6b655d;
-    --ink-faint: #97918a;
-    --accent: #b4690e;
-    --accent-soft: #fdf3e3;
-    --danger: #a03232;
+    --line: #dfe5e8;
+    --line-soft: #eaeff1;
+    --ink: #10151a;
+    --ink-soft: #5a656d;
+    --ink-faint: #8a949b;
+    --accent: #b26a05;
+    --accent-soft: #fdf1de;
+    --ok: #2f8f68;
+    --danger: #b03b3b;
+    --shadow: 0 1px 2px rgb(16 21 26 / .06), 0 8px 24px rgb(16 21 26 / .06);
+    --shadow-lift: 0 2px 4px rgb(16 21 26 / .08), 0 16px 40px rgb(16 21 26 / .12);
   }
 }
 
@@ -93,17 +146,19 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--line);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--line-soft);
 }
 
+/* The wordmark is neutral, not amber. Amber means "this is happening"; a
+   logo is never happening. */
 .mark {
   font-family: var(--mono);
   font-weight: 700;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
-  color: var(--accent);
-  font-size: 13px;
+  color: var(--ink);
+  font-size: var(--t-small);
 }
 
 .conversations { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
@@ -111,20 +166,27 @@ body {
 .conv {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
   width: 100%;
-  padding: 8px 10px;
+  padding: var(--s2) var(--s3);
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--ink-soft);
   font: inherit;
-  font-size: 14px;
+  font-size: 13.5px;
   text-align: left;
   cursor: pointer;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
 }
 .conv:hover { background: var(--raised); color: var(--ink); }
-.conv[aria-current="true"] { background: var(--raised); color: var(--ink); box-shadow: inset 2px 0 0 var(--accent); }
+/* The open one is marked by weight and ground, not a coloured rail: which
+   conversation you are in is a fact, not an event. */
+.conv[aria-current="true"] {
+  background: var(--raised);
+  color: var(--ink);
+  font-weight: 600;
+}
 .conv .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv .del { opacity: 0; color: var(--ink-faint); border: 0; background: none; cursor: pointer; font-size: 15px; padding: 0 2px; }
 .conv:hover .del { opacity: 1; }
@@ -161,58 +223,156 @@ body {
 .topbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 16px;
+  gap: var(--s2);
+  padding: var(--s2) var(--s4);
   border-bottom: 1px solid var(--line);
-  background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  /* The thread scrolls under it; blur keeps the controls readable without a
+     hard band of solid colour across the top. */
+  backdrop-filter: blur(12px);
+  position: relative;
+  z-index: 2;
 }
 .spacer { flex: 1; }
-.stat { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); white-space: nowrap; }
+.stat { font-family: var(--mono); font-size: var(--t-small); color: var(--ink-faint); white-space: nowrap; }
 
+/* ------------------------------------------------------------ the gauge
+
+   A local model's context is a hard physical limit on this machine, and
+   nothing else in the interface says so. The track fills as the conversation
+   uses the window up and warms to amber near the end, which is the point at
+   which the oldest turns start being dropped. Fed from `done`, which reports
+   the prompt and generated tokens the turn actually cost. */
+.gauge {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-family: var(--mono);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  white-space: nowrap;
+  /* Nothing to show until a turn has reported its cost. */
+  opacity: 0;
+  transition: opacity var(--mid) var(--ease);
+}
+.gauge.live { opacity: 1; }
+.gauge .track {
+  width: 72px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+.gauge .fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--ink-faint);
+  transition: width var(--mid) var(--ease), background var(--mid) var(--ease);
+}
+.gauge.warm .fill { background: var(--accent); }
+.gauge.warm .used { color: var(--accent); }
+.gauge .used { color: var(--ink-soft); }
+
+/* The model and its quantisation are a machine fact, so the control that
+   names them is set in mono. */
 .select {
   appearance: none;
   background: var(--panel);
   color: var(--ink);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 6px 10px;
-  font: inherit;
-  font-size: 13px;
+  border-radius: var(--radius-sm);
+  padding: 6px 26px 6px var(--s3);
+  font-family: var(--mono);
+  font-size: var(--t-small);
   cursor: pointer;
   max-width: 240px;
+  /* The disclosure arrow, drawn rather than fetched. */
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 14px) 52%, calc(100% - 10px) 52%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+  transition: border-color var(--fast) var(--ease);
 }
+.select:hover { border-color: var(--ink-faint); }
 
 .icon-btn, .ghost-btn, .primary-btn {
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   font: inherit;
   cursor: pointer;
   border: 1px solid transparent;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease),
+              border-color var(--fast) var(--ease);
 }
-.icon-btn { background: transparent; color: var(--ink-soft); font-size: 18px; line-height: 1; padding: 4px 9px; }
+.icon-btn { background: transparent; color: var(--ink-soft); font-size: 17px; line-height: 1; padding: var(--s1) 9px; }
 .icon-btn:hover { background: var(--raised); color: var(--ink); }
-.ghost-btn { background: transparent; color: var(--ink-soft); border-color: var(--line); padding: 7px 12px; font-size: 13px; width: 100%; }
-.ghost-btn:hover { color: var(--ink); background: var(--raised); }
-.primary-btn { background: var(--accent); color: var(--bg); padding: 7px 14px; font-size: 13px; font-weight: 600; }
+.ghost-btn {
+  background: transparent; color: var(--ink-soft); border-color: var(--line);
+  padding: 7px var(--s3); font-size: var(--t-small); width: 100%;
+}
+.ghost-btn:hover { color: var(--ink); background: var(--raised); border-color: var(--ink-faint); }
+/* The primary button is ink, not amber. It is a control, and controls are
+   chrome; the accent is reserved for state. */
+.primary-btn {
+  background: var(--ink); color: var(--bg);
+  padding: 7px var(--s4); font-size: var(--t-small); font-weight: 600;
+}
+.primary-btn:hover { opacity: .88; }
+
+/* Every focusable thing gets the same visible ring, once. */
+:where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
 
 /* -------------------------------------------------------------- thread */
 
 .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 28px 0 12px; }
 
-.empty { max-width: 680px; margin: 14vh auto; text-align: center; color: var(--ink-faint); padding: 0 20px; }
-.empty h1 { font-family: var(--mono); font-size: 26px; letter-spacing: 0.02em; margin: 0 0 6px; color: var(--ink); }
-.empty p { margin: 0; }
+.empty { max-width: 620px; margin: 16vh auto; text-align: center; color: var(--ink-faint); padding: 0 var(--s5); }
+.empty h1 {
+  font-family: var(--mono);
+  font-size: var(--t-display);
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin: 0 0 var(--s2);
+  color: var(--ink);
+}
+.empty p { margin: 0; font-size: var(--t-lead); }
 
-.msg { max-width: 720px; margin: 0 auto 22px; padding: 0 20px; display: flex; gap: 14px; }
+.msg {
+  max-width: 720px;
+  margin: 0 auto var(--s5);
+  padding: 0 var(--s5);
+  display: flex;
+  gap: var(--s3);
+  /* Each message arrives rather than appearing. 4px is enough to read as
+     motion and not enough to be a performance. */
+  animation: msg-in 180ms var(--ease) both;
+}
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) { .msg { animation: none; } }
 .msg .who {
   flex: none;
-  width: 26px; height: 26px;
-  border-radius: 7px;
+  width: 24px; height: 24px;
+  border-radius: var(--radius-sm);
   display: grid; place-items: center;
-  font-family: var(--mono); font-size: 11px; font-weight: 700;
-  background: var(--panel); color: var(--ink-soft);
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .04em;
+  background: var(--panel); color: var(--ink-faint);
   border: 1px solid var(--line);
+  user-select: none;
 }
-.msg.user .who { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+/* Your own turns are marked by a filled badge; the model's are outlined. Two
+   states, no colour spent. */
+.msg.user .who { background: var(--ink); color: var(--bg); border-color: transparent; }
 .msg .body { min-width: 0; flex: 1; }
 .msg .body > :first-child { margin-top: 0; }
 
@@ -252,19 +412,111 @@ body {
 .lightbox-close:hover { background: rgb(255 255 255 / .2); }
 .msg .body > :last-child { margin-bottom: 0; }
 
-.msg pre {
-  background: var(--panel);
+/* ------------------------------------------------------------- code
+
+   A code block is a thing you take away, so it is built as an object with a
+   header rather than as indented prose: the language on the left, a copy
+   control on the right, the code below. */
+.code-block {
+  position: relative;
+  margin: 0 0 var(--s3);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 12px 14px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.code-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s1) var(--s2) var(--s1) var(--s3);
+  border-bottom: 1px solid var(--line-soft);
+  font-family: var(--mono);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  background: color-mix(in srgb, var(--ink) 3%, var(--panel));
+}
+.code-head .spacer { flex: 1; }
+.copy-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--t-micro);
+  padding: 3px var(--s2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color var(--fast) var(--ease), background var(--fast) var(--ease);
+}
+.copy-btn:hover { color: var(--ink); background: var(--raised); }
+.copy-btn.done { color: var(--ok); }
+
+/* A block the model never closed. Said plainly rather than repaired: the rest
+   of the reply really is inside it, and guessing a boundary would cut real
+   code in half. */
+.code-block.unterminated { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.code-head .flag {
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: none;
+  cursor: help;
+}
+
+.msg pre {
+  margin: 0;
+  background: transparent;
+  border: 0;
+  padding: var(--s3) var(--s4);
   overflow-x: auto;
   font-family: var(--mono);
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.6;
+  /* Tabs in real source are 8 columns wide by default, which throws the
+     indentation of anything a model pasted. */
+  tab-size: 4;
 }
 .msg code { font-family: var(--mono); font-size: 0.9em; }
-.msg :not(pre) > code { background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
-.msg blockquote { margin: 0; padding-left: 14px; border-left: 2px solid var(--line); color: var(--ink-soft); }
+.msg :not(pre) > code {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  /* An identifier must not be broken across lines mid-word. */
+  word-break: break-word;
+}
+.msg blockquote {
+  margin: 0 0 var(--s3);
+  padding: var(--s1) 0 var(--s1) var(--s4);
+  border-left: 2px solid var(--line);
+  color: var(--ink-soft);
+}
+/* A thematic break is a pause in the reply, so it is given air rather than a
+   heavy line. */
+.msg hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: var(--s5) 0;
+}
+.msg h3, .msg h4, .msg h5, .msg h6 {
+  margin: var(--s5) 0 var(--s2);
+  line-height: 1.3;
+  letter-spacing: -.01em;
+}
+.msg h3 { font-size: var(--t-title); }
+.msg h4 { font-size: var(--t-lead); }
+.msg h5, .msg h6 { font-size: var(--t-body); color: var(--ink-soft); }
+.msg p { margin: 0 0 var(--s3); }
+.msg ul, .msg ol { margin: 0 0 var(--s3); padding-left: var(--s5); }
+.msg li { margin: 0 0 var(--s1); }
+.msg li > ul, .msg li > ol { margin: var(--s1) 0 0; }
+.msg a { color: var(--ink); text-decoration-color: var(--ink-faint); text-underline-offset: 2px; }
+.msg a:hover { text-decoration-color: var(--accent); }
 
 /* Reasoning is secondary: present, collapsible, never shouting. */
 .msg .body .answer > :first-child { margin-top: 0; }
@@ -279,7 +531,17 @@ body {
   background: var(--panel);
   overflow: hidden;
 }
-.think summary { cursor: pointer; padding: 6px 12px; font-size: 12px; color: var(--ink-faint); font-family: var(--mono); }
+.think summary {
+  cursor: pointer;
+  padding: 5px var(--s3);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.think summary:hover { color: var(--ink-soft); }
 .think[open] summary { border-bottom: 1px solid var(--line); }
 
 /* While reasoning streams the summary animates, because the pane is collapsed
@@ -330,12 +592,17 @@ body {
    transcript between the reasoning and the answer, so it must read as
    supporting material rather than competing with the reply. */
 .tool-card {
-  margin: 0 0 8px;
+  margin: 0 0 var(--s2);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
   overflow: hidden;
+  transition: border-color var(--mid) var(--ease);
 }
+/* A running call is the one thing on screen that is happening, so it is the
+   one thing wearing the accent. */
+.tool-card.running { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.tool-card.bad { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
 .tool-card > summary {
   display: flex;
   align-items: center;
@@ -353,7 +620,7 @@ body {
   flex: none;
   width: 6px; height: 6px;
   border-radius: 50%;
-  background: var(--done);
+  background: var(--ok);
 }
 .tool-card.running .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
 .tool-card.bad .dot { background: var(--danger); }
@@ -386,8 +653,37 @@ body {
 .msg th { background: var(--panel); font-weight: 600; }
 .msg tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--panel) 45%, transparent); }
 
-:root { --done: #3f9e73; }
-:root:not([data-theme="light"]) { --done: #55c098; }
+/* `--done` predated the semantic tokens; it is `--ok` now. */
+
+/* ------------------------------------------------- scroll to latest
+
+   Appears only when the reader has moved away from the tail, which is the
+   only time it has anything to offer. It sits above the composer rather than
+   inside it, so it never shifts the controls. */
+.to-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  margin-bottom: var(--s2);
+  transform: translate(-50%, 4px);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px var(--s3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--raised);
+  box-shadow: var(--shadow);
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: var(--t-small);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--mid) var(--ease), transform var(--mid) var(--ease);
+}
+.to-latest.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+.to-latest:hover { color: var(--ink); border-color: var(--ink-faint); }
 
 /* ------------------------------------------------------------ composer */
 
@@ -396,16 +692,24 @@ body {
   max-width: 720px;
   width: 100%;
   margin: 0 auto;
-  padding: 12px 20px 22px;
+  padding: var(--s3) var(--s5) var(--s5);
+}
+/* The box lifts when it has focus, so the place text will go is obvious
+   without a coloured border. */
+.composer-box:focus-within {
+  border-color: var(--ink-faint);
+  box-shadow: var(--shadow-lift);
 }
 
 /* Input and its controls are one bordered unit, so the send button can never
    drift out of alignment with the box it belongs to. */
 .composer-box {
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   background: var(--raised);
-  padding: 8px 8px 8px 12px;
+  box-shadow: var(--shadow);
+  transition: border-color var(--mid) var(--ease), box-shadow var(--mid) var(--ease);
+  padding: var(--s2) var(--s2) var(--s2) var(--s3);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -437,15 +741,22 @@ body {
 
 .send-btn {
   flex: none;
-  width: 34px; height: 34px;
+  width: 32px; height: 32px;
   display: grid; place-items: center;
-  border: 0; border-radius: 9px;
-  background: var(--accent); color: var(--bg);
+  border: 0; border-radius: var(--radius-sm);
+  /* Ink, not amber: sending is a control, and the accent is kept for state
+     that is changing on its own. */
+  background: var(--ink); color: var(--bg);
   font-size: 15px; cursor: pointer;
+  transition: background var(--fast) var(--ease), opacity var(--fast) var(--ease),
+              transform var(--fast) var(--ease);
 }
-.send-btn:disabled { opacity: 0.4; cursor: default; }
+.send-btn:hover:not(:disabled) { transform: translateY(-1px); }
+.send-btn:active:not(:disabled) { transform: none; }
+.send-btn:disabled { opacity: 0.3; cursor: default; }
 /* Same element, same place — only the meaning changes while streaming. */
 .send-btn.is-stop { background: var(--danger); }
+@media (prefers-reduced-motion: reduce) { .send-btn { transition: none; } .send-btn:hover { transform: none; } }
 
 .attachments { display: flex; flex-wrap: wrap; gap: 6px; padding-bottom: 2px; }
 .chip-file {
@@ -785,7 +1096,7 @@ body {
   grid-auto-columns: 1fr;
   gap: 2px;
   padding: 2px;
-  background: var(--surface-2, rgba(127, 127, 127, .12));
+  background: var(--panel);
   border-radius: 7px;
 }
 .segmented button {
@@ -802,7 +1113,7 @@ body {
 }
 .segmented button:hover { opacity: .9; }
 .segmented button[aria-pressed="true"] {
-  background: var(--surface, rgba(127, 127, 127, .25));
+  background: var(--raised);
   opacity: 1;
   font-weight: 600;
 }

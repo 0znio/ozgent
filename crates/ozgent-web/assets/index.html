@@ -46,6 +46,12 @@
         </select>
         <span class="spacer"></span>
         <span class="stat" id="stat"></span>
+        <!-- The window this model is running with, and how much of it the
+             conversation has used. Hidden until a turn reports its cost. -->
+        <span class="gauge" id="gauge" title="Context used">
+          <span class="track"><span class="fill" id="gauge-fill"></span></span>
+          <span class="used" id="gauge-used"></span><span id="gauge-total"></span>
+        </span>
       </header>
 
       <div class="thread" id="thread">
@@ -56,6 +62,7 @@
       </div>
 
       <form class="composer" id="composer">
+        <button type="button" class="to-latest" id="to-latest" hidden>↓ Latest</button>
         <div class="quick" id="quick" hidden></div>
         <div class="composer-box" id="composer-box">
           <div class="attachments" id="attachments" hidden></div>

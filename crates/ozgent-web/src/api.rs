@@ -973,3 +973,32 @@ pub fn decode_data_url(value: &str) -> Result<ozgent_core::ImageSource, String> 
     }
     Ok(ozgent_core::ImageSource::Bytes { bytes, mime })
 }
+
+#[cfg(test)]
+mod asset_tests {
+    /// Run the client's own markdown tests.
+    ///
+    /// The renderer is JavaScript, so its tests are too; this puts them in
+    /// `cargo test` where the rest of the guards live. Skipped rather than
+    /// failed when node is absent, since node is not a build requirement —
+    /// the assets ship as source.
+    #[test]
+    fn markdown_renders_what_models_write() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
+        let run = std::process::Command::new("node")
+            .arg("markdown.test.mjs")
+            .current_dir(dir)
+            .output();
+
+        let Ok(out) = run else {
+            eprintln!("skipping: node is not installed");
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}

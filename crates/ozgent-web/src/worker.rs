@@ -524,7 +524,7 @@ fn turn(
     }
 
     if media_turn {
-        if let Some(observation) = ground(engine, session, resolved, &messages, media_for(projector, &images), request) {
+        if let Some(observation) = ground(engine, session, &messages, media_for(projector, &images), request) {
             // The observation alone was not enough: the model read the image
             // correctly, then searched anyway. Naming the *only* reason a tool
             // is still warranted turns "should I search?" from an open question
@@ -794,7 +794,9 @@ fn media_for<'a>(
 fn ground(
     engine: &Engine,
     session: &mut ozgent_llama::engine::Session<'_>,
-    resolved: &ozgent_core::options::Resolved,
+    // Deliberately not given the turn's options: this pass describes what is
+    // in the image, so it runs with reasoning off and no effort budget
+    // whatever the user asked of the answer itself.
     messages: &[Message],
     media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media])>,
     request: &Request,
