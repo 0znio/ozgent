@@ -423,3 +423,50 @@ fn a_conversation_can_be_found_by_its_public_id() {
         "an unknown id must be absent, not an error"
     );
 }
+
+#[test]
+fn empty_conversations_are_hidden_from_the_picker() {
+    let store = Store::open_in_memory().unwrap();
+    let empty = store.create_conversation("", Some("gemma4:12b")).unwrap();
+    let used = store.create_conversation("real", Some("gemma4:12b")).unwrap();
+    store.append_message(used, "user", "hello", 0).unwrap();
+
+    let listed = store.list_active_conversations(50).unwrap();
+    let ids: Vec<i64> = listed.iter().map(|c| c.id).collect();
+
+    assert_eq!(ids, vec![used], "only the one with messages is offerable");
+    assert_eq!(store.list_conversations(50).unwrap().len(), 2, "both still exist");
+    assert!(ids.iter().all(|id| *id != empty));
+}
+
+#[test]
+fn pruning_removes_the_empty_ones_and_spares_the_current() {
+    let store = Store::open_in_memory().unwrap();
+    let stale_a = store.create_conversation("", None).unwrap();
+    let stale_b = store.create_conversation("", None).unwrap();
+    let current = store.create_conversation("", None).unwrap();
+    let used = store.create_conversation("real", None).unwrap();
+    store.append_message(used, "user", "hello", 0).unwrap();
+
+    assert_eq!(store.empty_conversation_count().unwrap(), 3);
+
+    let removed = store.delete_empty_conversations(Some(current)).unwrap();
+    assert_eq!(removed, 2, "the two stale ones, not the one being used");
+
+    let left: Vec<i64> = store.list_conversations(50).unwrap().iter().map(|c| c.id).collect();
+    assert!(left.contains(&current), "the live conversation must survive");
+    assert!(left.contains(&used), "a conversation with messages is never empty");
+    assert!(!left.contains(&stale_a) && !left.contains(&stale_b));
+}
+
+#[test]
+fn pruning_with_nothing_to_keep_clears_them_all() {
+    // `keep = None` has to mean "spare nothing", not "spare NULL" — a plain
+    // `id != ?1` against NULL matches no row and would delete nothing.
+    let store = Store::open_in_memory().unwrap();
+    store.create_conversation("", None).unwrap();
+    store.create_conversation("", None).unwrap();
+
+    assert_eq!(store.delete_empty_conversations(None).unwrap(), 2);
+    assert_eq!(store.empty_conversation_count().unwrap(), 0);
+}

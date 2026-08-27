@@ -76,7 +76,12 @@ pub struct Chat<'a> {
     store: Store,
     embedder: Box<dyn ozgent_memory::Embedder>,
     tools: Option<ToolHost>,
-    conversation: i64,
+    /// The conversation being written to, once there is one.
+    ///
+    /// `None` until the first message. Opening a chat and closing it again
+    /// used to leave a titleless empty row behind every time, which filled
+    /// the picker with nothing.
+    conversation: Option<i64>,
     opts: Resolved,
     theme: Theme,
     width: usize,
@@ -170,14 +175,9 @@ async fn run_one(
 
     // One database for every front end, so the web UI sees the same history.
     let store = Store::open(paths.root().join("ozgent.db"))?;
-    let conversation_id = match *conversation {
-        Some(id) => id,
-        None => {
-            let id = store.create_conversation("", Some(&model_ref.to_string()))?;
-            *conversation = Some(id);
-            id
-        }
-    };
+    // Deliberately not created here. A conversation begins when the user says
+    // something, not when a model finishes loading.
+    let conversation_id = *conversation;
 
     let tools = if opts.tools && config.tools.enabled {
         match crate::start_tools(paths, config).await {
@@ -195,7 +195,9 @@ async fn run_one(
     };
 
     let plain = options.plain || !config.ui.markdown;
-    let turn = store.message_count(conversation_id).unwrap_or(0) as usize;
+    let turn = conversation_id
+        .and_then(|id| store.message_count(id).ok())
+        .unwrap_or(0) as usize;
 
     let mut chat = Chat {
         engine: &engine,
@@ -235,7 +237,7 @@ async fn run_one(
     if let Some(host) = &chat.tools {
         host.shutdown().await;
     }
-    *conversation = Some(chat.conversation);
+    *conversation = chat.conversation;
 
     match outcome? {
         Flow::Switch(other) => Ok(Some(other)),
@@ -315,8 +317,10 @@ impl<'a> Chat<'a> {
             }
         }
 
+        // The first message is what brings a conversation into existence.
+        let conversation = self.ensure_conversation()?;
         let user_id = self.store.append_message(
-            self.conversation,
+            conversation,
             "user",
             &extracted.text,
             0,
@@ -331,13 +335,13 @@ impl<'a> Chat<'a> {
         // something readable in its sidebar.
         if self.turn == 1 {
             let title: String = extracted.text.chars().take(60).collect();
-            self.store.rename_conversation(self.conversation, &title)?;
+            self.store.rename_conversation(conversation, &title)?;
         }
 
         if self.media_turn {
             self.media_observation = self.ground(&extracted.text);
         }
-        let mut messages = self.build_context(&extracted.text)?;
+        let mut messages = self.build_context(Some(conversation), &extracted.text)?;
         let mut reply = self.generate(&messages)?;
 
         // A tool call is a request, not an answer: run it, hand the result
@@ -407,7 +411,7 @@ impl<'a> Chat<'a> {
         }
 
         let assistant_id = self.store.append_message_full(
-            self.conversation,
+            conversation,
             "assistant",
             &reply.text,
             reply.thinking.as_deref(),
@@ -424,7 +428,7 @@ impl<'a> Chat<'a> {
     }
 
     /// Assemble the prompt from pinned facts, recent turns, and recall.
-    fn build_context(&self, query: &str) -> Result<Vec<Message>> {
+    fn build_context(&self, conversation: Option<i64>, query: &str) -> Result<Vec<Message>> {
         // Leave room for the answer, and keep the window inside the context.
         let budget = Budget {
             total: self.session.n_ctx() as usize,
@@ -433,9 +437,14 @@ impl<'a> Chat<'a> {
             max_retrieved: 6,
         };
 
-        let ctx = ContextBuilder::new(&self.store, &self.embedder)
-            .with_budget(budget)
-            .build(self.conversation, query)?;
+        // Before the first message there is no conversation and so no history
+        // to assemble — the system prompt and the query are the whole context.
+        let ctx = match conversation {
+            Some(id) => ContextBuilder::new(&self.store, &self.embedder)
+                .with_budget(budget)
+                .build(id, query)?,
+            None => Default::default(),
+        };
 
         if ctx.used_recall() {
             eprintln!(
@@ -757,6 +766,136 @@ impl<'a> Chat<'a> {
         eprintln!("{arrow} {}{timing}", self.theme.style(Style::dim(), &text));
     }
 
+    /// The conversation being written to, creating it if this is the first
+    /// message.
+    fn ensure_conversation(&mut self) -> Result<i64> {
+        if let Some(id) = self.conversation {
+            return Ok(id);
+        }
+        let id = self
+            .store
+            .create_conversation("", Some(&self.model.to_string()))?;
+        self.conversation = Some(id);
+        Ok(id)
+    }
+
+    /// List past conversations, reopen one, or delete one.
+    ///
+    ///   /conv           list
+    ///   /conv 3         reopen the third
+    ///   /conv rm 3      delete it
+    ///   /conv prune     drop every empty one left by older versions
+    ///
+    /// Reopening is only a change of id: the prompt is rebuilt from the store
+    /// on every turn, so the history comes back on its own and the engine's
+    /// prefix check refuses the stale checkpoint by itself.
+    fn conversations(&mut self, arg: &str) -> Result<Flow> {
+        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        let mut parts = arg.split_whitespace();
+        let verb = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("");
+
+        let listed = self.store.list_active_conversations(50)?;
+
+        match verb {
+            "" => {
+                if listed.is_empty() {
+                    eprintln!("{}", dim("no conversations yet; send a message to start one"));
+                    return Ok(Flow::Continue);
+                }
+                eprintln!("{}", dim("conversations:"));
+                for (i, c) in listed.iter().enumerate() {
+                    let marker = if Some(c.id) == self.conversation { "*" } else { " " };
+                    eprintln!("{}", dim(&format!("{marker} {:>2}. {}", i + 1, describe(c))));
+                }
+                let empties = self.store.empty_conversation_count()?;
+                // Only worth mentioning when there is a mess to clean up; one
+                // empty row is the live conversation and is not news.
+                if empties > 1 {
+                    eprintln!(
+                        "{}",
+                        dim(&format!("{empties} empty conversations · /conv prune to remove them"))
+                    );
+                }
+                eprintln!("{}", dim("/conv <number> to reopen · /conv rm <number> to delete"));
+            }
+
+            "rm" | "delete" | "del" => {
+                let Some(target) = pick(&listed, rest) else {
+                    eprintln!("{}", dim(&format!("no conversation {rest:?}; /conv to list")));
+                    return Ok(Flow::Continue);
+                };
+                let (id, label) = (target.id, describe(target));
+                self.store.delete_conversation(id)?;
+                // Deleting the one being written to leaves the chat with no
+                // conversation rather than a dangling id; the next message
+                // starts a fresh one.
+                if self.conversation == Some(id) {
+                    self.conversation = None;
+                    self.session.reset();
+                    self.turn = 0;
+                    eprintln!("{}", dim(&format!("· deleted {label} (was the current one)")));
+                } else {
+                    eprintln!("{}", dim(&format!("· deleted {label}")));
+                }
+            }
+
+            "prune" => {
+                let removed = self.store.delete_empty_conversations(self.conversation)?;
+                eprintln!("{}", dim(&format!("· removed {removed} empty conversation(s)")));
+            }
+
+            "new" => {
+                self.conversation = None;
+                self.session.reset();
+                self.turn = 0;
+                eprintln!("{}", dim("· started a new conversation"));
+            }
+
+            number => {
+                let Some(target) = pick(&listed, number) else {
+                    eprintln!("{}", dim(&format!("no conversation {number:?}; /conv to list")));
+                    return Ok(Flow::Continue);
+                };
+                if self.conversation == Some(target.id) {
+                    eprintln!("{}", dim("already in that conversation"));
+                    return Ok(Flow::Continue);
+                }
+                let (id, model) = (target.id, target.model.clone());
+                self.conversation = Some(id);
+                self.turn = self.store.message_count(id)? as usize;
+                // The KV cache holds the previous conversation's prompt, and
+                // none of it is a prefix of this one.
+                self.session.reset();
+                eprintln!("{}", dim(&format!("· {} ({} messages)", describe(target), self.turn)));
+                self.recap(id)?;
+
+                // Not switched automatically: reloading weights is a ten-second
+                // surprise for someone who only asked to look at a thread.
+                if let Some(model) = model.filter(|m| *m != self.model.to_string()) {
+                    eprintln!("{}", dim(&format!("  was {model} · /models {model} to switch back")));
+                }
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Print the tail of a conversation, so reopening one lands somewhere
+    /// recognisable rather than at a bare prompt.
+    fn recap(&self, conversation: i64) -> Result<()> {
+        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        let recent = self.store.recent_messages(conversation, 4)?;
+        for m in &recent {
+            let who = match m.role.as_str() {
+                "user" => "you",
+                "assistant" => self.model.name.as_str(),
+                other => other,
+            };
+            eprintln!("{}", dim(&format!("  {who}: {}", one_line(&m.content, 72))));
+        }
+        Ok(())
+    }
+
     /// Show installed models and pick one to switch to.
     fn pick_model(&mut self, arg: &str) -> Result<Option<String>> {
         let models = ozgent_core::installed(&self.paths);
@@ -989,7 +1128,9 @@ impl<'a> Chat<'a> {
             return Ok(());
         };
 
-        let mut messages = self.build_context(query)?;
+        // `/call` is a probe: it uses the conversation for context when there
+        // is one, but must not bring one into being.
+        let mut messages = self.build_context(self.conversation, query)?;
         messages.push(Message::user(format!(
             "Call the most appropriate tool to answer: {query}"
         )));
@@ -1031,13 +1172,15 @@ impl<'a> Chat<'a> {
             }
 
             "/clear" | "/new" => {
-                self.conversation = self
-                    .store
-                    .create_conversation("", Some(&self.model.to_string()))?;
+                // Nothing is created here either: the next message does it.
+                // Otherwise `/clear` typed twice leaves an orphan behind.
+                self.conversation = None;
                 self.session.reset();
                 self.turn = 0;
                 eprintln!("{}", dim("· started a new conversation"));
             }
+
+            "/conv" | "/convs" | "/conversations" => return self.conversations(arg),
 
             "/think" => match arg {
                 "" => eprintln!("{}", dim(&format!("thinking: {:?}", self.opts.thinking))),
@@ -1080,8 +1223,12 @@ impl<'a> Chat<'a> {
                 if arg.is_empty() {
                     eprintln!("{}", dim("usage: /remember <fact>"));
                 } else {
+                    // Scoped to the conversation when there is one; before
+                    // the first message there is nothing to scope it to, and
+                    // an unscoped fact is the right reading of "remember this
+                    // from now on".
                     let id = self.store.add_fact(
-                        Some(self.conversation),
+                        self.conversation,
                         ozgent_memory::Scope::User,
                         arg,
                         None,
@@ -1100,8 +1247,12 @@ impl<'a> Chat<'a> {
             }
 
             "/memory" => {
-                let facts = self.store.facts_for(self.conversation)?;
-                let count = self.store.message_count(self.conversation)?;
+                let (facts, count) = match self.conversation {
+                    Some(id) => {
+                        (self.store.facts_for(id)?, self.store.message_count(id)?)
+                    }
+                    None => (Vec::new(), 0),
+                };
                 eprintln!("{}", dim(&format!("{count} messages, {} facts", facts.len())));
                 for f in facts.iter().take(20) {
                     let mark = if f.pinned { "*" } else { " " };
@@ -1311,6 +1462,52 @@ fn truncate_result(s: &str) -> String {
 
 
 
+/// One line describing a conversation, for the `/conv` listing.
+fn describe(c: &ozgent_memory::Conversation) -> String {
+    let title = if c.title.trim().is_empty() {
+        "(untitled)".to_string()
+    } else {
+        one_line(&c.title, 48)
+    };
+    format!("{title}  ·  {} msg  ·  {}", c.message_count, ago(c.updated_at))
+}
+
+/// Resolve a `/conv` argument — currently a 1-based position in the listing.
+fn pick<'c>(listed: &'c [ozgent_memory::Conversation], arg: &str) -> Option<&'c ozgent_memory::Conversation> {
+    let n: usize = arg.trim().parse().ok()?;
+    listed.get(n.checked_sub(1)?)
+}
+
+/// Collapse to a single line and cap it, so a pasted paragraph stays one row.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    // Counted in characters, not bytes: slicing a multi-byte character in
+    // half panics, and titles are whatever the user typed.
+    let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// A coarse "when", accurate enough to tell threads apart in a list.
+fn ago(timestamp: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(timestamp);
+    let seconds = now.saturating_sub(timestamp);
+    match seconds {
+        // A clock that disagrees with the database is not worth a negative
+        // duration; `saturating_sub` lands it here.
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s if s < 86_400 * 30 => format!("{}d ago", s / 86_400),
+        s => format!("{}mo ago", s / (86_400 * 30)),
+    }
+}
+
 /// Setting names `/config` accepts, listed for the user in one place so the
 /// listing, the error and `/help` cannot drift apart.
 const SETTABLE: &str =
@@ -1321,6 +1518,8 @@ const HELP: &str = "\
 /help              this list
 /exit              quit
 /clear             start a new conversation
+/conv              list past conversations
+/conv <n>          reopen one · /conv rm <n> delete · /conv prune drop empties
 /think on|off|auto show or suppress reasoning
 /effort low|med|high how long the model may reason
 /system <text>     set the system prompt
@@ -1345,8 +1544,75 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats"] {
+        for cmd in ["/help", "/exit", "/clear", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
+        }
+    }
+
+    #[test]
+    fn one_line_flattens_and_caps() {
+        assert_eq!(one_line("a\n  b   c", 40), "a b c");
+        assert_eq!(one_line("hello", 5), "hello", "an exact fit is not truncated");
+        assert_eq!(one_line("hello there", 6), "hello…");
+    }
+
+    #[test]
+    fn one_line_counts_characters_not_bytes() {
+        // Slicing a multi-byte character in half panics, and a title is
+        // whatever the user typed.
+        let text = "héllo wörld ünd mehr";
+        let out = one_line(text, 8);
+        assert_eq!(out.chars().count(), 8, "{out}");
+    }
+
+    #[test]
+    fn pick_is_one_based_and_refuses_nonsense() {
+        let listed = vec![conversation(1, "first"), conversation(2, "second")];
+        assert_eq!(pick(&listed, "1").map(|c| c.id), Some(1));
+        assert_eq!(pick(&listed, "2").map(|c| c.id), Some(2));
+        for bad in ["0", "3", "", "rm", "-1", "1.5"] {
+            assert!(pick(&listed, bad).is_none(), "{bad:?} must not resolve");
+        }
+    }
+
+    #[test]
+    fn an_untitled_conversation_still_reads_as_something() {
+        let c = conversation(1, "");
+        assert!(describe(&c).contains("(untitled)"), "{}", describe(&c));
+    }
+
+    #[test]
+    fn ago_reads_in_the_largest_useful_unit() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(ago(now), "just now");
+        assert_eq!(ago(now - 300), "5m ago");
+        assert_eq!(ago(now - 7200), "2h ago");
+        assert_eq!(ago(now - 86_400 * 3), "3d ago");
+    }
+
+    #[test]
+    fn a_timestamp_from_the_future_does_not_wrap_around() {
+        // A database written on a machine whose clock ran ahead must not
+        // produce a duration of eighteen quintillion seconds.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(ago(now + 10_000), "just now");
+    }
+
+    fn conversation(id: i64, title: &str) -> ozgent_memory::Conversation {
+        ozgent_memory::Conversation {
+            id,
+            uuid: String::new(),
+            title: title.to_string(),
+            model: None,
+            created_at: 0,
+            updated_at: 0,
+            message_count: 2,
         }
     }
 

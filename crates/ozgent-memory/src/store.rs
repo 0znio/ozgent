@@ -275,6 +275,47 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Conversations that have at least one message, newest first.
+    ///
+    /// A conversation with nothing in it is a placeholder the user never
+    /// filled, and showing it in a picker is offering to reopen nothing.
+    /// Filtered in SQL rather than after the fact, so `limit` counts rows the
+    /// caller can actually use.
+    pub fn list_active_conversations(&self, limit: i64) -> Result<Vec<Conversation>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT c.id, c.uuid, c.title, c.model, c.created_at, c.updated_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS n
+             FROM conversations c WHERE n > 0
+             ORDER BY c.updated_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_conversation)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// How many conversations hold no messages at all.
+    pub fn empty_conversation_count(&self) -> Result<i64, StoreError> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM conversations c WHERE NOT EXISTS
+               (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Delete every conversation holding no messages, returning how many went.
+    ///
+    /// `keep` is spared whatever its state — it is the one the caller is
+    /// sitting in, and deleting the row underneath a live chat would strand
+    /// every message written afterwards against a conversation that is gone.
+    pub fn delete_empty_conversations(&self, keep: Option<i64>) -> Result<usize, StoreError> {
+        let removed = self.db.execute(
+            "DELETE FROM conversations WHERE id IS NOT ?1 AND NOT EXISTS
+               (SELECT 1 FROM messages m WHERE m.conversation_id = conversations.id)",
+            params![keep],
+        )?;
+        Ok(removed)
+    }
+
     pub fn rename_conversation(&self, id: i64, title: &str) -> Result<(), StoreError> {
         self.db.execute(
             "UPDATE conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
