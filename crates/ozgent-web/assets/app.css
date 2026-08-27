@@ -429,12 +429,30 @@ body {
 }
 .pill-toggle .ic { width: 15px; height: 15px; }
 .pill-toggle:hover { color: var(--ink-soft); border-color: var(--ink-faint); }
+
+/* On is green, off is neutral and struck through. Two greys separated only by
+   a slightly different background was unreadable — which state you were in was
+   the one thing this control exists to tell you. Green rather than the amber
+   accent: amber means "something is happening right now" (a running call, a
+   filling window), and a standing permission is not an event.
+
+   Three cues, not one: hue, the label's own words, and a struck-through globe.
+   A control whose state is carried by colour alone cannot be read by everyone,
+   and cannot be read at all in a screenshot printed in grey. */
 .pill-toggle[aria-pressed="true"] {
-  background: var(--panel);
-  border-color: transparent;
-  color: var(--ink);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  color: var(--ok);
+  font-weight: 600;
 }
-.pill-toggle[aria-pressed="true"]:hover { background: var(--line-soft); }
+.pill-toggle[aria-pressed="true"]:hover {
+  background: color-mix(in srgb, var(--ok) 22%, transparent);
+  border-color: var(--ok);
+}
+.pill-toggle[aria-pressed="false"] {
+  color: var(--ink-faint);
+  border-style: dashed;
+}
 .ghost-btn {
   background: transparent; color: var(--ink-soft); border-color: var(--line);
   padding: 7px var(--s3); font-size: var(--t-small); width: 100%;

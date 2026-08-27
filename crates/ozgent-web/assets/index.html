@@ -59,6 +59,14 @@
     <circle cx="12" cy="12" r="8.5"/>
     <path d="M3.5 12h17M12 3.5c2.2 2.4 3.3 5.4 3.3 8.5s-1.1 6.1-3.3 8.5c-2.2-2.4-3.3-5.4-3.3-8.5S9.8 5.9 12 3.5z"/>
   </symbol>
+  <!-- The same globe, struck through. Colour alone is not enough to read a
+       state at a glance, and it is no help at all to anyone who cannot
+       distinguish the two hues. -->
+  <symbol id="i-globe-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <circle cx="12" cy="12" r="8.5"/>
+    <path d="M3.5 12h17M12 3.5c2.2 2.4 3.3 5.4 3.3 8.5s-1.1 6.1-3.3 8.5c-2.2-2.4-3.3-5.4-3.3-8.5S9.8 5.9 12 3.5z"/>
+    <path d="M4.5 19.5l15-15"/>
+  </symbol>
   <symbol id="i-clip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
     <path d="M20 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/>
   </symbol>
@@ -162,7 +170,7 @@
                the network and the filesystem, outlined when it may not. -->
           <button type="button" id="tools-toggle" class="pill-toggle" aria-pressed="true"
                   data-tip="Let the model search and read files" aria-label="Toggle tools">
-            <svg class="ic"><use href="#i-globe"></use></svg><span>Tools</span>
+            <svg class="ic"><use href="#i-globe"></use></svg><span class="pill-label">Tools on</span>
           </button>
           <span class="spacer"></span>
           <span class="hint inline" id="attach-hint">paste or drop to attach</span>

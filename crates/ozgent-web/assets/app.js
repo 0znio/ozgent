@@ -1360,6 +1360,7 @@ async function boot() {
   // Sets the button's label; the stamp itself was applied by the inline
   // script in the document head, before anything was painted.
   applyTheme(storedTheme());
+  syncTools();
   const models = await api("/api/models");
   el.model.replaceChildren();
   for (const m of models) {
@@ -1409,12 +1410,25 @@ el.send.addEventListener("click", (e) => {
   state.abort?.abort();
 });
 
-$("tools-toggle").addEventListener("click", () => {
-  state.tools = !state.tools;
-  $("tools-toggle").setAttribute("aria-pressed", String(state.tools));
-  $("tools-toggle").title = state.tools
+/// Put the tools control in step with the state it reports.
+///
+/// Three cues, because one is not enough to read at a glance: the hue, the
+/// label's own words, and a globe that is struck through when off.
+function syncTools() {
+  const button = $("tools-toggle");
+  button.setAttribute("aria-pressed", String(state.tools));
+  button.querySelector(".pill-label").textContent = state.tools ? "Tools on" : "Tools off";
+  setIcon(button.querySelector(".ic"), state.tools ? "i-globe" : "i-globe-off");
+  // `data-tip` is what the page draws; `title` waits a second and renders in
+  // the desktop's own style, and setting it here left the visible tip stale.
+  button.dataset.tip = state.tools
     ? "Tools on: the model may search the web and read files"
     : "Tools off: the model answers from what it knows";
+}
+
+$("tools-toggle").addEventListener("click", () => {
+  state.tools = !state.tools;
+  syncTools();
 });
 
 $("lightbox").addEventListener("click", (e) => {
