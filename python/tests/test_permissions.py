@@ -145,12 +145,14 @@ class Permissions(unittest.TestCase):
 
 
 class PageToText(unittest.TestCase):
+    """The floor: markup out, words in. See test_extract.py for the rest."""
+
     def test_script_and_markup_are_stripped(self):
-        from ozgent_tools.builtin.fetch_url import _to_text
+        from ozgent_tools.extract import extract
 
         page = "<html><head><style>a{}</style><script>x()</script></head>" \
                "<body><h1>Title</h1><p>Body &amp; more</p></body></html>"
-        text = _to_text(page)
+        text = extract(page)["text"]
         self.assertIn("Title", text)
         self.assertIn("Body & more", text)
         self.assertNotIn("x()", text)

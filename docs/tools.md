@@ -16,7 +16,7 @@ grant is one people disable wholesale.
 | `web_search` | search the web | provider key |
 | `write_file` | create or modify a file | **`write = true`** |
 | `run_command` | run one allowed program | **`shell = true`** + allowlist |
-| `fetch_url` | read a web page | **`network = true`** |
+| `fetch_url` | read a page, article, JSON API, or feed | **`network = true`** |
 | `get_temperature` | example tool | — |
 
 ## Where they live
@@ -67,6 +67,37 @@ the disk. A single tool can override it:
 [tools.config.read_file]
 root = "/home/you/notes"           # this tool only
 ```
+
+## What `fetch_url` returns
+
+Not the page. The *article* in the page.
+
+A stripped-tags dump of any real URL is a navigation menu — Wikipedia opens
+with sixty lines of it — so a model handed the first 12,000 characters gets a
+table of contents and no story. That fetch succeeds and the answer is useless,
+which is worse than failing. Three strategies run, best first:
+
+| `strategy` | when | what it means |
+|---|---|---|
+| `json-ld` | news sites | the publisher's own `articleBody`, already clean |
+| `readability` | most pages | the block with the most text and the fewest links |
+| `whole-page` | short or unusual pages | tags stripped, everything kept |
+
+Content type decides the rest: JSON is pretty-printed, RSS and Atom give up
+their entries, `text/*` is passed through untouched, PDFs are read if `pypdf`
+is installed and refused clearly if not, and anything binary is refused by
+name rather than dumped as noise.
+
+Pass `query` on a long page and it comes back as the paragraphs that match,
+in their original order, instead of the first few thousand characters.
+
+Two things it deliberately does not do. It does not run JavaScript — a page
+built entirely in the browser comes back with a note saying so rather than an
+empty string. And it sends a browser `User-Agent`, because a great many sites
+answer an unrecognised one with 401 regardless of `robots.txt`; the request is
+still one page, on demand, because you asked for it. Sites that block harder
+than that (Reuters, at the time of writing) are reported as blocking, with the
+status code, rather than as a vague failure.
 
 ## What the boundaries actually guarantee
 

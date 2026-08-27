@@ -849,7 +849,9 @@ impl<'a> Chat<'a> {
                 self.conversation = None;
                 self.session.reset();
                 self.turn = 0;
-                eprintln!("{}", dim("· started a new conversation"));
+                clear_screen();
+                self.banner();
+                eprintln!("{}", dim("· new conversation"));
             }
 
             number => {
@@ -867,6 +869,10 @@ impl<'a> Chat<'a> {
                 // The KV cache holds the previous conversation's prompt, and
                 // none of it is a prefix of this one.
                 self.session.reset();
+                // Same reasoning as /new: the thread being left behind must
+                // not stay on screen above the one being opened.
+                clear_screen();
+                self.banner();
                 eprintln!("{}", dim(&format!("· {} ({} messages)", describe(target), self.turn)));
                 self.recap(id)?;
 
@@ -1177,7 +1183,12 @@ impl<'a> Chat<'a> {
                 self.conversation = None;
                 self.session.reset();
                 self.turn = 0;
-                eprintln!("{}", dim("· started a new conversation"));
+                // Wipe the screen too. The old thread staying on screen under
+                // a one-line notice reads as "still in that conversation",
+                // which is the opposite of what just happened.
+                clear_screen();
+                self.banner();
+                eprintln!("{}", dim("· new conversation"));
             }
 
             "/conv" | "/convs" | "/conversations" => return self.conversations(arg),
@@ -1462,6 +1473,23 @@ fn truncate_result(s: &str) -> String {
 
 
 
+/// Clear the terminal and put the cursor at the top.
+///
+/// Written straight to the terminal rather than through the theme: this is a
+/// cursor movement, not styling, and a plain-output run still wants a clean
+/// screen. Skipped when stderr is not a terminal, where the escapes would end
+/// up in whatever is capturing the output.
+fn clear_screen() {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    // Erase the scrollback as well as the screen: without `3J` the old
+    // conversation is one scroll away and still looks current.
+    eprint!("\x1b[H\x1b[2J\x1b[3J");
+    std::io::stderr().flush().ok();
+}
+
 /// One line describing a conversation, for the `/conv` listing.
 fn describe(c: &ozgent_memory::Conversation) -> String {
     let title = if c.title.trim().is_empty() {
@@ -1517,7 +1545,7 @@ const SETTABLE: &str =
 const HELP: &str = "\
 /help              this list
 /exit              quit
-/clear             start a new conversation
+/new, /clear       start a new conversation and clear the screen
 /conv              list past conversations
 /conv <n>          reopen one · /conv rm <n> delete · /conv prune drop empties
 /think on|off|auto show or suppress reasoning
@@ -1544,7 +1572,7 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats"] {
+        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
         }
     }
