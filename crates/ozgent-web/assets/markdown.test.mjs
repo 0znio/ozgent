@@ -23,7 +23,10 @@ if (from < 0 || to < 0) {
 }
 const body = source.slice(from, source.lastIndexOf("\n", to));
 const context = vm.createContext({});
-vm.runInContext(`${body}\nglobalThis.markdown = markdown;`, context);
+vm.runInContext(
+  `${body}\nglobalThis.markdown = markdown; globalThis.highlight = highlight;`,
+  context,
+);
 const { markdown } = context;
 
 let failures = 0;
@@ -164,6 +167,85 @@ check(
   (out) => out.includes("<ol>") && out.includes("<li>first</li>"),
 );
 check("tables render", markdown("| a |\n| --- |\n| 1 |"), has("<table>"));
+
+// --- syntax highlighting ---------------------------------------------------
+// The renderer and the highlighter share a file, so the same harness covers
+// both. Escaping matters most here: this one writes HTML from source text.
+const { highlight } = context;
+
+check(
+  "python keywords and strings separate",
+  highlight('def f(x):\n    return "hi"', "python"),
+  (out) => out.includes('t-kw">def') && out.includes('t-str">&quot;hi&quot;'),
+);
+check(
+  "comments are marked",
+  highlight("# a note\nx = 1", "python"),
+  has('t-com"># a note'),
+);
+check(
+  "a triple-quoted docstring is one string, not three",
+  highlight('"""line one\nline two"""\nx = 1', "python"),
+  // If the scanner closed on the first quote, `line` would be outside it.
+  (out) => (out.match(/t-str/g) || []).length === 1,
+);
+check(
+  "an apostrophe in a comment does not colour the rest of the file",
+  highlight("# it's fine\nreal_code = 1", "python"),
+  has("real_code"),
+);
+check(
+  "shell scripts are highlighted",
+  highlight('#!/bin/bash\nif true; then\n  echo "hi"\nfi', "bash"),
+  (out) => out.includes('t-kw">if') && out.includes('t-typ">echo'),
+);
+check(
+  "aliases resolve",
+  highlight("const x = 1;", "js"),
+  has('t-kw">const'),
+);
+check(
+  "an unknown language is left alone but still escaped",
+  highlight("<script>alert(1)</script>", "brainfuck"),
+  (out) => !out.includes("<script>") && out.includes("&lt;script&gt;"),
+);
+check(
+  "markup inside a string is escaped, not emitted",
+  highlight('x = "<img onerror=1>"', "python"),
+  (out) => !out.includes("<img") && out.includes("&lt;img"),
+);
+check(
+  "an ampersand survives exactly once",
+  highlight("a && b", "javascript"),
+  (out) => (out.match(/&amp;/g) || []).length === 2 && !out.includes("&amp;amp;"),
+);
+check(
+  "the visible text is unchanged by colouring",
+  highlight('def f():\n    return {"a": 1}', "python"),
+  // Strip the spans and unescape: what is left must be the original.
+  (out) => {
+    const text = out.replace(/<[^>]+>/g, "")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+    return text === 'def f():\n    return {"a": 1}';
+  },
+);
+check(
+  "numbers are found but not inside identifiers",
+  highlight("x1 = 42", "python"),
+  (out) => out.includes('t-num">42') && !out.includes('t-num">1'),
+);
+check(
+  "a call is marked as one",
+  highlight("print(x)", "python"),
+  has('t-typ">print'),
+);
+check(
+  "json keys and values are strings",
+  highlight('{"a": 1, "b": true}', "json"),
+  (out) => out.includes("t-str") && out.includes('t-num">1') && out.includes('t-kw">true'),
+);
 
 if (failures) {
   console.error(`\n${failures} markdown test(s) failed`);

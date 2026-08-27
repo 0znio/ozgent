@@ -328,6 +328,303 @@ function markdown(src) {
   return out.join("\n");
 }
 
+// ------------------------------------------------------- syntax colour
+//
+// A hand-rolled tokenizer, because the alternative is a CDN and this page has
+// to render with no network at all. It is small on purpose: the job is to make
+// code read as code — comments receding, strings and keywords separating from
+// identifiers — not to be a language server. Anything it does not know falls
+// back to plain monospace, which is what the block looked like before.
+//
+// It scans the *text*, never the markup, and escapes on the way out. A
+// highlighter that rewrites already-escaped HTML with regexes is how you turn
+// a code block into an injection point.
+
+/// What a language is made of. `kw` and `typ` are two weights of the same
+/// idea: the words that steer control flow, and the words that name things
+/// the language provides.
+const LANG_SPEC = (() => {
+  const cLike = { line: ["//"], block: [["/*", "*/"]], quotes: ['"', "'", "`"] };
+  const hash = { line: ["#"], block: [], quotes: ['"', "'"] };
+
+  const spec = {
+    python: {
+      ...hash,
+      // Triple quotes first, or the scanner closes on the opening pair.
+      quotes: ['"""', "'''", '"', "'"],
+      kw: `and as assert async await break class continue def del elif else except finally
+           for from global if import in is lambda nonlocal not or pass raise return try
+           while with yield match case`,
+      typ: `True False None self cls int float str bool list dict set tuple bytes object
+            len range print open enumerate zip map filter sum min max abs sorted isinstance
+            super type Exception ValueError TypeError KeyError IndexError`,
+    },
+    javascript: {
+      ...cLike,
+      kw: `async await break case catch class const continue debugger default delete do else
+           export extends finally for from function get if import in instanceof let new of
+           return set static super switch this throw try typeof var void while with yield`,
+      typ: `true false null undefined NaN Infinity console window document Math JSON Object
+            Array String Number Boolean Promise Map Set Symbol Error RegExp Date globalThis`,
+    },
+    typescript: null, // filled in below
+    rust: {
+      ...cLike,
+      quotes: ['"'],
+      kw: `as async await break const continue crate dyn else enum extern fn for if impl in
+           let loop match mod move mut pub ref return self Self static struct super trait
+           type unsafe use where while`,
+      typ: `bool char f32 f64 i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize str String
+            Vec Option Some None Result Ok Err Box Rc Arc HashMap HashSet true false`,
+    },
+    go: {
+      ...cLike,
+      kw: `break case chan const continue default defer else fallthrough for func go goto if
+           import interface map package range return select struct switch type var`,
+      typ: `bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64
+            rune string uint uint8 uint16 uint32 uint64 uintptr true false nil iota make new
+            len cap append copy delete panic recover`,
+    },
+    c: {
+      ...cLike,
+      quotes: ['"', "'"],
+      kw: `auto break case const continue default do else enum extern for goto if inline
+           register restrict return sizeof static struct switch typedef union volatile while
+           class namespace template public private protected virtual override new delete
+           using try catch throw constexpr nullptr`,
+      typ: `bool char double float int long short signed unsigned void size_t NULL true false
+            std string vector map set auto uint8_t uint32_t int32_t int64_t`,
+    },
+    java: {
+      ...cLike,
+      quotes: ['"', "'"],
+      kw: `abstract assert break case catch class const continue default do else enum extends
+           final finally for goto if implements import instanceof interface native new package
+           private protected public return static strictfp super switch synchronized this
+           throw throws transient try void volatile while`,
+      typ: `boolean byte char double float int long short String Object List Map Set Integer
+            Double Boolean Long System true false null var record sealed`,
+    },
+    bash: {
+      ...hash,
+      quotes: ['"', "'"],
+      kw: `if then else elif fi for while until do done case esac function select in return
+           break continue exit local export readonly declare shift trap set unset source eval`,
+      typ: `echo cd ls cat grep sed awk find cp mv rm mkdir touch chmod chown curl wget git
+            sudo apt yum pip python python3 node npm cargo make docker kubectl test true false`,
+    },
+    sql: {
+      line: ["--"], block: [["/*", "*/"]], quotes: ["'", '"'],
+      kw: `select from where insert into values update set delete create table alter drop
+           index view join inner left right outer full on group by order having limit offset
+           union all distinct as and or not null is in exists between like case when then
+           else end primary key foreign references default constraint unique begin commit
+           rollback transaction with returning`,
+      typ: `int integer bigint smallint serial text varchar char boolean bool date timestamp
+            timestamptz numeric decimal real double float json jsonb uuid array count sum avg
+            min max coalesce now true false`,
+      fold: true,
+    },
+    json: { line: [], block: [], quotes: ['"'], kw: `true false null`, typ: `` },
+    yaml: { ...hash, kw: `true false null yes no on off`, typ: `` },
+    toml: { ...hash, kw: `true false`, typ: `` },
+    css: {
+      line: [], block: [["/*", "*/"]], quotes: ['"', "'"],
+      kw: `import media supports keyframes font-face charset use include mixin extend
+           if else for each while return`,
+      typ: `inherit initial unset auto none block flex grid inline absolute relative fixed
+            sticky hidden visible solid dashed dotted transparent currentColor var calc rgb
+            rgba hsl url`,
+    },
+    ruby: {
+      ...hash,
+      kw: `alias and begin break case class def defined do else elsif end ensure false for if
+           in module next nil not or redo rescue retry return self super then true undef
+           unless until when while yield require require_relative attr_accessor`,
+      typ: `puts print p String Integer Float Array Hash Symbol Proc Struct nil true false`,
+    },
+  };
+
+  spec.typescript = {
+    ...spec.javascript,
+    kw: `${spec.javascript.kw} abstract as any declare enum implements interface is keyof
+         namespace never private protected public readonly satisfies type unknown`,
+    typ: `${spec.javascript.typ} string number boolean object bigint symbol Record Partial
+          Readonly Pick Omit Array`,
+  };
+
+  // Turn the word lists into sets once, rather than splitting on every token.
+  for (const key of Object.keys(spec)) {
+    const s = spec[key];
+    if (!s) continue;
+    s.kwSet = new Set((s.kw || "").split(/\s+/).filter(Boolean));
+    s.typSet = new Set((s.typ || "").split(/\s+/).filter(Boolean));
+  }
+  return spec;
+})();
+
+/// Map what a model writes in a fence to a spec.
+const LANG_ALIAS = {
+  py: "python", python3: "python", js: "javascript", mjs: "javascript", cjs: "javascript",
+  jsx: "javascript", node: "javascript", ts: "typescript", tsx: "typescript",
+  rs: "rust", sh: "bash", shell: "bash", zsh: "bash", console: "bash", terminal: "bash",
+  golang: "go", "c++": "c", cpp: "c", cc: "c", h: "c", hpp: "c", cs: "java", csharp: "java",
+  kotlin: "java", kt: "java", swift: "java", scala: "java", postgres: "sql", psql: "sql",
+  mysql: "sql", sqlite: "sql", yml: "yaml", scss: "css", sass: "css", less: "css", rb: "ruby",
+};
+
+const specFor = (lang) => {
+  const key = String(lang || "").toLowerCase();
+  return LANG_SPEC[LANG_ALIAS[key] || key] || null;
+};
+
+const IDENT_START = /[A-Za-z_$@]/;
+const IDENT_REST = /[A-Za-z0-9_$-]/;
+
+/// Colour one block of source.
+///
+/// Returns escaped HTML. Every branch escapes what it emits, so a `<script>`
+/// in a string is shown, never run.
+function highlight(src, lang) {
+  const spec = specFor(lang);
+  if (!spec) return escapeHtml(src);
+
+  const out = [];
+  const push = (cls, text) =>
+    out.push(cls ? `<span class="t-${cls}">${escapeHtml(text)}</span>` : escapeHtml(text));
+
+  let i = 0;
+  const n = src.length;
+  let plain = "";
+  const flush = () => { if (plain) { push(null, plain); plain = ""; } };
+
+  while (i < n) {
+    const rest = src.slice(i);
+
+    // --- comments ---
+    const line = spec.line.find((m) => rest.startsWith(m));
+    if (line) {
+      flush();
+      const end = src.indexOf("\n", i);
+      const stop = end === -1 ? n : end;
+      push("com", src.slice(i, stop));
+      i = stop;
+      continue;
+    }
+    const block = spec.block.find(([open]) => rest.startsWith(open));
+    if (block) {
+      flush();
+      const close = src.indexOf(block[1], i + block[0].length);
+      const stop = close === -1 ? n : close + block[1].length;
+      push("com", src.slice(i, stop));
+      i = stop;
+      continue;
+    }
+
+    // --- strings ---
+    // Longest opener first, so `"""` is not read as `"` followed by `""`.
+    const quote = [...spec.quotes].sort((a, b) => b.length - a.length)
+      .find((q) => rest.startsWith(q));
+    if (quote) {
+      flush();
+      const multi = quote.length > 1;
+      let j = i + quote.length;
+      while (j < n) {
+        if (src[j] === "\\") { j += 2; continue; }
+        if (src.startsWith(quote, j)) { j += quote.length; break; }
+        // A single-quoted string that runs off the line was never a string;
+        // stopping here keeps one stray apostrophe from colouring the rest of
+        // the file.
+        if (!multi && src[j] === "\n") break;
+        j++;
+      }
+      push("str", src.slice(i, Math.min(j, n)));
+      i = Math.min(j, n);
+      continue;
+    }
+
+    const ch = src[i];
+
+    // --- numbers ---
+    if (/[0-9]/.test(ch) && !(i > 0 && IDENT_REST.test(src[i - 1]))) {
+      flush();
+      const m = rest.match(/^(0[xXbBoO][0-9a-fA-F_]+|[0-9][0-9_]*(\.[0-9_]+)?([eE][+-]?[0-9]+)?)[a-zA-Z_]*/);
+      const text = m ? m[0] : ch;
+      push("num", text);
+      i += text.length;
+      continue;
+    }
+
+    // --- words ---
+    if (IDENT_START.test(ch)) {
+      let j = i + 1;
+      while (j < n && IDENT_REST.test(src[j])) j++;
+      const word = src.slice(i, j);
+      const lookup = spec.fold ? word.toLowerCase() : word;
+
+      let cls = null;
+      if (spec.kwSet.has(lookup)) cls = "kw";
+      else if (spec.typSet.has(lookup)) cls = "typ";
+      else {
+        // A name immediately followed by `(` is being called. Cheap, and right
+        // often enough to be worth the two characters of lookahead.
+        let k = j;
+        while (k < n && (src[k] === " " || src[k] === "\t")) k++;
+        if (src[k] === "(") cls = "fn";
+        else if (word[0] === "@" || word[0] === "$") cls = "typ";
+      }
+      if (cls) { flush(); push(cls, word); } else { plain += word; }
+      i = j;
+      continue;
+    }
+
+    // --- punctuation ---
+    if (/[{}()[\];,.:=+\-*/%<>!&|^~?]/.test(ch)) {
+      flush();
+      push("op", ch);
+      i++;
+      continue;
+    }
+
+    plain += ch;
+    i++;
+  }
+  flush();
+  return out.join("");
+}
+
+/// Highlighted HTML, remembered by source.
+///
+/// `dressCode` runs on every streamed token and `innerHTML` rebuilds all the
+/// blocks each time, so without this a reply with five code blocks would
+/// re-colour all five on every token. Only the block still being written
+/// misses, which bounds the work to the tail.
+const HIGHLIGHT_CACHE = new Map();
+const HIGHLIGHT_CACHE_MAX = 120;
+
+function highlightCached(src, lang) {
+  // A NUL cannot occur in a language name — the fence regex limits it to word
+  // characters — so the two halves cannot be confused for one another.
+  const key = `${lang}\u0000${src}`;
+  const hit = HIGHLIGHT_CACHE.get(key);
+  if (hit !== undefined) {
+    // Re-inserting moves it to the end, which turns insertion order into
+    // recency. Left as a plain FIFO, streaming one long block writes a new key
+    // per token and evicts the finished blocks above it — which are exactly
+    // the entries the cache exists to keep.
+    HIGHLIGHT_CACHE.delete(key);
+    HIGHLIGHT_CACHE.set(key, hit);
+    return hit;
+  }
+
+  const html = highlight(src, lang);
+  if (HIGHLIGHT_CACHE.size >= HIGHLIGHT_CACHE_MAX) {
+    HIGHLIGHT_CACHE.delete(HIGHLIGHT_CACHE.keys().next().value);
+  }
+  HIGHLIGHT_CACHE.set(key, html);
+  return html;
+}
+
 /// Give every code block a header with its language and a copy control.
 ///
 /// Applied after rendering rather than inside `markdown`, so the renderer
@@ -343,6 +640,17 @@ function dressCode(root) {
 
     const block = document.createElement("div");
     block.className = "code-block";
+
+    // Colour it. `textContent` is the original source — the markup around it
+    // was written by `markdown`, so this never re-parses escaped HTML.
+    if (code) {
+      const source = code.textContent ?? "";
+      const coloured = highlightCached(source, lang);
+      if (coloured !== escapeHtml(source)) {
+        code.innerHTML = coloured;
+        block.classList.add("lit");
+      }
+    }
     const head = document.createElement("div");
     head.className = "code-head";
     head.innerHTML = '<span class="nm"></span><span class="spacer"></span>' +

@@ -33,6 +33,19 @@
   --shadow: 0 1px 2px rgb(16 21 26 / .06), 0 8px 24px rgb(16 21 26 / .06);
   --shadow-lift: 0 2px 4px rgb(16 21 26 / .08), 0 16px 40px rgb(16 21 26 / .12);
 
+  /* --- syntax -----------------------------------------------------------
+     Its own small palette, and deliberately not built from the accent:
+     colour inside a code block is describing the code, the way a chart's
+     series colours describe data. Amber stays out of it entirely, or the one
+     hue that means "something is happening" would appear in every listing.
+     No red, so a genuine error stays the only red on screen. */
+  --c-com: #7c8790;
+  --c-kw:  #8250df;
+  --c-str: #1a7f37;
+  --c-num: #0e7490;
+  --c-fn:  #2563eb;
+  --c-typ: #0891b2;
+
   /* --- scale ------------------------------------------------------------
      One 4px rhythm for everything, so spacing is chosen from a set rather
      than typed. */
@@ -78,6 +91,13 @@
   --danger: #e06c6c;
   --shadow: 0 1px 2px rgb(0 0 0 / .4), 0 8px 24px rgb(0 0 0 / .3);
   --shadow-lift: 0 2px 4px rgb(0 0 0 / .5), 0 16px 40px rgb(0 0 0 / .45);
+
+  --c-com: #5f6b74;
+  --c-kw:  #c792ea;
+  --c-str: #9ece6a;
+  --c-num: #6ac7c0;
+  --c-fn:  #82aaff;
+  --c-typ: #56b6c2;
 }
 
 @media (prefers-color-scheme: light) {
@@ -96,6 +116,13 @@
     --danger: #b03b3b;
     --shadow: 0 1px 2px rgb(16 21 26 / .06), 0 8px 24px rgb(16 21 26 / .06);
     --shadow-lift: 0 2px 4px rgb(16 21 26 / .08), 0 16px 40px rgb(16 21 26 / .12);
+
+    --c-com: #7c8790;
+    --c-kw:  #8250df;
+    --c-str: #1a7f37;
+    --c-num: #0e7490;
+    --c-fn:  #2563eb;
+    --c-typ: #0891b2;
   }
 }
 
@@ -645,6 +672,20 @@ body {
      indentation of anything a model pasted. */
   tab-size: 4;
 }
+/* Token colours. Only six, because a listing with a dozen hues is decoration
+   rather than structure — the eye needs comments to recede and strings and
+   keywords to separate, and little else. Identifiers stay the body colour,
+   which is what makes the coloured tokens readable as exceptions. */
+.t-com { color: var(--c-com); font-style: italic; }
+.t-kw  { color: var(--c-kw); }
+.t-str { color: var(--c-str); }
+.t-num { color: var(--c-num); }
+.t-fn  { color: var(--c-fn); }
+.t-typ { color: var(--c-typ); }
+/* Punctuation only steps back; giving it a hue of its own makes every line
+   look busier without telling you anything. */
+.t-op  { color: var(--ink-soft); }
+
 .msg code { font-family: var(--mono); font-size: 0.9em; }
 .msg :not(pre) > code {
   background: var(--panel);
