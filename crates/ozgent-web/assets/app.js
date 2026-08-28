@@ -883,39 +883,15 @@ function fillToolCard(card, event) {
 /// belongs to.
 function askConsent(event) {
   const panel = $("consent");
-  // A sentence, not a label and a category. "write_file wants to change files
-  // or data" is a form field read aloud; "Let write_file write poem.txt?" is
-  // the question actually being asked.
-  const verbs = {
-    read: "read something",
-    write: "change files or data",
-    execute: "run a program",
-    unknown: "run",
-  };
   const raw = { ...(event.arguments ?? {}) };
   // A fact about the call, not one of its arguments; it belongs in the
-  // sentence rather than in the list underneath it.
+  // sentence underneath rather than in the list of what is being passed.
   const unfinished = UNFINISHED in raw;
   delete raw[UNFINISHED];
-  const args = Object.entries(raw);
-  const lead = ["command", "path", "url", "query", "file"]
-    .map((k) => raw[k])
-    .find((v) => typeof v === "string");
 
-  $("consent-q").innerHTML =
-    `Let <span class="tool">${escapeHtml(event.name)}</span> ` +
-    `${escapeHtml(verbs[event.effect] ?? "run")}` +
-    (lead ? ` — <span class="tool">${escapeHtml(clip(lead, 60))}</span>?` : "?");
-  // Everything else, once, underneath. The lead argument is already in the
-  // question and is not repeated.
-  const detail = args
-    .filter(([, v]) => v !== lead)
-    .map(([k, v]) => `${k}: ${clip(typeof v === "string" ? v : JSON.stringify(v), 90)}`);
-  // Said plainly, because the question is being asked before the answer to
-  // "what exactly" exists — which is the point: refusing now costs seconds
-  // rather than the minute it takes to generate a file nobody wanted.
-  if (unfinished) detail.push("the content is still being generated");
-  $("consent-detail").textContent = detail.join("   ");
+  const { question, meta } = consentWording(event.name, event.effect, raw, unfinished);
+  $("consent-q").innerHTML = question;
+  $("consent-meta").innerHTML = meta;
   $("consent-always").textContent = "always";
   panel.hidden = false;
 
@@ -939,6 +915,59 @@ function askConsent(event) {
     for (const b of buttons) b.addEventListener("click", onClick);
     document.addEventListener("keydown", onKey, true);
   });
+}
+
+/// The verb for a call, chosen by the argument that names what it acts on.
+///
+/// "Write config.py?" is a question. "Let write_file change files or data —
+/// config.py?" is a form field read aloud, and was what this used to say.
+/// The effect alone cannot pick the verb: a search and a file read are both
+/// `read`, and "Read rust async?" is not English.
+const CONSENT_VERBS = {
+  command: () => "Run",
+  path: (effect) => (effect === "write" ? "Write" : "Read"),
+  file: (effect) => (effect === "write" ? "Write" : "Read"),
+  url: () => "Fetch",
+  query: () => "Search for",
+};
+
+const CONSENT_EFFECTS = {
+  read: "read something",
+  write: "change files or data",
+  execute: "run a program",
+  unknown: "run",
+};
+
+/// The two lines the panel shows: the question, and what it is about.
+///
+/// Exported shape rather than written inline so the wording can be tested
+/// without a browser — it is the part most likely to come out wrong.
+function consentWording(name, effect, args, unfinished) {
+  const key = Object.keys(CONSENT_VERBS).find((k) => typeof args[k] === "string");
+  const tool = `<span class="consent-name">${escapeHtml(name)}</span>`;
+
+  // Three parts, because only the middle one may shrink: a long path is cut
+  // by the CSS, and a question mark cut off with it stops being a question.
+  // The cap is only so the DOM never holds a whole file.
+  const [before, middle, after] = key
+    ? [`${CONSENT_VERBS[key](effect)} `, clip(args[key], 200), "?"]
+    // Nothing names a target — a tool taking no arguments, or one whose
+    // arguments had not arrived yet. Fall back to what it is allowed to do.
+    : ["Allow ", name, ` to ${CONSENT_EFFECTS[effect] ?? "run"}?`];
+  const question =
+    `<span class="consent-fix">${escapeHtml(before)}</span>` +
+    `<span class="consent-name">${escapeHtml(middle)}</span>` +
+    `<span class="consent-fix">${escapeHtml(after)}</span>`;
+
+  // The tool is always named somewhere, so a verb never hides which tool is
+  // asking. Everything else it was passed goes here too, once.
+  const rest = Object.entries(args)
+    .filter(([k]) => k !== key)
+    .map(([k, v]) => `${k}: ${clip(typeof v === "string" ? v : JSON.stringify(v), 48)}`);
+  if (unfinished) rest.push("the content is still being generated");
+
+  const parts = key ? [tool, ...rest.map(escapeHtml)] : rest.map(escapeHtml);
+  return { question, meta: parts.join(" · ") };
 }
 
 /// One value, short enough to sit on a line, with newlines flattened.

@@ -247,6 +247,81 @@ check(
   (out) => out.includes("t-str") && out.includes('t-num">1') && out.includes('t-kw">true'),
 );
 
+// --- the consent wording ---------------------------------------------------
+// The panel that asks whether a tool may run. Its wording is the part most
+// likely to come out wrong and the least likely to be noticed: it appears
+// mid-conversation, is read once, and is gone. An earlier version said
+// "Let write_file change files or data - config.py?", which is a form field
+// read aloud rather than a question.
+const verbFrom = source.indexOf("const CONSENT_VERBS");
+const verbTo = source.indexOf("/// One value, short enough");
+if (verbFrom < 0 || verbTo < 0) {
+  console.error("could not find the consent wording in app.js; the markers moved");
+  process.exit(1);
+}
+vm.runInContext(
+  'function clip(t, w) { const f = String(t).replace(/\\s*\\n\\s*/g, " x "); ' +
+    'return f.length > w ? f.slice(0, w - 1) + "\u2026" : f; }\n' +
+    source.slice(verbFrom, verbTo) +
+    "\nglobalThis.consentWording = consentWording;",
+  context,
+);
+const { consentWording } = context;
+const asks = (name, effect, args, unfinished = false) => {
+  const r = consentWording(name, effect, args, unfinished);
+  return { q: r.question.replace(/<[^>]+>/g, ""), meta: r.meta.replace(/<[^>]+>/g, "") };
+};
+
+check("a write asks to write, naming the file",
+  asks("write_file", "write", { path: "config.py" }).q,
+  (q) => q === "Write config.py?");
+check("a command asks to run it",
+  asks("run_command", "execute", { command: "git status" }).q,
+  (q) => q === "Run git status?");
+check("a search is not a read",
+  // Both are `read`, so the effect alone cannot pick the verb: "Read rust
+  // async?" is not English.
+  asks("web_search", "read", { query: "rust async" }).q,
+  (q) => q === "Search for rust async?");
+check("a file read asks to read",
+  asks("read_file", "read", { path: "src/main.rs" }).q,
+  (q) => q === "Read src/main.rs?");
+check("a url is fetched",
+  asks("fetch_url", "read", { url: "https://example.com" }).q,
+  (q) => q === "Fetch https://example.com?");
+check("a call with nothing to name falls back to what it may do",
+  asks("write_file", "write", {}).q,
+  (q) => q === "Allow write_file to change files or data?");
+check("the tool is always named somewhere",
+  // A verb in the question must not hide which tool is asking.
+  asks("write_file", "write", { path: "config.py" }),
+  (r) => r.meta.includes("write_file"));
+check("the named argument is not repeated underneath",
+  asks("write_file", "write", { path: "config.py", mode: "create" }),
+  (r) => !r.meta.includes("config.py") && r.meta.includes("mode: create"));
+check("an unfinished call says so in words",
+  asks("write_file", "write", { path: "a.txt" }, true).meta,
+  has("still being generated"));
+check("a long path is bounded, so the dom never holds a whole file",
+  // The visible truncation is the CSS's job now; this only guards the size
+  // of what gets put into the document.
+  asks("write_file", "write", { path: "x".repeat(4000) }).q,
+  (q) => q.length < 260);
+check("the question mark survives a truncated path",
+  // It is outside the span that shrinks. A question with its "?" cut off
+  // makes the whole panel look broken.
+  consentWording("write_file", "write", { path: "x".repeat(400) }, false).question,
+  (html) => html.endsWith('<span class="consent-fix">?</span>'));
+check("the shrinking part is the name, not the sentence",
+  consentWording("write_file", "write", { path: "a.txt" }, false).question,
+  (html) => /<span class="consent-name">a\.txt<\/span>/.test(html));
+check("markup in an argument is escaped",
+  consentWording("write_file", "write", { path: "<img src=x onerror=y>" }, false).question,
+  lacks("<img"));
+check("markup in a tool name is escaped",
+  consentWording("<script>x</script>", "write", {}, false).question,
+  lacks("<script>"));
+
 if (failures) {
   console.error(`\n${failures} markdown test(s) failed`);
   process.exit(1);

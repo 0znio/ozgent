@@ -797,66 +797,68 @@ body {
    transcript between the reasoning and the answer, so it must read as
    supporting material rather than competing with the reply. */
 /* --- the consent gate --------------------------------------------------
-   The turn is stopped until this is answered, so it is attached to the top
-   of the composer — where the answer will be given — rather than dropped
-   into the transcript, where it would scroll away from the control you use
-   to reply to it.
+   Attached to the top of the composer, because the turn is stopped until it
+   is answered and a question that scrolls away from the control you answer
+   it with is a question people lose.
 
-   Deliberately plain. This appears mid-conversation, unbidden, and anything
-   that draws attention to itself twice — a coloured stripe, a tinted icon
-   disc, three type sizes — reads as decoration on a question that only needs
-   asking once. One sentence, one line of detail, one filled button. */
+   Small. It interrupts a conversation and then leaves, so it has to be
+   readable at a glance: one question, one line of context, two buttons. An
+   earlier version stood four hundred pixels tall with a stripe, an icon disc
+   and three type sizes, which is a lot of furniture for a yes/no.
+
+   Every class here is prefixed. A bare `.tool` collided with the settings
+   page's tool row — `display:flex` and a border — and turned each inline
+   name into a full-width box. */
 .consent {
-  margin-bottom: var(--s2);
-  padding: var(--s3) var(--s4);
+  display: flex;
+  align-items: center;
+  gap: var(--s4);
+  margin-bottom: 6px;
+  padding: 10px var(--s4);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--panel);
 }
 
-.consent-q { font-size: var(--t-body); }
-.consent-q .tool { font-family: var(--mono); font-weight: 600; }
-
-/* The arguments, when there are any worth showing. Its own line, allowed to
-   scroll rather than widen the panel or wrap into a paragraph. */
-.consent-detail {
-  margin-top: 2px;
+.consent-text { flex: 1; min-width: 0; }
+/* A row, so the name is the only part that shrinks: a long path is cut and
+   the question mark after it survives. Cutting the "?" off a question is a
+   small thing that makes the whole panel look broken. */
+.consent-q {
+  display: flex;
+  align-items: baseline;
+  font-size: var(--t-body);
+  line-height: 1.35;
+  white-space: nowrap;
+}
+/* `pre`, or the flex row swallows the space after the verb and it reads
+   "Runcargo test". The fixed parts carry their own spacing because a `gap`
+   would also put one before the question mark. */
+.consent-q .consent-fix { flex: none; white-space: pre; }
+.consent-q .consent-name {
   font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--ink-soft);
-  white-space: pre;
-  overflow-x: auto;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.consent-detail:empty { display: none; }
-
-.consent-row {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  margin-top: var(--s3);
-}
-/* The two that change a setting are text, not buttons: they are the rare
-   answer, and four buttons of equal weight is what makes a prompt look
-   generated. */
-.consent-alt {
-  flex: 1;
-  display: flex;
-  gap: var(--s3);
+.consent-meta {
+  margin-top: 1px;
+  font-size: 12px;
   color: var(--ink-faint);
-  font-size: var(--t-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.linky {
-  background: none;
-  border: 0;
-  padding: 0;
-  color: var(--ink-faint);
-  font: inherit;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  cursor: pointer;
-}
-.linky:hover { color: var(--ink); }
+.consent-meta .consent-name { font-family: var(--mono); }
 
+.consent-acts {
+  flex: none;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 6px var(--s2);
+  justify-items: end;
+}
 .consent-yes, .consent-no {
   border-radius: var(--radius);
   padding: 6px var(--s4);
@@ -864,15 +866,41 @@ body {
   font-weight: 600;
   border: 1px solid transparent;
   cursor: pointer;
+  white-space: nowrap;
 }
 .consent-yes { background: var(--ink); color: var(--bg); }
 .consent-yes:hover { opacity: .88; }
 .consent-no { background: transparent; color: var(--ink-soft); border-color: var(--line); }
 .consent-no:hover { color: var(--ink); border-color: var(--ink-faint); }
 
+/* The two answers that change a setting are text, not buttons: they are the
+   rare choice, and four buttons of equal weight is what makes a prompt read
+   as generated. */
+.consent-alt {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: var(--s3);
+  font-size: 11.5px;
+}
+/* Underlined only on hover. Two permanently underlined links directly under
+   two buttons is more lines than a yes/no needs. */
+.linky {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--ink-faint);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.linky:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
+
 @media (max-width: 620px) {
-  .consent-alt { flex-basis: 100%; order: 3; margin-top: var(--s2); }
-  .consent-row { flex-wrap: wrap; justify-content: flex-end; }
+  .consent { flex-wrap: wrap; gap: var(--s2); }
+  .consent-text { flex-basis: 100%; }
+  .consent-acts { width: 100%; grid-template-columns: 1fr 1fr; justify-items: stretch; }
+  .consent-yes, .consent-no { width: 100%; }
+  .consent-alt { justify-content: center; }
 }
 
 /* --- the permissions manager ---------------------------------------- */
