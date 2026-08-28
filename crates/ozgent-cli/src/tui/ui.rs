@@ -27,6 +27,14 @@ const FRAME: Duration = Duration::from_millis(50);
 /// Lines moved per notch of the wheel, matching a terminal's own scrollback.
 const WHEEL: usize = 3;
 
+/// Braille dots, because they turn without the line changing width — a
+/// spinner made of `|/-\` shifts everything after it by a column each frame.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How often the spinner advances. Slow enough not to strobe, fast enough to
+/// read as motion rather than as something stuck.
+pub const SPIN: Duration = Duration::from_millis(90);
+
 /// What the user did at the prompt.
 pub enum Submission {
     Line(String),
@@ -48,6 +56,9 @@ pub struct Ui {
     posture: String,
     /// The question on the permission bar, while there is one.
     question: Option<Question>,
+    /// The line whose marker is currently spinning, without its marker.
+    activity: Option<String>,
+    spin: usize,
     size: (usize, usize),
     last_frame: Instant,
     /// Kept even in full-screen mode, where its editor is never used: it owns
@@ -83,6 +94,8 @@ impl Ui {
             status: Vec::new(),
             posture: String::new(),
             question: None,
+            activity: None,
+            spin: 0,
             size,
             last_frame: Instant::now() - FRAME,
             piped: screen.is_none(),
@@ -106,6 +119,62 @@ impl Ui {
         self.prompt.save();
     }
 
+    /// Announce something that is about to take time.
+    ///
+    /// The line goes in immediately with a settled marker; [`Ui::tick`] swaps
+    /// in the next spinner frame while it runs, and [`Ui::settle`] puts the
+    /// marker back. `text` carries no marker of its own — this owns that
+    /// column, so the spinner and the dot cannot disagree about where it is.
+    pub fn begin_activity(&mut self, text: impl Into<String>) {
+        self.activity = Some(text.into());
+        self.spin = 0;
+        let line = self.activity_line(false);
+        if self.screen.is_some() {
+            self.transcript.push(Block::plain(line));
+            self.render();
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Advance the spinner. Does nothing when nothing is running.
+    pub fn tick(&mut self) {
+        if self.activity.is_none() || self.screen.is_none() {
+            return;
+        }
+        self.spin = self.spin.wrapping_add(1);
+        let line = self.activity_line(true);
+        self.transcript.set_last(Block::plain(line));
+        self.render();
+    }
+
+    /// Stop the spinner, leaving the line as a plain record of what happened.
+    pub fn settle(&mut self) {
+        if self.activity.is_none() {
+            return;
+        }
+        let line = self.activity_line(false);
+        if self.screen.is_some() {
+            self.transcript.set_last(Block::plain(line));
+            self.render();
+        }
+        self.activity = None;
+    }
+
+    fn activity_line(&self, running: bool) -> String {
+        let text = self.activity.as_deref().unwrap_or_default();
+        let marker = if running {
+            // Amber while it is happening, which is the one thing amber means.
+            self.theme.style(
+                Style::color(Color::Yellow),
+                SPINNER[self.spin % SPINNER.len()],
+            )
+        } else {
+            self.theme.style(Style::color(Color::Green), "●")
+        };
+        format!("{marker} {text}")
+    }
+
     /// Whether the terminal was taken over.
     #[allow(dead_code)] // asserted by the fallback test
     pub fn full_screen(&self) -> bool {
@@ -115,10 +184,16 @@ impl Ui {
     // ------------------------------------------------------------ output
 
     /// One line of ozgent's own chrome — a note, a heading, a tool result.
+    ///
+    /// Painted at once. Appending without painting means nothing appears until
+    /// something else happens to redraw, and the something else is usually the
+    /// reply that comes *after* the slow thing you were waiting on — so a tool
+    /// call announced before it ran showed up only once it had finished.
     pub fn say(&mut self, text: impl Into<String>) {
         let text = text.into();
         if self.screen.is_some() {
             self.transcript.note(text);
+            self.render();
         } else {
             eprintln!("{text}");
         }
@@ -127,6 +202,7 @@ impl Ui {
     pub fn blank(&mut self) {
         if self.screen.is_some() {
             self.transcript.blank();
+            self.render();
         } else {
             eprintln!();
         }
@@ -137,6 +213,7 @@ impl Ui {
         let text = text.into();
         if self.screen.is_some() {
             self.transcript.push(Block::markdown(text));
+            self.render();
         } else {
             let width = ozgent_render::terminal_width();
             print!("{}", ozgent_render::MarkdownRenderer::new(self.theme.clone(), width).render(&text));
@@ -578,6 +655,21 @@ mod tests {
     fn padding_fills_exactly_and_never_overflows() {
         assert_eq!(display_width(&pad("short", 20)), 20);
         assert_eq!(display_width(&pad(&"x".repeat(50), 20)), 20);
+    }
+
+    #[test]
+    fn the_spinner_keeps_the_line_the_same_width() {
+        // A spinner made of `|/-\\` shifts everything after it by a column
+        // each frame, which reads as the text jittering rather than turning.
+        let widths: std::collections::BTreeSet<usize> =
+            SPINNER.iter().map(|f| display_width(f)).collect();
+        assert_eq!(widths.len(), 1, "frames differ in width: {SPINNER:?}");
+    }
+
+    #[test]
+    fn every_spinner_frame_is_distinct() {
+        let unique: std::collections::BTreeSet<&&str> = SPINNER.iter().collect();
+        assert_eq!(unique.len(), SPINNER.len(), "a repeated frame reads as a stall");
     }
 
     #[test]

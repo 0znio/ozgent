@@ -548,10 +548,8 @@ impl<'a> Chat<'a> {
                 let result = match self.permit(call).await? {
                     Some(approved) => {
                         let started = std::time::Instant::now();
-                        let host = self.tools.as_ref().expect("checked above");
-                        let outcome = host
-                            .call_approved(&call.name, call.arguments.clone(), approved)
-                            .await;
+                        let outcome = self.run_tool(call, approved).await;
+                        self.ui.settle();
                         self.show_result(&outcome, started.elapsed());
                         match outcome {
                             Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
@@ -559,6 +557,7 @@ impl<'a> Chat<'a> {
                         }
                     }
                     None => {
+                        self.ui.settle();
                         self.show_refusal(&call.name);
                         ozgent_core::permission::refusal(&call.name)
                     }
@@ -993,6 +992,40 @@ impl<'a> Chat<'a> {
         self.ui.blank();
     }
 
+    /// Run one tool, keeping the screen alive while it works.
+    ///
+    /// A web search takes seconds and a page fetch can take most of the tool
+    /// timeout. Awaiting it plainly leaves a still screen for that whole time,
+    /// which is indistinguishable from a hang — so the spinner on the call's
+    /// own line is advanced until the call returns.
+    ///
+    /// The two borrows are of different fields, which is what makes this
+    /// legal: the host is read while the screen is written.
+    async fn run_tool(
+        &mut self,
+        call: &ozgent_core::ToolCall,
+        approved: bool,
+    ) -> Result<serde_json::Value, ozgent_tools::ToolCallError> {
+        let host = self.tools.as_ref().expect("checked above");
+        let ui = &mut *self.ui;
+
+        let running = host.call_approved(&call.name, call.arguments.clone(), approved);
+        tokio::pin!(running);
+        // The first tick fires immediately, which would advance the spinner
+        // before any time had passed; starting a period late keeps the line
+        // still for calls that return at once.
+        let mut spin = tokio::time::interval_at(
+            tokio::time::Instant::now() + crate::tui::ui::SPIN,
+            crate::tui::ui::SPIN,
+        );
+        loop {
+            tokio::select! {
+                outcome = &mut running => return outcome,
+                _ = spin.tick() => ui.tick(),
+            }
+        }
+    }
+
     /// Say that a call did not run, in the same shape as a result.
     ///
     /// Shaped like `show_result` on purpose: a refusal is an outcome of the
@@ -1011,12 +1044,14 @@ impl<'a> Chat<'a> {
     /// Arguments are shown as `key: value` rather than raw JSON, since the
     /// braces and quotes carry no information the user needs.
     fn show_call(&mut self, call: &ozgent_core::ToolCall) {
-        let marker = self.theme.style(Style::color(ozgent_render::Color::Green), "●");
         let name = self.theme.style(
             ozgent_render::Style { bold: true, ..Default::default() },
             &call.name,
         );
-        self.ui.say(format!("{marker} {name}{}", self.theme.style(Style::dim(), &pretty_args(&call.arguments))));
+        let args = self.theme.style(Style::dim(), &pretty_args(&call.arguments));
+        // The marker column belongs to the screen, which turns it into a
+        // spinner while the call runs and back into a dot when it returns.
+        self.ui.begin_activity(format!("{name}{args}"));
     }
 
     /// Report what a tool returned, indented under its call.
@@ -1545,8 +1580,12 @@ impl<'a> Chat<'a> {
                     return Ok(());
                 }
             };
-            let host = self.tools.as_ref().expect("checked above");
-            match host.call_approved(&call.name, call.arguments.clone(), approved).await {
+            // The same spinner as the model's own calls: `/call` runs the
+            // identical tool and can take just as long.
+            self.ui.begin_activity(self.theme.style(Style::dim(), &call.name.clone()));
+            let outcome = self.run_tool(call, approved).await;
+            self.ui.settle();
+            match outcome {
                 Ok(v) => {
                     // Into the transcript, not stdout: in full-screen mode
                     // stdout is the screen, and writing to it directly would

@@ -141,6 +141,21 @@ impl Transcript {
         self.push(Block::plain(text));
     }
 
+    /// Re-render the last block in place.
+    ///
+    /// For a line that is still being decided — a tool call whose marker turns
+    /// from a spinner into a dot when it returns. Appending a new line each
+    /// frame would fill the transcript with the same sentence a dozen times.
+    pub fn set_last(&mut self, mut block: Block) {
+        let before = self.total_lines();
+        block.render(&self.theme, self.width);
+        match self.blocks.last_mut() {
+            Some(last) => *last = block,
+            None => self.blocks.push(block),
+        }
+        self.hold_position(before);
+    }
+
     pub fn blank(&mut self) {
         self.push(Block::fixed(vec![String::new()]));
     }
@@ -436,6 +451,23 @@ mod tests {
         let narrow = t.visible(20).len();
         t.resize(80);
         assert!(t.visible(20).len() < narrow);
+    }
+
+    #[test]
+    fn replacing_the_last_block_does_not_append_a_second_one() {
+        // A spinner redrawn thirty times must leave one line, not thirty.
+        let mut t = transcript();
+        t.note("first");
+        t.set_last(Block::plain("second"));
+        t.set_last(Block::plain("third"));
+        assert_eq!(t.visible(10), vec!["third"]);
+    }
+
+    #[test]
+    fn replacing_into_an_empty_transcript_still_lands() {
+        let mut t = transcript();
+        t.set_last(Block::plain("only"));
+        assert_eq!(t.visible(10), vec!["only"]);
     }
 
     #[test]
