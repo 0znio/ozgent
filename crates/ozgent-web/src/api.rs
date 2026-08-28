@@ -64,22 +64,40 @@ async fn js() -> impl IntoResponse {
 // ------------------------------------------------------------------- errors
 
 /// Any handler failure, rendered as JSON so the frontend can show it.
-struct ApiError(anyhow::Error);
+struct ApiError {
+    error: anyhow::Error,
+    /// What the caller sent was wrong, as opposed to something failing here.
+    ///
+    /// Worth the extra field: a client that retries on 500 would keep resending
+    /// a request that can never succeed, and a log full of 500s hides the ones
+    /// that are actually ozgent's fault.
+    bad_request: bool,
+}
+
+impl ApiError {
+    fn bad_request(message: impl std::fmt::Display) -> Self {
+        Self { error: anyhow::anyhow!("{message}"), bad_request: true }
+    }
+}
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self { error: e.into(), bad_request: false }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        tracing::error!("{:#}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        let status = if self.bad_request {
+            // Not logged as an error: the caller made a mistake, and ozgent's
+            // log is for ozgent's mistakes.
+            tracing::debug!("rejected: {:#}", self.error);
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("{:#}", self.error);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, Json(serde_json::json!({ "error": self.error.to_string() }))).into_response()
     }
 }
 
@@ -179,7 +197,7 @@ async fn put_permissions(
             Some(text) => text
                 .parse::<ozgent_core::Rule>()
                 .map(Some)
-                .map_err(|e| anyhow::anyhow!("{name}: {e}").into()),
+                .map_err(|e| ApiError::bad_request(format!("{name}: {e}"))),
         }
     };
     let read = parse("read", &body.read)?;
@@ -347,7 +365,7 @@ async fn conversation_by_uuid(
     let store = state.store.lock().unwrap();
     let found = store
         .conversation_by_uuid(&uuid)?
-        .ok_or_else(|| ApiError(anyhow::anyhow!("no conversation {uuid}")))?;
+        .ok_or_else(|| ApiError::bad_request(format!("no conversation {uuid}")))?;
     let messages = store.message_count(found.id)?;
     Ok(Json(ConversationInfo {
         id: found.id,
@@ -491,7 +509,8 @@ async fn chat(
         .iter()
         .map(|d| decode_data_url(d))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+        // An unreadable data URL came from the browser, not from here.
+        .map_err(ApiError::bad_request)?;
 
     // Record the question, then assemble context from pinned facts, the recent
     // window and retrieval — the same path the terminal client uses, so a
@@ -572,7 +591,9 @@ async fn chat(
             images,
             out: tx,
         })
-        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+        // The inference thread is gone, which is ozgent's problem, not the
+        // caller's.
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // A relay task, not the SSE stream itself, owns the reply.
     //
@@ -859,7 +880,9 @@ async fn set_tool_config(
         }
         if let Some(provider) = &body.search_provider {
             if !SEARCH_PROVIDERS.iter().any(|(n, _)| n == provider) {
-                return Err(ApiError(anyhow::anyhow!("unknown search provider {provider:?}")));
+                return Err(ApiError::bad_request(format!(
+                    "unknown search provider {provider:?}"
+                )));
             }
             set_search_provider(&mut config, provider, body.api_key.as_deref());
         }
@@ -987,7 +1010,7 @@ async fn add_fact(
     Json(body): Json<NewFact>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if body.text.trim().is_empty() {
-        return Err(ApiError(anyhow::anyhow!("a fact needs some text")));
+        return Err(ApiError::bad_request("a fact needs some text"));
     }
     let scope = match body.scope.as_deref() {
         Some("user") => ozgent_memory::Scope::User,
@@ -1149,6 +1172,38 @@ pub fn decode_data_url(value: &str) -> Result<ozgent_core::ImageSource, String> 
         return Err("an attached image was empty".into());
     }
     Ok(ozgent_core::ImageSource::Bytes { bytes, mime })
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn a_callers_mistake_is_not_reported_as_the_servers() {
+        // A client that retries on 500 would keep resending a request that
+        // can never succeed, and a log full of 500s hides the ones that are
+        // actually ozgent's fault.
+        let refused = ApiError::bad_request("execute: expected allow, ask or deny");
+        assert_eq!(refused.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_internal_failure_still_reports_itself_as_one() {
+        let broke: ApiError = anyhow::anyhow!("the database is on fire").into();
+        assert_eq!(broke.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn an_unparseable_rule_is_a_bad_request() {
+        // The path a settings page hits by sending a value ozgent does not
+        // know, which is a typo in a request rather than a fault here.
+        let err: ApiError = "maybe"
+            .parse::<ozgent_core::Rule>()
+            .map(|_| ())
+            .map_err(|e| ApiError::bad_request(format!("execute: {e}")))
+            .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 #[cfg(test)]
