@@ -11,9 +11,9 @@ use ozgent_llama::engine::{Engine, Session, StopReason};
 use ozgent_llama::thinking::{Chunk, ThinkingFilter};
 use ozgent_llama::toolcall;
 use ozgent_memory::{Budget, ContextBuilder, HashingEmbedder, OwnerKind, Store};
-use ozgent_render::{MarkdownRenderer, StreamRenderer, Style, Theme};
+use ozgent_render::{Style, Theme};
 use ozgent_tools::ToolHost;
-use crate::input::{Input, Prompt};
+use crate::tui::{Submission, Ui};
 use std::io::Write;
 
 /// Everything one chat session needs.
@@ -84,8 +84,10 @@ pub struct Chat<'a> {
     conversation: Option<i64>,
     opts: Resolved,
     theme: Theme,
-    /// The bottom row: what is true right now, kept out of the transcript.
-    status: crate::status::StatusLine,
+    /// The screen. Borrowed rather than owned because switching models tears
+    /// this struct down and rebuilds it, and the conversation on screen must
+    /// survive that.
+    ui: &'a mut Ui,
     /// Tools the user has approved for the rest of this run. Never written
     /// to disk: "yes, for now" is a different promise from "yes, always".
     grants: ozgent_core::Grants,
@@ -130,24 +132,39 @@ pub async fn run(
         )?;
 
     paths.ensure()?;
-    let mut prompt = Prompt::new(Some(paths.root().join("history")));
     // The conversation survives a model switch: it is the user's thread, not
     // the model's.
     let mut conversation: Option<i64> = None;
 
+    // Built once, outside the loop. Switching models tears down the engine and
+    // the tool worker; taking over the terminal again as well would blank the
+    // screen and lose everything said so far.
+    let plain = options.plain || !config.ui.markdown;
+    let theme = if plain { Theme::plain() } else { Theme::default() };
+    let mut ui = Ui::new(theme, Some(paths.root().join("history")));
+
     // Each pass loads one model. `/models` unwinds here to load another;
     // rebuilding the store and tool worker costs far less than the model load
     // that is happening anyway.
-    loop {
-        let next = run_one(paths, config, &name, options, &mut prompt, &mut conversation).await?;
+    let outcome = loop {
+        let next = match run_one(paths, config, &name, options, &mut ui, &mut conversation).await {
+            Ok(next) => next,
+            Err(e) => break Err(e),
+        };
         match next {
             Some(other) => {
-                eprintln!();
+                ui.blank();
                 name = other;
             }
-            None => return Ok(()),
+            None => break Ok(()),
         }
-    }
+    };
+
+    ui.save_history();
+    // Before the error is printed, or it lands on the alternate screen and
+    // disappears with it.
+    ui.close();
+    outcome
 }
 
 /// Run a chat against one model. Returns the model to switch to, if any.
@@ -156,7 +173,7 @@ async fn run_one(
     config: &Config,
     name: &str,
     options: &crate::cli::OptionFlags,
-    prompt: &mut Prompt,
+    ui: &mut Ui,
     conversation: &mut Option<i64>,
 ) -> Result<Option<String>> {
     let found = ozgent_core::resolve(paths, name)?;
@@ -168,16 +185,18 @@ async fn run_one(
         .merge(&options.to_options()?)
         .resolve();
 
-    eprint!("loading {model_ref}… ");
-    std::io::stderr().flush().ok();
+    // Painted before the load rather than after, because the load is the long
+    // part and a blank screen for twenty seconds looks like a hang.
+    ui.say(format!("loading {model_ref}…"));
+    ui.render();
     let started = std::time::Instant::now();
     let engine = Engine::load(&manifest.primary_weights(&dir), &opts)?;
-    eprintln!(
+    ui.say(format!(
         "{} layers ({} on gpu) in {:.1}s",
         engine.n_layer(),
         engine.gpu_layers_used(),
         started.elapsed().as_secs_f32()
-    );
+    ));
 
     let session = engine.session(&opts)?;
 
@@ -190,11 +209,11 @@ async fn run_one(
     let tools = if opts.tools && config.tools.enabled {
         match crate::start_tools(paths, config).await {
             Ok(host) => {
-                eprintln!("{} tools loaded", host.tools().len());
+                ui.say(format!("{} tools loaded", host.tools().len()));
                 Some(host)
             }
             Err(e) => {
-                eprintln!("tools unavailable: {e}");
+                ui.say(format!("tools unavailable: {e}"));
                 None
             }
         }
@@ -202,6 +221,8 @@ async fn run_one(
         None
     };
 
+    // The same decision `run` made when it built the screen, so the two
+    // cannot disagree about whether this session is in colour.
     let plain = options.plain || !config.ui.markdown;
     let theme = if plain { Theme::plain() } else { Theme::default() };
     let turn = conversation_id
@@ -215,7 +236,7 @@ async fn run_one(
         embedder: build_embedder(paths, config),
         tools,
         conversation: conversation_id,
-        status: crate::status::StatusLine::install(&theme),
+        ui,
         theme,
         grants: ozgent_core::Grants::default(),
         last_rate: None,
@@ -247,11 +268,7 @@ async fn run_one(
     }
 
     chat.banner();
-    let outcome = chat.repl(prompt).await;
-    // Before anything else prints: leaving the shrunken scrolling region in
-    // place would hand the shell a terminal that refuses its own last line.
-    chat.status.remove();
-    prompt.save();
+    let outcome = chat.repl().await;
 
     if let Some(host) = &chat.tools {
         host.shutdown().await;
@@ -265,15 +282,18 @@ async fn run_one(
 }
 
 impl<'a> Chat<'a> {
-    fn banner(&self) {
-        let dim = |s: &str| self.theme.style(Style::dim(), s);
-        eprintln!();
+    fn banner(&mut self) {
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |s: &str| theme.style(Style::dim(), s);
+        self.ui.blank();
         let window = self.session.n_ctx();
-        eprintln!(
+        self.ui.say(format!(
             "{} {}",
             self.model,
             dim(&format!("· {} ctx", ozgent_core::format_count(window)))
-        );
+        ));
         // A window smaller than the one asked for is not a detail to leave in
         // the log. The model was loaded, answers will be correct, and the only
         // visible symptom is that a long conversation runs out sooner than the
@@ -289,10 +309,10 @@ impl<'a> Chat<'a> {
             } else {
                 "that much KV cache does not fit in this machine's memory".to_string()
             };
-            eprintln!("{}", dim(&format!("· asked for {asked}; {why}")));
+            self.ui.say(dim(&format!("· asked for {asked}; {why}")));
         }
-        eprintln!("{}", dim("/help for commands, /exit to quit"));
-        eprintln!();
+        self.ui.say(dim("/help for commands, /exit to quit"));
+        self.ui.blank();
     }
 
     /// What the bottom row says: the facts that change as the session runs.
@@ -363,26 +383,42 @@ impl<'a> Chat<'a> {
         segments
     }
 
-    /// Repaint the bottom row from the session's current state.
+    /// Refresh the two bottom bars from the session's current state.
     fn update_status(&mut self) {
         let segments = self.status_segments();
-        self.status.set(&segments);
+        self.ui.set_status(segments);
+        let posture = self.permission_posture();
+        self.ui.set_posture(posture);
     }
 
-    async fn repl(&mut self, prompt: &mut Prompt) -> Result<Flow> {
+    /// What the permission bar says when nothing is being asked.
+    ///
+    /// The standing policy, in the same words the prompt will use when a tool
+    /// does ask. Someone who has been reading "runs programs: ask" all week
+    /// knows what the question means the moment it appears.
+    fn permission_posture(&self) -> String {
+        let p = &self.config.permissions;
+        let session: Vec<&str> = self.grants.allowed().collect();
+        let mut text = format!(
+            "tools · read {} · write {} · run {}",
+            p.read, p.write, p.execute
+        );
+        if !session.is_empty() {
+            text.push_str(&format!("  ·  allowed this session: {}", session.join(", ")));
+        }
+        text
+    }
+
+    async fn repl(&mut self) -> Result<Flow> {
         crate::input::install_interrupt_handler();
-        let marker = self.theme.style(Style::color(ozgent_render::Color::Cyan), "› ");
         self.update_status();
 
         loop {
-            // Before every prompt, because a resize silently drops the
-            // scrolling region that keeps the row reserved.
-            self.status.refresh();
-            let line = match prompt.read(&marker) {
-                Input::Line(l) => l,
+            let line = match self.ui.read("› ") {
+                Submission::Line(l) => l,
                 // Ctrl-C at the prompt abandons the line, not the session.
-                Input::Cancelled => continue,
-                Input::Eof => break,
+                Submission::Cancelled => continue,
+                Submission::Eof => break,
             };
             let input = line.trim();
 
@@ -400,22 +436,25 @@ impl<'a> Chat<'a> {
                     // The engine is owned by `run`, so switching unwinds to
                     // there rather than swapping it underneath us.
                     Flow::Switch(next) => {
-                        prompt.save();
+                        self.ui.save_history();
                         return Ok(Flow::Switch(next));
                     }
                 }
             }
 
+            // Echoed into the transcript. In the scrolling REPL the terminal
+            // did this for free; a full-screen application draws its own
+            // rows, so without it a conversation is a column of answers to
+            // questions nobody can see.
+            self.echo(input);
+
             if let Err(e) = self.turn(input).await {
-                eprintln!(
-                    "{}",
-                    self.theme.style(Style::color(ozgent_render::Color::Red), &format!("error: {e}"))
-                );
+                self.ui.say(self.theme.style(Style::color(ozgent_render::Color::Red), &format!("error: {e}")));
             }
             self.update_status();
-            prompt.save();
+            self.ui.save_history();
         }
-        eprintln!();
+        self.ui.blank();
         Ok(Flow::Exit)
     }
 
@@ -435,7 +474,7 @@ impl<'a> Chat<'a> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("{}", self.theme.style(Style::dim(), &format!("note: {e}")));
+                    self.ui.say(self.theme.style(Style::dim(), &format!("note: {e}")));
                     self.pending_images.clear();
                 }
             }
@@ -486,10 +525,7 @@ impl<'a> Chat<'a> {
             if !parsed.has_calls() && reply.attempted_call {
                 if let Some(host) = &self.tools {
                     if let Some(grammar) = ozgent_llama::grammar::tool_call_grammar(host.tools()) {
-                        eprintln!(
-                            "{}",
-                            self.theme.style(Style::dim(), "· malformed tool call; retrying under grammar")
-                        );
+                        self.ui.say(self.theme.style(Style::dim(), "· malformed tool call; retrying under grammar"));
                         reply = self.generate_with(&messages, Some(&grammar))?;
                         parsed = toolcall::extract(&reply.text);
                     }
@@ -562,10 +598,7 @@ impl<'a> Chat<'a> {
             }
 
             if round + 1 == max_calls {
-                eprintln!(
-                    "{}",
-                    self.theme.style(Style::dim(), "· tool call limit reached")
-                );
+                self.ui.say(self.theme.style(Style::dim(), "· tool call limit reached"));
             }
             reply = self.generate(&messages)?;
         }
@@ -588,7 +621,7 @@ impl<'a> Chat<'a> {
     }
 
     /// Assemble the prompt from pinned facts, recent turns, and recall.
-    fn build_context(&self, conversation: Option<i64>, query: &str) -> Result<Vec<Message>> {
+    fn build_context(&mut self, conversation: Option<i64>, query: &str) -> Result<Vec<Message>> {
         // Leave room for the answer, and keep the window inside the context.
         let budget = Budget {
             total: self.session.n_ctx() as usize,
@@ -607,13 +640,10 @@ impl<'a> Chat<'a> {
         };
 
         if ctx.used_recall() {
-            eprintln!(
-                "{}",
-                self.theme.style(
+            self.ui.say(self.theme.style(
                     Style::dim(),
                     &format!("· recalled {} earlier item(s)", ctx.retrieved.len())
-                )
-            );
+                ));
         }
         // The date goes first: it is context about the world, not instruction,
         // and a model reads the opening of a system prompt most reliably.
@@ -709,8 +739,8 @@ impl<'a> Chat<'a> {
             )
             .ok()?;
 
-        eprint!("{}", self.theme.style(Style::dim(), "· looking"));
-        let _ = std::io::stderr().flush();
+        self.ui.say(self.theme.style(Style::dim(), "· looking"));
+        self.ui.render();
 
         let mut observed = String::new();
         let result = self.session.generate_with_media(
@@ -722,7 +752,7 @@ impl<'a> Chat<'a> {
                 true
             },
         );
-        eprintln!("{}", self.theme.style(Style::dim(), " ✓"));
+        self.ui.say(self.theme.style(Style::dim(), " ✓"));
 
         match result {
             Ok(_) if !observed.trim().is_empty() => Some(observed.trim().to_string()),
@@ -770,13 +800,10 @@ impl<'a> Chat<'a> {
             prompt.len()
         );
 
-        let mut markdown =
-            StreamRenderer::new(MarkdownRenderer::new(self.theme.clone(), ozgent_render::terminal_width()));
         let mut filter = ThinkingFilter::new(self.opts.thinking);
         if let Some(close) = Engine::stream_starts_inside(&prompt) {
             filter = filter.starting_inside(close);
         }
-        let mut out = std::io::stdout();
 
         // Tool-call syntax is a request to the runtime, not output for the
         // user, so it is withheld from the terminal while still being captured
@@ -789,79 +816,64 @@ impl<'a> Chat<'a> {
         crate::input::arm_interrupt();
         let mut answer = String::new();
         let mut thinking = String::new();
-        let mut in_thinking = false;
+        // What has actually been shown, as opposed to what the model has
+        // produced. The gates withhold a partial tool call until they know
+        // whether it is one, and the screen must not flicker a half-written
+        // call into view and then take it back.
+        let mut shown_thinking = String::new();
+        let mut shown_answer = String::new();
         let show_thinking = self.opts.thinking != ThinkingMode::Off;
-        let theme = self.theme.clone();
 
         let media = self
             .projector
             .as_ref()
             .filter(|_| !pending_images.is_empty())
             .map(|p| (p, &pending_images[..], &pending_sources[..]));
-        let (stats, reason) = self.session.generate_with_media(&prompt, media, self.opts.max_tokens, |piece| {
+
+        // The screen is repainted from the whole reply on every token rather
+        // than appended to. Markdown cannot be appended: a closing fence
+        // changes how every line since the opening one is drawn, so a renderer
+        // that had already committed those lines would have to take them back.
+        // `Ui::stream` throttles the repaint, so this is cheap.
+        let ui = &mut *self.ui;
+        let session = &mut self.session;
+        let (stats, reason) = session.generate_with_media(&prompt, media, self.opts.max_tokens, |piece| {
             for chunk in filter.push(piece) {
                 match chunk {
                     Chunk::Thinking(text) => {
                         thinking.push_str(&text);
                         if show_thinking {
-                            let visible = think_gate.push(&text);
-                            // A model that decides not to reason still emits an
-                            // empty `<think></think>`. Waiting for real content
-                            // before printing the label means those produce no
-                            // output at all, rather than a bare "thinking".
-                            if !in_thinking {
-                                if !visible.trim().is_empty() {
-                                    in_thinking = true;
-                                    eprint!("{}", theme.style(theme.thinking, "thinking "));
-                                    eprint!(
-                                        "{}",
-                                        theme.style(theme.thinking, visible.trim_start())
-                                    );
-                                    let _ = std::io::stderr().flush();
-                                }
-                            } else if !visible.is_empty() {
-                                eprint!("{}", theme.style(theme.thinking, &visible));
-                                let _ = std::io::stderr().flush();
-                            }
+                            shown_thinking.push_str(&think_gate.push(&text));
                         }
                     }
                     Chunk::Answer(text) => {
-                        if in_thinking {
-                            in_thinking = false;
-                            eprintln!();
-                        }
                         answer.push_str(&text);
                         // Gated: tool-call syntax is a request to the runtime,
                         // not prose, and must never reach the terminal.
-                        let visible = gate.push(&text);
-                        if !visible.is_empty() {
-                            let _ = markdown.push(&visible, &mut out);
-                        }
+                        shown_answer.push_str(&gate.push(&text));
                     }
                 }
             }
-            // Polled between tokens, so Ctrl-C stops the answer not the process.
-            !crate::input::interrupted()
+            ui.stream(Some(shown_thinking.as_str()), &shown_answer, false);
+            // Polled between tokens, so Ctrl-C stops the answer not the
+            // process — and so a resize or a page-up is noticed mid-reply.
+            !ui.poll_interrupt()
         })?;
 
         for chunk in filter.finish() {
             if let Chunk::Answer(text) = chunk {
                 answer.push_str(&text);
-                let visible = gate.push(&text);
-                if !visible.is_empty() {
-                    let _ = markdown.push(&visible, &mut out);
-                }
+                shown_answer.push_str(&gate.push(&text));
             }
         }
-        let tail = gate.finish();
-        if !tail.is_empty() {
-            let _ = markdown.push(&tail, &mut out);
-        }
-        markdown.finish(&mut out)?;
-        println!();
+        shown_answer.push_str(&gate.finish());
+        // Forced, because the last token would otherwise sit unpainted behind
+        // the throttle until something else happened to redraw.
+        self.ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
+        self.ui.commit();
 
         if crate::input::interrupted() {
-            eprintln!("{}", self.theme.style(Style::dim(), "· interrupted"));
+            self.ui.say(self.theme.style(Style::dim(), "· interrupted"));
         }
         // Three different situations used to share one message, and it was
         // wrong for two of them.
@@ -878,7 +890,7 @@ impl<'a> Chat<'a> {
                 None
             };
             if let Some(note) = note {
-                eprintln!("{}", self.theme.style(Style::dim(), note));
+                self.ui.say(self.theme.style(Style::dim(), note));
             }
         }
         // Kept for the status line. Only a real generation updates it: an
@@ -888,12 +900,10 @@ impl<'a> Chat<'a> {
             self.last_rate = Some(stats.tokens_per_second());
         }
         if reason == StopReason::ContextFull {
-            eprintln!("{}", self.theme.style(Style::dim(), "· context full"));
+            self.ui.say(self.theme.style(Style::dim(), "· context full"));
         }
         if self.opts_show_stats() {
-            eprintln!(
-                "{}",
-                self.theme.style(
+            self.ui.say(self.theme.style(
                     Style::dim(),
                     &format!(
                         "· {} in ({:.0}/s), {} reused · {} out ({:.1}/s)",
@@ -903,8 +913,7 @@ impl<'a> Chat<'a> {
                         stats.generated_tokens,
                         stats.tokens_per_second()
                     )
-                )
-            );
+                ));
         }
 
         // A reasoning block the model never closed was not a reasoning block.
@@ -932,7 +941,6 @@ impl<'a> Chat<'a> {
             // An empty reasoning block is not a reasoning trace.
             thinking: reasoning.filter(|t| !t.trim().is_empty()),
             attempted_call: gate.suppressing() || think_gate.suppressing(),
-            unclosed_reasoning: unclosed,
         })
     }
 
@@ -946,7 +954,7 @@ impl<'a> Chat<'a> {
     /// `by_user` says a person authorised this call, which is what lets the
     /// Python side treat it as past its own standing boundaries.
     async fn permit(&mut self, call: &ozgent_core::ToolCall) -> Result<Option<bool>> {
-        use ozgent_core::permission::{Choice, Verdict};
+        use ozgent_core::permission::Verdict;
 
         let effect = self
             .tools
@@ -963,7 +971,7 @@ impl<'a> Chat<'a> {
             Verdict::Ask => {}
         }
 
-        let choice = crate::permission::ask(&self.theme, &call.name, effect, &call.arguments);
+        let choice = self.ui.ask_permission(&call.name, effect, &call.arguments);
         self.grants.remember(&call.name, choice);
         // "Always" is the one answer that outlives the process, so it is the
         // one that touches the file.
@@ -973,35 +981,47 @@ impl<'a> Chat<'a> {
         Ok(choice.is_allow().then_some(true))
     }
 
+    /// Put what the user typed into the transcript.
+    ///
+    /// Marked with the same `›` the prompt box wears, so the eye can find
+    /// where each exchange started when scrolling back through a long thread.
+    fn echo(&mut self, text: &str) {
+        let marker = self.theme.style(Style::color(ozgent_render::Color::Cyan), "› ");
+        let body = self.theme.style(Style { bold: true, ..Default::default() }, text);
+        self.ui.blank();
+        self.ui.say(format!("{marker}{body}"));
+        self.ui.blank();
+    }
+
     /// Say that a call did not run, in the same shape as a result.
     ///
     /// Shaped like `show_result` on purpose: a refusal is an outcome of the
     /// call, and putting it anywhere else makes the transcript look like the
     /// tool is still running.
-    fn show_refusal(&self, name: &str) {
+    fn show_refusal(&mut self, name: &str) {
         let arrow = self.theme.style(Style::color(ozgent_render::Color::Red), "  ⎿");
-        eprintln!(
+        self.ui.say(format!(
             "{arrow} {}",
             self.theme.style(Style::dim(), &format!("declined · {name} did not run"))
-        );
+        ));
     }
 
     /// Announce a tool call: a green marker, the name, then its arguments.
     ///
     /// Arguments are shown as `key: value` rather than raw JSON, since the
     /// braces and quotes carry no information the user needs.
-    fn show_call(&self, call: &ozgent_core::ToolCall) {
+    fn show_call(&mut self, call: &ozgent_core::ToolCall) {
         let marker = self.theme.style(Style::color(ozgent_render::Color::Green), "●");
         let name = self.theme.style(
             ozgent_render::Style { bold: true, ..Default::default() },
             &call.name,
         );
-        eprintln!("{marker} {name}{}", self.theme.style(Style::dim(), &pretty_args(&call.arguments)));
+        self.ui.say(format!("{marker} {name}{}", self.theme.style(Style::dim(), &pretty_args(&call.arguments))));
     }
 
     /// Report what a tool returned, indented under its call.
     fn show_result(
-        &self,
+        &mut self,
         outcome: &Result<serde_json::Value, ozgent_tools::ToolCallError>,
         elapsed: std::time::Duration,
     ) {
@@ -1011,7 +1031,7 @@ impl<'a> Chat<'a> {
         };
         let arrow = self.theme.style(Style::color(colour), "  ⎿");
         let timing = self.theme.style(Style::dim(), &format!(" · {}ms", elapsed.as_millis()));
-        eprintln!("{arrow} {}{timing}", self.theme.style(Style::dim(), &text));
+        self.ui.say(format!("{arrow} {}{timing}", self.theme.style(Style::dim(), &text)));
     }
 
     /// The conversation being written to, creating it if this is the first
@@ -1038,7 +1058,10 @@ impl<'a> Chat<'a> {
     /// on every turn, so the history comes back on its own and the engine's
     /// prefix check refuses the stale checkpoint by itself.
     fn conversations(&mut self, arg: &str) -> Result<Flow> {
-        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
         let mut parts = arg.split_whitespace();
         let verb = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
@@ -1048,29 +1071,26 @@ impl<'a> Chat<'a> {
         match verb {
             "" => {
                 if listed.is_empty() {
-                    eprintln!("{}", dim("no conversations yet; send a message to start one"));
+                    self.ui.say(dim("no conversations yet; send a message to start one"));
                     return Ok(Flow::Continue);
                 }
-                eprintln!("{}", dim("conversations:"));
+                self.ui.say(dim("conversations:"));
                 for (i, c) in listed.iter().enumerate() {
                     let marker = if Some(c.id) == self.conversation { "*" } else { " " };
-                    eprintln!("{}", dim(&format!("{marker} {:>2}. {}", i + 1, describe(c))));
+                    self.ui.say(dim(&format!("{marker} {:>2}. {}", i + 1, describe(c))));
                 }
                 let empties = self.store.empty_conversation_count()?;
                 // Only worth mentioning when there is a mess to clean up; one
                 // empty row is the live conversation and is not news.
                 if empties > 1 {
-                    eprintln!(
-                        "{}",
-                        dim(&format!("{empties} empty conversations · /conv prune to remove them"))
-                    );
+                    self.ui.say(dim(&format!("{empties} empty conversations · /conv prune to remove them")));
                 }
-                eprintln!("{}", dim("/conv <number> to reopen · /conv rm <number> to delete"));
+                self.ui.say(dim("/conv <number> to reopen · /conv rm <number> to delete"));
             }
 
             "rm" | "delete" | "del" => {
                 let Some(target) = pick(&listed, rest) else {
-                    eprintln!("{}", dim(&format!("no conversation {rest:?}; /conv to list")));
+                    self.ui.say(dim(&format!("no conversation {rest:?}; /conv to list")));
                     return Ok(Flow::Continue);
                 };
                 let (id, label) = (target.id, describe(target));
@@ -1082,33 +1102,33 @@ impl<'a> Chat<'a> {
                     self.conversation = None;
                     self.session.reset();
                     self.turn = 0;
-                    eprintln!("{}", dim(&format!("· deleted {label} (was the current one)")));
+                    self.ui.say(dim(&format!("· deleted {label} (was the current one)")));
                 } else {
-                    eprintln!("{}", dim(&format!("· deleted {label}")));
+                    self.ui.say(dim(&format!("· deleted {label}")));
                 }
             }
 
             "prune" => {
                 let removed = self.store.delete_empty_conversations(self.conversation)?;
-                eprintln!("{}", dim(&format!("· removed {removed} empty conversation(s)")));
+                self.ui.say(dim(&format!("· removed {removed} empty conversation(s)")));
             }
 
             "new" => {
                 self.conversation = None;
                 self.session.reset();
                 self.turn = 0;
-                clear_screen();
+                self.ui.clear();
                 self.banner();
-                eprintln!("{}", dim("· new conversation"));
+                self.ui.say(dim("· new conversation"));
             }
 
             number => {
                 let Some(target) = pick(&listed, number) else {
-                    eprintln!("{}", dim(&format!("no conversation {number:?}; /conv to list")));
+                    self.ui.say(dim(&format!("no conversation {number:?}; /conv to list")));
                     return Ok(Flow::Continue);
                 };
                 if self.conversation == Some(target.id) {
-                    eprintln!("{}", dim("already in that conversation"));
+                    self.ui.say(dim("already in that conversation"));
                     return Ok(Flow::Continue);
                 }
                 let (id, model) = (target.id, target.model.clone());
@@ -1121,13 +1141,13 @@ impl<'a> Chat<'a> {
                 // not stay on screen above the one being opened.
                 clear_screen();
                 self.banner();
-                eprintln!("{}", dim(&format!("· {} ({} messages)", describe(target), self.turn)));
+                self.ui.say(dim(&format!("· {} ({} messages)", describe(target), self.turn)));
                 self.recap(id)?;
 
                 // Not switched automatically: reloading weights is a ten-second
                 // surprise for someone who only asked to look at a thread.
                 if let Some(model) = model.filter(|m| *m != self.model.to_string()) {
-                    eprintln!("{}", dim(&format!("  was {model} · /models {model} to switch back")));
+                    self.ui.say(dim(&format!("  was {model} · /models {model} to switch back")));
                 }
             }
         }
@@ -1136,8 +1156,11 @@ impl<'a> Chat<'a> {
 
     /// Print the tail of a conversation, so reopening one lands somewhere
     /// recognisable rather than at a bare prompt.
-    fn recap(&self, conversation: i64) -> Result<()> {
-        let dim = |t: &str| self.theme.style(Style::dim(), t);
+    fn recap(&mut self, conversation: i64) -> Result<()> {
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
         let recent = self.store.recent_messages(conversation, 4)?;
         for m in &recent {
             let who = match m.role.as_str() {
@@ -1145,7 +1168,7 @@ impl<'a> Chat<'a> {
                 "assistant" => self.model.name.as_str(),
                 other => other,
             };
-            eprintln!("{}", dim(&format!("  {who}: {}", one_line(&m.content, 72))));
+            self.ui.say(dim(&format!("  {who}: {}", one_line(&m.content, 72))));
         }
         Ok(())
     }
@@ -1153,10 +1176,13 @@ impl<'a> Chat<'a> {
     /// Show installed models and pick one to switch to.
     fn pick_model(&mut self, arg: &str) -> Result<Option<String>> {
         let models = ozgent_core::installed(&self.paths);
-        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
 
         if models.is_empty() {
-            eprintln!("{}", dim("no models installed. Try: ozgent pull <repo> --name <short>"));
+            self.ui.say(dim("no models installed. Try: ozgent pull <repo> --name <short>"));
             return Ok(None);
         }
 
@@ -1164,30 +1190,30 @@ impl<'a> Chat<'a> {
         if !arg.is_empty() {
             if let Ok(n) = arg.parse::<usize>() {
                 let Some(chosen) = models.get(n.wrapping_sub(1)) else {
-                    eprintln!("{}", dim(&format!("no model {n}; there are {}", models.len())));
+                    self.ui.say(dim(&format!("no model {n}; there are {}", models.len())));
                     return Ok(None);
                 };
                 if chosen.model == self.model {
-                    eprintln!("{}", dim("already using that model"));
+                    self.ui.say(dim("already using that model"));
                     return Ok(None);
                 }
                 return Ok(Some(chosen.short_name()));
             }
             let found = ozgent_core::resolve(&self.paths, arg)?;
             if found.model == self.model {
-                eprintln!("{}", dim(&format!("already using {}", found.model)));
+                self.ui.say(dim(&format!("already using {}", found.model)));
                 return Ok(None);
             }
             return Ok(Some(found.short_name()));
         }
 
-        eprintln!("{}", dim("installed models:"));
+        self.ui.say(dim("installed models:"));
         for (i, m) in models.iter().enumerate() {
             let marker = if m.model == self.model { "*" } else { " " };
             let alias = m.manifest.alias.as_ref().map(|a| format!("  ({a})")).unwrap_or_default();
-            eprintln!("{}", dim(&format!("{marker} {:>2}. {}{alias}", i + 1, m.model)));
+            self.ui.say(dim(&format!("{marker} {:>2}. {}{alias}", i + 1, m.model)));
         }
-        eprintln!("{}", dim("switch with /models <number|alias|name:tag>"));
+        self.ui.say(dim("switch with /models <number|alias|name:tag>"));
         Ok(None)
     }
 
@@ -1196,23 +1222,26 @@ impl<'a> Chat<'a> {
     /// The same names as the command-line flags, minus their dashes, so that
     /// `--top-p 0.9` and `/config top_p 0.9` are one thing to learn.
     fn configure(&mut self, arg: &str) -> Result<()> {
-        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
         let mut parts = arg.split_whitespace();
         let key = parts.next().unwrap_or("");
         let value = parts.collect::<Vec<_>>().join(" ");
 
         if key.is_empty() {
-            eprintln!("{}", dim(&format!("settings for {}:", self.model)));
-            eprintln!("{}", dim(&format!("  thinking        {:?}", self.opts.thinking)));
-            eprintln!("{}", dim(&format!("  effort          {:?}", self.opts.reasoning_effort)));
-            eprintln!("{}", dim(&format!("  temperature     {}", self.opts.temperature)));
-            eprintln!("{}", dim(&format!("  top_p           {}", self.opts.top_p)));
-            eprintln!("{}", dim(&format!("  top_k           {}", self.opts.top_k)));
-            eprintln!("{}", dim(&format!("  min_p           {}", self.opts.min_p)));
-            eprintln!("{}", dim(&format!("  repeat_penalty  {}", self.opts.repeat_penalty)));
-            eprintln!("{}", dim(&format!("  max_tokens      {}", self.opts.max_tokens)));
+            self.ui.say(dim(&format!("settings for {}:", self.model)));
+            self.ui.say(dim(&format!("  thinking        {:?}", self.opts.thinking)));
+            self.ui.say(dim(&format!("  effort          {:?}", self.opts.reasoning_effort)));
+            self.ui.say(dim(&format!("  temperature     {}", self.opts.temperature)));
+            self.ui.say(dim(&format!("  top_p           {}", self.opts.top_p)));
+            self.ui.say(dim(&format!("  top_k           {}", self.opts.top_k)));
+            self.ui.say(dim(&format!("  min_p           {}", self.opts.min_p)));
+            self.ui.say(dim(&format!("  repeat_penalty  {}", self.opts.repeat_penalty)));
+            self.ui.say(dim(&format!("  max_tokens      {}", self.opts.max_tokens)));
             let seed = self.opts.seed.map_or("random".to_string(), |s| s.to_string());
-            eprintln!("{}", dim(&format!("  seed            {seed}")));
+            self.ui.say(dim(&format!("  seed            {seed}")));
             // Both numbers, because they can differ: what was asked for is
             // what `/config ctx` set, and what the session runs on is what
             // the machine's memory allowed.
@@ -1223,14 +1252,14 @@ impl<'a> Chat<'a> {
             } else {
                 format!("{asked} (running at {})", ozgent_core::format_count(window))
             };
-            eprintln!("{}", dim(&format!("  ctx             {ctx}")));
-            eprintln!("{}", dim(&format!("  gpu layers      {}", self.opts.gpu_layers)));
-            eprintln!("{}", dim(&format!("  tools           {}", self.opts.tools)));
-            eprintln!("{}", dim(&format!("set with /config <key> <value>; keys: {SETTABLE}")));
+            self.ui.say(dim(&format!("  ctx             {ctx}")));
+            self.ui.say(dim(&format!("  gpu layers      {}", self.opts.gpu_layers)));
+            self.ui.say(dim(&format!("  tools           {}", self.opts.tools)));
+            self.ui.say(dim(&format!("set with /config <key> <value>; keys: {SETTABLE}")));
             return Ok(());
         }
         if value.is_empty() {
-            eprintln!("{}", dim(&format!("usage: /config {key} <value>")));
+            self.ui.say(dim(&format!("usage: /config {key} <value>")));
             return Ok(());
         }
 
@@ -1293,14 +1322,11 @@ impl<'a> Chat<'a> {
                 let entry = self.config.models.entry(self.model.to_string()).or_default();
                 *entry = entry.clone().merge(&layer);
                 self.config.save(&self.paths)?;
-                eprintln!(
-                    "{}",
-                    dim(&format!(
+                self.ui.say(dim(&format!(
                         "· ctx = {n} (saved; applies when the model is next loaded, \
                          currently {})",
                         ozgent_core::format_count(self.session.n_ctx())
-                    ))
-                );
+                    )));
                 return Ok(());
             }
             "tools" => {
@@ -1309,7 +1335,7 @@ impl<'a> Chat<'a> {
                 layer.tools = Some(on);
             }
             other => {
-                eprintln!("{}", dim(&format!("unknown setting {other:?}; try {SETTABLE}")));
+                self.ui.say(dim(&format!("unknown setting {other:?}; try {SETTABLE}")));
                 return Ok(());
             }
         }
@@ -1322,7 +1348,7 @@ impl<'a> Chat<'a> {
         let entry = self.config.models.entry(self.model.to_string()).or_default();
         *entry = entry.clone().merge(&layer);
         self.config.save(&self.paths)?;
-        eprintln!("{}", dim(&format!("· {key} = {value} (saved)")));
+        self.ui.say(dim(&format!("· {key} = {value} (saved)")));
         Ok(())
     }
 
@@ -1334,26 +1360,29 @@ impl<'a> Chat<'a> {
     fn permissions(&mut self, arg: &str) -> Result<()> {
         use ozgent_core::permission::Rule;
 
-        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
         let mut parts = arg.split_whitespace();
         let target = parts.next().unwrap_or("");
         let value = parts.next().unwrap_or("");
 
         if target.is_empty() {
             let policy = &self.config.permissions;
-            eprintln!("{}", dim("by what a tool does:"));
+            self.ui.say(dim("by what a tool does:"));
             for (label, rule) in [
                 ("reads", policy.read),
                 ("writes", policy.write),
                 ("runs programs", policy.execute),
                 ("does not say", policy.unknown),
             ] {
-                eprintln!("{}", dim(&format!("  {label:<14}  {rule}")));
+                self.ui.say(dim(&format!("  {label:<14}  {rule}")));
             }
 
             match &self.tools {
                 Some(host) if !host.tools().is_empty() => {
-                    eprintln!("{}", dim("by tool:"));
+                    self.ui.say(dim("by tool:"));
                     for spec in host.tools() {
                         let rule = policy.rule_for(&spec.name, spec.effect);
                         // Marked so that clearing an override is a visible
@@ -1369,29 +1398,23 @@ impl<'a> Chat<'a> {
                         } else {
                             ""
                         };
-                        eprintln!(
-                            "{}",
-                            dim(&format!(
+                        self.ui.say(dim(&format!(
                                 "  {:<16} {:<8} {:<8} ({how}){session}",
                                 spec.name,
                                 spec.effect.to_string(),
                                 rule.to_string(),
-                            ))
-                        );
+                            )));
                     }
                 }
-                _ => eprintln!("{}", dim("no tools are loaded")),
+                _ => self.ui.say(dim("no tools are loaded")),
             }
-            eprintln!(
-                "{}",
-                dim("/permissions <tool> allow|ask|deny · /permissions <tool> clear · \
-                     /permissions <kind> <rule> where kind is read|write|execute|unknown")
-            );
+            self.ui.say(dim("/permissions <tool> allow|ask|deny · /permissions <tool> clear · \
+                     /permissions <kind> <rule> where kind is read|write|execute|unknown"));
             return Ok(());
         }
 
         if value.is_empty() {
-            eprintln!("{}", dim(&format!("usage: /permissions {target} allow|ask|deny|clear")));
+            self.ui.say(dim(&format!("usage: /permissions {target} allow|ask|deny|clear")));
             return Ok(());
         }
 
@@ -1407,7 +1430,7 @@ impl<'a> Chat<'a> {
                 ozgent_core::Effect::Unknown => policy.unknown = rule,
             }
             self.config.save(&self.paths)?;
-            eprintln!("{}", dim(&format!("· tools that {effect}: {rule} (saved)")));
+            self.ui.say(dim(&format!("· tools that {effect}: {rule} (saved)")));
             return Ok(());
         }
 
@@ -1416,32 +1439,35 @@ impl<'a> Chat<'a> {
             // Not an error: a rule can be set for a tool that is not loaded
             // right now, and refusing would make the manager useless whenever
             // tools are switched off.
-            eprintln!("{}", dim(&format!("· {target} is not loaded; setting it anyway")));
+            self.ui.say(dim(&format!("· {target} is not loaded; setting it anyway")));
         }
         if value == "clear" || value == "default" {
             self.config.permissions.set(target, None);
             self.config.save(&self.paths)?;
-            eprintln!("{}", dim(&format!("· {target} follows its kind again (saved)")));
+            self.ui.say(dim(&format!("· {target} follows its kind again (saved)")));
             return Ok(());
         }
         let rule: Rule = value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         self.config.permissions.set(target, Some(rule));
         self.config.save(&self.paths)?;
-        eprintln!("{}", dim(&format!("· {target}: {rule} (saved)")));
+        self.ui.say(dim(&format!("· {target}: {rule} (saved)")));
         Ok(())
     }
 
     /// Point a tool at a provider, e.g. `/tools web_search brave`.
     fn configure_tool(&mut self, arg: &str) -> Result<()> {
-        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
         let mut parts = arg.split_whitespace();
         let tool = parts.next().unwrap_or("").to_string();
         let provider = parts.next().map(str::to_string);
 
         let Some(provider) = provider else {
-            eprintln!("{}", dim(&format!("usage: /tools {tool} <provider>")));
+            self.ui.say(dim(&format!("usage: /tools {tool} <provider>")));
             if tool == "web_search" {
-                eprintln!("{}", dim("  providers: brave, tavily, duckduckgo"));
+                self.ui.say(dim("  providers: brave, tavily, duckduckgo"));
             }
             return Ok(());
         };
@@ -1465,12 +1491,8 @@ impl<'a> Chat<'a> {
                     .and_then(|v| v.get("api_key"))
                     .is_some();
             if !already {
-                eprintln!("{}", dim(&format!("{provider} needs an API key (or set ${var}).")));
-                eprint!("{}", dim("api key (blank to skip): "));
-                std::io::stderr().flush().ok();
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let line = line.trim().to_string();
+                self.ui.say(dim(&format!("{provider} needs an API key (or set ${var}).")));
+                let line = self.ui.ask_text("api key (blank to skip): ").unwrap_or_default();
                 if !line.is_empty() {
                     key = Some(line);
                 }
@@ -1481,19 +1503,19 @@ impl<'a> Chat<'a> {
         self.config.save(&self.paths)?;
         harden_config_permissions(&self.paths.config_file());
 
-        eprintln!("{}", dim(&format!("· {tool} now uses {provider} (saved)")));
-        eprintln!("{}", dim("restart the chat for the tool worker to pick it up"));
+        self.ui.say(dim(&format!("· {tool} now uses {provider} (saved)")));
+        self.ui.say(dim("restart the chat for the tool worker to pick it up"));
         Ok(())
     }
 
     /// Force the next reply to be a tool call, for `/call`.
     async fn forced_call(&mut self, query: &str) -> Result<()> {
         let Some(host) = &self.tools else {
-            eprintln!("{}", self.theme.style(Style::dim(), "tools are disabled"));
+            self.ui.say(self.theme.style(Style::dim(), "tools are disabled"));
             return Ok(());
         };
         let Some(grammar) = ozgent_llama::grammar::tool_call_grammar(host.tools()) else {
-            eprintln!("{}", self.theme.style(Style::dim(), "no tools available"));
+            self.ui.say(self.theme.style(Style::dim(), "no tools available"));
             return Ok(());
         };
 
@@ -1507,14 +1529,11 @@ impl<'a> Chat<'a> {
 
         let parsed = toolcall::extract(&reply.text);
         if parsed.calls.is_empty() {
-            eprintln!("{}", self.theme.style(Style::dim(), "· the model produced no call"));
+            self.ui.say(self.theme.style(Style::dim(), "· the model produced no call"));
             return Ok(());
         }
         for call in &parsed.calls {
-            eprintln!(
-                "{}",
-                self.theme.style(Style::dim(), &format!("· {}({})", call.name, compact(&call.arguments)))
-            );
+            self.ui.say(self.theme.style(Style::dim(), &format!("· {}({})", call.name, compact(&call.arguments))));
             // `/call` is the user asking directly, which is consent for this
             // one call — but the standing policy still decides, so a tool set
             // to `deny` stays denied rather than being reachable by typing a
@@ -1528,8 +1547,14 @@ impl<'a> Chat<'a> {
             };
             let host = self.tools.as_ref().expect("checked above");
             match host.call_approved(&call.name, call.arguments.clone(), approved).await {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
-                Err(e) => eprintln!("{}", self.theme.style(Style::dim(), &e.for_model())),
+                Ok(v) => {
+                    // Into the transcript, not stdout: in full-screen mode
+                    // stdout is the screen, and writing to it directly would
+                    // scroll the layout apart.
+                    let text = serde_json::to_string_pretty(&v).unwrap_or_default();
+                    self.ui.markdown(format!("```json\n{text}\n```"));
+                }
+                Err(e) => self.ui.say(self.theme.style(Style::dim(), &e.for_model())),
             }
         }
         Ok(())
@@ -1542,13 +1567,16 @@ impl<'a> Chat<'a> {
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
-        let dim = |s: &str| self.theme.style(Style::dim(), s);
+        // A clone, not a borrow of `self.theme`: writing to the screen
+        // takes `&mut self`, and a closure holding the theme would block it.
+        let theme = self.theme.clone();
+        let dim = |s: &str| theme.style(Style::dim(), s);
 
         match cmd {
             "/exit" | "/quit" | "/q" => return Ok(Flow::Exit),
 
             "/help" | "/h" => {
-                eprintln!("{}", dim(HELP));
+                self.ui.say(dim(HELP));
             }
 
             "/clear" | "/new" => {
@@ -1560,53 +1588,50 @@ impl<'a> Chat<'a> {
                 // Wipe the screen too. The old thread staying on screen under
                 // a one-line notice reads as "still in that conversation",
                 // which is the opposite of what just happened.
-                clear_screen();
+                self.ui.clear();
                 self.banner();
-                eprintln!("{}", dim("· new conversation"));
+                self.ui.say(dim("· new conversation"));
             }
 
             "/conv" | "/convs" | "/conversations" => return self.conversations(arg),
 
             "/think" => match arg {
-                "" => eprintln!("{}", dim(&format!("thinking: {:?}", self.opts.thinking))),
+                "" => self.ui.say(dim(&format!("thinking: {:?}", self.opts.thinking))),
                 other => match other.parse::<ThinkingMode>() {
                     Ok(mode) => {
                         self.opts.thinking = mode;
-                        eprintln!("{}", dim(&format!("· thinking {other}")));
+                        self.ui.say(dim(&format!("· thinking {other}")));
                     }
-                    Err(e) => eprintln!("{}", dim(&e)),
+                    Err(e) => self.ui.say(dim(&e)),
                 },
             },
 
             "/effort" => match arg {
-                "" => eprintln!(
-                    "{}",
-                    dim(&format!("effort: {:?}", self.opts.reasoning_effort))
-                ),
+                "" => self.ui.say(dim(&format!("effort: {:?}", self.opts.reasoning_effort))),
                 other => match other.parse::<ozgent_core::ReasoningEffort>() {
                     Ok(level) => {
                         self.opts.reasoning_effort = level;
-                        eprintln!("{}", dim(&format!("· effort {other}")));
+                        self.ui.say(dim(&format!("· effort {other}")));
                     }
-                    Err(e) => eprintln!("{}", dim(&e)),
+                    Err(e) => self.ui.say(dim(&e)),
                 },
             },
 
             "/system" => {
                 if arg.is_empty() {
                     match &self.opts.system_prompt {
-                        Some(s) => eprintln!("{}", dim(s)),
-                        None => eprintln!("{}", dim("no system prompt set")),
+                        Some(s) => self.ui.say(dim(s)),
+                        None => self.ui.say(dim("no system prompt set")),
                     }
                 } else {
                     self.opts.system_prompt = Some(arg.to_string());
-                    eprintln!("{}", dim("· system prompt updated"));
+                    self.ui.say(dim("· system prompt updated"));
                 }
             }
 
             "/remember" => {
                 if arg.is_empty() {
-                    eprintln!("{}", dim("usage: /remember <fact>"));
+                    self.ui.say(dim("usage: /remember <fact>"));
                 } else {
                     // Scoped to the conversation when there is one; before
                     // the first message there is nothing to scope it to, and
@@ -1627,7 +1652,7 @@ impl<'a> Chat<'a> {
                         id,
                         &self.embedder.embed(arg),
                     )?;
-                    eprintln!("{}", dim("· remembered"));
+                    self.ui.say(dim("· remembered"));
                 }
             }
 
@@ -1638,16 +1663,16 @@ impl<'a> Chat<'a> {
                     }
                     None => (Vec::new(), 0),
                 };
-                eprintln!("{}", dim(&format!("{count} messages, {} facts", facts.len())));
+                self.ui.say(dim(&format!("{count} messages, {} facts", facts.len())));
                 for f in facts.iter().take(20) {
                     let mark = if f.pinned { "*" } else { " " };
-                    eprintln!("{}", dim(&format!("  {mark} {}", f.text)));
+                    self.ui.say(dim(&format!("  {mark} {}", f.text)));
                 }
             }
 
             "/call" => {
                 if arg.is_empty() {
-                    eprintln!("{}", dim("usage: /call <what you want done>"));
+                    self.ui.say(dim("usage: /call <what you want done>"));
                 } else {
                     self.forced_call(arg).await?;
                 }
@@ -1675,14 +1700,11 @@ impl<'a> Chat<'a> {
                 if arg == "clear" || arg == "off" {
                     self.config.default_model = None;
                     self.config.save(&self.paths)?;
-                    eprintln!("{}", dim("· no default model; name one each time"));
+                    self.ui.say(dim("· no default model; name one each time"));
                 } else {
                     self.config.default_model = Some(name.clone());
                     self.config.save(&self.paths)?;
-                    eprintln!(
-                        "{}",
-                        dim(&format!("· {name} is now the default for `ozgent chat` and the web interface"))
-                    );
+                    self.ui.say(dim(&format!("· {name} is now the default for `ozgent chat` and the web interface")));
                 }
             }
 
@@ -1690,18 +1712,16 @@ impl<'a> Chat<'a> {
 
             "/tools" => match &self.tools {
                 Some(host) => {
-                    eprintln!("{}", dim(&format!("{} tools", host.tools().len())));
+                    self.ui.say(dim(&format!("{} tools", host.tools().len())));
                     for t in host.tools() {
-                        eprintln!("{}", dim(&format!("  {}  {}", t.name, ozgent_tools::first_line(&t.description))));
+                        self.ui.say(dim(&format!("  {}  {}", t.name, ozgent_tools::first_line(&t.description))));
                     }
                 }
-                None => eprintln!("{}", dim("tools are disabled")),
+                None => self.ui.say(dim("tools are disabled")),
             },
 
             "/stats" => {
-                eprintln!(
-                    "{}",
-                    dim(&format!(
+                self.ui.say(dim(&format!(
                         "{} · {} layers ({} gpu) · {} ctx, {} used, {} reused last turn · thinking {:?}",
                         self.model,
                         self.engine.n_layer(),
@@ -1710,30 +1730,20 @@ impl<'a> Chat<'a> {
                         self.session.used(),
                         self.session.last_reused(),
                         self.opts.thinking
-                    ))
-                );
+                    )));
             }
 
-            other => eprintln!("{}", dim(&format!("unknown command {other}; try /help"))),
+            other => self.ui.say(dim(&format!("unknown command {other}; try /help"))),
         }
         Ok(Flow::Continue)
     }
 }
 
-/// Describe the available tools in the system prompt.
-///
-/// Most local GGUF chat templates have no tool slot, so the description goes
-/// in as plain text. The output format is stated exactly, because a model that
-/// invents its own wrapper produces a call the parser will not recognise.
-
-
+/// What one generation produced, after the reasoning and tool-call streams
+/// have been told apart.
 struct Reply {
     text: String,
     thinking: Option<String>,
-    /// The model ended its turn without closing `</think>`, so what it wrote
-    /// was recovered from the reasoning stream rather than read from the
-    /// answer stream.
-    unclosed_reasoning: bool,
     /// The model began a tool call, whether or not it parsed. Used to decide
     /// when a grammar-constrained retry is worth attempting.
     attempted_call: bool,
@@ -1882,7 +1892,7 @@ fn truncate_result(s: &str) -> String {
 /// cursor movement, not styling, and a plain-output run still wants a clean
 /// screen. Skipped when stderr is not a terminal, where the escapes would end
 /// up in whatever is capturing the output.
-fn clear_screen() {
+pub fn clear_screen() {
     use std::io::IsTerminal;
     if !std::io::stderr().is_terminal() {
         return;

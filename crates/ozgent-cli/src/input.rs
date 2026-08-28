@@ -54,8 +54,6 @@ pub enum Input {
 pub struct Prompt {
     editor: Editor<(), FileHistory>,
     history_path: Option<PathBuf>,
-    /// True when input is not a terminal, e.g. a pipe or a test harness.
-    piped: bool,
 }
 
 impl Prompt {
@@ -78,7 +76,6 @@ impl Prompt {
         Self {
             editor,
             history_path,
-            piped: !std::io::IsTerminal::is_terminal(&std::io::stdin()),
         }
     }
 
@@ -103,8 +100,22 @@ impl Prompt {
         }
     }
 
-    pub fn is_piped(&self) -> bool {
-        self.piped
+    /// The history as plain lines, oldest first.
+    ///
+    /// The full-screen interface keeps its own editor but reads and writes the
+    /// same file, so a session started in a terminal and one started from a
+    /// pipe do not each keep half the history.
+    pub fn history_lines(&self) -> Vec<String> {
+        self.editor.history().iter().map(ToString::to_string).collect()
+    }
+
+    /// Record a line typed somewhere other than this editor.
+    pub fn remember(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || matches!(trimmed, "/exit" | "/quit" | "/q") {
+            return;
+        }
+        let _ = self.editor.add_history_entry(trimmed);
     }
 
     /// Persist history. Failure is not worth interrupting the user over.

@@ -4,6 +4,12 @@ pub mod markdown;
 pub mod stream;
 pub mod theme;
 
+// Re-exported rather than added to `ozgent-cli`'s own dependencies. It is
+// already in the graph through this crate, and every distinct dependency set
+// in this workspace gets its own llama.cpp build directory — a quarter-hour
+// compile and half a gigabyte to buy an import path.
+pub use crossterm;
+
 pub use markdown::MarkdownRenderer;
 pub use stream::StreamRenderer;
 pub use theme::{Color, Style, Theme};

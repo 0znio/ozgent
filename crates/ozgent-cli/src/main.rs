@@ -6,6 +6,7 @@ mod cli;
 mod logging;
 mod permission;
 mod status;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
