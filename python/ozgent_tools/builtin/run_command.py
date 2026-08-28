@@ -21,7 +21,7 @@ COMMAND_TIMEOUT = 60.0
 MAX_OUTPUT = 8000
 
 
-@tool
+@tool(effect="execute")
 async def run_command(
     command: Annotated[str, "One program and its arguments, e.g. 'cargo test'. No pipes or redirection."],
 ) -> dict[str, Any]:

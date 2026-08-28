@@ -142,6 +142,11 @@ pub struct ToolSpec {
     /// what a tool returns before it enters the context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// What the tool does to the world, as it declares itself. Decides
+    /// whether a call runs unasked; never sent to the model, which has no
+    /// business knowing which of its requests will be waved through.
+    #[serde(default)]
+    pub effect: crate::permission::Effect,
 }
 
 /// Base64, shared so front ends can decode what a browser hands them.

@@ -34,6 +34,8 @@ pub fn router(state: State) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/models/{model}/options", get(model_options).put(set_model_options))
         .route("/api/tools", get(tools).put(set_tool_config))
+        .route("/api/permissions", get(get_permissions).put(put_permissions))
+        .route("/api/permissions/decide", post(decide_permission))
         .route("/api/conversations/{id}/facts", get(facts).post(add_fact))
         .route("/api/conversations/{id}/recall", post(preview_recall))
         .route("/api/facts/{id}", patch(pin_fact).delete(forget_fact))
@@ -82,6 +84,164 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+// -------------------------------------------------------------- permissions
+
+/// One tool as the permissions manager shows it.
+#[derive(Serialize)]
+struct PermissionRow {
+    name: String,
+    description: String,
+    /// What the tool says it does. Decides the rule when nothing names it.
+    effect: String,
+    /// The rule in force: the override if there is one, otherwise the rule the
+    /// effect inherits.
+    rule: String,
+    /// Whether that rule was set for this tool by name, as opposed to being
+    /// inherited. The page shows the difference so "clear" has a meaning.
+    overridden: bool,
+    /// Allowed for the rest of this run by a "don't ask again" answer.
+    granted: bool,
+}
+
+#[derive(Serialize)]
+struct PermissionsView {
+    /// The effect defaults, as `{ read, write, execute, unknown }`.
+    defaults: serde_json::Value,
+    tools: Vec<PermissionRow>,
+}
+
+/// The policy, joined against the tools actually installed.
+///
+/// Joined rather than returned raw because a list of rules is unreadable
+/// without the tools they apply to, and a tool with no rule of its own still
+/// has an answer — the one its effect gives it — which is the thing a user
+/// most needs to see before deciding to override it.
+async fn get_permissions(AxumState(state): AxumState<State>) -> ApiResult<Json<PermissionsView>> {
+    let policy = state.config.lock().unwrap().permissions.clone();
+    let grants = state.permissions.grants.lock().unwrap().clone();
+    let granted: std::collections::BTreeSet<&str> = grants.allowed().collect();
+
+    let installed = match crate::worker::current_tools(&state.tools) {
+        Some(t) => t.host.tools().to_vec(),
+        None => Vec::new(),
+    };
+    let tools = installed
+        .iter()
+        .map(|spec| PermissionRow {
+            rule: policy.rule_for(&spec.name, spec.effect).to_string(),
+            overridden: policy.is_overridden(&spec.name),
+            granted: granted.contains(spec.name.as_str()),
+            effect: spec.effect.to_string(),
+            description: ozgent_tools::first_line(&spec.description).to_string(),
+            name: spec.name.clone(),
+        })
+        .collect();
+
+    Ok(Json(PermissionsView {
+        defaults: serde_json::json!({
+            "read": policy.read.to_string(),
+            "write": policy.write.to_string(),
+            "execute": policy.execute.to_string(),
+            "unknown": policy.unknown.to_string(),
+        }),
+        tools,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PermissionsUpdate {
+    #[serde(default)]
+    read: Option<String>,
+    #[serde(default)]
+    write: Option<String>,
+    #[serde(default)]
+    execute: Option<String>,
+    #[serde(default)]
+    unknown: Option<String>,
+    /// Per-tool rules. A tool mapped to `null` has its override cleared and
+    /// goes back to inheriting from its effect — which is a different state
+    /// from being set to the same value the effect would have given it.
+    #[serde(default)]
+    tools: std::collections::BTreeMap<String, Option<String>>,
+    /// Drop every "don't ask again this session" answer.
+    #[serde(default)]
+    clear_session: bool,
+}
+
+async fn put_permissions(
+    AxumState(state): AxumState<State>,
+    Json(body): Json<PermissionsUpdate>,
+) -> ApiResult<StatusCode> {
+    let parse = |name: &str, value: &Option<String>| -> ApiResult<Option<ozgent_core::Rule>> {
+        match value {
+            None => Ok(None),
+            Some(text) => text
+                .parse::<ozgent_core::Rule>()
+                .map(Some)
+                .map_err(|e| anyhow::anyhow!("{name}: {e}").into()),
+        }
+    };
+    let read = parse("read", &body.read)?;
+    let write = parse("write", &body.write)?;
+    let execute = parse("execute", &body.execute)?;
+    let unknown = parse("unknown", &body.unknown)?;
+
+    let mut per_tool = Vec::new();
+    for (tool, value) in &body.tools {
+        per_tool.push((tool.clone(), parse(tool, value)?));
+    }
+
+    let config = {
+        let mut config = state.config.lock().unwrap();
+        let p = &mut config.permissions;
+        if let Some(r) = read {
+            p.read = r;
+        }
+        if let Some(r) = write {
+            p.write = r;
+        }
+        if let Some(r) = execute {
+            p.execute = r;
+        }
+        if let Some(r) = unknown {
+            p.unknown = r;
+        }
+        for (tool, rule) in per_tool {
+            p.set(&tool, rule);
+        }
+        config.clone()
+    };
+    config.save(&state.paths)?;
+
+    if body.clear_session {
+        state.permissions.grants.lock().unwrap().clear();
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct Decision {
+    /// The call id from the `permission` event.
+    id: String,
+    choice: ozgent_core::Choice,
+}
+
+/// Answer one outstanding permission question.
+///
+/// A `404` means nothing was waiting: the turn ended, the wait ran out, or the
+/// button was clicked twice. The page treats that as "already decided" rather
+/// than an error, because from the user's side it is.
+async fn decide_permission(
+    AxumState(state): AxumState<State>,
+    Json(body): Json<Decision>,
+) -> StatusCode {
+    if state.permissions.pending.answer(&body.id, body.choice) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
 
 // ------------------------------------------------------------------- models
 
@@ -398,6 +558,8 @@ async fn chat(
     state
         .worker
         .submit(Request {
+            // The browser can show a permission card and answer it.
+            can_ask: true,
             model: body.model.clone(),
             messages,
             thinking,

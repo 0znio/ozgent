@@ -796,6 +796,117 @@ body {
 /* A tool call is one quiet row that opens for the detail. It sits in the
    transcript between the reasoning and the answer, so it must read as
    supporting material rather than competing with the reply. */
+/* --- permission -------------------------------------------------------
+   A question, not a notification: the turn is stopped until it is answered,
+   so the card is the loudest thing in the transcript and stays put once
+   answered. Removing it would leave the transcript saying a tool simply ran.
+
+   The border carries the weight, keyed to what the tool does. Amber is
+   already "something is happening", so `write` borrows it and `execute` —
+   the only kind that runs code — gets the one red on screen. */
+.perm {
+  margin: 0 0 var(--s3);
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.perm-read    { border-left-color: var(--ok); }
+.perm-write   { border-left-color: var(--accent); }
+.perm-execute { border-left-color: var(--danger); }
+.perm-unknown { border-left-color: var(--ink-faint); }
+
+.perm-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: var(--s2);
+}
+.perm-head .ic { width: 16px; height: 16px; flex: none; color: var(--ink-soft); }
+.perm-head .nm { font-family: var(--mono); font-weight: 600; }
+.perm-head .what { color: var(--ink-soft); font-size: var(--t-small); }
+
+/* The arguments are the question. A long value scrolls inside its own row
+   rather than widening the card, which would push the buttons off screen —
+   the one place a horizontal scrollbar is better than the alternative. */
+.perm-args {
+  display: grid;
+  gap: 4px;
+  margin-bottom: var(--s3);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.perm-arg {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.perm-arg .k { color: var(--ink-faint); flex: none; }
+.perm-arg .v { color: var(--ink); white-space: pre; }
+
+/* The shared ghost button is full-width for the sidebar; here it sits in a
+   row of four, so the width is released rather than a new button invented. */
+.perm-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.perm-actions .ghost-btn,
+.perm-row .ghost-btn,
+.perm-session .ghost-btn { width: auto; }
+.perm-actions .decline { color: var(--danger); }
+.perm-actions .decline:hover {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+}
+.perm-outcome { color: var(--ink-soft); font-size: var(--t-small); }
+.perm.answered { opacity: .75; }
+.perm.declined { border-left-color: var(--ink-faint); }
+
+/* --- the permissions manager ---------------------------------------- */
+.perm-list { display: grid; gap: var(--s2); }
+.perm-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s2) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.perm-row:last-child { border-bottom: 0; }
+.perm-id { flex: 1; min-width: 0; }
+.perm-id .nm { font-family: var(--mono); font-size: 13px; }
+.perm-id .desc {
+  display: block;
+  color: var(--ink-faint);
+  font-size: var(--t-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.perm-id .eff {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--line-soft);
+  color: var(--ink-soft);
+}
+.eff-write   { background: var(--accent-soft); color: var(--accent); }
+.eff-execute { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+
+.perm-session {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin-top: var(--s3);
+  color: var(--ink-soft);
+  font-size: var(--t-small);
+}
+
+/* A phone has no room for a rule dropdown beside a description. */
+@media (max-width: 620px) {
+  .perm-row { flex-wrap: wrap; }
+  .perm-id { flex-basis: 100%; }
+}
+
 .tool-card {
   margin: 0 0 var(--s2);
   border: 1px solid var(--line);

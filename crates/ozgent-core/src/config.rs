@@ -26,6 +26,13 @@ pub struct Config {
 
     pub tools: ToolsConfig,
 
+    /// Which tool calls run, which are asked about, and which are refused.
+    ///
+    /// Distinct from `[tools.config.permissions]`, which the Python side reads
+    /// to bound what a tool may touch once it is running. This decides whether
+    /// it runs at all.
+    pub permissions: crate::permission::Permissions,
+
     pub ui: UiConfig,
 
     pub embedding: EmbeddingConfig,
@@ -222,6 +229,35 @@ mod tests {
         // A model with no clock guesses the year; the default should protect
         // against that rather than require opting in.
         assert!(UiConfig::default().date_awareness);
+    }
+
+    #[test]
+    fn permissions_default_to_asking_before_anything_acts() {
+        // A fresh install must not need a config file to be safe.
+        let c = Config::default();
+        let g = crate::permission::Grants::default();
+        use crate::permission::{Effect, Verdict};
+        assert_eq!(c.permissions.verdict("run_command", Effect::Execute, &g), Verdict::Ask);
+        assert_eq!(
+            c.permissions.verdict("web_search", Effect::Read, &g),
+            Verdict::Allow { by_user: false },
+        );
+    }
+
+    #[test]
+    fn the_permissions_section_is_read_from_the_config_file() {
+        let c: Config = toml::from_str(
+            r#"
+            [permissions]
+            execute = "allow"
+            [permissions.tools]
+            write_file = "deny"
+            "#,
+        )
+        .unwrap();
+        use crate::permission::{Effect, Rule};
+        assert_eq!(c.permissions.rule_for("run_command", Effect::Execute), Rule::Allow);
+        assert_eq!(c.permissions.rule_for("write_file", Effect::Write), Rule::Deny);
     }
 
     #[test]

@@ -92,6 +92,10 @@
   <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M4 7h16M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7M6.5 7l.8 12A1.5 1.5 0 0 0 8.8 20h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12"/>
   </symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6L12 3Z"/>
+    <path d="M9.5 12.2 11.3 14l3.4-3.6"/>
+  </symbol>
   <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 3l1.9 5.3L19 10l-5.1 1.7L12 17l-1.9-5.3L5 10l5.1-1.7z"/>
     <path d="M18.5 15.5l.7 1.9 1.8.6-1.8.6-.7 1.9-.7-1.9-1.8-.6 1.8-.6z"/>
@@ -204,6 +208,7 @@
     <button class="tab" role="tab" data-tab="general" aria-selected="true">General</button>
     <button class="tab" role="tab" data-tab="params" aria-selected="false">Model</button>
     <button class="tab" role="tab" data-tab="tools" aria-selected="false">Tools</button>
+    <button class="tab" role="tab" data-tab="permissions" aria-selected="false">Permissions</button>
     <button class="tab" role="tab" data-tab="memory" aria-selected="false">Memory</button>
   </div>
 
@@ -241,6 +246,25 @@
     <p class="hint" id="key-hint"></p>
     <h3 class="sub">Available tools</h3>
     <div id="tool-list" class="tool-list"></div>
+  </section>
+
+  <section class="panel" data-panel="permissions" hidden>
+    <p class="hint">
+      What a tool is allowed to do without asking. A tool says what it does —
+      read something, change something, run a program — and these decide the
+      answer for each kind. Naming a tool below overrides its kind.
+    </p>
+    <div class="row"><span>Tools that read</span><select class="select" data-perm="read"></select></div>
+    <div class="row"><span>Tools that change files or data</span><select class="select" data-perm="write"></select></div>
+    <div class="row"><span>Tools that run programs</span><select class="select" data-perm="execute"></select></div>
+    <div class="row"><span>Tools that do not say</span><select class="select" data-perm="unknown"></select></div>
+
+    <h3 class="sub">Per tool</h3>
+    <div id="perm-list" class="perm-list"></div>
+    <div class="perm-session" id="perm-session" hidden>
+      <span id="perm-session-text"></span>
+      <button type="button" class="ghost-btn" id="perm-forget">Forget</button>
+    </div>
   </section>
 
   <section class="panel" data-panel="memory" hidden>

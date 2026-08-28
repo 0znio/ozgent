@@ -20,7 +20,7 @@ from typing import Annotated, Any
 from ..base import ToolError, get_config, tool
 from ..permissions import perms, resolve_within
 
-@tool
+@tool(effect="write")
 async def write_file(
     path: Annotated[str, "Path to write, absolute or relative to the project root."],
     content: Annotated[str, "The full text to write."],

@@ -847,6 +847,86 @@ function openToolCard(answerEl, event) {
   return card;
 }
 
+/// Ask whether a tool call may run.
+///
+/// The arguments are the question. "Allow run_command?" cannot be answered by
+/// anyone — the whole risk is in the string being run — so the card shows the
+/// call in full and the buttons are only meaningful underneath it.
+///
+/// The card answers once and then becomes a record of what was answered. It is
+/// never removed: the following tool card or refusal reads as its consequence,
+/// and a question that vanishes leaves the transcript saying a tool simply ran.
+function permissionCard(answerEl, event) {
+  const card = document.createElement("div");
+  card.className = `perm perm-${event.effect}`;
+
+  const args = Object.entries(event.arguments ?? {});
+  const rows = args.length
+    ? args
+        .map(
+          ([k, v]) =>
+            `<div class="perm-arg"><span class="k">${escapeHtml(k)}</span>` +
+            `<span class="v">${escapeHtml(typeof v === "string" ? v : JSON.stringify(v))}</span></div>`,
+        )
+        .join("")
+    : '<div class="perm-arg"><span class="v">no arguments</span></div>';
+
+  const what = {
+    read: "wants to read something",
+    write: "wants to change files or data",
+    execute: "wants to run a program",
+    unknown: "does not say what it does",
+  }[event.effect] ?? "wants to run";
+
+  card.innerHTML =
+    '<div class="perm-head">' +
+      '<svg class="ic"><use href="#i-shield"></use></svg>' +
+      `<span class="nm">${escapeHtml(event.name)}</span>` +
+      `<span class="what">${escapeHtml(what)}</span>` +
+    '</div>' +
+    `<div class="perm-args">${rows}</div>` +
+    '<div class="perm-actions">' +
+      '<button class="primary-btn" data-choice="once">Allow</button>' +
+      '<button class="ghost-btn" data-choice="session">Allow this session</button>' +
+      `<button class="ghost-btn" data-choice="always">Always allow ${escapeHtml(event.name)}</button>` +
+      '<button class="ghost-btn decline" data-choice="deny">Decline</button>' +
+    '</div>' +
+    '<div class="perm-outcome" hidden></div>';
+
+  const answered = {
+    once: "allowed once",
+    session: "allowed for this session",
+    always: `always allowed — ${event.name} will not ask again`,
+    deny: "declined",
+  };
+
+  card.querySelectorAll("[data-choice]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const choice = button.dataset.choice;
+      // Disabled before the request, not after: a second click would answer a
+      // question that is no longer waiting and read as an error.
+      card.querySelectorAll("[data-choice]").forEach((b) => (b.disabled = true));
+      try {
+        await api("/api/permissions/decide", {
+          method: "POST",
+          body: JSON.stringify({ id: event.id, choice }),
+        });
+      } catch {
+        // A 404 means the turn moved on — the wait ran out, or another tab
+        // answered. Nothing to recover, and nothing worth alarming about.
+      }
+      card.classList.add("answered", choice === "deny" ? "declined" : "allowed");
+      card.querySelector(".perm-actions").remove();
+      const outcome = card.querySelector(".perm-outcome");
+      outcome.textContent = answered[choice];
+      outcome.hidden = false;
+    });
+  });
+
+  answerEl.before(card);
+  return card;
+}
+
 /// Fill in a card once the tool has returned.
 function closeToolCard(card, event) {
   if (!card) return;
@@ -1177,6 +1257,12 @@ async function send(text) {
           // Re-dressed on every token: the blocks are rebuilt by innerHTML,
           // so the headers have to be put back with them.
           dressCode(answerEl);
+          scrollToTail();
+        } else if (event.type === "permission") {
+          // The turn is stopped on this card until it is answered, so it goes
+          // where the eye already is — at the tail, in the flow — rather than
+          // in a modal that hides what the model was doing when it asked.
+          permissionCard(answerEl, event);
           scrollToTail();
         } else if (event.type === "tool_call") {
           toolCards.set(event.id, openToolCard(answerEl, event));
@@ -1622,6 +1708,109 @@ function renderDefaultModel(current) {
   select.value = [...select.options].some((o) => o.value === current) ? current : "";
 }
 
+// ---- permissions ----
+
+const RULES = [
+  ["allow", "Run it"],
+  ["ask", "Ask me"],
+  ["deny", "Never"],
+];
+
+/// Fill one rule dropdown.
+function ruleSelect(select, value) {
+  select.replaceChildren();
+  for (const [rule, label] of RULES) {
+    const option = document.createElement("option");
+    option.value = rule;
+    option.textContent = label;
+    select.append(option);
+  }
+  select.value = value;
+}
+
+/// Draw the permissions page from the server's view of the policy.
+///
+/// The per-tool rows show the rule in force whether or not it was set by name,
+/// because "what will happen if this tool is called" is the question being
+/// asked. An inherited rule is marked as such, so clearing an override is a
+/// visible change rather than a no-op.
+function renderPermissions(view) {
+  for (const [key, value] of Object.entries(view.defaults)) {
+    const select = document.querySelector(`[data-perm="${key}"]`);
+    if (select) ruleSelect(select, value);
+  }
+
+  const list = $("perm-list");
+  list.replaceChildren();
+  if (!view.tools.length) {
+    list.innerHTML = '<p class="hint">No tools are loaded.</p>';
+  }
+  for (const tool of view.tools) {
+    const row = document.createElement("div");
+    row.className = "perm-row";
+    row.innerHTML =
+      '<div class="perm-id">' +
+        `<span class="nm">${escapeHtml(tool.name)}</span>` +
+        `<span class="eff eff-${tool.effect}">${escapeHtml(tool.effect)}</span>` +
+        `<span class="desc">${escapeHtml(tool.description)}</span>` +
+      '</div>' +
+      '<select class="select"></select>' +
+      '<button type="button" class="ghost-btn" hidden>Clear</button>';
+
+    const select = row.querySelector("select");
+    ruleSelect(select, tool.rule);
+    const clear = row.querySelector("button");
+    clear.hidden = !tool.overridden;
+    clear.title = `Go back to the rule for tools that ${tool.effect}`;
+
+    select.addEventListener("change", async () => {
+      await api("/api/permissions", {
+        method: "PUT",
+        body: JSON.stringify({ tools: { [tool.name]: select.value } }),
+      });
+      await loadPermissions();
+    });
+    clear.addEventListener("click", async () => {
+      // null, not the current value: clearing has to restore inheritance, and
+      // writing back the same rule would look identical and behave differently.
+      await api("/api/permissions", {
+        method: "PUT",
+        body: JSON.stringify({ tools: { [tool.name]: null } }),
+      });
+      await loadPermissions();
+    });
+    list.append(row);
+  }
+
+  const granted = view.tools.filter((t) => t.granted).map((t) => t.name);
+  const box = $("perm-session");
+  box.hidden = granted.length === 0;
+  $("perm-session-text").textContent =
+    `Allowed until ozgent restarts: ${granted.join(", ")}`;
+}
+
+async function loadPermissions() {
+  renderPermissions(await api("/api/permissions"));
+}
+
+for (const select of document.querySelectorAll("[data-perm]")) {
+  select.addEventListener("change", async () => {
+    await api("/api/permissions", {
+      method: "PUT",
+      body: JSON.stringify({ [select.dataset.perm]: select.value }),
+    });
+    await loadPermissions();
+  });
+}
+
+$("perm-forget").addEventListener("click", async () => {
+  await api("/api/permissions", {
+    method: "PUT",
+    body: JSON.stringify({ clear_session: true }),
+  });
+  await loadPermissions();
+});
+
 // ---- open / save ----
 
 async function openSettings() {
@@ -1637,6 +1826,9 @@ async function openSettings() {
   $("set-date").checked = config.ui.date_awareness;
   renderDefaultModel(config.default_model);
   renderTools(tools);
+  // Loaded with the rest rather than when the tab is opened: it is one small
+  // request, and a tab that shows an empty list for a moment reads as broken.
+  await loadPermissions();
 
   const model = el.model.value;
   if (model && !el.model.disabled) {

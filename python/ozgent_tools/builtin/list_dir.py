@@ -24,7 +24,7 @@ NOISE = frozenset(
 )
 
 
-@tool
+@tool(effect="read")
 async def list_dir(
     path: Annotated[str, "Directory to list, absolute or relative to the project root."] = ".",
     depth: Annotated[int, "How many levels to descend. 1 lists just this directory."] = 1,

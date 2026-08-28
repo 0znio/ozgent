@@ -9,6 +9,7 @@ pub mod datetime;
 pub mod manifest;
 pub mod options;
 pub mod paths;
+pub mod permission;
 pub mod registry;
 pub mod tokens;
 
@@ -20,5 +21,6 @@ pub use datetime::DateTime;
 pub use manifest::{Capability, Manifest};
 pub use options::{GpuLayers, Options, Resolved, ThinkingMode};
 pub use paths::{ModelRef, Paths};
+pub use permission::{Choice, Effect, Grants, Permissions, Rule, Verdict};
 pub use registry::{Installed, RegistryError, installed, resolve, set_alias, validate_alias};
 pub use tokens::{format_count, parse_count};

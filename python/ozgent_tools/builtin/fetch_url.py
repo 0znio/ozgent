@@ -35,7 +35,7 @@ MAX_PAGE = 12000
 THIN = 200
 
 
-@tool
+@tool(effect="read")
 async def fetch_url(
     url: Annotated[str, "The http or https URL to read."],
     query: Annotated[

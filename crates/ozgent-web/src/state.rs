@@ -4,7 +4,7 @@ use ozgent_core::{Config, Paths};
 use ozgent_memory::{HashingEmbedder, Store};
 use std::sync::{Arc, Mutex};
 
-use crate::worker::{SharedConfig, SharedTools, Tools, Worker};
+use crate::worker::{Permissions, SharedConfig, SharedTools, Tools, Worker};
 
 /// One tool as the settings page shows it.
 #[derive(serde::Serialize)]
@@ -57,6 +57,9 @@ pub struct App {
     /// a model. A clone handed over at start-up meant the settings page could
     /// save a change, report it applied, and have it never reach the model.
     pub config: SharedConfig,
+    /// Permission questions in flight and answers given this run. Shared with
+    /// the inference thread, which asks, and the handlers, which answer.
+    pub permissions: Permissions,
     pub store: Mutex<Store>,
     pub embedder: HashingEmbedder,
     pub worker: Worker,
@@ -91,10 +94,25 @@ impl App {
         };
         let config: SharedConfig = Arc::new(Mutex::new(config));
         let tools: SharedTools = Arc::new(Mutex::new(tools));
-        let worker = Worker::spawn(paths.clone(), Arc::clone(&config), Arc::clone(&tools));
+        // Shared with the handlers, not owned by the worker: a permission
+        // question is asked on the inference thread and answered by an HTTP
+        // request on another, and the settings page reads the same grants to
+        // show what has been allowed for this run.
+        let permissions = Permissions {
+            pending: Arc::new(crate::permission::Pending::default()),
+            grants: Arc::new(Mutex::new(ozgent_core::Grants::default())),
+            config: Arc::clone(&config),
+        };
+        let worker = Worker::spawn(
+            paths.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tools),
+            permissions.clone(),
+        );
         Ok(Arc::new(App {
             paths,
             config,
+            permissions,
             tools,
             store: Mutex::new(store),
             embedder: HashingEmbedder::default(),

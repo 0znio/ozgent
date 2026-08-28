@@ -319,6 +319,7 @@ mod tests {
             description: String::new(),
             input_schema: schema,
             output_schema: None,
+            effect: Default::default(),
         }
     }
 

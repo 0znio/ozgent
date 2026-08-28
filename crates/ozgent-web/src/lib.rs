@@ -7,6 +7,7 @@
 pub mod api;
 pub mod media;
 pub mod openai;
+pub mod permission;
 pub mod state;
 pub mod worker;
 

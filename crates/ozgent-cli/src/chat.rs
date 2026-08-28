@@ -86,6 +86,9 @@ pub struct Chat<'a> {
     theme: Theme,
     /// The bottom row: what is true right now, kept out of the transcript.
     status: crate::status::StatusLine,
+    /// Tools the user has approved for the rest of this run. Never written
+    /// to disk: "yes, for now" is a different promise from "yes, always".
+    grants: ozgent_core::Grants,
     /// Generation rate of the last reply, for the status line. `None`
     /// until this session has produced one — a rate carried over from a
     /// previous model would be a lie about this one.
@@ -214,6 +217,7 @@ async fn run_one(
         conversation: conversation_id,
         status: crate::status::StatusLine::install(&theme),
         theme,
+        grants: ozgent_core::Grants::default(),
         last_rate: None,
         model: model_ref,
         manifest,
@@ -324,10 +328,31 @@ impl<'a> Chat<'a> {
                 _ => format!("think {}", self.opts.reasoning_effort),
             },
         ));
+        // Tools, and how many of them can act without being asked. A count
+        // alone says nothing about the thing worth knowing.
         segments.push(Segment::new(
             4,
             match &self.tools {
-                Some(host) => format!("{} tools", host.tools().len()),
+                Some(host) => {
+                    let asking = host
+                        .tools()
+                        .iter()
+                        .filter(|spec| {
+                            matches!(
+                                self.config.permissions.verdict(
+                                    &spec.name,
+                                    spec.effect,
+                                    &self.grants,
+                                ),
+                                ozgent_core::Verdict::Ask,
+                            )
+                        })
+                        .count();
+                    match asking {
+                        0 => format!("{} tools", host.tools().len()),
+                        n => format!("{} tools · {n} ask", host.tools().len()),
+                    }
+                }
                 None => "no tools".to_string(),
             },
         ));
@@ -478,15 +503,29 @@ impl<'a> Chat<'a> {
 
             for call in &parsed.calls {
                 self.show_call(call);
-                let started = std::time::Instant::now();
 
-                let host = self.tools.as_ref().expect("checked above");
-                let outcome = host.call(&call.name, call.arguments.clone()).await;
-                self.show_result(&outcome, started.elapsed());
-
-                let result = match outcome {
-                    Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
-                    Err(e) => e.for_model(),
+                // Asked before the call runs, so the transcript never shows
+                // a tool working that the user is about to refuse. A refusal
+                // still goes into the history as a result: the assistant
+                // message below records the call, and a call with no answer
+                // leaves the conversation malformed for every later turn.
+                let result = match self.permit(call).await? {
+                    Some(approved) => {
+                        let started = std::time::Instant::now();
+                        let host = self.tools.as_ref().expect("checked above");
+                        let outcome = host
+                            .call_approved(&call.name, call.arguments.clone(), approved)
+                            .await;
+                        self.show_result(&outcome, started.elapsed());
+                        match outcome {
+                            Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
+                            Err(e) => e.for_model(),
+                        }
+                    }
+                    None => {
+                        self.show_refusal(&call.name);
+                        ozgent_core::permission::refusal(&call.name)
+                    }
                 };
 
                 // Structured when the template can render a call itself, so
@@ -901,6 +940,52 @@ impl<'a> Chat<'a> {
         std::env::var("OZGENT_STATS").is_ok()
     }
 
+    /// Decide whether a call may run, asking the user if the policy says to.
+    ///
+    /// Returns `None` for a refusal, or `Some(by_user)` to run it — where
+    /// `by_user` says a person authorised this call, which is what lets the
+    /// Python side treat it as past its own standing boundaries.
+    async fn permit(&mut self, call: &ozgent_core::ToolCall) -> Result<Option<bool>> {
+        use ozgent_core::permission::{Choice, Verdict};
+
+        let effect = self
+            .tools
+            .as_ref()
+            .and_then(|h| h.get(&call.name))
+            .map(|spec| spec.effect)
+            // A call to a tool that does not exist fails in the host a moment
+            // later with a much better message than anything here could give.
+            .unwrap_or_default();
+
+        match self.config.permissions.verdict(&call.name, effect, &self.grants) {
+            Verdict::Allow { by_user } => return Ok(Some(by_user)),
+            Verdict::Deny => return Ok(None),
+            Verdict::Ask => {}
+        }
+
+        let choice = crate::permission::ask(&self.theme, &call.name, effect, &call.arguments);
+        self.grants.remember(&call.name, choice);
+        // "Always" is the one answer that outlives the process, so it is the
+        // one that touches the file.
+        if self.config.permissions.apply(&call.name, choice) {
+            self.config.save(&self.paths)?;
+        }
+        Ok(choice.is_allow().then_some(true))
+    }
+
+    /// Say that a call did not run, in the same shape as a result.
+    ///
+    /// Shaped like `show_result` on purpose: a refusal is an outcome of the
+    /// call, and putting it anywhere else makes the transcript look like the
+    /// tool is still running.
+    fn show_refusal(&self, name: &str) {
+        let arrow = self.theme.style(Style::color(ozgent_render::Color::Red), "  ⎿");
+        eprintln!(
+            "{arrow} {}",
+            self.theme.style(Style::dim(), &format!("declined · {name} did not run"))
+        );
+    }
+
     /// Announce a tool call: a green marker, the name, then its arguments.
     ///
     /// Arguments are shown as `key: value` rather than raw JSON, since the
@@ -924,7 +1009,7 @@ impl<'a> Chat<'a> {
             Ok(value) => (ozgent_render::Color::Green, summarise_result(value)),
             Err(e) => (ozgent_render::Color::Red, ozgent_tools::first_line(&e.for_model()).to_string()),
         };
-        let arrow = self.theme.style(Style::color(colour), "  ↳");
+        let arrow = self.theme.style(Style::color(colour), "  ⎿");
         let timing = self.theme.style(Style::dim(), &format!(" · {}ms", elapsed.as_millis()));
         eprintln!("{arrow} {}{timing}", self.theme.style(Style::dim(), &text));
     }
@@ -1241,6 +1326,111 @@ impl<'a> Chat<'a> {
         Ok(())
     }
 
+    /// Show or change what tools may do without asking.
+    ///
+    /// The listing shows the rule in force for every tool, whether or not it
+    /// was set by name — "what happens if this is called" is the question, and
+    /// an inherited rule answers it just as much as an override does.
+    fn permissions(&mut self, arg: &str) -> Result<()> {
+        use ozgent_core::permission::Rule;
+
+        let dim = |t: &str| self.theme.style(Style::dim(), t);
+        let mut parts = arg.split_whitespace();
+        let target = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("");
+
+        if target.is_empty() {
+            let policy = &self.config.permissions;
+            eprintln!("{}", dim("by what a tool does:"));
+            for (label, rule) in [
+                ("reads", policy.read),
+                ("writes", policy.write),
+                ("runs programs", policy.execute),
+                ("does not say", policy.unknown),
+            ] {
+                eprintln!("{}", dim(&format!("  {label:<14}  {rule}")));
+            }
+
+            match &self.tools {
+                Some(host) if !host.tools().is_empty() => {
+                    eprintln!("{}", dim("by tool:"));
+                    for spec in host.tools() {
+                        let rule = policy.rule_for(&spec.name, spec.effect);
+                        // Marked so that clearing an override is a visible
+                        // change rather than something that appears to do
+                        // nothing.
+                        let how = if policy.is_overridden(&spec.name) {
+                            "set here"
+                        } else {
+                            "from its kind"
+                        };
+                        let session = if self.grants.allowed().any(|t| t == spec.name) {
+                            "  · allowed for this session"
+                        } else {
+                            ""
+                        };
+                        eprintln!(
+                            "{}",
+                            dim(&format!(
+                                "  {:<16} {:<8} {:<8} ({how}){session}",
+                                spec.name,
+                                spec.effect.to_string(),
+                                rule.to_string(),
+                            ))
+                        );
+                    }
+                }
+                _ => eprintln!("{}", dim("no tools are loaded")),
+            }
+            eprintln!(
+                "{}",
+                dim("/permissions <tool> allow|ask|deny · /permissions <tool> clear · \
+                     /permissions <kind> <rule> where kind is read|write|execute|unknown")
+            );
+            return Ok(());
+        }
+
+        if value.is_empty() {
+            eprintln!("{}", dim(&format!("usage: /permissions {target} allow|ask|deny|clear")));
+            return Ok(());
+        }
+
+        // A kind before a tool: the four kinds are fixed names, and a tool
+        // called "write" would otherwise be unreachable in the other form.
+        if let Ok(effect) = target.parse::<ozgent_core::Effect>() {
+            let rule: Rule = value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let policy = &mut self.config.permissions;
+            match effect {
+                ozgent_core::Effect::Read => policy.read = rule,
+                ozgent_core::Effect::Write => policy.write = rule,
+                ozgent_core::Effect::Execute => policy.execute = rule,
+                ozgent_core::Effect::Unknown => policy.unknown = rule,
+            }
+            self.config.save(&self.paths)?;
+            eprintln!("{}", dim(&format!("· tools that {effect}: {rule} (saved)")));
+            return Ok(());
+        }
+
+        let known = self.tools.as_ref().is_some_and(|h| h.get(target).is_some());
+        if !known {
+            // Not an error: a rule can be set for a tool that is not loaded
+            // right now, and refusing would make the manager useless whenever
+            // tools are switched off.
+            eprintln!("{}", dim(&format!("· {target} is not loaded; setting it anyway")));
+        }
+        if value == "clear" || value == "default" {
+            self.config.permissions.set(target, None);
+            self.config.save(&self.paths)?;
+            eprintln!("{}", dim(&format!("· {target} follows its kind again (saved)")));
+            return Ok(());
+        }
+        let rule: Rule = value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        self.config.permissions.set(target, Some(rule));
+        self.config.save(&self.paths)?;
+        eprintln!("{}", dim(&format!("· {target}: {rule} (saved)")));
+        Ok(())
+    }
+
     /// Point a tool at a provider, e.g. `/tools web_search brave`.
     fn configure_tool(&mut self, arg: &str) -> Result<()> {
         let dim = |t: &str| self.theme.style(Style::dim(), t);
@@ -1325,8 +1515,19 @@ impl<'a> Chat<'a> {
                 "{}",
                 self.theme.style(Style::dim(), &format!("· {}({})", call.name, compact(&call.arguments)))
             );
+            // `/call` is the user asking directly, which is consent for this
+            // one call — but the standing policy still decides, so a tool set
+            // to `deny` stays denied rather than being reachable by typing a
+            // different command.
+            let approved = match self.permit(call).await? {
+                Some(by_user) => by_user,
+                None => {
+                    self.show_refusal(&call.name);
+                    return Ok(());
+                }
+            };
             let host = self.tools.as_ref().expect("checked above");
-            match host.call(&call.name, call.arguments.clone()).await {
+            match host.call_approved(&call.name, call.arguments.clone(), approved).await {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
                 Err(e) => eprintln!("{}", self.theme.style(Style::dim(), &e.for_model())),
             }
@@ -1459,6 +1660,8 @@ impl<'a> Chat<'a> {
             }
 
             "/config" => self.configure(arg)?,
+
+            "/permissions" | "/perms" => self.permissions(arg)?,
 
             "/default" => {
                 // The alias when there is one: it is the name the user chose,
@@ -1760,6 +1963,8 @@ const HELP: &str = "\
                    sizes take k/m: /config ctx 32k
 /tools             list available tools
 /default           use this model when none is named · /default clear to unset
+/permissions       what tools may do without asking
+/permissions <tool> allow|ask|deny|clear   ·  or read|write|execute <rule>
 /tools <t> <prov>  point a tool at a provider, e.g. /tools web_search brave
 /call <request>    force a tool call, constrained by grammar
 /stats             model and context state
@@ -1773,7 +1978,7 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats", "/default"] {
+        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats", "/default", "/permissions"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
         }
     }
@@ -1947,6 +2152,7 @@ mod tests {
                 "required": ["query"]
             }),
             output_schema: None,
+            effect: ozgent_core::Effect::Read,
         };
         let p = ozgent_tools::tool_preamble(&[spec]);
         assert!(p.contains("<tool_call>"), "the wrapper must be shown: {p}");

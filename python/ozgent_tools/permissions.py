@@ -19,16 +19,57 @@ Configured once, in ``~/ozgent/configs/config.toml``::
 
 An individual tool may still override ``root`` under its own
 ``[tools.config.<tool>]`` section, which is how it worked before this existed.
+
+Standing configuration is only half of it. ozgent also asks — at the moment of
+the call, showing the tool and its arguments — and a person who reads
+``run_command(command="git status")`` and says yes has authorised that call as
+surely as a config flag would have. So an approved call satisfies the checks
+here: refusing to run a command the user just approved, because a setting they
+have never seen is off, is a permission system arguing with its own user.
+
+What approval does *not* lift is the shell-metacharacter refusal below, which
+is not a permission at all — commands run without a shell, so a pipe in one
+would not do what it looks like it does.
 """
 
 from __future__ import annotations
 
+import contextvars
 import os
 import shlex
 from pathlib import Path
 from typing import Any
 
 from .base import ToolError, get_config
+
+#: Set for the duration of a call the user explicitly approved.
+#:
+#: A context variable rather than a global because calls run concurrently on
+#: one event loop: a plain flag set by one call would be visible to every
+#: other in flight, which is precisely the sort of hole a permission system
+#: must not have.
+_APPROVED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ozgent_call_approved", default=False
+)
+
+
+def approving(approved: bool):
+    """Mark the current call as approved, as a context manager."""
+
+    class _Scope:
+        def __enter__(self) -> None:
+            self.token = _APPROVED.set(bool(approved))
+
+        def __exit__(self, *exc: Any) -> None:
+            _APPROVED.reset(self.token)
+
+    return _Scope()
+
+
+def approved() -> bool:
+    """Whether a person authorised the call now running."""
+    return _APPROVED.get()
+
 
 #: Where the settings above live, as a tool name so the existing config
 #: transport carries it without a second channel.
@@ -67,6 +108,9 @@ def resolve_within(path: str, tool_name: str) -> Path:
         raise ToolError(f"cannot resolve {path!r}: {exc}") from exc
 
     if resolved != root and root not in resolved.parents:
+        # The prompt showed this path. Someone read it and said yes.
+        if approved():
+            return resolved
         raise ToolError(
             f"{path!r} is outside the permitted directory ({root}). "
             f"Set [tools.config.{SECTION}] root in config.toml to widen it."
@@ -75,12 +119,13 @@ def resolve_within(path: str, tool_name: str) -> Path:
 
 
 def require(flag: str, doing: str) -> None:
-    """Refuse unless `flag` is on, naming what would turn it on."""
-    if not perms().get(flag, False):
-        raise ToolError(
-            f"{doing} is not permitted. Set [tools.config.{SECTION}] {flag} = true "
-            "in ~/ozgent/configs/config.toml to allow it."
-        )
+    """Refuse unless `flag` is on or the user approved this call."""
+    if approved() or perms().get(flag, False):
+        return
+    raise ToolError(
+        f"{doing} is not permitted. Approve it when ozgent asks, or set "
+        f"[tools.config.{SECTION}] {flag} = true in ~/ozgent/configs/config.toml."
+    )
 
 
 def check_command(command: str) -> list[str]:
@@ -111,11 +156,18 @@ def check_command(command: str) -> list[str]:
                 "redirection and chaining have no effect. Run one program."
             )
 
+    # The allowlist answers "what may run without anyone looking". An approved
+    # call was looked at — the whole command string was on screen — so it is
+    # past the question the allowlist exists to answer.
+    if approved():
+        return argv
+
     allow = [str(a) for a in perms().get("shell_allow", [])]
     if not allow:
         raise ToolError(
-            f"no commands are allowed. List them in [tools.config.{SECTION}] "
-            'shell_allow, e.g. shell_allow = ["git", "cargo"].'
+            f"no commands are allowed. Approve this one when ozgent asks, or list "
+            f"them in [tools.config.{SECTION}] shell_allow, e.g. "
+            'shell_allow = ["git", "cargo"].'
         )
     program = Path(argv[0]).name
     if program not in allow:
@@ -139,6 +191,8 @@ def check_host(url: str) -> str:
         raise ToolError(f"{url!r} has no host")
 
     allow = [str(a).lower() for a in perms().get("network_allow", [])]
+    if approved():
+        return host
     if allow and not any(host.lower() == a or host.lower().endswith("." + a) for a in allow):
         raise ToolError(
             f"{host} is not in the allowlist. Permitted: {', '.join(sorted(allow))}. "

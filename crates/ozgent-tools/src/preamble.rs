@@ -67,6 +67,7 @@ mod tests {
             description: description.into(),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             output_schema: None,
+            effect: Default::default(),
         }
     }
 

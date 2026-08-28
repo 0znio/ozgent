@@ -243,7 +243,7 @@ OUTPUT_SCHEMA = {
 }
 
 
-@tool(output_schema=OUTPUT_SCHEMA)
+@tool(output_schema=OUTPUT_SCHEMA, effect="read")
 async def web_search(
     query: Annotated[str, "What to search for. Use plain keywords, not a question."],
     category: Annotated[Category, "'news' restricts to recent news coverage."] = "web",

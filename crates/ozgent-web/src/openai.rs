@@ -513,6 +513,9 @@ pub fn client_tools(value: Option<&serde_json::Value>) -> Vec<ToolSpec> {
                     .to_string(),
                 input_schema,
                 output_schema: None,
+                // A caller's own tool is executed by the caller, never here,
+                // so ozgent has nothing to permit and nobody to ask.
+                effect: ozgent_core::permission::Effect::Read,
             })
         })
         .collect()
@@ -572,6 +575,8 @@ async fn chat_completions(
     state
         .worker
         .submit(Request {
+            // An OpenAI client is a program; it cannot consent for a person.
+            can_ask: false,
             model: found.model.to_string(),
             messages: to_messages(&request),
             // A reasoning model opens with `<think>`, which no schema admits —
@@ -734,7 +739,14 @@ async fn collect(
                 stop = finish_reason(&reason);
             }
             Event::Error { message } => return Err(from_worker(message)),
-            Event::Ready { .. } | Event::ToolCall { .. } | Event::ToolResult { .. } => {}
+            // A permission question cannot reach an OpenAI client — there is
+            // no field in the protocol for it and no person behind the socket
+            // to answer. The worker knows that and refuses without waiting;
+            // the refusal arrives as the tool's result.
+            Event::Ready { .. }
+            | Event::ToolCall { .. }
+            | Event::ToolResult { .. }
+            | Event::Permission { .. } => {}
         }
     }
 
@@ -855,7 +867,7 @@ fn stream_chunks(
                         (rx, model, completion, true, false),
                     ));
                 }
-                Event::Ready { .. } | Event::ToolResult { .. } => {}
+                Event::Ready { .. } | Event::ToolResult { .. } | Event::Permission { .. } => {}
             }
 
             if delta.is_empty() {

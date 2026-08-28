@@ -127,6 +127,7 @@ mod tests {
                 "required": ["query"]
             }),
             output_schema: None,
+            effect: Default::default(),
         }
     }
 

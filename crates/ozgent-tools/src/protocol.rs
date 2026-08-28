@@ -97,6 +97,11 @@ pub struct ToolManifest {
     /// older build that did not report one, which is not worth an error.
     #[serde(default)]
     pub source: String,
+    /// What the tool does to the world. A worker that does not report one —
+    /// or a tool whose author has not said — lands on `unknown`, which is
+    /// asked about rather than assumed harmless.
+    #[serde(default)]
+    pub effect: ozgent_core::permission::Effect,
 }
 
 impl From<ToolManifest> for ozgent_core::ToolSpec {
@@ -106,6 +111,7 @@ impl From<ToolManifest> for ozgent_core::ToolSpec {
             description: m.description,
             input_schema: m.input_schema,
             output_schema: m.output_schema,
+            effect: m.effect,
         }
     }
 }

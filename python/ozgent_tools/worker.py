@@ -238,7 +238,14 @@ class Worker:
 
         arguments = coerce(params.get("arguments") or {}, entry.input_schema)
 
-        task = asyncio.ensure_future(entry.invoke(arguments))
+        # Whether a person saw this call and said yes. Set around the task's
+        # creation, not around awaiting it: a task copies the context at the
+        # moment it is created, so setting it afterwards would arrive too late
+        # to be seen by the tool.
+        from .permissions import approving
+
+        with approving(bool(params.get("approved"))):
+            task = asyncio.ensure_future(entry.invoke(arguments))
         key = str(params.get("call_id") or req_id)
         self.running[key] = task
         try:

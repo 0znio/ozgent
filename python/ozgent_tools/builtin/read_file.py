@@ -60,7 +60,7 @@ def _numbered(lines: list[str], start: int) -> str:
     return "\n".join(f"{start + i:>{width}} | {line}" for i, line in enumerate(lines))
 
 
-@tool
+@tool(effect="read")
 async def read_file(
     path: Annotated[str, "Path to the file, absolute or relative to the project root."],
     query: Annotated[

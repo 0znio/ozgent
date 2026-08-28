@@ -252,8 +252,33 @@ impl ToolHost {
     /// On timeout the call is cancelled inside the worker rather than merely
     /// abandoned, so a runaway tool does not keep consuming resources.
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value, ToolCallError> {
+        self.call_approved(name, arguments, false).await
+    }
+
+    /// Invoke a tool, saying whether a person authorised this particular call.
+    ///
+    /// `approved` is not a convenience: the Python side keeps its own
+    /// boundaries — a root directory for file tools, an allowlist for
+    /// commands — and those exist to answer "what may run with nobody
+    /// looking". A call the user read and approved is past that question, so
+    /// the flag lifts them for that call only.
+    ///
+    /// It defaults to false through [`ToolHost::call`] on purpose. Forgetting
+    /// to pass it means the sandbox applies, which is the harmless mistake;
+    /// the harmful one would need someone to write `true`.
+    pub async fn call_approved(
+        &self,
+        name: &str,
+        arguments: Value,
+        approved: bool,
+    ) -> Result<Value, ToolCallError> {
         let call_id = format!("c{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let params = json!({ "name": name, "arguments": arguments, "call_id": call_id });
+        let params = json!({
+            "name": name,
+            "arguments": arguments,
+            "call_id": call_id,
+            "approved": approved,
+        });
 
         match self.request("call", Some(params), self.timeout).await {
             Ok(v) => Ok(v),
@@ -431,6 +456,11 @@ pub enum ToolCallError {
     Timeout { name: String, after: Duration },
     #[error("tool worker unavailable: {0}")]
     Transport(String),
+    /// The user was asked and said no. Not a failure — nothing went wrong —
+    /// but it travels the same path as one, because what the model needs is a
+    /// tool result either way.
+    #[error("{name} was declined")]
+    Declined { name: String },
 }
 
 impl ToolCallError {
@@ -457,6 +487,7 @@ impl ToolCallError {
             Self::Transport(e) => {
                 format!("The tool system is unavailable: {e}. Do not retry; tell the user.")
             }
+            Self::Declined { name } => ozgent_core::permission::refusal(name),
         }
     }
 }

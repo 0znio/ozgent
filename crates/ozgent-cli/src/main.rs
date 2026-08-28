@@ -4,6 +4,7 @@ mod chat;
 mod input;
 mod cli;
 mod logging;
+mod permission;
 mod status;
 
 use anyhow::{Context, Result};

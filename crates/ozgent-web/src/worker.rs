@@ -60,6 +60,10 @@ pub struct Request {
     /// Images for this turn. Resolved on the inference thread, where the
     /// projector lives.
     pub images: Vec<ozgent_core::ImageSource>,
+    /// Whether there is a person on the other end who can answer a permission
+    /// question. True for the web interface, false for the OpenAI API, where
+    /// the caller is a program.
+    pub can_ask: bool,
     pub out: UnboundedSender<Event>,
 }
 
@@ -78,6 +82,20 @@ pub enum Event {
     /// current call" leaves every card but the last stuck running and lands
     /// the first result on the wrong one.
     ToolCall { id: String, name: String, arguments: serde_json::Value },
+    /// A tool call is waiting for the user to allow it.
+    ///
+    /// `id` is the same call id the matching `ToolCall` and `ToolResult`
+    /// carry, so the client answers about the card it is showing. Exactly one
+    /// of a `ToolCall` or a `ToolResult` follows: an approval runs the tool
+    /// normally, a refusal goes straight to a result saying so.
+    Permission {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+        /// What the tool does to the world, so the page can colour the
+        /// question by how much it matters.
+        effect: ozgent_core::permission::Effect,
+    },
     /// The model called a tool the *caller* owns. Nothing runs here; the turn
     /// ends and the caller is expected to execute it and send the result back.
     ClientToolCall { name: String, arguments: serde_json::Value },
@@ -140,11 +158,16 @@ pub fn current_tools(tools: &SharedTools) -> Option<Tools> {
 
 impl Worker {
     /// Start the thread. It lives for the process.
-    pub fn spawn(paths: Paths, config: SharedConfig, tools: SharedTools) -> Self {
+    pub fn spawn(
+        paths: Paths,
+        config: SharedConfig,
+        tools: SharedTools,
+        permissions: Permissions,
+    ) -> Self {
         let (tx, rx) = channel::<Job>();
         std::thread::Builder::new()
             .name("ozgent-inference".into())
-            .spawn(move || run(paths, config, tools, rx))
+            .spawn(move || run(paths, config, tools, permissions, rx))
             .expect("spawning the inference thread");
         Self { tx }
     }
@@ -187,7 +210,32 @@ fn snapshot(config: &SharedConfig) -> Config {
     config.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-fn run(paths: Paths, config: SharedConfig, tools: SharedTools, rx: Receiver<Job>) {
+/// Everything the inference thread needs to ask about a tool call.
+///
+/// Grouped rather than passed as two more arguments because they are always
+/// used together: the questions in flight, and the answers already given that
+/// mean a question need not be asked at all.
+#[derive(Clone)]
+pub struct Permissions {
+    pub pending: crate::permission::SharedPending,
+    /// "Don't ask again this session", shared with the settings page so it can
+    /// show — and clear — what has been granted.
+    pub grants: SharedGrants,
+    /// The standing policy. The same handle the settings page writes to, so a
+    /// rule changed there applies to the very next call rather than the next
+    /// restart.
+    pub config: SharedConfig,
+}
+
+pub type SharedGrants = std::sync::Arc<std::sync::Mutex<ozgent_core::Grants>>;
+
+fn run(
+    paths: Paths,
+    config: SharedConfig,
+    tools: SharedTools,
+    permissions: Permissions,
+    rx: Receiver<Job>,
+) {
     let mut pending: Option<Box<Request>> = None;
     // Held across model loads: the embedding model is independent of whichever
     // chat model happens to be resident.
@@ -209,7 +257,7 @@ fn run(paths: Paths, config: SharedConfig, tools: SharedTools, rx: Receiver<Job>
 
         // Loading and the session that borrows it both live in this scope, so
         // the borrow checker is satisfied without any self-referential trick.
-        match serve_model(&paths, &config, &tools, &mut embedder, request, &rx) {
+        match serve_model(&paths, &config, &tools, &permissions, &mut embedder, request, &rx) {
             Ok(next) => pending = next,
             Err(e) => tracing::error!("inference thread: {e}"),
         }
@@ -222,6 +270,7 @@ fn serve_model(
     paths: &Paths,
     shared: &SharedConfig,
     tools: &SharedTools,
+    permissions: &Permissions,
     // Threaded through rather than rebuilt: an embedding request that arrives
     // mid-conversation should not reload the model it already has.
     embedder: &mut Option<ozgent_llama::embed::Embedder>,
@@ -316,11 +365,15 @@ fn serve_model(
             &per_turn,
             thinking,
             tools,
+            permissions,
             projector.as_ref(),
             &request,
         ) {
             let _ = request.out.send(Event::Error { message: e.to_string() });
         }
+        // A turn that ended while a question was outstanding leaves nobody to
+        // answer it; the card is gone from the page with the stream.
+        permissions.pending.abandon_all();
         // Dropping the sender ends the SSE stream for this request.
         drop(request);
 
@@ -389,6 +442,83 @@ fn embedding_unavailable() -> String {
 
 /// One user turn: generate, run any tools the model asks for, generate again.
 ///
+/// Decide whether one call may run, asking the browser if the policy says to.
+///
+/// Returns `None` for a refusal, or `Some(by_user)` to run it, where `by_user`
+/// records that a person authorised this call rather than a default doing it
+/// for them — the distinction the Python sandbox reads.
+///
+/// Blocking is deliberate and safe here: this is the inference thread, which
+/// has nothing else to do while a tool would have been running, and the wait
+/// is bounded so a closed tab cannot strand it.
+fn permit(
+    permissions: &Permissions,
+    spec: Option<&ozgent_core::ToolSpec>,
+    call: &ozgent_core::ToolCall,
+    request: &Request,
+) -> Option<bool> {
+    use ozgent_core::permission::Verdict;
+    let config = &permissions.config;
+
+    // A call naming a tool that does not exist fails in the host a moment
+    // later with a far better message than anything here could produce.
+    let effect = spec.map(|s| s.effect).unwrap_or_default();
+
+    let verdict = {
+        let policy = config.lock().unwrap_or_else(|e| e.into_inner());
+        let grants = permissions.grants.lock().unwrap_or_else(|e| e.into_inner());
+        policy.permissions.verdict(&call.name, effect, &grants)
+    };
+    match verdict {
+        Verdict::Allow { by_user } => return Some(by_user),
+        Verdict::Deny => return None,
+        // Nobody to ask. An OpenAI client is a program, and a program cannot
+        // consent on a person's behalf; blocking for five minutes and then
+        // refusing would be the same answer, arrived at slowly. An operator
+        // who wants these tools available to the API says so in the policy.
+        Verdict::Ask if !request.can_ask => return None,
+        Verdict::Ask => {}
+    }
+
+    let rx = permissions.pending.ask(&call.id);
+    if request
+        .out
+        .send(Event::Permission {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            effect,
+        })
+        .is_err()
+    {
+        // Nobody is listening to this turn any more, so nobody will answer.
+        permissions.pending.forget(&call.id);
+        return None;
+    }
+
+    let choice = crate::permission::wait(rx);
+    permissions.pending.forget(&call.id);
+    permissions
+        .grants
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remember(&call.name, choice);
+
+    // "Always" is the answer that outlives the process, so it is the one that
+    // touches the file. Saving is best-effort: a config that could not be
+    // written must not turn an approval into a refusal.
+    let mut policy = config.lock().unwrap_or_else(|e| e.into_inner());
+    if policy.permissions.apply(&call.name, choice) {
+        let saved = ozgent_core::Paths::discover()
+            .map_err(|e| e.to_string())
+            .and_then(|p| policy.save(&p).map_err(|e| e.to_string()));
+        if let Err(e) = saved {
+            tracing::warn!("could not save the permission for {}: {e}", call.name);
+        }
+    }
+    choice.is_allow().then_some(true)
+}
+
 /// Mirrors the terminal client's loop so a conversation behaves the same in
 /// both front ends. Bounded, because a model that keeps calling tools would
 /// otherwise never produce an answer.
@@ -398,6 +528,7 @@ fn turn(
     resolved: &ozgent_core::options::Resolved,
     thinking: ThinkingMode,
     tools: &SharedTools,
+    permissions: &Permissions,
     projector: Option<&LoadedProjector<'_>>,
     request: &Request,
 ) -> anyhow::Result<()> {
@@ -699,17 +830,35 @@ fn turn(
         // Every call is announced before any is awaited, so the transcript
         // shows the whole batch as pending rather than appearing to work
         // through them one at a time.
+        // Permission first, one question at a time. Asking about a batch all
+        // at once would put four modal cards on the page and make the user
+        // answer them in whatever order they happened to be announced; asking
+        // in the model's own order means the first refusal is about the first
+        // call, which is the one the user is reading.
+        let mut approved: Vec<Option<bool>> = Vec::with_capacity(parsed.calls.len());
         for call in &parsed.calls {
-            let _ = request.out.send(Event::ToolCall {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            });
+            approved.push(permit(permissions, t.host.get(&call.name), call, request));
+        }
+
+        // Only the calls that survived are announced as running. A card that
+        // appears and then turns into a refusal reads as a tool that failed.
+        for (call, allowed) in parsed.calls.iter().zip(&approved) {
+            if allowed.is_some() {
+                let _ = request.out.send(Event::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+            }
         }
         let outcomes = t.runtime.block_on(futures_util::future::join_all(
-            parsed.calls.iter().map(|call| async {
+            parsed.calls.iter().zip(&approved).map(|(call, allowed)| async {
+                let Some(by_user) = *allowed else {
+                    return (Err(ozgent_tools::ToolCallError::Declined { name: call.name.clone() }), 0);
+                };
                 let started = std::time::Instant::now();
-                let outcome = t.host.call(&call.name, call.arguments.clone()).await;
+                let outcome =
+                    t.host.call_approved(&call.name, call.arguments.clone(), by_user).await;
                 (outcome, started.elapsed().as_millis() as u64)
             }),
         ));
@@ -1214,6 +1363,8 @@ mod tests {
         let worker = Worker { tx };
         let (out, _keep) = tokio::sync::mpsc::unbounded_channel();
         let result = worker.submit(Request {
+            // No stream is being watched in a test.
+            can_ask: false,
             model: "any".into(),
             messages: Vec::new(),
             thinking: None,
