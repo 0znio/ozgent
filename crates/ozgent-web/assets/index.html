@@ -159,6 +159,30 @@
       </button>
       <div class="quick" id="quick" hidden></div>
 
+      <!-- The turn is stopped on this, so it sits where the answer will be
+           acted on rather than in the transcript: attached to the top of the
+           composer, sharing its width. One question is outstanding at a time,
+           so one panel is enough. -->
+      <section class="consent" id="consent" hidden aria-live="assertive">
+        <span class="consent-mark"><svg class="ic"><use href="#i-shield"></use></svg></span>
+        <div class="consent-body">
+          <p class="consent-ask">
+            <span class="consent-tool" id="consent-tool"></span>
+            <span class="consent-effect" id="consent-effect"></span>
+          </p>
+          <p class="consent-args" id="consent-args"></p>
+          <p class="consent-more">
+            <button type="button" class="linky" data-choice="session">Allow for this session</button>
+            <button type="button" class="linky" data-choice="always" id="consent-always"></button>
+          </p>
+        </div>
+        <div class="consent-actions">
+          <button type="button" class="consent-no" data-choice="deny">Decline</button>
+          <button type="button" class="consent-yes" data-choice="once">Allow</button>
+          <span class="consent-keys">Enter · Esc</span>
+        </div>
+      </section>
+
       <div class="composer-box" id="composer-box">
         <div class="attachments" id="attachments" hidden></div>
         <textarea id="input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>

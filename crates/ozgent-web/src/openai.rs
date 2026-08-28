@@ -745,6 +745,7 @@ async fn collect(
             // the refusal arrives as the tool's result.
             Event::Ready { .. }
             | Event::ToolCall { .. }
+            | Event::ToolCallStarted { .. }
             | Event::ToolResult { .. }
             | Event::Permission { .. } => {}
         }
@@ -867,7 +868,10 @@ fn stream_chunks(
                         (rx, model, completion, true, false),
                     ));
                 }
-                Event::Ready { .. } | Event::ToolResult { .. } | Event::Permission { .. } => {}
+                Event::Ready { .. }
+                | Event::ToolResult { .. }
+                | Event::ToolCallStarted { .. }
+                | Event::Permission { .. } => {}
             }
 
             if delta.is_empty() {

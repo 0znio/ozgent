@@ -82,6 +82,15 @@ pub enum Event {
     /// current call" leaves every card but the last stuck running and lands
     /// the first result on the wrong one.
     ToolCall { id: String, name: String, arguments: serde_json::Value },
+    /// The model has committed to a tool call and is still writing it.
+    ///
+    /// Sent as soon as the name is readable, which is long before the
+    /// arguments are. Everything from the opening marker is withheld from the
+    /// stream, so without this the page simply stops: a model writing a file
+    /// generates the whole file before the call can be parsed, and a minute of
+    /// nothing reads as a dropped connection. A `ToolCall` or a `Permission`
+    /// with the same name follows once the arguments are in.
+    ToolCallStarted { name: String },
     /// A tool call is waiting for the user to allow it.
     ///
     /// `id` is the same call id the matching `ToolCall` and `ToolResult`
@@ -1150,6 +1159,9 @@ fn generate(
     let mut answered = false;
     let out = request.out.clone();
     let mut raw = String::new();
+    // Set once the call being written has been named, so it is announced once
+    // rather than on every token.
+    let mut announced = false;
 
     let limit = request.max_tokens.unwrap_or(resolved.max_tokens);
     let (stats, reason) = session.generate_with_media(&prompt, media, limit, |piece| {
@@ -1180,6 +1192,17 @@ fn generate(
             // frees the GPU instead of generating into nothing.
             if out.send(event).is_err() {
                 return false;
+            }
+        }
+
+        // The name is readable from the call's first few tokens. Announcing it
+        // here is what fills the silence while the arguments are generated.
+        if !announced && answer_gate.suppressing() {
+            if let Some(name) = ozgent_llama::toolcall::pending_name(&raw) {
+                announced = true;
+                if out.send(Event::ToolCallStarted { name: name.to_string() }).is_err() {
+                    return false;
+                }
             }
         }
         true

@@ -796,70 +796,123 @@ body {
 /* A tool call is one quiet row that opens for the detail. It sits in the
    transcript between the reasoning and the answer, so it must read as
    supporting material rather than competing with the reply. */
-/* --- permission -------------------------------------------------------
-   A question, not a notification: the turn is stopped until it is answered,
-   so the card is the loudest thing in the transcript and stays put once
-   answered. Removing it would leave the transcript saying a tool simply ran.
+/* --- the consent gate --------------------------------------------------
+   The turn is stopped until this is answered, so it is attached to the top
+   of the composer — where the answer will be given — rather than dropped
+   into the transcript, where it would scroll away from the thing you use to
+   reply to it.
 
-   The border carries the weight, keyed to what the tool does. Amber is
-   already "something is happening", so `write` borrows it and `execute` —
-   the only kind that runs code — gets the one red on screen. */
-.perm {
-  margin: 0 0 var(--s3);
-  padding: var(--s3);
-  border: 1px solid var(--line);
-  border-left-width: 3px;
-  border-radius: var(--radius);
-  background: var(--panel);
-}
-.perm-read    { border-left-color: var(--ok); }
-.perm-write   { border-left-color: var(--accent); }
-.perm-execute { border-left-color: var(--danger); }
-.perm-unknown { border-left-color: var(--ink-faint); }
-
-.perm-head {
+   Hierarchy does the work rather than four equal buttons: one filled action
+   for the answer given nine times in ten, one quiet one beside it, and the
+   two that change a setting demoted to text. A row of identical buttons is
+   what makes a prompt read as generated. */
+.consent {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  gap: var(--s3);
   margin-bottom: var(--s2);
+  padding: var(--s3) var(--s4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+  box-shadow: var(--shadow);
+  position: relative;
+  overflow: hidden;
+  animation: consent-in 180ms var(--ease);
 }
-.perm-head .ic { width: 16px; height: 16px; flex: none; color: var(--ink-soft); }
-.perm-head .nm { font-family: var(--mono); font-weight: 600; }
-.perm-head .what { color: var(--ink-soft); font-size: var(--t-small); }
+/* The stripe carries the severity, so the panel itself stays quiet. */
+.consent::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--consent-hue);
+}
+@keyframes consent-in {
+  from { opacity: 0; transform: translateY(6px); }
+}
+@media (prefers-reduced-motion: reduce) { .consent { animation: none; } }
 
-/* The arguments are the question. A long value scrolls inside its own row
-   rather than widening the card, which would push the buttons off screen —
-   the one place a horizontal scrollbar is better than the alternative. */
-.perm-args {
+.consent            { --consent-hue: var(--ink-faint); }
+.consent-read       { --consent-hue: var(--ok); }
+.consent-write      { --consent-hue: var(--accent); }
+.consent-execute    { --consent-hue: var(--danger); }
+
+.consent-mark {
+  flex: none;
   display: grid;
-  gap: 4px;
-  margin-bottom: var(--s3);
+  place-items: center;
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  color: var(--consent-hue);
+  background: color-mix(in srgb, var(--consent-hue) 14%, transparent);
+}
+.consent-mark .ic { width: 16px; height: 16px; }
+
+.consent-body { flex: 1; min-width: 0; }
+.consent-ask { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.consent-tool { font-family: var(--mono); font-weight: 600; font-size: 13.5px; }
+.consent-effect { color: var(--ink-soft); font-size: var(--t-small); }
+
+/* The arguments are the question, so they are the widest thing here and are
+   allowed to scroll rather than widen the panel or wrap into a paragraph. */
+.consent-args {
+  margin-top: 3px;
   font-family: var(--mono);
   font-size: 12.5px;
-}
-.perm-arg {
-  display: flex;
-  gap: 8px;
+  color: var(--ink);
+  white-space: pre;
   overflow-x: auto;
   padding-bottom: 2px;
 }
-.perm-arg .k { color: var(--ink-faint); flex: none; }
-.perm-arg .v { color: var(--ink); white-space: pre; }
-
-/* The shared ghost button is full-width for the sidebar; here it sits in a
-   row of four, so the width is released rather than a new button invented. */
-.perm-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
-.perm-actions .ghost-btn,
-.perm-row .ghost-btn,
-.perm-session .ghost-btn { width: auto; }
-.perm-actions .decline { color: var(--danger); }
-.perm-actions .decline:hover {
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+.consent-more { margin-top: 6px; display: flex; gap: var(--s3); flex-wrap: wrap; }
+.linky {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--ink-faint);
+  font-size: var(--t-small);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
 }
-.perm-outcome { color: var(--ink-soft); font-size: var(--t-small); }
-.perm.answered { opacity: .75; }
-.perm.declined { border-left-color: var(--ink-faint); }
+.linky:hover { color: var(--ink); }
+
+.consent-actions {
+  flex: none;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: var(--s2);
+  align-items: center;
+}
+.consent-yes, .consent-no {
+  border-radius: var(--radius);
+  padding: 7px var(--s4);
+  font-size: var(--t-small);
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.consent-yes { background: var(--ink); color: var(--bg); }
+.consent-yes:hover { opacity: .88; }
+.consent-no { background: transparent; color: var(--ink-soft); border-color: var(--line); }
+.consent-no:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, var(--line)); }
+.consent-keys {
+  grid-column: 1 / -1;
+  text-align: right;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+/* Stacked on a phone: the actions go full width under the question rather
+   than squeezing it into a column two words wide. */
+@media (max-width: 620px) {
+  .consent { flex-wrap: wrap; }
+  .consent-body { flex-basis: 100%; }
+  .consent-actions { width: 100%; grid-template-columns: 1fr 1fr; }
+  .consent-keys { display: none; }
+}
 
 /* --- the permissions manager ---------------------------------------- */
 .perm-list { display: grid; gap: var(--s2); }
@@ -919,6 +972,9 @@ body {
    one thing wearing the accent. */
 .tool-card.running { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .tool-card.bad { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+/* Declined is not failed: nothing went wrong, the call simply did not happen. */
+.tool-card.declined { opacity: .7; }
+.tool-card.declined .dot { background: var(--ink-faint); animation: none; }
 .tool-card > summary {
   display: flex;
   align-items: center;

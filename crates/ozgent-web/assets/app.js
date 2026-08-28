@@ -843,91 +843,102 @@ function openToolCard(answerEl, event) {
   card.querySelector(".nm").textContent = event.name;
   card.querySelector(".lead").textContent = lead;
   card.querySelector(".rest").textContent = rest;
+  // Named but not yet written: the dot is already pulsing, so this only has
+  // to say what the pulse is for.
+  if (!leadKey && !rest) card.querySelector(".ms").textContent = "writing the call…";
   answerEl.before(card);
   return card;
 }
 
-/// Ask whether a tool call may run.
-///
-/// The arguments are the question. "Allow run_command?" cannot be answered by
-/// anyone — the whole risk is in the string being run — so the card shows the
-/// call in full and the buttons are only meaningful underneath it.
-///
-/// The card answers once and then becomes a record of what was answered. It is
-/// never removed: the following tool card or refusal reads as its consequence,
-/// and a question that vanishes leaves the transcript saying a tool simply ran.
-function permissionCard(answerEl, event) {
-  const card = document.createElement("div");
-  card.className = `perm perm-${event.effect}`;
+/// Put the arguments into a card that was opened before they existed.
+function fillToolCard(card, event) {
+  const args = event.arguments ?? {};
+  const leadKey = ["path", "query", "url", "city"].find((k) => args[k] !== undefined);
+  card.querySelector(".lead").textContent = leadKey ? String(args[leadKey]) : "";
+  card.querySelector(".rest").textContent = Object.entries(args)
+    .filter(([k]) => k !== leadKey)
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join("  ");
+  card.querySelector(".ms").textContent = "running";
+}
 
-  const args = Object.entries(event.arguments ?? {});
-  const rows = args.length
-    ? args
-        .map(
-          ([k, v]) =>
-            `<div class="perm-arg"><span class="k">${escapeHtml(k)}</span>` +
-            `<span class="v">${escapeHtml(typeof v === "string" ? v : JSON.stringify(v))}</span></div>`,
-        )
-        .join("")
-    : '<div class="perm-arg"><span class="v">no arguments</span></div>';
-
-  const what = {
+/// Ask whether a tool call may run, on the panel above the composer.
+///
+/// Not a card in the transcript: the turn is stopped until this is answered,
+/// and a question that scrolls away from the thing you answer it with is a
+/// question people lose. One is outstanding at a time, so one panel does.
+///
+/// Resolves to the choice, so the caller can record it next to the call it
+/// belongs to.
+function askConsent(event) {
+  const panel = $("consent");
+  const effects = {
     read: "wants to read something",
     write: "wants to change files or data",
     execute: "wants to run a program",
     unknown: "does not say what it does",
-  }[event.effect] ?? "wants to run";
+  };
 
-  card.innerHTML =
-    '<div class="perm-head">' +
-      '<svg class="ic"><use href="#i-shield"></use></svg>' +
-      `<span class="nm">${escapeHtml(event.name)}</span>` +
-      `<span class="what">${escapeHtml(what)}</span>` +
-    '</div>' +
-    `<div class="perm-args">${rows}</div>` +
-    '<div class="perm-actions">' +
-      '<button class="primary-btn" data-choice="once">Allow</button>' +
-      '<button class="ghost-btn" data-choice="session">Allow this session</button>' +
-      `<button class="ghost-btn" data-choice="always">Always allow ${escapeHtml(event.name)}</button>` +
-      '<button class="ghost-btn decline" data-choice="deny">Decline</button>' +
-    '</div>' +
-    '<div class="perm-outcome" hidden></div>';
+  panel.className = `consent consent-${event.effect}`;
+  $("consent-tool").textContent = event.name;
+  $("consent-effect").textContent = effects[event.effect] ?? "wants to run";
+  $("consent-args").textContent = consentArgs(event.arguments);
+  $("consent-always").textContent = `Always allow ${event.name}`;
+  panel.hidden = false;
 
-  const answered = {
+  return new Promise((resolve) => {
+    const answer = (choice) => {
+      // Detached before the request so a second click, or a key pressed while
+      // it is in flight, cannot answer a question that is no longer waiting.
+      panel.hidden = true;
+      document.removeEventListener("keydown", onKey, true);
+      for (const b of buttons) b.removeEventListener("click", onClick);
+      resolve(choice);
+    };
+    const onClick = (e) => answer(e.currentTarget.dataset.choice);
+    const onKey = (e) => {
+      // Captured, and only these two: anything else typed while a tool waits
+      // belongs in the composer, not to the panel.
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); answer("once"); }
+      else if (e.key === "Escape") { e.preventDefault(); answer("deny"); }
+    };
+    const buttons = [...panel.querySelectorAll("[data-choice]")];
+    for (const b of buttons) b.addEventListener("click", onClick);
+    document.addEventListener("keydown", onKey, true);
+  });
+}
+
+/// The arguments, as one line the panel can show without wrapping.
+function consentArgs(args) {
+  const entries = Object.entries(args ?? {});
+  if (!entries.length) return "no arguments";
+  return entries
+    .map(([k, v]) => {
+      const text = typeof v === "string" ? v : JSON.stringify(v);
+      // A newline would break the single-line layout; a whole file would
+      // push the buttons off screen. The head says what it is.
+      const flat = text.replace(/\n/g, "⏎");
+      const clipped = flat.length > 160 ? `${flat.slice(0, 159)}…` : flat;
+      return `${k}: ${clipped}`;
+    })
+    .join("   ");
+}
+
+/// Record in the transcript what was decided, next to the call it was about.
+function noteConsent(answerEl, event, choice) {
+  const said = {
     once: "allowed once",
     session: "allowed for this session",
     always: `always allowed — ${event.name} will not ask again`,
     deny: "declined",
-  };
-
-  card.querySelectorAll("[data-choice]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const choice = button.dataset.choice;
-      // Disabled before the request, not after: a second click would answer a
-      // question that is no longer waiting and read as an error.
-      card.querySelectorAll("[data-choice]").forEach((b) => (b.disabled = true));
-      try {
-        await api("/api/permissions/decide", {
-          method: "POST",
-          body: JSON.stringify({ id: event.id, choice }),
-        });
-      } catch {
-        // A 404 means the turn moved on — the wait ran out, or another tab
-        // answered. Nothing to recover, and nothing worth alarming about.
-      }
-      card.classList.add("answered", choice === "deny" ? "declined" : "allowed");
-      card.querySelector(".perm-actions").remove();
-      const outcome = card.querySelector(".perm-outcome");
-      outcome.textContent = answered[choice];
-      outcome.hidden = false;
-    });
-  });
-
-  answerEl.before(card);
-  return card;
+  }[choice];
+  const note = document.createElement("p");
+  note.className = choice === "deny" ? "error" : "note";
+  note.textContent = `${event.name} · ${said}`;
+  answerEl.before(note);
 }
 
-/// Fill in a card once the tool has returned.
+/// Fill in a card once the tool has returned./// Fill in a card once the tool has returned.
 function closeToolCard(card, event) {
   if (!card) return;
   card.classList.remove("running");
@@ -1196,6 +1207,10 @@ async function send(text) {
   const controller = new AbortController();
   state.abort = controller;
 
+  // The card opened when a call was named, waiting for its arguments. Out
+  // here because `finally` closes it, and a `let` inside the `try` is not in
+  // scope there.
+  let pending = null;
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -1258,14 +1273,49 @@ async function send(text) {
           // so the headers have to be put back with them.
           dressCode(answerEl);
           scrollToTail();
+        } else if (event.type === "tool_call_started") {
+          // The model has committed to a call and is still writing it. For a
+          // file that means generating the whole file first, and the stream
+          // withholds every token of it — so without a card here the page
+          // simply stops for a minute and looks disconnected.
+          pending = openToolCard(answerEl, { name: event.name, arguments: {} });
+          scrollToTail();
         } else if (event.type === "permission") {
-          // The turn is stopped on this card until it is answered, so it goes
-          // where the eye already is — at the tail, in the flow — rather than
-          // in a modal that hides what the model was doing when it asked.
-          permissionCard(answerEl, event);
+          // The arguments are known by now, so the card stops saying it is
+          // still being written even while the question is open.
+          if (pending) fillToolCard(pending, event);
+          const choice = await askConsent(event);
+          await api("/api/permissions/decide", {
+            method: "POST",
+            body: JSON.stringify({ id: event.id, choice }),
+          }).catch(() => {
+            // A 404 means the turn moved on — the wait ran out, or another
+            // tab answered. Nothing to recover, and nothing to alarm about.
+          });
+          if (choice === "deny") {
+            // No `tool_call` follows a refusal, so this card has to be closed
+            // here or it spins until the stream ends. Not through
+            // `closeToolCard`, which would print a duration for something
+            // that never ran.
+            if (pending) {
+              pending.classList.remove("running");
+              pending.classList.add("declined");
+              pending.querySelector(".ms").textContent = "declined";
+            }
+            pending = null;
+          } else if (choice !== "once") {
+            // Worth recording in the transcript: these two change what
+            // happens next time, and the card only describes this call.
+            noteConsent(answerEl, event, choice);
+          }
           scrollToTail();
         } else if (event.type === "tool_call") {
-          toolCards.set(event.id, openToolCard(answerEl, event));
+          // Reuse the card opened when the call was named, rather than
+          // stacking a second one under it.
+          const card = pending ?? openToolCard(answerEl, event);
+          pending = null;
+          fillToolCard(card, event);
+          toolCards.set(event.id, card);
           scrollToTail();
         } else if (event.type === "tool_result") {
           closeToolCard(toolCards.get(event.id), event);
@@ -1300,13 +1350,16 @@ async function send(text) {
   } finally {
     // Anything still marked running never got its result: the stream ended
     // first. A card that spins for good is worse than one that says so.
-    for (const card of toolCards.values()) {
+    for (const card of [...toolCards.values(), pending].filter(Boolean)) {
       card.classList.remove("running");
       card.classList.add("bad");
       const ms = card.querySelector(".ms");
       if (ms) ms.textContent = "no result";
     }
     toolCards.clear();
+    pending = null;
+    // A question nobody will now answer must not keep the panel on screen.
+    $("consent").hidden = true;
     body.querySelector(".think")?.classList.remove("streaming");
     answerEl.classList.remove("cursor");
     setStreaming(false);
