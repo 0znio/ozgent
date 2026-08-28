@@ -762,8 +762,9 @@ fn turn(
         let media = (round == 0 && !images.is_empty())
             .then(|| projector.map(|p| (p, &images[..], &request.images[..])))
             .flatten();
-        let (reply, stats, reason) =
-            generate(engine, session, resolved, thinking, &messages, media, request, &offered)?;
+        let (reply, stats, reason, early) = generate(
+            engine, session, resolved, thinking, &messages, media, request, &offered, permissions,
+        )?;
         // A turn can span several generations; the client is told once, at the
         // end, with the totals. Sending `Done` per round ended the SSE stream
         // before the first tool had even run.
@@ -864,7 +865,12 @@ fn turn(
         // call, which is the one the user is reading.
         let mut approved: Vec<Option<bool>> = Vec::with_capacity(parsed.calls.len());
         for call in &parsed.calls {
-            approved.push(permit(permissions, t.host.get(&call.name), call, request));
+            // Already answered while the call was still being written. Asking
+            // again would make the early prompt look like it did nothing.
+            match early.as_ref().filter(|(name, _)| *name == call.name) {
+                Some((_, allowed)) => approved.push(allowed.then_some(true)),
+                None => approved.push(permit(permissions, t.host.get(&call.name), call, request)),
+            }
         }
 
         // Only the calls that survived are announced as running. A card that
@@ -944,6 +950,13 @@ fn turn(
     });
     Ok(())
 }
+
+/// Tokens a call is given to finish its arguments before it is asked about.
+///
+/// Long enough that a compact call — a command, a search — arrives whole and
+/// is asked about in full; short enough that a file's `content` has barely
+/// started, which is the point of asking early at all.
+const ARGUMENT_GRACE: usize = 24;
 
 /// How many times a turn may call tools before it must answer.
 ///
@@ -1141,7 +1154,8 @@ fn generate(
     media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media], &[ozgent_core::ImageSource])>,
     request: &Request,
     tools: &[ozgent_core::ToolSpec],
-) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason)> {
+    permissions: &Permissions,
+) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason, Option<(String, bool)>)> {
     let prompt =
         engine.render_prompt_full(messages, thinking, resolved.reasoning_effort, tools)?;
     let mut filter = ThinkingFilter::new(thinking);
@@ -1162,6 +1176,10 @@ fn generate(
     // Set once the call being written has been named, so it is announced once
     // rather than on every token.
     let mut announced = false;
+    let mut since_named = 0usize;
+    // The answer given before the content existed, so the tool loop does not
+    // ask a second time about the same call.
+    let mut early: Option<(String, bool)> = None;
 
     let limit = request.max_tokens.unwrap_or(resolved.max_tokens);
     let (stats, reason) = session.generate_with_media(&prompt, media, limit, |piece| {
@@ -1205,6 +1223,41 @@ fn generate(
                 }
             }
         }
+
+        // Ask before the content is generated, not after. A model writing a
+        // file spends the whole call on `content`, so waiting for the finished
+        // call means asking a minute after the decision was made — and a
+        // refusal then has already paid for every token of it. Asked here, a
+        // refusal stops generation on the spot.
+        if announced {
+            since_named += 1;
+            if early.is_none() && since_named >= ARGUMENT_GRACE {
+                let name =
+                    ozgent_llama::toolcall::pending_name(&raw).unwrap_or_default().to_string();
+                let mut arguments = ozgent_llama::toolcall::pending_arguments(&raw);
+                // Said plainly, because the question is being asked before the
+                // answer to "what exactly" exists.
+                if !ozgent_llama::toolcall::call_is_closed(&raw) {
+                    arguments.insert(
+                        "…".into(),
+                        serde_json::Value::String("still being written".into()),
+                    );
+                }
+                let call = ozgent_core::ToolCall {
+                    id: format!("early-{name}"),
+                    name: name.clone(),
+                    arguments: serde_json::Value::Object(arguments),
+                };
+                let spec = tools.iter().find(|t| t.name == name);
+                match permit(permissions, spec, &call, request) {
+                    Some(_) => early = Some((name, true)),
+                    None => {
+                        early = Some((name, false));
+                        return false;
+                    }
+                }
+            }
+        }
         true
     })?;
 
@@ -1226,7 +1279,7 @@ fn generate(
         let _ = out.send(Event::Answer { text: std::mem::take(&mut reasoning) });
     }
 
-    Ok((raw, stats, reason))
+    Ok((raw, stats, reason, early))
 }
 
 #[cfg(test)]

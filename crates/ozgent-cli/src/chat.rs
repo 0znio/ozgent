@@ -554,7 +554,7 @@ impl<'a> Chat<'a> {
                 // still goes into the history as a result: the assistant
                 // message below records the call, and a call with no answer
                 // leaves the conversation malformed for every later turn.
-                let result = match self.permit(call).await? {
+                let result = match self.permit(call, reply.early_permission.as_ref()).await? {
                     Some(approved) => {
                         let started = std::time::Instant::now();
                         let outcome = self.run_tool(call, approved).await;
@@ -833,8 +833,26 @@ impl<'a> Chat<'a> {
         // Set once the call being written has been named, so it is announced
         // once rather than on every token.
         let mut announced = false;
-        let preparing = self.theme.style(Style::dim(), "  writing the call…");
+        // Tokens generated since the name appeared, so a compact call gets a
+        // moment to finish its arguments before it is asked about.
+        let mut since_named = 0usize;
+        // The answer given before the content was generated, applied in the
+        // tool loop instead of asking a second time.
+        let mut early: Option<(String, ozgent_core::Choice)> = None;
+        let generating = self.theme.style(Style::dim(), "  generating the arguments…");
+        let generating_content =
+            self.theme.style(Style::dim(), "  approved · generating the content…");
         let show_thinking = self.opts.thinking != ThinkingMode::Off;
+
+        // Read out of `self` before the borrow below, so the callback can
+        // consult the policy without holding the whole struct.
+        let policy = self.config.permissions.clone();
+        let effects: std::collections::BTreeMap<String, ozgent_core::Effect> = self
+            .tools
+            .as_ref()
+            .map(|h| h.tools().iter().map(|t| (t.name.clone(), t.effect)).collect())
+            .unwrap_or_default();
+        let grants = &mut self.grants;
 
         let media = self
             .projector
@@ -881,10 +899,59 @@ impl<'a> Chat<'a> {
                     // The reply so far is finished; what follows is the call.
                     ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
                     ui.commit();
-                    ui.begin_activity(format!("{name}{}", preparing));
+                    ui.begin_activity(format!("{name}{}", generating));
                 }
             }
             if announced {
+                since_named += 1;
+
+                // Ask before the content is generated, not after.
+                //
+                // A model writing a file spends the whole call on `content`,
+                // so waiting for the finished call means asking a minute
+                // after the decision was made — and a refusal then has
+                // already paid for every token. Asked here, a refusal stops
+                // generation on the spot.
+                //
+                // The grace period is what keeps the question answerable: a
+                // compact call finishes inside it and is asked about in full,
+                // while a file's `content` has barely started, so what is
+                // shown is the `path` that identifies it.
+                if early.is_none() && since_named >= ARGUMENT_GRACE {
+                    let name = toolcall::pending_name(&answer).unwrap_or_default().to_string();
+                    let effect = effects.get(&name).copied().unwrap_or_default();
+                    let mut arguments = toolcall::pending_arguments(&answer);
+                    let complete = toolcall::call_is_closed(&answer);
+                    if !complete {
+                        arguments.insert(
+                            "…".into(),
+                            serde_json::Value::String("still being written".into()),
+                        );
+                    }
+                    let choice = match policy.verdict(&name, effect, grants) {
+                        ozgent_core::Verdict::Allow { .. } => None,
+                        ozgent_core::Verdict::Deny => Some(ozgent_core::Choice::Deny),
+                        ozgent_core::Verdict::Ask => Some(ui.ask_permission(
+                            &name,
+                            effect,
+                            &serde_json::Value::Object(arguments),
+                        )),
+                    };
+                    if let Some(choice) = choice {
+                        grants.remember(&name, choice);
+                        early = Some((name, choice));
+                        if !choice.is_allow() {
+                            // Nothing after this point is wanted, and the rest
+                            // of the file would cost a minute to refuse.
+                            return false;
+                        }
+                        ui.begin_activity(format!(
+                            "{}{}",
+                            early.as_ref().unwrap().0,
+                            generating_content,
+                        ));
+                    }
+                }
                 ui.tick();
             } else {
                 ui.stream(Some(shown_thinking.as_str()), &shown_answer, false);
@@ -977,11 +1044,20 @@ impl<'a> Chat<'a> {
             (answer, Some(thinking))
         };
 
+        // Persisted here rather than in the callback, which cannot reach the
+        // config or the paths while the session is borrowed.
+        if let Some((name, choice)) = &early {
+            if self.config.permissions.apply(name, *choice) {
+                self.config.save(&self.paths)?;
+            }
+        }
+
         Ok(Reply {
             text,
             // An empty reasoning block is not a reasoning trace.
             thinking: reasoning.filter(|t| !t.trim().is_empty()),
             attempted_call: gate.suppressing() || think_gate.suppressing(),
+            early_permission: early,
         })
     }
 
@@ -994,8 +1070,20 @@ impl<'a> Chat<'a> {
     /// Returns `None` for a refusal, or `Some(by_user)` to run it — where
     /// `by_user` says a person authorised this call, which is what lets the
     /// Python side treat it as past its own standing boundaries.
-    async fn permit(&mut self, call: &ozgent_core::ToolCall) -> Result<Option<bool>> {
+    async fn permit(
+        &mut self,
+        call: &ozgent_core::ToolCall,
+        early: Option<&(String, ozgent_core::Choice)>,
+    ) -> Result<Option<bool>> {
         use ozgent_core::permission::Verdict;
+
+        // Already answered, while the call was still being written. Asking
+        // again about the same call would make the early prompt look like it
+        // did nothing.
+        if let Some((name, choice)) = early.filter(|(n, _)| *n == call.name) {
+            let _ = name;
+            return Ok(choice.is_allow().then_some(true));
+        }
 
         let effect = self
             .tools
@@ -1654,7 +1742,7 @@ impl<'a> Chat<'a> {
             // one call — but the standing policy still decides, so a tool set
             // to `deny` stays denied rather than being reachable by typing a
             // different command.
-            let approved = match self.permit(call).await? {
+            let approved = match self.permit(call, None).await? {
                 Some(by_user) => by_user,
                 None => {
                     self.show_refusal(&call.name);
@@ -1859,11 +1947,22 @@ impl<'a> Chat<'a> {
     }
 }
 
+/// Tokens a call is given to finish its arguments before it is asked about.
+///
+/// The whole point of asking early is to ask before a file's `content` has
+/// been generated, so this cannot be large. It only has to be long enough
+/// that a compact call — a command, a search — arrives complete and is asked
+/// about in full, which takes a couple of dozen tokens.
+const ARGUMENT_GRACE: usize = 24;
+
 /// What one generation produced, after the reasoning and tool-call streams
 /// have been told apart.
 struct Reply {
     text: String,
     thinking: Option<String>,
+    /// A permission answered while the call was still being written, so the
+    /// tool loop does not ask a second time about the same call.
+    early_permission: Option<(String, ozgent_core::Choice)>,
     /// The model began a tool call, whether or not it parsed. Used to decide
     /// when a grammar-constrained retry is worth attempting.
     attempted_call: bool,
@@ -1936,9 +2035,13 @@ fn pretty_args(args: &serde_json::Value) -> String {
         .map(|(k, v)| {
             let shown = match v {
                 // Strings print bare; quotes add nothing at a glance.
-                serde_json::Value::String(s) => truncate_middle(s, 48),
-                other => truncate_middle(&other.to_string(), 48),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
             };
+            // Flattened before truncating, not after: a whole file's contents
+            // clipped to 48 characters can still contain three newlines, and
+            // each one breaks the row it is supposed to be sharing.
+            let shown = truncate_middle(&shown.replace('\n', "⏎"), 48);
             format!("{k}: {shown}")
         })
         .collect();
@@ -2113,6 +2216,17 @@ Paste an image path or URL in a message and it is picked up automatically.";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_multiline_argument_stays_on_one_row() {
+        // A file's contents clipped to 48 characters can still contain three
+        // newlines, and each one breaks the row it is meant to share.
+        let out = pretty_args(&serde_json::json!({
+            "path": "a.py",
+            "content": "line one\nline two\nline three\n",
+        }));
+        assert!(!out.contains('\n'), "{out:?}");
+    }
 
     #[test]
     fn help_lists_every_command_the_parser_accepts() {

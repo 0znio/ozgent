@@ -850,16 +850,27 @@ function openToolCard(answerEl, event) {
   return card;
 }
 
+/// The key the server adds to say a call is still being written.
+const UNFINISHED = "\u2026";
+
 /// Put the arguments into a card that was opened before they existed.
+///
+/// A call asked about early has only the arguments that were finished in
+/// time, and the server marks it. That marker is a fact about the card, not
+/// an argument, so it becomes the label rather than a row of its own.
 function fillToolCard(card, event) {
-  const args = event.arguments ?? {};
+  const args = { ...(event.arguments ?? {}) };
+  const unfinished = UNFINISHED in args;
+  delete args[UNFINISHED];
+
   const leadKey = ["path", "query", "url", "city"].find((k) => args[k] !== undefined);
   card.querySelector(".lead").textContent = leadKey ? String(args[leadKey]) : "";
   card.querySelector(".rest").textContent = Object.entries(args)
     .filter(([k]) => k !== leadKey)
     .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
     .join("  ");
-  card.querySelector(".ms").textContent = "running";
+  card.querySelector(".ms").textContent =
+    unfinished ? "generating the content…" : "running";
 }
 
 /// Ask whether a tool call may run, on the panel above the composer.
@@ -872,24 +883,47 @@ function fillToolCard(card, event) {
 /// belongs to.
 function askConsent(event) {
   const panel = $("consent");
-  const effects = {
-    read: "wants to read something",
-    write: "wants to change files or data",
-    execute: "wants to run a program",
-    unknown: "does not say what it does",
+  // A sentence, not a label and a category. "write_file wants to change files
+  // or data" is a form field read aloud; "Let write_file write poem.txt?" is
+  // the question actually being asked.
+  const verbs = {
+    read: "read something",
+    write: "change files or data",
+    execute: "run a program",
+    unknown: "run",
   };
+  const raw = { ...(event.arguments ?? {}) };
+  // A fact about the call, not one of its arguments; it belongs in the
+  // sentence rather than in the list underneath it.
+  const unfinished = UNFINISHED in raw;
+  delete raw[UNFINISHED];
+  const args = Object.entries(raw);
+  const lead = ["command", "path", "url", "query", "file"]
+    .map((k) => raw[k])
+    .find((v) => typeof v === "string");
 
-  panel.className = `consent consent-${event.effect}`;
-  $("consent-tool").textContent = event.name;
-  $("consent-effect").textContent = effects[event.effect] ?? "wants to run";
-  $("consent-args").textContent = consentArgs(event.arguments);
-  $("consent-always").textContent = `Always allow ${event.name}`;
+  $("consent-q").innerHTML =
+    `Let <span class="tool">${escapeHtml(event.name)}</span> ` +
+    `${escapeHtml(verbs[event.effect] ?? "run")}` +
+    (lead ? ` — <span class="tool">${escapeHtml(clip(lead, 60))}</span>?` : "?");
+  // Everything else, once, underneath. The lead argument is already in the
+  // question and is not repeated.
+  const detail = args
+    .filter(([, v]) => v !== lead)
+    .map(([k, v]) => `${k}: ${clip(typeof v === "string" ? v : JSON.stringify(v), 90)}`);
+  // Said plainly, because the question is being asked before the answer to
+  // "what exactly" exists — which is the point: refusing now costs seconds
+  // rather than the minute it takes to generate a file nobody wanted.
+  if (unfinished) detail.push("the content is still being generated");
+  $("consent-detail").textContent = detail.join("   ");
+  $("consent-always").textContent = "always";
   panel.hidden = false;
 
   return new Promise((resolve) => {
+    const buttons = [...panel.querySelectorAll("[data-choice]")];
     const answer = (choice) => {
-      // Detached before the request so a second click, or a key pressed while
-      // it is in flight, cannot answer a question that is no longer waiting.
+      // Detached before resolving so a second click, or a key pressed while
+      // the decision is in flight, cannot answer a question already gone.
       panel.hidden = true;
       document.removeEventListener("keydown", onKey, true);
       for (const b of buttons) b.removeEventListener("click", onClick);
@@ -898,30 +932,22 @@ function askConsent(event) {
     const onClick = (e) => answer(e.currentTarget.dataset.choice);
     const onKey = (e) => {
       // Captured, and only these two: anything else typed while a tool waits
-      // belongs in the composer, not to the panel.
+      // belongs in the composer.
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); answer("once"); }
       else if (e.key === "Escape") { e.preventDefault(); answer("deny"); }
     };
-    const buttons = [...panel.querySelectorAll("[data-choice]")];
     for (const b of buttons) b.addEventListener("click", onClick);
     document.addEventListener("keydown", onKey, true);
   });
 }
 
-/// The arguments, as one line the panel can show without wrapping.
-function consentArgs(args) {
-  const entries = Object.entries(args ?? {});
-  if (!entries.length) return "no arguments";
-  return entries
-    .map(([k, v]) => {
-      const text = typeof v === "string" ? v : JSON.stringify(v);
-      // A newline would break the single-line layout; a whole file would
-      // push the buttons off screen. The head says what it is.
-      const flat = text.replace(/\n/g, "⏎");
-      const clipped = flat.length > 160 ? `${flat.slice(0, 159)}…` : flat;
-      return `${k}: ${clipped}`;
-    })
-    .join("   ");
+/// One value, short enough to sit on a line, with newlines flattened.
+///
+/// A file's contents clipped to ninety characters can still contain three
+/// newlines, and each one breaks the row it is meant to share.
+function clip(text, width) {
+  const flat = String(text).replace(/\s*\n\s*/g, " ⏎ ");
+  return flat.length > width ? `${flat.slice(0, width - 1)}…` : flat;
 }
 
 /// Record in the transcript what was decided, next to the call it was about.
@@ -1303,7 +1329,10 @@ async function send(text) {
               pending.querySelector(".ms").textContent = "declined";
             }
             pending = null;
-          } else if (choice !== "once") {
+          }
+          // Nothing to do on approval: `fillToolCard` above already put the
+          // card on "generating the content…", which is what happens next.
+          if (choice !== "deny" && choice !== "once") {
             // Worth recording in the transcript: these two change what
             // happens next time, and the card only describes this call.
             noteConsent(answerEl, event, choice);

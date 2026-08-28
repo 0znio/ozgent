@@ -799,95 +799,67 @@ body {
 /* --- the consent gate --------------------------------------------------
    The turn is stopped until this is answered, so it is attached to the top
    of the composer — where the answer will be given — rather than dropped
-   into the transcript, where it would scroll away from the thing you use to
-   reply to it.
+   into the transcript, where it would scroll away from the control you use
+   to reply to it.
 
-   Hierarchy does the work rather than four equal buttons: one filled action
-   for the answer given nine times in ten, one quiet one beside it, and the
-   two that change a setting demoted to text. A row of identical buttons is
-   what makes a prompt read as generated. */
+   Deliberately plain. This appears mid-conversation, unbidden, and anything
+   that draws attention to itself twice — a coloured stripe, a tinted icon
+   disc, three type sizes — reads as decoration on a question that only needs
+   asking once. One sentence, one line of detail, one filled button. */
 .consent {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--s3);
   margin-bottom: var(--s2);
   padding: var(--s3) var(--s4);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
-  background: var(--raised);
-  box-shadow: var(--shadow);
-  position: relative;
-  overflow: hidden;
-  animation: consent-in 180ms var(--ease);
+  background: var(--panel);
 }
-/* The stripe carries the severity, so the panel itself stays quiet. */
-.consent::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  background: var(--consent-hue);
-}
-@keyframes consent-in {
-  from { opacity: 0; transform: translateY(6px); }
-}
-@media (prefers-reduced-motion: reduce) { .consent { animation: none; } }
 
-.consent            { --consent-hue: var(--ink-faint); }
-.consent-read       { --consent-hue: var(--ok); }
-.consent-write      { --consent-hue: var(--accent); }
-.consent-execute    { --consent-hue: var(--danger); }
+.consent-q { font-size: var(--t-body); }
+.consent-q .tool { font-family: var(--mono); font-weight: 600; }
 
-.consent-mark {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 30px; height: 30px;
-  border-radius: 50%;
-  color: var(--consent-hue);
-  background: color-mix(in srgb, var(--consent-hue) 14%, transparent);
-}
-.consent-mark .ic { width: 16px; height: 16px; }
-
-.consent-body { flex: 1; min-width: 0; }
-.consent-ask { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.consent-tool { font-family: var(--mono); font-weight: 600; font-size: 13.5px; }
-.consent-effect { color: var(--ink-soft); font-size: var(--t-small); }
-
-/* The arguments are the question, so they are the widest thing here and are
-   allowed to scroll rather than widen the panel or wrap into a paragraph. */
-.consent-args {
-  margin-top: 3px;
+/* The arguments, when there are any worth showing. Its own line, allowed to
+   scroll rather than widen the panel or wrap into a paragraph. */
+.consent-detail {
+  margin-top: 2px;
   font-family: var(--mono);
   font-size: 12.5px;
-  color: var(--ink);
+  color: var(--ink-soft);
   white-space: pre;
   overflow-x: auto;
-  padding-bottom: 2px;
 }
-.consent-more { margin-top: 6px; display: flex; gap: var(--s3); flex-wrap: wrap; }
+.consent-detail:empty { display: none; }
+
+.consent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin-top: var(--s3);
+}
+/* The two that change a setting are text, not buttons: they are the rare
+   answer, and four buttons of equal weight is what makes a prompt look
+   generated. */
+.consent-alt {
+  flex: 1;
+  display: flex;
+  gap: var(--s3);
+  color: var(--ink-faint);
+  font-size: var(--t-small);
+}
 .linky {
   background: none;
   border: 0;
   padding: 0;
   color: var(--ink-faint);
-  font-size: var(--t-small);
+  font: inherit;
   text-decoration: underline;
   text-underline-offset: 2px;
   cursor: pointer;
 }
 .linky:hover { color: var(--ink); }
 
-.consent-actions {
-  flex: none;
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: var(--s2);
-  align-items: center;
-}
 .consent-yes, .consent-no {
   border-radius: var(--radius);
-  padding: 7px var(--s4);
+  padding: 6px var(--s4);
   font-size: var(--t-small);
   font-weight: 600;
   border: 1px solid transparent;
@@ -896,22 +868,11 @@ body {
 .consent-yes { background: var(--ink); color: var(--bg); }
 .consent-yes:hover { opacity: .88; }
 .consent-no { background: transparent; color: var(--ink-soft); border-color: var(--line); }
-.consent-no:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, var(--line)); }
-.consent-keys {
-  grid-column: 1 / -1;
-  text-align: right;
-  color: var(--ink-faint);
-  font-size: 11px;
-  font-family: var(--mono);
-}
+.consent-no:hover { color: var(--ink); border-color: var(--ink-faint); }
 
-/* Stacked on a phone: the actions go full width under the question rather
-   than squeezing it into a column two words wide. */
 @media (max-width: 620px) {
-  .consent { flex-wrap: wrap; }
-  .consent-body { flex-basis: 100%; }
-  .consent-actions { width: 100%; grid-template-columns: 1fr 1fr; }
-  .consent-keys { display: none; }
+  .consent-alt { flex-basis: 100%; order: 3; margin-top: var(--s2); }
+  .consent-row { flex-wrap: wrap; justify-content: flex-end; }
 }
 
 /* --- the permissions manager ---------------------------------------- */

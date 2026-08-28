@@ -70,6 +70,133 @@ pub fn pending_name(text: &str) -> Option<&str> {
     identifier(&line[..end])
 }
 
+/// Whether the call being written has been closed.
+///
+/// Not `extract(text).has_calls()`: that deliberately reads an unclosed final
+/// value, because a call cut off by the token limit is better read than
+/// thrown away. Here the question is the opposite one — are these *all* the
+/// arguments — and answering it wrongly means telling someone a file has no
+/// content when its content is what is still arriving.
+pub fn call_is_closed(text: &str) -> bool {
+    let Some((start, opener, closer)) = OPENERS
+        .iter()
+        .filter_map(|(open, close)| text.rfind(open).map(|i| (i, *open, *close)))
+        .max_by_key(|(i, _, _)| *i)
+    else {
+        return false;
+    };
+    let body = &text[start + opener.len()..];
+    match closer {
+        Some(closer) => body.contains(closer),
+        // No closing marker to wait for; the body is JSON, so it is finished
+        // when it parses.
+        None => serde_json::from_str::<serde_json::Value>(body.trim()).is_ok(),
+    }
+}
+
+/// The arguments of a half-written call that are already complete.
+///
+/// A companion to [`pending_name`], for asking permission before the call has
+/// finished being written. `write_file` spends almost all its time on
+/// `content`, and `path` — the argument that actually identifies what is
+/// about to happen — is usually written first and complete within a token or
+/// two of the name.
+///
+/// Only *finished* pairs are returned. A value still being generated is a
+/// prefix, and showing the first eighty characters of a file as though it
+/// were the whole argument would be worse than showing nothing.
+pub fn pending_arguments(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let Some((start, opener)) = OPENERS
+        .iter()
+        .filter_map(|(open, _)| text.rfind(open).map(|i| (i, *open)))
+        .max_by_key(|(i, _)| *i)
+    else {
+        return out;
+    };
+    let body = &text[start + opener.len()..];
+
+    // `<function=NAME><parameter=k>v</parameter>` — a pair is complete when
+    // its closing tag has arrived.
+    if opener == "<function=" {
+        let mut rest = body;
+        while let Some(i) = rest.find("<parameter=") {
+            rest = &rest[i + "<parameter=".len()..];
+            let Some(gt) = rest.find('>') else { break };
+            let key = rest[..gt].trim().to_string();
+            let Some(end) = rest[gt + 1..].find("</parameter>") else { break };
+            // Trimmed and coerced exactly as `from_parameters` does, or the
+            // prompt would describe a different value from the one that runs.
+            out.insert(key, coerce(rest[gt + 1..gt + 1 + end].trim()));
+            rest = &rest[gt + 1 + end..];
+        }
+        return out;
+    }
+
+    // `<arg_key>k</arg_key><arg_value>v</arg_value>`, Ling's shape.
+    if body.contains("<arg_key>") {
+        let mut rest = body;
+        while let Some(i) = rest.find("<arg_key>") {
+            rest = &rest[i + "<arg_key>".len()..];
+            let Some(k_end) = rest.find("</arg_key>") else { break };
+            let key = rest[..k_end].trim().to_string();
+            rest = &rest[k_end..];
+            let Some(v_start) = rest.find("<arg_value>") else { break };
+            rest = &rest[v_start + "<arg_value>".len()..];
+            let Some(v_end) = rest.find("</arg_value>") else { break };
+            out.insert(key, coerce(rest[..v_end].trim()));
+            rest = &rest[v_end..];
+        }
+        return out;
+    }
+
+    // The JSON shapes. The object will not parse until it is closed, so the
+    // complete `"key": value` pairs are read one at a time instead.
+    let Some(args) = body.find("\"arguments\"") else { return out };
+    let mut rest = &body[args + "\"arguments\"".len()..];
+    if let Some(brace) = rest.find('{') {
+        rest = &rest[brace + 1..];
+    } else {
+        return out;
+    }
+    while let Some((key, value, tail)) = next_pair(rest) {
+        out.insert(key, value);
+        rest = tail;
+    }
+    out
+}
+
+/// One complete `"key": value,` from the front of a partial JSON object.
+fn next_pair(text: &str) -> Option<(String, serde_json::Value, &str)> {
+    let rest = text.trim_start().trim_start_matches(',').trim_start();
+    let quoted = rest.strip_prefix('"')?;
+    let key_end = quoted.find('"')?;
+    let key = quoted[..key_end].to_string();
+    let rest = quoted[key_end + 1..].trim_start().strip_prefix(':')?.trim_start();
+
+    if let Some(body) = rest.strip_prefix('"') {
+        // Find the closing quote, honouring escapes: a value containing `\"`
+        // would otherwise be reported as finished halfway through.
+        let mut escaped = false;
+        for (i, c) in body.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                let raw = format!("\"{}\"", &body[..i]);
+                let value = serde_json::from_str(&raw).ok()?;
+                return Some((key, value, &body[i + 1..]));
+            }
+        }
+        return None;
+    }
+    // A bare literal — number, bool, null — ends at the next delimiter.
+    let end = rest.find([',', '}'])?;
+    let value = serde_json::from_str(rest[..end].trim()).ok()?;
+    Some((key, value, &rest[end..]))
+}
+
 /// Accept only something that could be a tool name.
 ///
 /// The alternative is announcing whatever punctuation happened to follow the
@@ -980,6 +1107,118 @@ mod gate_tests {
 
 #[cfg(test)]
 mod pending_name_tests {
+    #[test]
+    fn a_call_still_being_written_is_not_closed() {
+        // The distinction that decides whether the prompt says "and more is
+        // coming". `extract` reads an unclosed value on purpose, so it cannot
+        // answer this.
+        let partial = r#"<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "half"#;
+        assert!(!call_is_closed(partial));
+
+        // The native shape is where `extract` is lenient — it keeps an
+        // unclosed final value rather than throwing the call away — which is
+        // exactly why it cannot answer "are these all the arguments".
+        let native = "<tool_call>write_file\n<arg_key>path</arg_key><arg_value>a.txt</arg_value>\
+                      <arg_key>content</arg_key><arg_value>half";
+        assert!(extract(native).has_calls(), "extract reads the unclosed value");
+        assert!(!call_is_closed(native), "but the call is plainly not finished");
+    }
+
+    #[test]
+    fn a_finished_call_is_closed() {
+        let whole = r#"<tool_call>{"name": "write_file", "arguments": {"path": "a.txt"}}</tool_call>"#;
+        assert!(call_is_closed(whole));
+        assert!(call_is_closed("<function=run_command><parameter=command>ls</parameter></function>"));
+    }
+
+    #[test]
+    fn prose_is_not_a_closed_call() {
+        assert!(!call_is_closed("no call here"));
+    }
+
+    #[test]
+    fn a_native_value_is_trimmed_the_way_the_real_parser_trims_it() {
+        // Observed against Qwythos: the value arrives wrapped in newlines, and
+        // an untrimmed early view showed "\nseapoem.txt\n" in the prompt.
+        let text = "<tool_call>write_file\n<arg_key>path</arg_key><arg_value>\nseapoem.txt\n</arg_value>";
+        assert_eq!(pending_arguments(text)["path"], serde_json::json!("seapoem.txt"));
+    }
+
+    fn args(text: &str) -> Vec<(String, String)> {
+        pending_arguments(text)
+            .into_iter()
+            .map(|(k, v)| (k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn the_path_is_readable_while_the_content_is_still_being_written() {
+        // The case this exists for: permission is asked before the file is
+        // generated, and `path` is what makes that question answerable.
+        let partial = concat!(
+            r#"<tool_call>{"name": "write_file", "arguments": {"path": "poem.txt", "#,
+            r#""content": "The sea, the sea, the op"#,
+        );
+        assert_eq!(args(partial), [("path".into(), "poem.txt".into())]);
+    }
+
+    #[test]
+    fn a_value_still_being_generated_is_not_reported_as_finished() {
+        // Showing the first eighty characters of a file as though it were the
+        // whole argument is worse than showing nothing.
+        let partial = r#"<tool_call>{"name": "write_file", "arguments": {"content": "half a"#;
+        assert!(args(partial).is_empty());
+    }
+
+    #[test]
+    fn a_compact_call_is_complete_by_the_time_it_is_asked_about() {
+        let whole = r#"<tool_call>{"name": "run_command", "arguments": {"command": "git status"}}"#;
+        assert_eq!(args(whole), [("command".into(), "git status".into())]);
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_value_early() {
+        let text = r#"<tool_call>{"name": "run_command", "arguments": {"command": "echo \"hi\"", "cwd": "/tmp"}}"#;
+        assert_eq!(
+            args(text),
+            [("command".into(), "echo \"hi\"".into()), ("cwd".into(), "/tmp".into())],
+        );
+    }
+
+    #[test]
+    fn numbers_and_booleans_are_read_too() {
+        let text = r#"<tool_call>{"name": "web_search", "arguments": {"count": 5, "safe": true, "q": "x"}}"#;
+        let got = pending_arguments(text);
+        assert_eq!(got["count"], serde_json::json!(5));
+        assert_eq!(got["safe"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn the_native_syntaxes_give_up_their_finished_pairs() {
+        assert_eq!(
+            args("<function=write_file><parameter=path>a.txt</parameter><parameter=content>half"),
+            [("path".into(), "a.txt".into())],
+        );
+        assert_eq!(
+            args("<tool_call>write_file\n<arg_key>path</arg_key><arg_value>a.txt</arg_value><arg_key>content</arg_key><arg_value>half"),
+            [("path".into(), "a.txt".into())],
+        );
+    }
+
+    #[test]
+    fn prose_has_no_arguments() {
+        assert!(pending_arguments("just talking").is_empty());
+    }
+
+    #[test]
+    fn what_is_read_early_matches_what_is_finally_parsed() {
+        // The prompt must not describe a call different from the one that runs.
+        let whole = r#"<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "x"}}</tool_call>"#;
+        let early = pending_arguments(whole);
+        let parsed = &extract(whole).calls[0].arguments;
+        assert_eq!(early["path"], parsed["path"]);
+    }
+
     use super::*;
 
     #[test]
