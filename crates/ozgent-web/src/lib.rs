@@ -14,8 +14,14 @@ pub mod worker;
 use ozgent_core::{Config, Paths};
 
 /// Run the server until the process is stopped.
-pub async fn serve(paths: Paths, config: Config, host: &str, port: u16) -> anyhow::Result<()> {
-    let state = state::App::new(paths, config).await?;
+pub async fn serve(
+    paths: Paths,
+    config: Config,
+    host: &str,
+    port: u16,
+    cli: ozgent_core::Options,
+) -> anyhow::Result<()> {
+    let state = state::App::new(paths, config, cli).await?;
     let app = api::router(state).layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("{host}:{port}");
@@ -71,8 +77,9 @@ pub async fn serve_api(
     host: &str,
     port: u16,
     api_key: Option<String>,
+    cli: ozgent_core::Options,
 ) -> anyhow::Result<()> {
-    let state = state::App::new(paths, config).await?;
+    let state = state::App::new(paths, config, cli).await?;
     let app = openai::router(state, openai::ApiKey(api_key.clone()))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 

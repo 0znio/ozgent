@@ -34,19 +34,22 @@ async fn main() -> Result<()> {
         Some(Command::Run { model, prompt, options }) => {
             run_once(&paths, &config, &model, &prompt.join(" "), &options).await
         }
-        Some(Command::Web { port, host, no_open, .. }) => {
+        Some(Command::Web { port, host, no_open, options }) => {
             // `--no-open` had no effect and nothing ever opened a browser,
             // though `--help` said one would.
             if !no_open {
                 open_browser(port);
             }
-            ozgent_web::serve(paths, config, &host, port).await
+            // The flags were parsed and thrown away: `ozgent web --ctx 32k`
+            // printed nothing and changed nothing.
+            ozgent_web::serve(paths, config, &host, port, options.to_options()?).await
         }
-        Some(Command::Serve { port, host, api_key, .. }) => {
+        Some(Command::Serve { port, host, api_key, options }) => {
             // The environment is the right place for a secret; a flag lands in
             // shell history and in `ps`.
             let api_key = api_key.or_else(|| std::env::var("OZGENT_API_KEY").ok());
-            ozgent_web::serve_api(paths, config, &host, port, api_key).await
+            let overrides = options.to_options()?;
+            ozgent_web::serve_api(paths, config, &host, port, api_key, overrides).await
         }
         Some(Command::Pull { repo, quant, as_ref, name, revision, max_size, list }) => {
             pull(&paths, &repo, quant, as_ref, name, revision, max_size, list).await

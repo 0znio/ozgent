@@ -163,11 +163,12 @@ impl Worker {
         config: SharedConfig,
         tools: SharedTools,
         permissions: Permissions,
+        cli: CliOptions,
     ) -> Self {
         let (tx, rx) = channel::<Job>();
         std::thread::Builder::new()
             .name("ozgent-inference".into())
-            .spawn(move || run(paths, config, tools, permissions, rx))
+            .spawn(move || run(paths, config, tools, permissions, cli, rx))
             .expect("spawning the inference thread");
         Self { tx }
     }
@@ -227,6 +228,15 @@ pub struct Permissions {
     pub config: SharedConfig,
 }
 
+/// Option flags given to `ozgent web` or `ozgent serve` on the command line.
+///
+/// A layer of their own rather than folded into `config.defaults`, because
+/// they have to beat the per-model blocks in `config.toml` — a flag typed at
+/// the terminal that a config file silently overrides is worse than no flag.
+/// They were previously discarded outright: `ozgent web --ctx 32k` parsed,
+/// printed nothing, and changed nothing.
+pub type CliOptions = std::sync::Arc<ozgent_core::Options>;
+
 pub type SharedGrants = std::sync::Arc<std::sync::Mutex<ozgent_core::Grants>>;
 
 fn run(
@@ -234,6 +244,7 @@ fn run(
     config: SharedConfig,
     tools: SharedTools,
     permissions: Permissions,
+    cli: CliOptions,
     rx: Receiver<Job>,
 ) {
     let mut pending: Option<Box<Request>> = None;
@@ -257,7 +268,7 @@ fn run(
 
         // Loading and the session that borrows it both live in this scope, so
         // the borrow checker is satisfied without any self-referential trick.
-        match serve_model(&paths, &config, &tools, &permissions, &mut embedder, request, &rx) {
+        match serve_model(&paths, &config, &tools, &permissions, &cli, &mut embedder, request, &rx) {
             Ok(next) => pending = next,
             Err(e) => tracing::error!("inference thread: {e}"),
         }
@@ -271,6 +282,7 @@ fn serve_model(
     shared: &SharedConfig,
     tools: &SharedTools,
     permissions: &Permissions,
+    cli: &ozgent_core::Options,
     // Threaded through rather than rebuilt: an embedding request that arrives
     // mid-conversation should not reload the model it already has.
     embedder: &mut Option<ozgent_llama::embed::Embedder>,
@@ -292,7 +304,10 @@ fn serve_model(
     // Read now, not at start-up: the settings page may have written the file
     // since, and this load is usually the direct consequence of that.
     let config = snapshot(shared);
-    let base = config.options_for(&found.model.to_string()).merge(&found.manifest.defaults);
+    let base = config
+        .options_for(&found.model.to_string())
+        .merge(&found.manifest.defaults)
+        .merge(cli);
     let resolved = base
         .clone()
         .merge(first.overrides.as_ref().unwrap_or(&Default::default()))
@@ -320,7 +335,10 @@ fn serve_model(
         // keeps two clients on one model from inheriting each other's
         // temperature, seed and reasoning budget.
         let live = snapshot(shared);
-        let base = live.options_for(&found.model.to_string()).merge(&found.manifest.defaults);
+        let base = live
+            .options_for(&found.model.to_string())
+            .merge(&found.manifest.defaults)
+            .merge(cli);
         let per_turn = base
             .clone()
             .merge(request.overrides.as_ref().unwrap_or(&Default::default()))

@@ -306,6 +306,10 @@ impl<'a> Chat<'a> {
             // cache, the other by picking a model that was trained longer.
             let why = if trained > 0 && window >= trained {
                 format!("this model was trained for {}", ozgent_core::format_count(trained))
+            } else if self.opts.kv_offload {
+                "that much KV cache does not fit in VRAM. `/config mode gpu_ram` puts it \
+                 in system RAM instead: the whole window, slower per token"
+                    .to_string()
             } else {
                 "that much KV cache does not fit in this machine's memory".to_string()
             };
@@ -1327,6 +1331,13 @@ impl<'a> Chat<'a> {
             };
             self.ui.say(dim(&format!("  ctx             {ctx}")));
             self.ui.say(dim(&format!("  gpu layers      {}", self.opts.gpu_layers)));
+            let kv = if self.opts.kv_offload { "gpu" } else { "system ram" };
+            self.ui.say(dim(&format!("  kv cache        {kv}")));
+            self.ui.say(dim(&format!(
+                "  mode            {} ({})",
+                self.opts.inference_mode,
+                self.opts.inference_mode.describes(),
+            )));
             self.ui.say(dim(&format!("  tools           {}", self.opts.tools)));
             self.ui.say(dim(&format!("set with /config <key> <value>; keys: {SETTABLE}")));
             return Ok(());
@@ -1406,6 +1417,38 @@ impl<'a> Chat<'a> {
                 let on = matches!(value.as_str(), "on" | "true" | "yes" | "1");
                 self.opts.tools = on;
                 layer.tools = Some(on);
+            }
+            "mode" | "inference_mode" => {
+                let mode: ozgent_core::InferenceMode =
+                    value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                layer.inference_mode = Some(mode);
+                // Load-time: where the weights and the cache live is fixed
+                // when the context opens.
+                let entry = self.config.models.entry(self.model.to_string()).or_default();
+                *entry = entry.clone().merge(&layer);
+                self.config.save(&self.paths)?;
+                self.ui.say(dim(&format!(
+                    "· mode = {mode} — {} (saved; applies when the model is next loaded)",
+                    mode.describes(),
+                )));
+                return Ok(());
+            }
+            "kv_offload" | "kv" => {
+                // Load-time, like ctx: where the cache lives is fixed when the
+                // context opens and cannot move under a live one.
+                let on = matches!(value.as_str(), "on" | "true" | "yes" | "1" | "gpu");
+                layer.kv_offload = Some(on);
+                let entry = self.config.models.entry(self.model.to_string()).or_default();
+                *entry = entry.clone().merge(&layer);
+                self.config.save(&self.paths)?;
+                let note = if on {
+                    "kv cache on the gpu (saved; applies when the model is next loaded)"
+                } else {
+                    "kv cache in system ram — a larger window, more slowly \
+                     (saved; applies when the model is next loaded)"
+                };
+                self.ui.say(dim(&format!("· {note}")));
+                return Ok(());
             }
             other => {
                 self.ui.say(dim(&format!("unknown setting {other:?}; try {SETTABLE}")));
@@ -2030,7 +2073,7 @@ fn ago(timestamp: i64) -> String {
 /// listing, the error and `/help` cannot drift apart.
 const SETTABLE: &str =
     "thinking, effort, temperature, top_p, top_k, min_p, repeat_penalty, max_tokens, seed, \
-     ctx, tools";
+     ctx, mode, kv, tools";
 
 const HELP: &str = "\
 /help              this list
@@ -2048,6 +2091,9 @@ const HELP: &str = "\
                    temperature, top_p, top_k, min_p, repeat_penalty, max_tokens,
                    seed, thinking, effort, tools, and ctx (applies on next load)
                    sizes take k/m: /config ctx 32k
+                   /config mode gpu|gpu_ram|ram — where the model runs.
+                   gpu_ram keeps the weights on the card and the KV cache in
+                   RAM: the full window, several times slower per token
 /tools             list available tools
 /default           use this model when none is named · /default clear to unset
 /permissions       what tools may do without asking

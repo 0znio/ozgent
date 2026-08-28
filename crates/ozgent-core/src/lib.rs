@@ -19,7 +19,7 @@ pub use config::Config;
 pub use options::ReasoningEffort;
 pub use datetime::DateTime;
 pub use manifest::{Capability, Manifest};
-pub use options::{GpuLayers, Options, Resolved, ThinkingMode};
+pub use options::{GpuLayers, InferenceMode, Options, Resolved, ThinkingMode};
 pub use paths::{ModelRef, Paths};
 pub use permission::{Choice, Effect, Grants, Permissions, Rule, Verdict};
 pub use registry::{Installed, RegistryError, installed, resolve, set_alias, validate_alias};

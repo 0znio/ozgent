@@ -68,7 +68,11 @@ pub struct App {
 pub type State = Arc<App>;
 
 impl App {
-    pub async fn new(paths: Paths, config: Config) -> anyhow::Result<State> {
+    pub async fn new(
+        paths: Paths,
+        config: Config,
+        cli: ozgent_core::Options,
+    ) -> anyhow::Result<State> {
         let store = Store::open(paths.root().join("ozgent.db"))?;
 
         // Attachments are kept for a month; sweeping at startup avoids a timer
@@ -108,6 +112,7 @@ impl App {
             Arc::clone(&config),
             Arc::clone(&tools),
             permissions.clone(),
+            std::sync::Arc::new(cli),
         );
         Ok(Arc::new(App {
             paths,

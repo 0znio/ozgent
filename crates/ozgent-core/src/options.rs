@@ -101,6 +101,90 @@ mod gpu_keyword {
     }
 }
 
+/// Where the model runs, as one choice instead of three.
+///
+/// Two settings actually decide this — how many layers sit on the GPU, and
+/// whether the KV cache sits with them — and the useful combinations are few
+/// enough to name. Naming them also makes the trade visible: every mode below
+/// buys context with speed or speed with context, and picking one should feel
+/// like picking that, not like guessing at two unrelated knobs.
+///
+/// Either knob, set explicitly, still wins over the mode. The mode fills in
+/// what was not said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceMode {
+    /// Everything on the GPU, cache included.
+    ///
+    /// The fastest, and the reason a model advertising 128k opens at 50k: the
+    /// window is bounded by whatever VRAM is left after the weights.
+    #[default]
+    Gpu,
+    /// Weights on the GPU, KV cache in system RAM.
+    ///
+    /// The window is bounded by RAM instead, so the full one is usually
+    /// available. Attention reads the whole cache across PCIe on every token,
+    /// so the token rate drops — several-fold at a large window.
+    ///
+    /// Note what this does *not* do: llama.cpp holds one cache in one place,
+    /// so this is not a cache that fills VRAM and spills into RAM. The
+    /// compute stays on the GPU and the cache moves off it, whole.
+    GpuRam,
+    /// No GPU at all. Slow, and the only option when there is nothing to
+    /// offload to or the card is needed elsewhere.
+    Ram,
+}
+
+impl InferenceMode {
+    /// Layer placement this mode implies.
+    pub fn gpu_layers(self) -> GpuLayers {
+        match self {
+            Self::Gpu | Self::GpuRam => GpuLayers::AUTO,
+            Self::Ram => GpuLayers::OFF,
+        }
+    }
+
+    /// Whether the KV cache sits with the weights.
+    pub fn kv_offload(self) -> bool {
+        matches!(self, Self::Gpu)
+    }
+
+    /// What this mode trades, for a settings page or a `--help` line.
+    pub fn describes(self) -> &'static str {
+        match self {
+            Self::Gpu => "everything on the GPU; the window is limited by free VRAM",
+            Self::GpuRam => "weights on the GPU, KV cache in RAM; a larger window, slower",
+            Self::Ram => "no GPU at all",
+        }
+    }
+}
+
+impl std::fmt::Display for InferenceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gpu => "gpu",
+            Self::GpuRam => "gpu_ram",
+            Self::Ram => "ram",
+        })
+    }
+}
+
+impl std::str::FromStr for InferenceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Both spellings of the middle one, because it is the one people type
+        // and `+` is the obvious way to write "and".
+        match s.trim().to_ascii_lowercase().replace(['-', '+', ' '], "_").as_str() {
+            "gpu" | "vram" => Ok(Self::Gpu),
+            "gpu_ram" | "ram_gpu" | "hybrid" | "both" => Ok(Self::GpuRam),
+            "ram" | "cpu" | "host" => Ok(Self::Ram),
+            other => Err(format!(
+                "expected gpu, gpu_ram, or ram; got {other:?}"
+            )),
+        }
+    }
+}
+
 /// Whether a reasoning model should be allowed to think.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -226,6 +310,18 @@ pub struct Options {
     pub use_mlock: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flash_attention: Option<bool>,
+    /// Where the model runs, as a single choice. Fills in `gpu_layers` and
+    /// `kv_offload` where they were not set explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_mode: Option<InferenceMode>,
+    /// Whether the KV cache lives on the GPU with the weights.
+    ///
+    /// On, the window is bounded by free VRAM — which is why a model
+    /// advertising 128k gets 53k on a card with 2 GB spare. Off, the cache
+    /// lives in system RAM and the window is bounded by that instead, at the
+    /// cost of reading the whole cache across PCIe on every token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_offload: Option<bool>,
 
     // --- acceleration ---
     /// Keep routed experts of the first N layers in system RAM.
@@ -301,7 +397,7 @@ impl Options {
         // not work rather than like a bug in this list.
         take!(
             gpu_layers, context_length, batch_size, ubatch, threads, main_gpu, use_mmap, use_mlock,
-            flash_attention, cpu_moe, control_vector, control_strength,
+            flash_attention, inference_mode, kv_offload, cpu_moe, control_vector, control_strength,
             cache_type_k, cache_type_v, speculative,
             speculative_tuning, prefix_reuse, temperature, top_p, top_k, min_p, repeat_penalty, repeat_last_n,
             seed, max_tokens, system_prompt, thinking, reasoning_effort, tools,
@@ -312,8 +408,12 @@ impl Options {
     /// Collapse into concrete values, filling any remaining gaps with built-in
     /// defaults.
     pub fn resolve(&self) -> Resolved {
+        // The mode is a shorthand for the two settings below it, so it is
+        // read first and then overridden by either of them if they were set.
+        let mode = self.inference_mode.unwrap_or_default();
         Resolved {
-            gpu_layers: self.gpu_layers.unwrap_or(GpuLayers::AUTO),
+            inference_mode: mode,
+            gpu_layers: self.gpu_layers.unwrap_or_else(|| mode.gpu_layers()),
             context_length: self.context_length.unwrap_or(4096),
             batch_size: self.batch_size.unwrap_or(512),
             ubatch: self.ubatch,
@@ -323,6 +423,10 @@ impl Options {
             use_mmap: self.use_mmap.unwrap_or(true),
             use_mlock: self.use_mlock.unwrap_or(false),
             flash_attention: self.flash_attention.unwrap_or(true),
+            // The cache is read in full on every token, so keeping it beside
+            // the weights is worth several times the token rate. Moving it
+            // buys window, not speed — which is what the mode chooses.
+            kv_offload: self.kv_offload.unwrap_or_else(|| mode.kv_offload()),
             cpu_moe: self.cpu_moe.unwrap_or(MoeOffload::AUTO),
             control_vector: self.control_vector.clone(),
             // 1.0 applies the vector as trained. Not clamped, because the
@@ -375,6 +479,8 @@ impl Resolved {
             || self.use_mmap != other.use_mmap
             || self.use_mlock != other.use_mlock
             || self.flash_attention != other.flash_attention
+            || self.kv_offload != other.kv_offload
+            || self.inference_mode != other.inference_mode
             || self.cpu_moe != other.cpu_moe
             || self.control_vector != other.control_vector
             || self.control_strength != other.control_strength
@@ -430,6 +536,11 @@ pub struct Resolved {
     pub use_mmap: bool,
     pub use_mlock: bool,
     pub flash_attention: bool,
+    /// False keeps the KV cache in system RAM. See [`Options::kv_offload`].
+    pub kv_offload: bool,
+    /// The mode the two settings above were derived from, for display. It has
+    /// no effect of its own once they are resolved.
+    pub inference_mode: InferenceMode,
     pub cpu_moe: MoeOffload,
     pub control_vector: Option<std::path::PathBuf>,
     pub control_strength: f32,
@@ -454,6 +565,75 @@ pub struct Resolved {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_mode_places_the_weights_and_the_cache() {
+        let r = |m: InferenceMode| Options { inference_mode: Some(m), ..Default::default() }.resolve();
+
+        let gpu = r(InferenceMode::Gpu);
+        assert_eq!(gpu.gpu_layers, GpuLayers::AUTO);
+        assert!(gpu.kv_offload, "gpu mode keeps the cache with the weights");
+
+        let hybrid = r(InferenceMode::GpuRam);
+        assert_eq!(hybrid.gpu_layers, GpuLayers::AUTO, "the weights still go to the card");
+        assert!(!hybrid.kv_offload, "only the cache moves");
+
+        let ram = r(InferenceMode::Ram);
+        assert!(ram.gpu_layers.is_cpu_only());
+        assert!(!ram.kv_offload);
+    }
+
+    #[test]
+    fn an_explicit_setting_beats_the_mode_it_would_have_filled_in() {
+        // The mode is a shorthand, not an override: someone who has tuned
+        // `gpu_layers` for their card must not lose it by naming a mode.
+        let o = Options {
+            inference_mode: Some(InferenceMode::Ram),
+            gpu_layers: Some(GpuLayers::Count(20)),
+            ..Default::default()
+        };
+        assert_eq!(o.resolve().gpu_layers, GpuLayers::Count(20));
+
+        let o = Options {
+            inference_mode: Some(InferenceMode::Gpu),
+            kv_offload: Some(false),
+            ..Default::default()
+        };
+        assert!(!o.resolve().kv_offload);
+    }
+
+    #[test]
+    fn the_default_mode_is_the_fast_one() {
+        // Changing this silently halves the token rate of every existing
+        // install, which is not a thing to do by default.
+        let r = Options::default().resolve();
+        assert_eq!(r.inference_mode, InferenceMode::Gpu);
+        assert!(r.kv_offload);
+    }
+
+    #[test]
+    fn modes_round_trip_through_the_names_people_type() {
+        for mode in [InferenceMode::Gpu, InferenceMode::GpuRam, InferenceMode::Ram] {
+            assert_eq!(mode.to_string().parse(), Ok(mode));
+        }
+        // The spellings someone would actually reach for.
+        assert_eq!("gpu+ram".parse(), Ok(InferenceMode::GpuRam));
+        assert_eq!("GPU-RAM".parse(), Ok(InferenceMode::GpuRam));
+        assert_eq!("cpu".parse(), Ok(InferenceMode::Ram));
+        assert!("gpu_only".parse::<InferenceMode>().is_err());
+    }
+
+    #[test]
+    fn a_mode_survives_a_trip_through_toml() {
+        let text = toml::to_string_pretty(&Options {
+            inference_mode: Some(InferenceMode::GpuRam),
+            ..Default::default()
+        })
+        .unwrap();
+        let back: Options = toml::from_str(&text).unwrap();
+        assert_eq!(back.inference_mode, Some(InferenceMode::GpuRam));
+        assert!(text.contains("gpu_ram"), "written the way it is typed: {text}");
+    }
+
     use super::*;
 
     #[test]
@@ -475,6 +655,8 @@ mod tests {
         changed.use_mmap = !base.use_mmap;
         changed.use_mlock = !base.use_mlock;
         changed.flash_attention = !base.flash_attention;
+        changed.kv_offload = !base.kv_offload;
+        changed.inference_mode = InferenceMode::Ram;
         changed.cpu_moe = MoeOffload::Layers(9);
         changed.control_vector = Some("/tmp/v.gguf".into());
         changed.control_strength = 0.5;
@@ -519,6 +701,8 @@ mod tests {
         expected.use_mmap = base.use_mmap;
         expected.use_mlock = base.use_mlock;
         expected.flash_attention = base.flash_attention;
+        expected.kv_offload = base.kv_offload;
+        expected.inference_mode = base.inference_mode;
         expected.cpu_moe = base.cpu_moe;
         expected.control_vector = base.control_vector.clone();
         expected.control_strength = base.control_strength;

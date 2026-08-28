@@ -37,6 +37,9 @@ Running as a server:
 
 Tuning a run (all work on any command, and with `ozgent chat`):
   ozgent chat coder --ctx 32k                  context length, or 8192, or 128k
+  ozgent chat coder --ctx 128k --inference-mode gpu_ram
+                                               the whole window, cache in RAM,
+                                               slower per token
   ozgent chat coder --temp 0.2 --top-p 0.9     sampling
   ozgent chat coder --top-k 40 --min-p 0.05
   ozgent chat coder --think off --effort high  reasoning
@@ -343,6 +346,23 @@ pub struct OptionFlags {
     #[arg(long, value_name = "N", global = true)]
     pub ubatch: Option<u32>,
 
+    /// Where the model runs: `gpu`, `gpu_ram`, or `ram`.
+    ///
+    /// `gpu` puts everything on the card and trims the context window to the
+    /// VRAM left over. `gpu_ram` keeps the weights on the card and moves the
+    /// KV cache into system RAM, so the window is bounded by RAM instead — a
+    /// much larger window, several times slower per token at that size. `ram`
+    /// uses no GPU at all.
+    #[arg(long, value_name = "MODE", global = true)]
+    pub inference_mode: Option<ozgent_core::InferenceMode>,
+
+    /// Keep the KV cache in system RAM instead of on the GPU.
+    ///
+    /// The low-level half of `--inference-mode gpu_ram`, for combining with an
+    /// explicit `--gpu-layers`.
+    #[arg(long, global = true)]
+    pub no_kv_offload: bool,
+
     /// How hard a reasoning model should think: `low`, `medium`, or `high`.
     #[arg(long, value_name = "LEVEL", global = true)]
     pub effort: Option<ozgent_core::ReasoningEffort>,
@@ -455,6 +475,8 @@ impl OptionFlags {
             control_vector: self.control_vector.clone(),
             control_strength: self.control_strength,
             context_length: self.ctx,
+            inference_mode: self.inference_mode,
+            kv_offload: self.no_kv_offload.then_some(false),
             cache_type_k: self.cache_type,
             cache_type_v: self.cache_type,
             // A bare flag can only express one direction; absent means "defer".
@@ -607,6 +629,49 @@ mod tests {
         let opts = parse(&["ozgent", "--cache-type", "q4_0"]).options.to_options().unwrap();
         assert_eq!(opts.cache_type_k, Some(CacheType::Q4_0));
         assert_eq!(opts.cache_type_v, Some(CacheType::Q4_0));
+    }
+
+    #[test]
+    fn the_inference_mode_flag_reaches_the_options_layer() {
+        let hybrid = Cli::parse_from(["ozgent", "chat", "m", "--inference-mode", "gpu_ram"])
+            .options
+            .to_options()
+            .unwrap()
+            .resolve();
+        assert!(!hybrid.kv_offload, "the cache moves to ram");
+        assert_eq!(hybrid.gpu_layers, ozgent_core::GpuLayers::AUTO, "the weights do not");
+
+        let ram = Cli::parse_from(["ozgent", "chat", "m", "--inference-mode", "cpu"])
+            .options
+            .to_options()
+            .unwrap()
+            .resolve();
+        assert!(ram.gpu_layers.is_cpu_only());
+    }
+
+    #[test]
+    fn a_nonsense_mode_is_refused_at_the_command_line() {
+        assert!(Cli::try_parse_from(["ozgent", "chat", "m", "--inference-mode", "quantum"]).is_err());
+    }
+
+    #[test]
+    fn the_kv_offload_flag_reaches_the_options_layer() {
+        // The merge list drops any field it does not name, and the failure is
+        // silent: the flag parses, the config accepts it, and llama.cpp never
+        // hears about it. See docs/settings.md and the merge trap it warns of.
+        let on = Cli::parse_from(["ozgent", "chat", "m"]).options.to_options().unwrap();
+        assert_eq!(on.kv_offload, None, "unset must not override a config file");
+
+        let off = Cli::parse_from(["ozgent", "chat", "m", "--no-kv-offload"])
+            .options
+            .to_options()
+            .unwrap();
+        assert_eq!(off.kv_offload, Some(false));
+        assert!(!off.resolve().kv_offload, "and it must survive resolve()");
+        assert!(
+            ozgent_core::Options::default().resolve().kv_offload,
+            "the default keeps the cache on the gpu",
+        );
     }
 
     #[test]

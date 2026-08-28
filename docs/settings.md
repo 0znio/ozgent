@@ -45,6 +45,8 @@ worse than saying so.
 | `--think` / `--no-think` | `thinking` | `thinking` | `auto`, `on`, `off` |
 | `--effort` | `effort` | `reasoning_effort` | `low`, `medium`, `high` |
 | `--no-tools` | `tools` | `tools` | whether the model may call tools |
+| `--inference-mode` | `mode` | `inference_mode` | `gpu`, `gpu_ram`, or `ram` |
+| `--no-kv-offload` | `kv` | `kv_offload` | keep the KV cache in RAM, not VRAM |
 
 Loading settings — `--gpu-layers`, `--no-gpu`, `--cpu-moe`, `--cache-type`,
 `--control-vector` — are in `ozgent --help`. They differ in one way that
@@ -78,9 +80,54 @@ Qwythos-9B-MTP:Q4_K_M · 50k ctx
 ```
 
 `/config` shows both numbers when they differ, and the status line always shows
-the one in force. To get more of what you asked for, quantise the cache
-(`--cache-type q4_0`), move layers off the GPU, or close whatever else is using
-it. A window cut for a different reason says so instead:
+the one in force.
+
+### Where the model runs
+
+Two settings decide this — how many layers sit on the GPU, and whether the KV
+cache sits with them — and the useful combinations are few enough to name:
+
+```
+ozgent chat coder --inference-mode gpu_ram
+ozgent web --inference-mode gpu_ram
+/config mode gpu_ram              # inside a chat; saved, applies on next load
+```
+
+| mode | weights | KV cache | window bounded by |
+|---|---|---|---|
+| `gpu` (default) | GPU | GPU | free VRAM |
+| `gpu_ram` | GPU | system RAM | system RAM |
+| `ram` | CPU | system RAM | system RAM |
+
+`gpu` is the fast one, and the reason a model advertising 128k opens at 50k:
+the window is whatever VRAM is left after the weights. `gpu_ram` keeps the
+compute on the card and moves the cache off it, so the full window is usually
+available — attention then reads the whole cache across PCIe on every token.
+`ram` uses no GPU at all.
+
+Measured on one machine, 200 tokens at a 32k window with a 9B model, so the
+window is identical and only the cache location differs:
+
+| mode | wall clock |
+|---|---|
+| `gpu` | 3.1s |
+| `gpu_ram` | 4.9s |
+| `ram` | 82.5s |
+
+The gap between the first two widens as the window grows, because the cache
+being read each token grows with it. On the same machine `--ctx 100k` gives
+51200 tokens under `gpu` and the full 102400 under `gpu_ram`.
+
+A mode is a shorthand, not an override: `--gpu-layers` or `--no-kv-offload`
+set explicitly still win, so a placement you have tuned for your card is not
+lost by naming a mode. ozgent suggests `gpu_ram` only when it would actually
+help — on a machine whose RAM is no larger than its spare VRAM, moving the
+cache buys nothing.
+
+Cheaper to try first: quantise the cache (`--cache-type q4_0`), or close
+whatever else is using the card.
+
+A window cut for a different reason says so instead:
 
 ```
 · asked for 256k; this model was trained for 128k

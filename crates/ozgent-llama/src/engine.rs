@@ -583,30 +583,50 @@ impl Engine {
         // llama.cpp" with nothing pointing at memory as the cause. Sizing the
         // window to the memory that exists trades an unusable session for a
         // shorter one.
-        let budget = ozgent_core::accel::kv_budget(
-            free,
-            ozgent_core::accel::available_host_memory(),
-            self.gpu_layers_used,
-            self.n_layer,
-        );
+        // Where the cache lives decides what bounds the window. Offloaded, it
+        // sits beside the weights and is bounded by free VRAM; kept in host
+        // memory it is bounded by RAM instead, which is usually far larger —
+        // that is the trade `kv_offload = false` buys, and it costs reading
+        // the whole cache across PCIe on every token.
+        let host = ozgent_core::accel::available_host_memory();
+        let budget = if opts.kv_offload {
+            ozgent_core::accel::kv_budget(free, host, self.gpu_layers_used, self.n_layer)
+        } else {
+            ozgent_core::accel::kv_budget(0, host, 0, self.n_layer)
+        };
         // K and V can end up on different types; sizing against the wider one
         // keeps the estimate on the safe side of the real allocation.
         let widest = if type_k.bits() >= type_v.bits() { type_k } else { type_v };
         let requested =
             ozgent_core::accel::fit_context(self.kv_elements, requested, widest, budget);
         if requested < opts.context_length.min(self.n_ctx_train.max(512)) {
-            tracing::warn!(
-                "context {} needs {} MiB of {:?} kv cache; only {} MiB is free, so the window is {}",
-                opts.context_length,
-                ozgent_core::accel::kv_bytes(
-                    self.kv_elements,
-                    opts.context_length.min(self.n_ctx_train.max(512)),
-                    widest,
-                ) / (1024 * 1024),
+            let wanted = ozgent_core::accel::kv_bytes(
+                self.kv_elements,
+                opts.context_length.min(self.n_ctx_train.max(512)),
                 widest,
+            ) / (1024 * 1024);
+            let where_ = if opts.kv_offload { "vram" } else { "system ram" };
+            tracing::warn!(
+                "context {} needs {wanted} MiB of {widest:?} kv cache; only {} MiB of {where_} \
+                 is free, so the window is {requested}",
+                opts.context_length,
                 budget / (1024 * 1024),
-                requested,
             );
+            // Only worth suggesting when it would actually help. On a machine
+            // whose RAM is no larger than its spare VRAM, moving the cache
+            // buys nothing and costs the token rate.
+            if opts.kv_offload
+                && ozgent_core::accel::fit_context(
+                    self.kv_elements,
+                    opts.context_length,
+                    widest,
+                    ozgent_core::accel::kv_budget(0, host, 0, self.n_layer),
+                ) > requested
+            {
+                tracing::warn!(
+                    "--no-kv-offload would hold the whole window in system ram, more slowly"
+                );
+            }
         }
         if opts.cache_type_k == CacheType::Auto {
             tracing::info!(
@@ -631,6 +651,7 @@ impl Engine {
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(opts.batch_size)
             .with_flash_attention_policy(flash)
+            .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
             .with_type_v(ggml_type(type_v));
 
