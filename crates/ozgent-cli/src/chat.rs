@@ -1979,6 +1979,12 @@ const HELP: &str = "\
 /call <request>    force a tool call, constrained by grammar
 /stats             model and context state
 
+Scrolling    wheel, PageUp/PageDown, or Shift-Up/Shift-Down
+             Esc returns to the newest message
+             Shift-drag to select text, since the wheel belongs to ozgent
+Editing      Alt-Enter for a new line · Ctrl-A/E/K/U/W as in any shell
+             Up/Down walk what you typed before
+
 Paste an image path or URL in a message and it is picked up automatically.";
 
 #[cfg(test)]

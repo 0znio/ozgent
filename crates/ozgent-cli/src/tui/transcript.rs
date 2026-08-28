@@ -130,9 +130,10 @@ impl Transcript {
     }
 
     pub fn push(&mut self, mut block: Block) {
+        let before = self.total_lines();
         block.render(&self.theme, self.width);
         self.blocks.push(block);
-        self.follow_if_at_tail();
+        self.hold_position(before);
     }
 
     /// Convenience for the many one-line notes ozgent prints.
@@ -146,9 +147,10 @@ impl Transcript {
 
     /// Replace the block being streamed into.
     pub fn set_live(&mut self, mut block: Block) {
+        let before = self.total_lines();
         block.render(&self.theme, self.width);
         self.live = Some(block);
-        self.follow_if_at_tail();
+        self.hold_position(before);
     }
 
     /// Turn the live block into a permanent one.
@@ -198,17 +200,32 @@ impl Transcript {
         self.scroll == 0
     }
 
-    /// Keep following the tail if that is where the user was.
+    /// Lines below the window, hidden by scrolling back.
     ///
-    /// Reading back through a long answer while the model keeps writing is a
-    /// real thing to want, and yanking the view to the bottom on every token
-    /// makes it impossible.
-    fn follow_if_at_tail(&mut self) {
+    /// Worth showing: while scrolled back the view is deliberately held still,
+    /// so a reply arriving underneath produces no visible change at all. With
+    /// nothing saying why, a working session looks like a frozen one.
+    pub fn hidden_below(&self) -> usize {
+        self.scroll
+    }
+
+    /// Keep the same lines in view when content is added below them.
+    ///
+    /// `scroll` counts lines back from the *end*, so appending moves the
+    /// window forward on its own: reading back through a long answer while
+    /// the model keeps writing would drag the text out from under you, one
+    /// line per token. Growing `scroll` by however much was added holds the
+    /// view still. At the tail there is nothing to hold — that is the
+    /// following case, and it stays following.
+    ///
+    /// The delta can be negative: a streamed reply is re-rendered whole on
+    /// every token, and a closing fence can make it shorter than it was.
+    fn hold_position(&mut self, before: usize) {
         if self.scroll == 0 {
             return;
         }
-        // Scrolled back: hold the same lines in view as content grows below.
-        self.scroll = self.scroll.saturating_add(0);
+        let after = self.total_lines();
+        self.scroll = (self.scroll + after).saturating_sub(before);
     }
 
     pub fn clear(&mut self) {
@@ -419,6 +436,53 @@ mod tests {
         let narrow = t.visible(20).len();
         t.resize(80);
         assert!(t.visible(20).len() < narrow);
+    }
+
+    #[test]
+    fn new_content_does_not_drag_the_view_out_from_under_a_reader() {
+        // The bug this exists for: `scroll` counts back from the end, so
+        // appending moves the window forward on its own. Reading back through
+        // a long answer while the model wrote lost a line per token.
+        let mut t = transcript();
+        for i in 0..20 {
+            t.note(format!("line {i}"));
+        }
+        t.scroll_up(8, 4);
+        let held: Vec<String> = t.visible(4).iter().map(|s| s.to_string()).collect();
+
+        for i in 20..25 {
+            t.note(format!("line {i}"));
+        }
+        assert_eq!(t.visible(4), held, "the same lines must still be on screen");
+    }
+
+    #[test]
+    fn a_streamed_reply_getting_shorter_does_not_break_the_hold() {
+        // A reply is re-rendered whole on each token, and a closing fence can
+        // make it shorter than it was; the delta is negative there.
+        let mut t = transcript();
+        for i in 0..20 {
+            t.note(format!("line {i}"));
+        }
+        t.scroll_up(6, 4);
+        let held: Vec<String> = t.visible(4).iter().map(|s| s.to_string()).collect();
+
+        t.set_live(Block::plain("a\nb\nc\nd"));
+        t.set_live(Block::plain("a"));
+        assert_eq!(t.visible(4), held);
+    }
+
+    #[test]
+    fn at_the_tail_new_content_is_followed() {
+        // The other half: someone who has not scrolled wants to see the reply
+        // as it arrives.
+        let mut t = transcript();
+        t.note("first");
+        assert!(t.is_at_tail());
+        for i in 0..10 {
+            t.note(format!("line {i}"));
+        }
+        assert_eq!(t.visible(1), vec!["line 9"]);
     }
 
     #[test]

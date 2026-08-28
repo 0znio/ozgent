@@ -132,10 +132,26 @@ pub fn prompt_box(
     width: usize,
     marker: &str,
     accent: Style,
+    hint: Option<&str>,
 ) -> Vec<String> {
     let inner = width.saturating_sub(2).max(1);
     let paint = |s: Style, text: &str| theme.style(s, text);
     let mut out = vec![paint(accent, &format!("╭{}╮", "─".repeat(inner)))];
+    if let Some(hint) = hint.filter(|h| !h.is_empty() && h.len() + 6 <= inner) {
+        // Set into the top border rather than given a row of its own. That
+        // border is exactly the boundary between what has been said and where
+        // you type, which is where "there is more below" belongs — and a row
+        // that appears and disappears would shove the conversation about.
+        let label = format!(" {hint} ");
+        let lead = 2;
+        let rest = inner - lead - display_width(&label);
+        out[0] = format!(
+            "{}{}{}",
+            paint(accent, &format!("╭{}", "─".repeat(lead))),
+            paint(Style::dim(), &label),
+            paint(accent, &format!("{}╮", "─".repeat(rest))),
+        );
+    }
 
     for (i, line) in lines.iter().enumerate() {
         let lead = if i == 0 { marker } else { &" ".repeat(display_width(marker)) };
@@ -248,6 +264,7 @@ mod tests {
             40,
             "› ",
             Style::default(),
+            None,
         );
         let widths: Vec<usize> = lines.iter().map(|l| display_width(l)).collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}\n{lines:#?}");
@@ -262,6 +279,7 @@ mod tests {
             40,
             "› ",
             Style::default(),
+            None,
         );
         assert!(lines[1].contains("› first"));
         assert!(lines[2].contains("  second"), "a wrapped row is indented, not re-marked");
@@ -269,15 +287,46 @@ mod tests {
 
     #[test]
     fn an_empty_prompt_still_draws_a_box() {
-        let lines = prompt_box(&Theme::plain(), &[String::new()], 30, "› ", Style::default());
+        let lines = prompt_box(&Theme::plain(), &[String::new()], 30, "› ", Style::default(), None);
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|l| display_width(l) == 30));
     }
 
     #[test]
+    fn a_hint_sits_in_the_border_without_changing_the_shape() {
+        let plain = prompt_box(&Theme::plain(), &["hi".into()], 60, "› ", Style::default(), None);
+        let hinted = prompt_box(
+            &Theme::plain(),
+            &["hi".into()],
+            60,
+            "› ",
+            Style::default(),
+            Some("↓ 12 more"),
+        );
+        assert_eq!(hinted.len(), plain.len(), "a hint must not cost a row");
+        assert!(hinted[0].contains("↓ 12 more"));
+        let widths: Vec<usize> = hinted.iter().map(|l| display_width(l)).collect();
+        assert!(widths.iter().all(|w| *w == 60), "{widths:?}\n{hinted:#?}");
+    }
+
+    #[test]
+    fn a_hint_too_long_for_the_border_is_left_out_rather_than_bursting_it() {
+        let narrow = prompt_box(
+            &Theme::plain(),
+            &["hi".into()],
+            20,
+            "› ",
+            Style::default(),
+            Some("a hint far too long for this border"),
+        );
+        let widths: Vec<usize> = narrow.iter().map(|l| display_width(l)).collect();
+        assert!(widths.iter().all(|w| *w == 20), "{widths:?}");
+    }
+
+    #[test]
     fn a_coloured_box_is_the_same_shape_as_a_plain_one() {
-        let plain = prompt_box(&Theme::plain(), &["hi".into()], 40, "› ", Style::default());
-        let styled = prompt_box(&Theme::default(), &["hi".into()], 40, "› ", Style::dim());
+        let plain = prompt_box(&Theme::plain(), &["hi".into()], 40, "› ", Style::default(), None);
+        let styled = prompt_box(&Theme::default(), &["hi".into()], 40, "› ", Style::dim(), None);
         let a: Vec<usize> = plain.iter().map(|l| display_width(l)).collect();
         let b: Vec<usize> = styled.iter().map(|l| display_width(l)).collect();
         assert_eq!(a, b);

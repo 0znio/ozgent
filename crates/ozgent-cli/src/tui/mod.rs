@@ -33,7 +33,10 @@ use std::io::{IsTerminal, Write};
 
 use ozgent_render::crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
     terminal,
 };
 
@@ -63,9 +66,20 @@ impl Screen {
         let mut out = std::io::stdout();
         // The alternate screen means the user's scrollback is still there when
         // ozgent exits — the shell they started from comes back untouched.
+        //
+        // Mouse capture is what makes the wheel scroll the *conversation*.
+        // Without it a terminal in the alternate screen translates the wheel
+        // into Up and Down arrows, which this application reads as "walk the
+        // input history" — so spinning the wheel to re-read a long answer
+        // riffled through past commands in the prompt box instead.
+        //
+        // The cost is that click-drag selection now goes to ozgent rather
+        // than the terminal. Every mainstream terminal keeps Shift-drag for
+        // its own selection, which is what `/help` says.
         ozgent_render::crossterm::execute!(
             out,
             terminal::EnterAlternateScreen,
+            EnableMouseCapture,
             cursor::Hide,
         )?;
         out.flush()?;
@@ -137,6 +151,7 @@ fn restore() {
     let _ = ozgent_render::crossterm::execute!(
         out,
         cursor::Show,
+        DisableMouseCapture,
         terminal::LeaveAlternateScreen,
     );
     let _ = terminal::disable_raw_mode();
@@ -177,6 +192,9 @@ pub enum Key {
     PageDown,
     Tab,
     Escape,
+    /// The wheel, or a key that means the same thing.
+    ScrollUp,
+    ScrollDown,
     /// Ctrl-C: stop what is happening, keep the session.
     Interrupt,
     /// Ctrl-D on an empty line: leave.
@@ -196,6 +214,7 @@ pub enum Key {
 pub fn translate(event: Event) -> Option<Key> {
     let key = match event {
         Event::Resize(..) => return Some(Key::Resize),
+        Event::Mouse(m) => return from_mouse(m),
         Event::Key(k) => k,
         _ => return None,
     };
@@ -205,6 +224,17 @@ pub fn translate(event: Event) -> Option<Key> {
         return None;
     }
     Some(from_key(key))
+}
+
+/// Only the wheel. Clicks and drags are reported now that capture is on, and
+/// acting on them would mean inventing a click target the interface does not
+/// have — a stray click must not move the caret or select a message.
+fn from_mouse(event: MouseEvent) -> Option<Key> {
+    match event.kind {
+        MouseEventKind::ScrollUp => Some(Key::ScrollUp),
+        MouseEventKind::ScrollDown => Some(Key::ScrollDown),
+        _ => None,
+    }
 }
 
 fn from_key(key: KeyEvent) -> Key {
@@ -221,6 +251,13 @@ fn from_key(key: KeyEvent) -> Key {
         KeyCode::Delete => Key::Delete,
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
+        // Shift-arrow scrolls a line at a time, for anyone whose terminal does
+        // not report the wheel. Guarded arms first: a bare `KeyCode::Up` above
+        // these would match every Up and the modifier would never be read.
+        KeyCode::Up if shift => Key::ScrollUp,
+        KeyCode::Down if shift => Key::ScrollDown,
+        // Plain Up and Down are the history, which is what every shell has
+        // taught people to expect.
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
         KeyCode::Home => Key::Home,
@@ -295,6 +332,38 @@ mod tests {
         // conversation.
         assert_eq!(press(KeyCode::Char('c'), KeyModifiers::CONTROL), Some(Key::Interrupt));
         assert_eq!(press(KeyCode::Char('d'), KeyModifiers::CONTROL), Some(Key::Eof));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_conversation() {
+        // The bug this exists for: without mouse capture a terminal in the
+        // alternate screen turns the wheel into Up and Down, which this
+        // application reads as "walk the input history" — so spinning the
+        // wheel to re-read an answer riffled through past commands instead.
+        use ozgent_render::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let at = |kind| {
+            translate(Event::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        assert_eq!(at(MouseEventKind::ScrollUp), Some(Key::ScrollUp));
+        assert_eq!(at(MouseEventKind::ScrollDown), Some(Key::ScrollDown));
+        assert_eq!(
+            at(MouseEventKind::Down(MouseButton::Left)),
+            None,
+            "a click has no target in this interface and must not move the caret",
+        );
+    }
+
+    #[test]
+    fn shift_arrows_scroll_while_plain_arrows_stay_the_history() {
+        // Every shell has taught people that Up is the last thing they typed.
+        assert_eq!(press(KeyCode::Up, KeyModifiers::NONE), Some(Key::Up));
+        assert_eq!(press(KeyCode::Up, KeyModifiers::SHIFT), Some(Key::ScrollUp));
+        assert_eq!(press(KeyCode::Down, KeyModifiers::SHIFT), Some(Key::ScrollDown));
     }
 
     #[test]

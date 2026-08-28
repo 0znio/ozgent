@@ -24,6 +24,9 @@ use crate::status::Segment;
 /// flow and the cost stays flat.
 const FRAME: Duration = Duration::from_millis(50);
 
+/// Lines moved per notch of the wheel, matching a terminal's own scrollback.
+const WHEEL: usize = 3;
+
 /// What the user did at the prompt.
 pub enum Submission {
     Line(String),
@@ -270,6 +273,10 @@ impl Ui {
             Key::Down => self.editor.next(),
             Key::PageUp => self.transcript.scroll_up(page / 2, page),
             Key::PageDown => self.transcript.scroll_down(page / 2),
+            // Three lines a notch, which is what a terminal's own scrollback
+            // does and therefore what the hand already expects.
+            Key::ScrollUp => self.transcript.scroll_up(WHEEL, page),
+            Key::ScrollDown => self.transcript.scroll_down(WHEEL),
             Key::Escape => self.transcript.scroll_to_tail(),
             Key::Resize => self.resize(),
             Key::Enter | Key::Interrupt | Key::Eof | Key::Tab | Key::Ignored => {}
@@ -300,7 +307,12 @@ impl Ui {
                 Key::Interrupt => stop = true,
                 // Reading back through a long answer while the model keeps
                 // writing is a real thing to want.
-                Key::PageUp | Key::PageDown | Key::Escape | Key::Resize => self.edit(key),
+                Key::PageUp
+                | Key::PageDown
+                | Key::ScrollUp
+                | Key::ScrollDown
+                | Key::Escape
+                | Key::Resize => self.edit(key),
                 _ => {}
             }
         }
@@ -348,7 +360,11 @@ impl Ui {
                 Key::Char('4') | Key::Char('n') | Key::Escape | Key::Interrupt => {
                     break Choice::Deny
                 }
-                Key::PageUp | Key::PageDown | Key::Resize => self.edit(key),
+                // The call being asked about may be off the top of the
+                // screen; scrolling to read it is part of answering.
+                Key::PageUp | Key::PageDown | Key::ScrollUp | Key::ScrollDown | Key::Resize => {
+                    self.edit(key)
+                }
                 _ => {}
             }
         };
@@ -392,8 +408,19 @@ impl Ui {
         let first = caret.row.saturating_sub(visible_rows.saturating_sub(1));
         let shown: Vec<String> =
             lines.iter().skip(first).take(visible_rows).cloned().collect();
-        let accent = if self.question.is_some() { Style::dim() } else { Style::dim() };
-        rows.extend(frame::prompt_box(&self.theme, &shown, layout.width, "› ", accent));
+        // While scrolled back the view is held still on purpose, so a reply
+        // arriving underneath changes nothing on screen. Say what is down
+        // there, and how to get back to it.
+        let hidden = self.transcript.hidden_below();
+        let hint = (hidden > 0).then(|| format!("↓ {hidden} more · Esc to follow"));
+        rows.extend(frame::prompt_box(
+            &self.theme,
+            &shown,
+            layout.width,
+            "› ",
+            Style::dim(),
+            hint.as_deref(),
+        ));
 
         if layout.permission.is_some() {
             rows.push(self.permission_bar(layout.width));
