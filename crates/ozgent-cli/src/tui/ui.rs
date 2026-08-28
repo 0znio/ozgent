@@ -270,10 +270,15 @@ impl Ui {
             };
         }
 
+        // Painted once, then only when something changes. The obvious loop —
+        // render, poll, repeat — repaints the whole screen twenty times a
+        // second while the user sits thinking about what to type, which is
+        // pure waste on a local terminal and visible lag over ssh.
+        self.render();
         loop {
-            self.render();
             let key = match self.screen.as_ref().and_then(|s| s.key(FRAME).ok().flatten()) {
                 Some(k) => k,
+                // Nothing arrived, so nothing on screen can have changed.
                 None => continue,
             };
             match key {
@@ -290,7 +295,10 @@ impl Ui {
                     return Submission::Cancelled;
                 }
                 Key::Eof if self.editor.is_empty() => return Submission::Eof,
-                other => self.edit(other),
+                other => {
+                    self.edit(other);
+                    self.render();
+                }
             }
         }
     }
@@ -314,15 +322,18 @@ impl Ui {
         // The field is empty for the question and restored afterwards, so a
         // half-typed message is not eaten by a prompt that interrupted it.
         let stashed = self.editor.take();
+        self.render();
         let answer = loop {
-            self.render();
             let Some(key) = self.screen.as_ref().and_then(|s| s.key(FRAME).ok().flatten()) else {
                 continue;
             };
             match key {
                 Key::Enter => break Some(self.editor.take()),
                 Key::Escape | Key::Interrupt => break None,
-                other => self.edit(other),
+                other => {
+                    self.edit(other);
+                    self.render();
+                }
             }
         };
         self.posture = previous;
@@ -423,8 +434,8 @@ impl Ui {
             summary: summarise(arguments, 60),
         });
 
+        self.render();
         let choice = loop {
-            self.render();
             let Some(key) = self.screen.as_ref().and_then(|s| s.key(FRAME).ok().flatten()) else {
                 continue;
             };
@@ -440,7 +451,8 @@ impl Ui {
                 // The call being asked about may be off the top of the
                 // screen; scrolling to read it is part of answering.
                 Key::PageUp | Key::PageDown | Key::ScrollUp | Key::ScrollDown | Key::Resize => {
-                    self.edit(key)
+                    self.edit(key);
+                    self.render();
                 }
                 _ => {}
             }

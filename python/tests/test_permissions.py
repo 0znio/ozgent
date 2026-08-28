@@ -252,6 +252,70 @@ class ApprovalAtTheMomentOfTheCall(unittest.TestCase):
         self.assertEqual(refused, "refused")
 
 
+class ApprovalReachesEveryActingTool(unittest.TestCase):
+    """The bug class: a tool that checks the permission flag itself.
+
+    `write_file` read `perms()["write"]` directly instead of calling
+    `require`, so an approval given at the prompt never reached the only code
+    that was asking — pressing "yes" wrote nothing and said writing was not
+    permitted. Nothing about that is specific to `write_file`; the next tool
+    to inline the check would break the same way, silently.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.dir.name).resolve()
+        # Nothing switched on. Approval alone has to carry every case.
+        base.SHARED_CONFIG[SECTION] = {"root": str(self.root)}
+
+    def tearDown(self):
+        base.SHARED_CONFIG.pop(SECTION, None)
+        self.dir.cleanup()
+
+    def test_the_decision_lives_in_one_place(self):
+        """No builtin may read the permission flags for itself.
+
+        A static check, because the behavioural ones below can only cover the
+        tools that exist today. `perms()` is the accessor; reading it outside
+        `permissions.py` means deciding outside `permissions.py`.
+        """
+        builtin = Path(base.__file__).parent / "builtin"
+        offenders = [
+            f.name
+            for f in sorted(builtin.glob("*.py"))
+            if "perms()" in f.read_text()
+        ]
+        self.assertEqual(
+            offenders, [],
+            "these decide permission for themselves and so cannot see an "
+            "approval: use require()/resolve_within()/check_command()",
+        )
+
+    def test_writing_is_refused_unapproved_and_allowed_approved(self):
+        target = str(self.root / "note.txt")
+        with self.assertRaises(ToolError) as refused:
+            call(write_file, path=target, content="hi")
+        self.assertIn("permitted", str(refused.exception))
+
+        async def approved():
+            with approving(True):
+                return await write_file(path=target, content="hi")
+
+        result = asyncio.run(approved())
+        self.assertEqual(result["bytes"], 2)
+        self.assertTrue(Path(target).exists(), "approving must actually write the file")
+
+    def test_running_a_command_is_refused_unapproved_and_allowed_approved(self):
+        with self.assertRaises(ToolError):
+            call(run_command, command="echo hi")
+
+        async def approved():
+            with approving(True):
+                return await run_command(command="echo hi")
+
+        self.assertEqual(asyncio.run(approved())["stdout"].strip(), "hi")
+
+
 class DeclaredEffects(unittest.TestCase):
     """Every builtin says what it does, because the prompt is built from it."""
 

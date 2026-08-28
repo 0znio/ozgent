@@ -2,7 +2,7 @@
 
 Off until permitted. Writing is the one built-in that changes something the
 user did not ask for directly, so it is deny-by-default and confined to the
-same root as reading::
+same root as reading. Either approve it when ozgent asks, or set it standing::
 
     [tools.config.permissions]
     root  = "/home/you/code"
@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from ..base import ToolError, get_config, tool
-from ..permissions import perms, resolve_within
+from ..permissions import require, resolve_within
 
 @tool(effect="write")
 async def write_file(
@@ -30,15 +30,16 @@ async def write_file(
 
     Disabled unless turned on in config, and confined to the configured root.
     """
-    # Either switch turns writing on: the shared `write` permission, or the
-    # per-tool `enabled` this had before the shared one existed. Honouring both
-    # means an upgrade does not silently revoke a permission already granted.
-    settings = get_config("write_file")
-    if not (perms().get("write", False) or settings.get("enabled", False)):
-        raise ToolError(
-            "writing is not permitted. Set [tools.config.permissions] write = true "
-            "in ~/ozgent/configs/config.toml to allow it."
-        )
+    # Through `require`, never by reading the flag here. `require` is also
+    # where an approval the user gave at the prompt is honoured, and a tool
+    # that checks the flag itself silently ignores it — which is exactly what
+    # this one did: pressing "yes" wrote nothing, because the yes never
+    # reached the only code that was asking.
+    #
+    # The per-tool `enabled` predates the shared permission and still counts,
+    # so an upgrade does not silently revoke something already granted.
+    if not get_config("write_file").get("enabled", False):
+        require("write", "writing files")
     if mode not in {"create", "overwrite", "append"}:
         raise ToolError(f"unknown mode {mode!r}: use create, overwrite, or append")
 
