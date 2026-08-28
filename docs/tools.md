@@ -1,23 +1,88 @@
 # Tools and permissions
 
-ozgent ships seven tools. Three of them can change something or reach outside
-the machine, and those are **off until you turn them on**.
+ozgent ships seven tools. The model decides when to use one; you find out
+afterwards. Two things stand between the decision and the machine, and they
+answer different questions.
 
-The model decides when to use a tool; you find out afterwards. So the ones that
-only read something you already pointed at need no ceremony, and the ones that
-write, execute, or fetch are deny-by-default. Every refusal names the exact
-setting that would permit it — a permission system nobody can work out how to
-grant is one people disable wholesale.
+**Does this call happen at all?** ozgent asks you, at the moment of the call,
+showing the tool and its arguments. Asking about everything trains people to
+hit yes without reading, so the question is asked once per *kind* of thing: a
+tool declares what it does, and the policy answers per kind.
 
-| tool | what it does | permission |
-|---|---|---|
-| `read_file` | read a file, or the parts matching a query | confined to `root` |
-| `list_dir` | list a directory, up to 4 levels | confined to `root` |
-| `web_search` | search the web | provider key |
-| `write_file` | create or modify a file | **`write = true`** |
-| `run_command` | run one allowed program | **`shell = true`** + allowlist |
-| `fetch_url` | read a page, article, JSON API, or feed | **`network = true`** |
-| `get_temperature` | example tool | — |
+| the tool | out of the box |
+|---|---|
+| reads something | runs, no question |
+| changes files or data | asks |
+| runs a program | asks |
+| does not say what it does | asks |
+
+Answer once with "always allow" and it becomes a per-tool rule you can change
+later — the same rule `/permissions`, the Settings page and `config.toml` all
+edit. See [Deciding what runs](#deciding-what-runs).
+
+**What may it touch once it is running?** A root directory for the file tools,
+an allowlist for the shell, one for the network. This is the older layer and it
+is configured ahead of time, in `[tools.config.permissions]`. A call *you*
+approved is past the question this layer exists to ask, so approving lifts it
+for that call — refusing to run a command you have just read and approved,
+because a flag you have never seen is off, is a permission system arguing with
+its own user.
+
+| tool | what it does | declares | boundary |
+|---|---|---|---|
+| `read_file` | read a file, or the parts matching a query | read | confined to `root` |
+| `list_dir` | list a directory, up to 4 levels | read | confined to `root` |
+| `web_search` | search the web | read | provider key |
+| `fetch_url` | read a page, article, JSON API, or feed | read | `network` + host allowlist |
+| `write_file` | create or modify a file | write | `write = true`, confined to `root` |
+| `run_command` | run one allowed program | execute | `shell = true` + allowlist |
+| `get_temperature` | example tool | read | — |
+
+## Deciding what runs
+
+When a tool asks, the terminal shows the question on the bar above the status
+line and the web interface shows it as a card in the conversation. Four
+answers, everywhere:
+
+```
+▶ run_command  git status     1 yes · 2 session · 3 always · 4 no
+```
+
+`session` lasts until ozgent exits and is never written to disk. `always`
+writes a rule:
+
+```toml
+[permissions]
+read    = "allow"   # tools that only look something up
+write   = "ask"     # tools that change files or data
+execute = "ask"     # tools that run programs
+unknown = "ask"     # tools that do not declare an effect
+
+[permissions.tools]
+run_command = "allow"   # a named tool beats its kind
+write_file  = "deny"
+```
+
+From the terminal:
+
+```
+/permissions                       what every tool may do, and why
+/permissions run_command allow     a rule for one tool
+/permissions run_command clear     back to its kind
+/permissions execute deny          a rule for a whole kind
+```
+
+or from Settings → Permissions in the web interface. All three read and write
+the same file.
+
+Two cases have nobody to ask, and both refuse: a chat driven from a pipe, and
+the OpenAI-compatible API, where the caller is a program and cannot consent on
+a person's behalf. An operator who wants those tools available there says so in
+the policy above.
+
+A tool declares its own effect, because ozgent cannot know what your Python
+does — see [Adding your own tool](#adding-your-own-tool). A tool that declares
+nothing is asked about, which is what silence has to mean.
 
 ## Where they live
 
@@ -45,9 +110,12 @@ get_temperature
 
 Adding one is adding a file to `~/ozgent/tools/`; see [Adding your own tool](#adding-your-own-tool).
 
-## Configuring
+## Configuring the boundaries
 
-All of it lives in `~/ozgent/configs/config.toml`:
+The second layer — what a tool may touch once it is running — lives in
+`~/ozgent/configs/config.toml`, alongside the `[permissions]` policy above.
+Keep the two apart in your head: `[permissions]` decides whether a call
+happens, and this decides how far it can reach.
 
 ```toml
 [tools.config.permissions]
@@ -131,7 +199,7 @@ One file per tool in `~/ozgent/tools/`, discovered on startup:
 from typing import Annotated
 from ozgent_tools.base import tool
 
-@tool
+@tool(effect="read")
 async def get_temperature(
     city: Annotated[str, "City name, e.g. 'Oslo'."],
 ) -> dict:
@@ -141,8 +209,18 @@ async def get_temperature(
 
 The first line of the docstring is what the model sees, so it has to carry the
 whole rule about when to use the tool. Annotations become the JSON Schema the
-model is constrained to. A tool that needs a boundary should use
-`ozgent_tools.permissions` rather than rolling its own:
+model is constrained to.
+
+`effect` says what the tool does to the world, and decides whether ozgent runs
+it without asking: `"read"` looks something up, `"write"` creates or changes
+something, `"execute"` runs a program. Left off it is `"unknown"`, and ozgent
+asks — the right default for a tool whose author has not thought about it, and
+the reason every tool written before this existed still works. Declare it
+honestly: a tool that quietly writes files while claiming to read is the one
+way to defeat the prompt.
+
+A tool that needs a boundary should use `ozgent_tools.permissions` rather than
+rolling its own:
 
 ```python
 from ozgent_tools.permissions import resolve_within, require

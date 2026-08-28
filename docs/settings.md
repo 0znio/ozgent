@@ -50,6 +50,45 @@ Loading settings — `--gpu-layers`, `--no-gpu`, `--cpu-moe`, `--cache-type`,
 `--control-vector` — are in `ozgent --help`. They differ in one way that
 matters below.
 
+## The default model
+
+`ozgent chat` with no model named, and the web interface on every visit, both
+start with whichever model you have made the default:
+
+```
+ozgent default coder        set it
+ozgent default              what it is now
+ozgent default --clear      go back to naming one each time
+/default                    inside a chat, pin the model you are in
+```
+
+It is also Settings → General in the web interface, and `default_model` in
+`config.toml`. All four are the same value.
+
+## When the context you asked for is not the one you get
+
+A model's advertised window is a claim about which positions it understands,
+not a promise that the cache for them fits in memory — at the million-token
+windows recent models advertise, that cache runs to hundreds of gigabytes.
+ozgent sizes the window to the memory that actually exists and says so:
+
+```
+Qwythos-9B-MTP:Q4_K_M · 50k ctx
+· asked for 1m; that much KV cache does not fit in this machine's memory
+```
+
+`/config` shows both numbers when they differ, and the status line always shows
+the one in force. To get more of what you asked for, quantise the cache
+(`--cache-type q4_0`), move layers off the GPU, or close whatever else is using
+it. A window cut for a different reason says so instead:
+
+```
+· asked for 256k; this model was trained for 128k
+```
+
+Asking for more than the training length is not a longer memory — it is a model
+reading positions it has never seen — so that one is clamped too.
+
 ## Why `/config ctx` says "applies when the model is next loaded"
 
 Context length, layer placement, cache types and expert offload are fixed when
@@ -68,4 +107,10 @@ ozgent config show <model>    # resolved, all layers merged
 ozgent show <model>           # manifest and settings together
 /config                       # inside a chat, for the model you are in
 /stats                        # context used, layers, what was reused
+/permissions                  # what tools may do without asking
 ```
+
+In a terminal the status line at the bottom carries the same facts as they
+change: the model, how full the context is, the rate of the last reply,
+thinking, tools, and the sampler. The bar above it says what tools are allowed
+to do — and is where a tool asks, when one has to.
