@@ -744,7 +744,11 @@ fn turn(
             // context window holds. Unbounded, it crowds out the room the model
             // needs to answer and the reply stops mid-sentence — which reads
             // like a crash but is simply no space left.
-            let budget = fit_budget(resolved.context_length);
+            // The window the session actually opened, not the one that was
+            // asked for: a request for more context than memory holds is
+            // granted at a smaller size, and budgeting against the request
+            // would size tool results to a window that does not exist.
+            let budget = fit_budget(session.n_ctx());
             messages.push(Message::tool_result(call.id.clone(), fit(&payload, budget)));
         }
     }

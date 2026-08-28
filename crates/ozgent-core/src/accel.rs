@@ -160,6 +160,106 @@ pub fn choose_kv_type(
     CacheType::Q4_0
 }
 
+// ------------------------------------------------------- fitting the context
+
+/// Smallest context worth opening. Below this a chat cannot hold a system
+/// prompt and one exchange, so failing loudly beats handing back a stub.
+pub const MIN_CONTEXT: u32 = 512;
+
+/// Contexts are clamped to a multiple of this, so a shrunk window is a round
+/// number a user can recognise rather than 178_431.
+const CONTEXT_GRAIN: u32 = 256;
+
+/// The largest context at or below `requested` whose KV cache fits `budget`.
+///
+/// A model's advertised training context is not a promise that the cache for
+/// it fits in memory: at 1M tokens a mid-sized model's cache runs to hundreds
+/// of gigabytes. llama.cpp does not refuse that politely — it returns a null
+/// pointer, which reaches the user as "null reference from llama.cpp" with no
+/// hint that memory was the problem. Sizing the window to the memory that
+/// actually exists turns that into a working session with a smaller window.
+///
+/// `budget` of zero means the memory could not be measured, in which case the
+/// request is honoured unchanged: guessing a limit from nothing would shrink
+/// windows that would have worked.
+pub fn fit_context(elements_per_token: u64, requested: u32, t: CacheType, budget: u64) -> u32 {
+    if budget == 0 || elements_per_token == 0 || requested <= MIN_CONTEXT {
+        return requested;
+    }
+    if kv_bytes(elements_per_token, requested, t) <= budget {
+        return requested;
+    }
+    // Bytes per token is fractional for the quantised types, so the division
+    // happens in floating point; integer maths would round the scale away and
+    // over-estimate what fits.
+    let per_token = elements_per_token as f64 * t.bits() as f64 / 8.0;
+    let affordable = (budget as f64 / per_token) as u64;
+    let affordable = u32::try_from(affordable).unwrap_or(u32::MAX).min(requested);
+    let rounded = affordable / CONTEXT_GRAIN * CONTEXT_GRAIN;
+    rounded.max(MIN_CONTEXT)
+}
+
+/// Memory the KV cache may claim, given where the model's layers ended up.
+///
+/// llama.cpp places each layer's cache next to that layer's weights, so a
+/// partly offloaded model splits its cache across both pools in the same
+/// proportion. Budgeting only VRAM would shrink the window of a CPU-heavy
+/// model that had plenty of RAM, and budgeting only RAM would let a
+/// fully-offloaded one overrun the card.
+///
+/// Both pools are discounted by [`KV_VRAM_SHARE`]: compute buffers and
+/// llama.cpp's own scratch are not predictable from metadata, and an
+/// over-tight fit fails at allocation rather than degrading.
+pub fn kv_budget(free_vram: u64, available_ram: u64, gpu_layers: u32, n_layer: u32) -> u64 {
+    let share = |bytes: u64| bytes / 100 * KV_VRAM_SHARE;
+    if n_layer == 0 {
+        return share(free_vram.max(available_ram));
+    }
+    let on_gpu = gpu_layers.min(n_layer) as u64;
+    let on_cpu = (n_layer as u64).saturating_sub(on_gpu);
+    let total = n_layer as u64;
+    share(free_vram) * on_gpu / total + share(available_ram) * on_cpu / total
+}
+
+/// Memory the host can still hand out, in bytes. Zero when it cannot be read.
+///
+/// Zero is a meaningful answer rather than a failure: every caller treats an
+/// unknown budget as "do not clamp", which is the right call when the
+/// alternative is shrinking a window on a guess.
+pub fn available_host_memory() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // MemAvailable is the kernel's own estimate of what a new allocation
+        // can get without swapping, which is exactly the question here.
+        // MemFree is not: it excludes reclaimable page cache and would report
+        // a few hundred megabytes on a machine with plenty to spare.
+        let Ok(text) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kib: u64 = rest.trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
+                return kib * 1024;
+            }
+        }
+        0
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // There is no MemAvailable equivalent without linking libc, and this
+        // is read once per session, so shelling out is affordable. Physical
+        // memory is the total, not what is free; the caller's share keeps the
+        // over-estimate from being acted on directly.
+        let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok();
+        out.and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|total| total / 2)
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
 /// How many mixture-of-experts layers keep their routed experts in system RAM.
 ///
 /// In an MoE model the routed experts are most of the weight but only a
@@ -434,6 +534,75 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_context_that_fits_is_left_exactly_alone() {
+        let e = qwen_elements();
+        let budget = kv_bytes(e, 32_768, CacheType::F16) * 2;
+        assert_eq!(fit_context(e, 32_768, CacheType::F16, budget), 32_768);
+    }
+
+    #[test]
+    fn a_million_token_window_is_cut_to_what_memory_holds() {
+        // The failure this exists for: a model advertising a 1M training
+        // context on a 24 GB card. The cache alone would be hundreds of
+        // gigabytes, and llama.cpp answers that with a null pointer.
+        let e = qwen_elements();
+        let budget = 16 * 1024 * 1024 * 1024;
+        let fitted = fit_context(e, 1_048_576, CacheType::F16, budget);
+
+        assert!(fitted < 1_048_576, "the request must not survive unchanged");
+        assert!(fitted >= MIN_CONTEXT);
+        assert!(
+            kv_bytes(e, fitted, CacheType::F16) <= budget,
+            "the whole point is that the result fits",
+        );
+    }
+
+    #[test]
+    fn the_fitted_context_is_the_largest_that_fits() {
+        // Shrinking further than necessary costs the user memory they have.
+        let e = qwen_elements();
+        let budget = 8 * 1024 * 1024 * 1024;
+        let fitted = fit_context(e, 512 * 1024, CacheType::Q8_0, budget);
+        assert!(kv_bytes(e, fitted, CacheType::Q8_0) <= budget);
+        assert!(
+            kv_bytes(e, fitted + CONTEXT_GRAIN, CacheType::Q8_0) > budget,
+            "one more grain should not have fitted",
+        );
+    }
+
+    #[test]
+    fn a_fitted_context_is_a_round_number() {
+        let e = qwen_elements();
+        let fitted = fit_context(e, 1_000_000, CacheType::F16, 3 * 1024 * 1024 * 1024);
+        assert_eq!(fitted % CONTEXT_GRAIN, 0, "got {fitted}");
+    }
+
+    #[test]
+    fn an_unmeasurable_budget_does_not_shrink_anything() {
+        // Clamping on a guess would shrink windows that would have worked.
+        let e = qwen_elements();
+        assert_eq!(fit_context(e, 262_144, CacheType::F16, 0), 262_144);
+    }
+
+    #[test]
+    fn a_hopeless_budget_still_yields_a_usable_floor() {
+        let e = qwen_elements();
+        assert_eq!(fit_context(e, 131_072, CacheType::F16, 1024), MIN_CONTEXT);
+    }
+
+    #[test]
+    fn the_budget_follows_the_layers() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let all_gpu = kv_budget(24 * GIB, 64 * GIB, 32, 32);
+        let all_cpu = kv_budget(24 * GIB, 64 * GIB, 0, 32);
+        let half = kv_budget(24 * GIB, 64 * GIB, 16, 32);
+
+        assert!(all_cpu > all_gpu, "the larger pool should give the larger budget");
+        assert!(half > all_gpu && half < all_cpu, "a split model draws on both");
+        assert!(all_gpu < 24 * GIB, "compute buffers need room too");
+    }
 
     #[test]
     fn cache_type_parsing_and_sizing() {

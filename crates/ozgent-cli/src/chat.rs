@@ -84,7 +84,12 @@ pub struct Chat<'a> {
     conversation: Option<i64>,
     opts: Resolved,
     theme: Theme,
-    width: usize,
+    /// The bottom row: what is true right now, kept out of the transcript.
+    status: crate::status::StatusLine,
+    /// Generation rate of the last reply, for the status line. `None`
+    /// until this session has produced one — a rate carried over from a
+    /// previous model would be a lie about this one.
+    last_rate: Option<f64>,
     model: ModelRef,
     manifest: Manifest,
     /// Where this model's files live, for finding its projector.
@@ -195,6 +200,7 @@ async fn run_one(
     };
 
     let plain = options.plain || !config.ui.markdown;
+    let theme = if plain { Theme::plain() } else { Theme::default() };
     let turn = conversation_id
         .and_then(|id| store.message_count(id).ok())
         .unwrap_or(0) as usize;
@@ -206,8 +212,9 @@ async fn run_one(
         embedder: build_embedder(paths, config),
         tools,
         conversation: conversation_id,
-        theme: if plain { Theme::plain() } else { Theme::default() },
-        width: ozgent_render::terminal_width(),
+        status: crate::status::StatusLine::install(&theme),
+        theme,
+        last_rate: None,
         model: model_ref,
         manifest,
         model_dir: dir.clone(),
@@ -237,6 +244,9 @@ async fn run_one(
 
     chat.banner();
     let outcome = chat.repl(prompt).await;
+    // Before anything else prints: leaving the shrunken scrolling region in
+    // place would hand the shell a terminal that refuses its own last line.
+    chat.status.remove();
     prompt.save();
 
     if let Some(host) = &chat.tools {
@@ -254,16 +264,95 @@ impl<'a> Chat<'a> {
     fn banner(&self) {
         let dim = |s: &str| self.theme.style(Style::dim(), s);
         eprintln!();
-        eprintln!("{} {}", self.model, dim(&format!("· {} ctx", self.session.n_ctx())));
+        let window = self.session.n_ctx();
+        eprintln!(
+            "{} {}",
+            self.model,
+            dim(&format!("· {} ctx", ozgent_core::format_count(window)))
+        );
+        // A window smaller than the one asked for is not a detail to leave in
+        // the log. The model was loaded, answers will be correct, and the only
+        // visible symptom is that a long conversation runs out sooner than the
+        // user planned for — which is impossible to work out after the fact.
+        if window < self.opts.context_length {
+            let asked = ozgent_core::format_count(self.opts.context_length);
+            let trained = self.engine.n_ctx_train();
+            // Two different reasons land here and the fix for each is
+            // different: one is answered by freeing memory or quantising the
+            // cache, the other by picking a model that was trained longer.
+            let why = if trained > 0 && window >= trained {
+                format!("this model was trained for {}", ozgent_core::format_count(trained))
+            } else {
+                "that much KV cache does not fit in this machine's memory".to_string()
+            };
+            eprintln!("{}", dim(&format!("· asked for {asked}; {why}")));
+        }
         eprintln!("{}", dim("/help for commands, /exit to quit"));
         eprintln!();
+    }
+
+    /// What the bottom row says: the facts that change as the session runs.
+    ///
+    /// Priorities decide what survives a narrow terminal. The model name goes
+    /// first because a status line that has dropped it no longer says which
+    /// machine's answer you are reading; the sampler settings go last because
+    /// they are the ones `/config` will tell you on demand.
+    fn status_segments(&self) -> Vec<crate::status::Segment> {
+        use crate::status::Segment;
+        use ozgent_core::format_count;
+
+        let used = self.session.used();
+        let window = self.session.n_ctx();
+        let percent = if window > 0 { used * 100 / window } else { 0 };
+
+        let mut segments = vec![
+            Segment::new(0, self.model.to_string()),
+            Segment::new(
+                1,
+                format!("ctx {}/{} {percent}%", format_count(used), format_count(window)),
+            ),
+        ];
+        // Absent rather than zero before the first reply: "0.0 tok/s" reads as
+        // a measurement, and there has not been one yet.
+        if let Some(rate) = self.last_rate {
+            segments.push(Segment::new(2, format!("{rate:.1} tok/s")));
+        }
+        segments.push(Segment::new(
+            3,
+            match self.opts.thinking {
+                ThinkingMode::Off => "think off".to_string(),
+                _ => format!("think {}", self.opts.reasoning_effort),
+            },
+        ));
+        segments.push(Segment::new(
+            4,
+            match &self.tools {
+                Some(host) => format!("{} tools", host.tools().len()),
+                None => "no tools".to_string(),
+            },
+        ));
+        segments.push(Segment::new(
+            5,
+            format!("temp {:.2} top-p {:.2}", self.opts.temperature, self.opts.top_p),
+        ));
+        segments
+    }
+
+    /// Repaint the bottom row from the session's current state.
+    fn update_status(&mut self) {
+        let segments = self.status_segments();
+        self.status.set(&segments);
     }
 
     async fn repl(&mut self, prompt: &mut Prompt) -> Result<Flow> {
         crate::input::install_interrupt_handler();
         let marker = self.theme.style(Style::color(ozgent_render::Color::Cyan), "› ");
+        self.update_status();
 
         loop {
+            // Before every prompt, because a resize silently drops the
+            // scrolling region that keeps the row reserved.
+            self.status.refresh();
             let line = match prompt.read(&marker) {
                 Input::Line(l) => l,
                 // Ctrl-C at the prompt abandons the line, not the session.
@@ -276,7 +365,11 @@ impl<'a> Chat<'a> {
                 continue;
             }
             if looks_like_command(input) {
-                match self.command(input).await? {
+                // A command can change the model's settings, empty the
+                // context, or load tools, so the row is stale afterwards.
+                let flow = self.command(input).await?;
+                self.update_status();
+                match flow {
                     Flow::Continue => continue,
                     Flow::Exit => return Ok(Flow::Exit),
                     // The engine is owned by `run`, so switching unwinds to
@@ -294,6 +387,7 @@ impl<'a> Chat<'a> {
                     self.theme.style(Style::color(ozgent_render::Color::Red), &format!("error: {e}"))
                 );
             }
+            self.update_status();
             prompt.save();
         }
         eprintln!();
@@ -638,7 +732,7 @@ impl<'a> Chat<'a> {
         );
 
         let mut markdown =
-            StreamRenderer::new(MarkdownRenderer::new(self.theme.clone(), self.width));
+            StreamRenderer::new(MarkdownRenderer::new(self.theme.clone(), ozgent_render::terminal_width()));
         let mut filter = ThinkingFilter::new(self.opts.thinking);
         if let Some(close) = Engine::stream_starts_inside(&prompt) {
             filter = filter.starting_inside(close);
@@ -747,6 +841,12 @@ impl<'a> Chat<'a> {
             if let Some(note) = note {
                 eprintln!("{}", self.theme.style(Style::dim(), note));
             }
+        }
+        // Kept for the status line. Only a real generation updates it: an
+        // interrupted or empty turn would otherwise report a rate measured
+        // over a handful of tokens.
+        if stats.generated_tokens > 0 {
+            self.last_rate = Some(stats.tokens_per_second());
         }
         if reason == StopReason::ContextFull {
             eprintln!("{}", self.theme.style(Style::dim(), "· context full"));
@@ -1028,7 +1128,17 @@ impl<'a> Chat<'a> {
             eprintln!("{}", dim(&format!("  max_tokens      {}", self.opts.max_tokens)));
             let seed = self.opts.seed.map_or("random".to_string(), |s| s.to_string());
             eprintln!("{}", dim(&format!("  seed            {seed}")));
-            eprintln!("{}", dim(&format!("  ctx             {}", self.opts.context_length)));
+            // Both numbers, because they can differ: what was asked for is
+            // what `/config ctx` set, and what the session runs on is what
+            // the machine's memory allowed.
+            let asked = ozgent_core::format_count(self.opts.context_length);
+            let window = self.session.n_ctx();
+            let ctx = if window == self.opts.context_length {
+                asked
+            } else {
+                format!("{asked} (running at {})", ozgent_core::format_count(window))
+            };
+            eprintln!("{}", dim(&format!("  ctx             {ctx}")));
             eprintln!("{}", dim(&format!("  gpu layers      {}", self.opts.gpu_layers)));
             eprintln!("{}", dim(&format!("  tools           {}", self.opts.tools)));
             eprintln!("{}", dim(&format!("set with /config <key> <value>; keys: {SETTABLE}")));
@@ -1103,7 +1213,7 @@ impl<'a> Chat<'a> {
                     dim(&format!(
                         "· ctx = {n} (saved; applies when the model is next loaded, \
                          currently {})",
-                        self.opts.context_length
+                        ozgent_core::format_count(self.session.n_ctx())
                     ))
                 );
                 return Ok(());
@@ -1349,6 +1459,29 @@ impl<'a> Chat<'a> {
             }
 
             "/config" => self.configure(arg)?,
+
+            "/default" => {
+                // The alias when there is one: it is the name the user chose,
+                // it is what `ozgent list` shows, and it survives re-pulling
+                // the model at another quantisation.
+                let name = self
+                    .manifest
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| self.model.to_string());
+                if arg == "clear" || arg == "off" {
+                    self.config.default_model = None;
+                    self.config.save(&self.paths)?;
+                    eprintln!("{}", dim("· no default model; name one each time"));
+                } else {
+                    self.config.default_model = Some(name.clone());
+                    self.config.save(&self.paths)?;
+                    eprintln!(
+                        "{}",
+                        dim(&format!("· {name} is now the default for `ozgent chat` and the web interface"))
+                    );
+                }
+            }
 
             "/tools" if !arg.is_empty() => self.configure_tool(arg)?,
 
@@ -1626,6 +1759,7 @@ const HELP: &str = "\
                    seed, thinking, effort, tools, and ctx (applies on next load)
                    sizes take k/m: /config ctx 32k
 /tools             list available tools
+/default           use this model when none is named · /default clear to unset
 /tools <t> <prov>  point a tool at a provider, e.g. /tools web_search brave
 /call <request>    force a tool call, constrained by grammar
 /stats             model and context state
@@ -1639,7 +1773,7 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats"] {
+        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats", "/default"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
         }
     }

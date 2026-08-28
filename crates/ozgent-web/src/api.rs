@@ -92,17 +92,32 @@ struct ModelInfo {
     quantization: Option<String>,
     size_bytes: Option<u64>,
     vision: bool,
+    /// Whether `default_model` names this one. The page opens on it, so the
+    /// model someone uses most is not one they re-pick on every visit.
+    is_default: bool,
 }
 
 async fn models(AxumState(state): AxumState<State>) -> Json<Vec<ModelInfo>> {
+    // The config, not the start-up clone: the default can be changed from the
+    // settings page, and a stale copy would keep opening the old model.
+    let default = state.config.lock().unwrap().default_model.clone();
     let models = ozgent_core::installed(&state.paths)
         .into_iter()
-        .map(|m| ModelInfo {
-            reference: m.model.to_string(),
-            alias: m.manifest.alias.clone(),
-            quantization: m.manifest.quantization.clone(),
-            size_bytes: m.manifest.size_bytes,
-            vision: m.manifest.supports_vision(),
+        .map(|m| {
+            let reference = m.model.to_string();
+            // `default_model` is stored as the user wrote it, which may be
+            // either spelling, so both have to be checked.
+            let is_default = default
+                .as_deref()
+                .is_some_and(|d| d == reference || Some(d) == m.manifest.alias.as_deref());
+            ModelInfo {
+                reference,
+                alias: m.manifest.alias.clone(),
+                quantization: m.manifest.quantization.clone(),
+                size_bytes: m.manifest.size_bytes,
+                vision: m.manifest.supports_vision(),
+                is_default,
+            }
         })
         .collect();
     Json(models)

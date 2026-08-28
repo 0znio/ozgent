@@ -4,6 +4,7 @@ mod chat;
 mod input;
 mod cli;
 mod logging;
+mod status;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -54,6 +55,9 @@ async fn main() -> Result<()> {
         Some(Command::List) => list_models(&paths),
         Some(Command::Show { model }) => show_model(&paths, &config, &model),
         Some(Command::Alias { model, alias, clear }) => set_alias(&paths, &model, alias, clear),
+        Some(Command::DefaultModel { model, clear }) => {
+            default_model(&paths, model, clear)
+        }
         Some(Command::Rm { model, force }) => remove_model(&paths, &model, force),
         Some(Command::Tools { command }) => tools(&paths, &config, command).await,
         Some(Command::Config { command }) => config_cmd(&paths, &config, command),
@@ -331,6 +335,35 @@ fn set_alias(paths: &Paths, model: &str, alias: Option<String>, clear: bool) -> 
         (None, false) => match found.manifest.alias {
             Some(a) => println!("{} is aliased to {a}", found.model),
             None => println!("{} has no alias", found.model),
+        },
+    }
+    Ok(())
+}
+
+/// Show, set, or clear the model used when none is named.
+///
+/// The name is stored exactly as the user typed it, alias and all, rather
+/// than expanded to `name:tag`: an alias is the name they chose, it survives
+/// re-pulling the model at a different quantisation, and `ozgent list` shows
+/// it. Resolving first is still worth doing — it turns a typo into an error
+/// here instead of at the start of the next chat.
+fn default_model(paths: &Paths, model: Option<String>, clear: bool) -> Result<()> {
+    let mut config = ozgent_core::Config::load(paths)?;
+    match (model, clear) {
+        (Some(name), _) => {
+            let found = ozgent_core::resolve(paths, &name)?;
+            config.default_model = Some(name.clone());
+            config.save(paths)?;
+            println!("{} ({}) is now the default", name, found.model);
+        }
+        (None, true) => {
+            config.default_model = None;
+            config.save(paths)?;
+            println!("cleared; name a model, or set one with `ozgent default <model>`");
+        }
+        (None, false) => match &config.default_model {
+            Some(name) => println!("{name}"),
+            None => println!("no default set. Try: ozgent default <model>"),
         },
     }
     Ok(())

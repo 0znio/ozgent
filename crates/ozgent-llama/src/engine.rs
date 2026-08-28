@@ -487,6 +487,61 @@ impl Engine {
             })
     }
 
+    /// Create the context, retreating to a smaller window when the allocation
+    /// fails.
+    ///
+    /// [`ozgent_core::accel::fit_context`] has already sized the window
+    /// against the KV cache, which is the large and predictable part. What it
+    /// cannot account for is the compute buffers and llama.cpp's own scratch:
+    /// those depend on the batch size and on how the backend's graph planner
+    /// lays the work out, and neither is derivable from metadata. When the
+    /// estimate turns out optimistic llama.cpp returns a null pointer, and a
+    /// session that opens with half the window is worth far more to the user
+    /// than one that refuses to open at all.
+    fn open_context(
+        &self,
+        backend: &'static LlamaBackend,
+        params: LlamaContextParams,
+        requested: u32,
+    ) -> Result<LlamaContext<'_>, EngineError> {
+        let mut window = requested;
+        // The first failure is the informative one: later attempts fail for
+        // the same reason at a smaller size, and the last one before the floor
+        // says least about what actually went wrong.
+        let mut first_reason: Option<String> = None;
+
+        loop {
+            crate::llamalog::clear();
+            let attempt = params.clone().with_n_ctx(NonZeroU32::new(window));
+            match self.model.new_context(backend, attempt) {
+                Ok(context) => {
+                    if window < requested {
+                        tracing::warn!(
+                            "a context of {requested} could not be allocated; opened {window} instead"
+                        );
+                    }
+                    return Ok(context);
+                }
+                Err(e) => {
+                    // llama.cpp returns a bare null for every kind of failure
+                    // and explains itself only through its log callback, so
+                    // `e` alone says nothing but "null reference".
+                    let reason = crate::llamalog::reason().unwrap_or_else(|| e.to_string());
+                    tracing::debug!("context of {window} failed: {reason}");
+                    first_reason.get_or_insert(reason);
+
+                    if window <= ozgent_core::accel::MIN_CONTEXT {
+                        let reason = first_reason.unwrap_or_else(|| e.to_string());
+                        return Err(EngineError::Context(format!(
+                            "{reason} (tried down to {window} tokens of context)"
+                        )));
+                    }
+                    window = (window / 2).max(ozgent_core::accel::MIN_CONTEXT);
+                }
+            }
+        }
+    }
+
     pub fn session(&self, opts: &Resolved) -> Result<Session<'_>, EngineError> {
         let backend = backend()?;
 
@@ -519,6 +574,40 @@ impl Engine {
         };
         let type_k = resolve_kv(opts.cache_type_k);
         let type_v = resolve_kv(opts.cache_type_v);
+
+        // Training context is a claim about which positions the model
+        // understands, not a promise that the cache for them fits in memory.
+        // At the million-token windows recent models advertise, the cache runs
+        // to hundreds of gigabytes, and llama.cpp answers that by returning a
+        // null pointer — which reached the user as "null reference from
+        // llama.cpp" with nothing pointing at memory as the cause. Sizing the
+        // window to the memory that exists trades an unusable session for a
+        // shorter one.
+        let budget = ozgent_core::accel::kv_budget(
+            free,
+            ozgent_core::accel::available_host_memory(),
+            self.gpu_layers_used,
+            self.n_layer,
+        );
+        // K and V can end up on different types; sizing against the wider one
+        // keeps the estimate on the safe side of the real allocation.
+        let widest = if type_k.bits() >= type_v.bits() { type_k } else { type_v };
+        let requested =
+            ozgent_core::accel::fit_context(self.kv_elements, requested, widest, budget);
+        if requested < opts.context_length.min(self.n_ctx_train.max(512)) {
+            tracing::warn!(
+                "context {} needs {} MiB of {:?} kv cache; only {} MiB is free, so the window is {}",
+                opts.context_length,
+                ozgent_core::accel::kv_bytes(
+                    self.kv_elements,
+                    opts.context_length.min(self.n_ctx_train.max(512)),
+                    widest,
+                ) / (1024 * 1024),
+                widest,
+                budget / (1024 * 1024),
+                requested,
+            );
+        }
         if opts.cache_type_k == CacheType::Auto {
             tracing::info!(
                 "kv cache: {type_k:?} ({} MiB at {requested} ctx, {} MiB free)",
@@ -557,10 +646,7 @@ impl Engine {
                 .with_n_threads_batch(opts.threads as i32);
         }
 
-        let mut context = self
-            .model
-            .new_context(backend, params)
-            .map_err(|e| EngineError::Context(e.to_string()))?;
+        let mut context = self.open_context(backend, params, requested)?;
 
         // Steering belongs to the context, not the turn: installed once here,
         // it shapes every generation until the session ends. Loading it lazily

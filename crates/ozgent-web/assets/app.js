@@ -1596,6 +1596,32 @@ async function previewRecall(query) {
     `<div>${r.recent} recent messages, ${r.elided} older left out, ~${r.tokens_used} tokens</div></div>`;
 }
 
+/// Fill the settings page's default-model picker.
+///
+/// Its options are the composer's, so the two can never disagree about what is
+/// installed. "None" is a real choice: it is how a user goes back to picking a
+/// model deliberately each time.
+function renderDefaultModel(current) {
+  const select = $("set-default-model");
+  select.replaceChildren();
+
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "None — choose each time";
+  select.append(none);
+
+  for (const option of el.model.options) {
+    if (!option.value) continue;
+    const copy = document.createElement("option");
+    copy.value = option.value;
+    copy.textContent = option.textContent;
+    select.append(copy);
+  }
+  // A default naming a model that has since been deleted must not silently
+  // become a different one, so it is only applied when it still matches.
+  select.value = [...select.options].some((o) => o.value === current) ? current : "";
+}
+
 // ---- open / save ----
 
 async function openSettings() {
@@ -1609,6 +1635,7 @@ async function openSettings() {
   $("set-markdown").checked = config.ui.markdown;
   $("set-thinking").checked = config.ui.show_thinking;
   $("set-date").checked = config.ui.date_awareness;
+  renderDefaultModel(config.default_model);
   renderTools(tools);
 
   const model = el.model.value;
@@ -1631,6 +1658,9 @@ async function saveSettings() {
     config.ui.markdown = $("set-markdown").checked;
     config.ui.show_thinking = $("set-thinking").checked;
     config.ui.date_awareness = $("set-date").checked;
+    // An empty selection means "no default"; the field is optional on the
+    // Rust side, so it has to be null rather than "".
+    config.default_model = $("set-default-model").value || null;
     await api("/api/settings", { method: "PUT", body: JSON.stringify(config) });
 
     const disabled = [...$("tool-list").querySelectorAll("[data-tool]")]
@@ -1657,9 +1687,54 @@ async function saveSettings() {
     setTimeout(() => { note.textContent = ""; }, 2000);
     settingsCache.tools = await api("/api/tools");
     renderTools(settingsCache.tools);
+    // The picker's default flag comes from the server, so it has to be re-read
+    // rather than assumed from what was just submitted.
+    const chosen = el.model.value;
+    await loadModels();
+    // Changing the default should not switch the conversation's model out from
+    // under someone mid-thread.
+    if ([...el.model.options].some((o) => o.value === chosen)) el.model.value = chosen;
   } catch (e) {
     note.textContent = e.message;
   }
+}
+
+// ------------------------------------------------------------------ models
+
+/// Fill the model picker, opening on the configured default.
+///
+/// Called again after settings are saved, because the default can be changed
+/// there and the picker would otherwise keep pointing at the old one until the
+/// page was reloaded.
+async function loadModels() {
+  const models = await api("/api/models");
+  el.model.replaceChildren();
+  el.model.disabled = false;
+
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.alias || m.reference;
+    opt.textContent = m.alias ? `${m.alias} (${m.reference})` : m.reference;
+    // The name the server matched on, so the default survives being written
+    // as either an alias or a full reference.
+    if (m.is_default) opt.dataset.default = "1";
+    el.model.append(opt);
+  }
+  if (!models.length) {
+    const opt = document.createElement("option");
+    // An <option> with no value attribute reports its text as its value, and
+    // that placeholder text would then be offered as a model to default to.
+    opt.value = "";
+    opt.textContent = "no models installed";
+    el.model.append(opt);
+    el.model.disabled = true;
+    return models;
+  }
+  // Without a default the browser picks the first option, which is what
+  // happened before and is still the right fallback.
+  const preferred = el.model.querySelector("option[data-default]");
+  if (preferred) el.model.value = preferred.value;
+  return models;
 }
 
 // ------------------------------------------------------------------- boot
@@ -1669,20 +1744,7 @@ async function boot() {
   // script in the document head, before anything was painted.
   applyTheme(storedTheme());
   syncTools();
-  const models = await api("/api/models");
-  el.model.replaceChildren();
-  for (const m of models) {
-    const opt = document.createElement("option");
-    opt.value = m.alias || m.reference;
-    opt.textContent = m.alias ? `${m.alias} (${m.reference})` : m.reference;
-    el.model.append(opt);
-  }
-  if (!models.length) {
-    const opt = document.createElement("option");
-    opt.textContent = "no models installed";
-    el.model.append(opt);
-    el.model.disabled = true;
-  }
+  await loadModels();
   await loadConversations();
   await openRoute();
 }

@@ -20,6 +20,7 @@ Getting started:
   ozgent list                                  see what is installed
   ozgent                                       chat with the last model used
   ozgent chat <model>                          chat with a specific one
+  ozgent default <model>                       start there when none is named
 
 Running as a server:
   ozgent web                                   web interface, opens a browser
@@ -217,6 +218,23 @@ pub enum Command {
         alias: Option<String>,
         /// Remove the model's alias.
         #[arg(long, conflicts_with = "alias")]
+        clear: bool,
+    },
+
+    /// Show or set the model used when no model is named.
+    ///
+    /// `ozgent chat` and the web interface both start with it, so the model
+    /// you use most does not have to be typed every time.
+    ///
+    ///   ozgent default            what it is now
+    ///   ozgent default coder      use `coder` from now on
+    ///   ozgent default --clear    go back to naming one each time
+    #[command(name = "default")]
+    DefaultModel {
+        /// The model, by alias or `name:tag`. Omit to show the current one.
+        model: Option<String>,
+        /// Forget the default and require a model to be named.
+        #[arg(long, conflicts_with = "model")]
         clear: bool,
     },
 

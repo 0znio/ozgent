@@ -60,6 +60,27 @@ pub fn parse_count(raw: &str) -> Result<u32, String> {
     Ok(scaled)
 }
 
+/// Render a token count the way [`parse_count`] would accept it back.
+///
+/// The status line and every "context full" message compete for room with
+/// other facts, and `131072` spends eleven columns saying what `128k` says in
+/// four. Exact multiples print without a fraction, so the common case — a
+/// context length, which is always a power of two — reads as the number the
+/// user typed. Anything else keeps one decimal, because a running total like
+/// `12.3k` is the whole point of showing it at all.
+pub fn format_count(n: u32) -> String {
+    const K: u32 = 1024;
+    const M: u32 = 1024 * 1024;
+
+    if n >= M {
+        if n % M == 0 { format!("{}m", n / M) } else { format!("{:.1}m", n as f64 / M as f64) }
+    } else if n >= K {
+        if n % K == 0 { format!("{}k", n / K) } else { format!("{:.1}k", n as f64 / K as f64) }
+    } else {
+        n.to_string()
+    }
+}
+
 /// Serde adapter so `config.toml` accepts `8192` and `"8k"` alike.
 ///
 /// Written against `Option<u32>` rather than a newtype on purpose: changing
@@ -90,6 +111,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_are_written_the_way_they_are_typed() {
+        assert_eq!(format_count(8192), "8k");
+        assert_eq!(format_count(131_072), "128k");
+        assert_eq!(format_count(1_048_576), "1m");
+        assert_eq!(format_count(512), "512");
+    }
+
+    #[test]
+    fn an_inexact_count_keeps_one_decimal() {
+        assert_eq!(format_count(12_600), "12.3k");
+        assert_eq!(format_count(1_600_000), "1.5m");
+    }
+
+    #[test]
+    fn a_formatted_count_parses_back_to_itself() {
+        // The two halves are used in the same breath — a status line prints
+        // what a flag accepts — so a round trip that lost precision would
+        // teach the user a value ozgent then rejects.
+        for n in [512u32, 4096, 8192, 32_768, 131_072, 262_144, 1_048_576] {
+            assert_eq!(parse_count(&format_count(n)), Ok(n), "round trip of {n}");
+        }
+    }
 
     #[test]
     fn plain_numbers_pass_through() {

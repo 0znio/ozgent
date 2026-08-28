@@ -21,4 +21,4 @@ pub use manifest::{Capability, Manifest};
 pub use options::{GpuLayers, Options, Resolved, ThinkingMode};
 pub use paths::{ModelRef, Paths};
 pub use registry::{Installed, RegistryError, installed, resolve, set_alias, validate_alias};
-pub use tokens::parse_count;
+pub use tokens::{format_count, parse_count};
