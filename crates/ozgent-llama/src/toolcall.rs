@@ -26,6 +26,62 @@ const OPENERS: &[(&str, Option<&str>)] = &[
     ("<function=", Some("</function>")),
 ];
 
+/// The tool a half-written call is for, as soon as its name is readable.
+///
+/// A tool call is parsed from the finished reply, which is the right moment to
+/// *run* it and the wrong moment to start telling the user about it: writing a
+/// file means generating the whole file first, and a model doing that in
+/// silence looks like a stall. The name arrives in the call's first few
+/// tokens, long before its arguments, and is enough to say what the wait is
+/// for.
+///
+/// Reads the *last* opener, not the first: a turn that already ran one tool
+/// and is now writing a second must name the second.
+pub fn pending_name(text: &str) -> Option<&str> {
+    let (start, opener) = OPENERS
+        .iter()
+        .filter_map(|(open, _)| text.rfind(open).map(|i| (i, *open)))
+        .max_by_key(|(i, _)| *i)?;
+    let body = &text[start + opener.len()..];
+
+    // `<function=NAME>` carries the name inside the marker itself, and the
+    // closing `>` may not have arrived yet.
+    if opener == "<function=" {
+        let end = body.find('>')?;
+        return identifier(&body[..end]);
+    }
+
+    // The JSON shapes: `{"name": "web_search", ...`. Matched on the key rather
+    // than by parsing, because the object is still being written and will not
+    // parse until it is closed.
+    if let Some(key) = body.find("\"name\"") {
+        let after = &body[key + 6..];
+        let after = after.trim_start().strip_prefix(':')?.trim_start();
+        let quoted = after.strip_prefix('"')?;
+        let end = quoted.find('"')?;
+        return identifier(&quoted[..end]);
+    }
+
+    // Ling writes the bare name on the line after the opener. Only accepted
+    // once that line has ended, or a name still being typed would be reported
+    // truncated and then corrected on screen.
+    let line = body.trim_start_matches(['\n', '\r']);
+    let end = line.find('\n')?;
+    identifier(&line[..end])
+}
+
+/// Accept only something that could be a tool name.
+///
+/// The alternative is announcing whatever punctuation happened to follow the
+/// opener as though it were a tool.
+fn identifier(text: &str) -> Option<&str> {
+    let name = text.trim();
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    ok.then_some(name)
+}
+
 /// What the model produced, separated into what to show and what to run.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Parsed {
@@ -919,5 +975,75 @@ mod gate_tests {
     fn multibyte_text_is_not_split() {
         let (out, _) = drip("日本語のテキスト 🎉");
         assert_eq!(out, "日本語のテキスト 🎉");
+    }
+}
+
+#[cfg(test)]
+mod pending_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_is_readable_before_the_arguments_are() {
+        // The whole point: a write of a large file spends most of its time
+        // generating `content`, and the name is there from the start.
+        let partial = concat!(
+            "Sure.<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "a.txt", "content": "the beginn"#,
+        );
+        assert_eq!(pending_name(partial), Some("write_file"));
+    }
+
+    #[test]
+    fn every_call_syntax_gives_up_its_name() {
+        assert_eq!(
+            pending_name("<function=run_command><parameter=command>ls"),
+            Some("run_command"),
+        );
+        assert_eq!(pending_name("<tool_call>web_search\n<arg_key>query"), Some("web_search"));
+        assert_eq!(pending_name(r#"[TOOL_CALLS][{"name": "list_dir""#), Some("list_dir"));
+        assert_eq!(pending_name(r#"<|python_tag|>{"name": "read_file""#), Some("read_file"));
+    }
+
+    #[test]
+    fn the_second_call_of_a_turn_is_the_one_named() {
+        let text = concat!(
+            r#"<tool_call>{"name": "web_search"}</tool_call>"#,
+            "\n",
+            r#"<tool_call>{"name": "fetch_url""#,
+        );
+        assert_eq!(pending_name(text), Some("fetch_url"));
+    }
+
+    #[test]
+    fn a_name_still_being_typed_is_not_reported_half_written() {
+        // Announcing "write_fi" and correcting it a token later reads as a
+        // glitch. Waiting for the delimiter costs nothing.
+        assert_eq!(pending_name(r#"<tool_call>{"name": "write_fi"#), None);
+        assert_eq!(pending_name("<tool_call>web_sea"), None);
+        assert_eq!(pending_name("<function=run_comm"), None);
+    }
+
+    #[test]
+    fn prose_with_no_call_names_nothing() {
+        assert_eq!(pending_name("Let me look that up for you."), None);
+        assert_eq!(pending_name(""), None);
+    }
+
+    #[test]
+    fn punctuation_after_an_opener_is_not_a_tool_name() {
+        assert_eq!(pending_name("<tool_call>\n{\n"), None);
+        assert_eq!(pending_name("<function= >"), None);
+    }
+
+    #[test]
+    fn a_name_found_early_matches_the_one_finally_parsed() {
+        // The announcement and the call must agree, or the line that said
+        // "write_file" is followed by a result from something else.
+        let whole = concat!(
+            r#"<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "x"}}"#,
+            "</tool_call>",
+        );
+        let parsed = extract(whole);
+        assert_eq!(pending_name(whole), Some(parsed.calls[0].name.as_str()));
     }
 }

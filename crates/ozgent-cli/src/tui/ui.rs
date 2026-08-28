@@ -126,20 +126,35 @@ impl Ui {
     /// marker back. `text` carries no marker of its own — this owns that
     /// column, so the spinner and the dot cannot disagree about where it is.
     pub fn begin_activity(&mut self, text: impl Into<String>) {
+        // Replacing rather than appending when one is already standing. A tool
+        // call is announced by name the moment the model commits to it, and
+        // again with its arguments once they are written; those are the same
+        // event and must be the same line, or a write shows up twice.
+        let replacing = self.activity.is_some();
         self.activity = Some(text.into());
-        self.spin = 0;
-        let line = self.activity_line(false);
+        let line = self.activity_line(replacing);
         if self.screen.is_some() {
-            self.transcript.push(Block::plain(line));
+            if replacing {
+                self.transcript.set_last(Block::plain(line));
+            } else {
+                self.spin = 0;
+                self.transcript.push(Block::plain(line));
+            }
             self.render();
-        } else {
+        } else if !replacing {
             eprintln!("{line}");
         }
     }
 
     /// Advance the spinner. Does nothing when nothing is running.
+    ///
+    /// Self-throttling, so a caller driving it from a per-token callback and
+    /// one driving it from a timer can both simply call it.
     pub fn tick(&mut self) {
         if self.activity.is_none() || self.screen.is_none() {
+            return;
+        }
+        if self.last_frame.elapsed() < SPIN {
             return;
         }
         self.spin = self.spin.wrapping_add(1);

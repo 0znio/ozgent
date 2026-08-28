@@ -533,6 +533,11 @@ impl<'a> Chat<'a> {
             }
 
             if !parsed.has_calls() || self.tools.is_none() {
+                // A call that was announced but never parsed leaves its line
+                // frozen mid-spin. Settle it: the model started something and
+                // did not finish, which is worth leaving on screen, but not as
+                // something that still looks like it is working.
+                self.ui.settle();
                 break;
             }
             reply.text = parsed.text.clone();
@@ -821,6 +826,10 @@ impl<'a> Chat<'a> {
         // call into view and then take it back.
         let mut shown_thinking = String::new();
         let mut shown_answer = String::new();
+        // Set once the call being written has been named, so it is announced
+        // once rather than on every token.
+        let mut announced = false;
+        let preparing = self.theme.style(Style::dim(), "  writing the call…");
         let show_thinking = self.opts.thinking != ThinkingMode::Off;
 
         let media = self
@@ -853,7 +862,29 @@ impl<'a> Chat<'a> {
                     }
                 }
             }
-            ui.stream(Some(shown_thinking.as_str()), &shown_answer, false);
+
+            // The moment the model commits to a tool call, say which one.
+            //
+            // Everything from the opening marker is withheld, so without this
+            // the screen simply stops: a model writing a file generates the
+            // whole file before the call can be parsed, and thirty seconds of
+            // nothing looks like a hang or a lost connection. The name is
+            // readable from the first few tokens of the call, long before its
+            // arguments, and is enough to say what the wait is for.
+            if gate.suppressing() && !announced {
+                if let Some(name) = toolcall::pending_name(&answer) {
+                    announced = true;
+                    // The reply so far is finished; what follows is the call.
+                    ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
+                    ui.commit();
+                    ui.begin_activity(format!("{name}{}", preparing));
+                }
+            }
+            if announced {
+                ui.tick();
+            } else {
+                ui.stream(Some(shown_thinking.as_str()), &shown_answer, false);
+            }
             // Polled between tokens, so Ctrl-C stops the answer not the
             // process — and so a resize or a page-up is noticed mid-reply.
             !ui.poll_interrupt()
@@ -866,10 +897,17 @@ impl<'a> Chat<'a> {
             }
         }
         shown_answer.push_str(&gate.finish());
-        // Forced, because the last token would otherwise sit unpainted behind
-        // the throttle until something else happened to redraw.
-        self.ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
-        self.ui.commit();
+        if announced {
+            // The reply was committed when the call was announced, and the
+            // activity line is left standing for the tool loop to fill in with
+            // the arguments it is about to ask permission for.
+            self.ui.tick();
+        } else {
+            // Forced, because the last token would otherwise sit unpainted
+            // behind the throttle until something else happened to redraw.
+            self.ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
+            self.ui.commit();
+        }
 
         if crate::input::interrupted() {
             self.ui.say(self.theme.style(Style::dim(), "· interrupted"));
