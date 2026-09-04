@@ -164,6 +164,14 @@ token   = "…"            # or $OZGENT_TELEGRAM_TOKEN
 allow   = ["@ada"]       # empty admits nobody
 ```
 
+## Workflows
+
+Workflows are drawn in the web interface rather than configured here, and are
+stored in `ozgent.db` beside conversations. The one setting they read from
+`config.toml` is `[permissions]`: a workflow runs with nobody watching, so
+anything your rules would *ask* about is refused rather than approved. See
+[workflows.md](workflows.md).
+
 ## Seeing what is in force
 
 ```

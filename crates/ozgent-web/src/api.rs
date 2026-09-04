@@ -21,10 +21,14 @@ pub fn router(state: State) -> Router {
         // link asks the server for them, so the shell must be served.
         .route("/new", get(index))
         .route("/chat", get(index))
+        .route("/flows", get(index))
+        .route("/flows/{id}", get(index))
         .route("/api/conversations/by-uuid/{uuid}", get(conversation_by_uuid))
         .route("/media/{name}", get(media_file))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
+        .route("/flows.css", get(flows_css))
+        .route("/flows.js", get(flows_js))
         .route("/api/models", get(models))
         .route("/api/conversations", get(list_conversations).post(new_conversation))
         .route("/api/conversations/{id}", delete(drop_conversation))
@@ -40,6 +44,8 @@ pub fn router(state: State) -> Router {
         .route("/api/facts/{id}", patch(pin_fact).delete(forget_fact))
         .route("/api/chat", post(chat))
         .route("/api/unload", post(unload))
+        // Workflows: the canvas, its API, and the webhook endpoints.
+        .merge(crate::flow::routes())
         .with_state(state)
 }
 
@@ -60,21 +66,35 @@ async fn js() -> impl IntoResponse {
     )
 }
 
+async fn flows_css() -> impl IntoResponse {
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("../assets/flows.css"),
+    )
+}
+
+async fn flows_js() -> impl IntoResponse {
+    (
+        [("content-type", "text/javascript; charset=utf-8")],
+        include_str!("../assets/flows.js"),
+    )
+}
+
 // ------------------------------------------------------------------- errors
 
 /// Any handler failure, rendered as JSON so the frontend can show it.
-struct ApiError {
-    error: anyhow::Error,
+pub(crate) struct ApiError {
+    pub(crate) error: anyhow::Error,
     /// What the caller sent was wrong, as opposed to something failing here.
     ///
     /// Worth the extra field: a client that retries on 500 would keep resending
     /// a request that can never succeed, and a log full of 500s hides the ones
     /// that are actually ozgent's fault.
-    bad_request: bool,
+    pub(crate) bad_request: bool,
 }
 
 impl ApiError {
-    fn bad_request(message: impl std::fmt::Display) -> Self {
+    pub(crate) fn bad_request(message: impl std::fmt::Display) -> Self {
         Self { error: anyhow::anyhow!("{message}"), bad_request: true }
     }
 }
@@ -100,7 +120,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
 // -------------------------------------------------------------- permissions
 

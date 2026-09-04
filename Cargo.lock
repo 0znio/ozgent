@@ -1409,6 +1409,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ozgent-flow"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ozgent-hub"
 version = "0.1.0"
 dependencies = [
@@ -1491,6 +1502,7 @@ dependencies = [
  "futures-util",
  "image",
  "ozgent-core",
+ "ozgent-flow",
  "ozgent-llama",
  "ozgent-memory",
  "ozgent-tools",

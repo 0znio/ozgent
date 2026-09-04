@@ -1572,6 +1572,12 @@ function setRoute(uuid, { replace = false } = {}) {
 }
 
 async function openRoute() {
+  // Workflows own their own routes and their own half of the layout.
+  if (window.Flows?.owns(location.pathname)) {
+    return window.Flows.open();
+  }
+  window.Flows?.close();
+
   const params = new URLSearchParams(location.search);
   const cid = params.get("cid");
   if (location.pathname === "/chat" && cid) {
@@ -2053,6 +2059,11 @@ async function boot() {
 }
 
 window.addEventListener("popstate", openRoute);
+
+$("open-flows").addEventListener("click", () => {
+  history.pushState({}, "", "/flows");
+  openRoute();
+});
 
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();

@@ -114,7 +114,7 @@ impl App {
             permissions.clone(),
             std::sync::Arc::new(cli),
         );
-        Ok(Arc::new(App {
+        let app = Arc::new(App {
             paths,
             config,
             permissions,
@@ -122,7 +122,12 @@ impl App {
             store: Mutex::new(store),
             embedder: HashingEmbedder::default(),
             worker,
-        }))
+        });
+        // Started here rather than in `serve`, so a workflow on a schedule
+        // fires under `ozgent gateway` too — the surface a person is looking
+        // at is not what decides whether a timer runs.
+        crate::flow::watch_schedules(app.clone());
+        Ok(app)
     }
 }
 

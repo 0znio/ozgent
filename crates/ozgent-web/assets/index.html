@@ -18,6 +18,7 @@
     } catch (e) { /* private browsing; fall back to the system preference */ }
   </script>
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/flows.css">
 </head>
 <body>
 
@@ -114,13 +115,20 @@
     <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
 
     <div class="sidebar-foot">
-      <button class="ghost-btn" id="open-settings">
-        <svg class="ic"><use href="#i-settings"></use></svg><span>Settings</span>
+      <!-- Workflows is a whole other mode of the application, not a utility
+           alongside Settings, so it gets a row rather than a third of one. -->
+      <button class="ghost-btn" id="open-flows">
+        <svg class="ic"><use href="#i-spark"></use></svg><span>Workflows</span>
       </button>
-      <button class="ghost-btn theme" id="theme-toggle" data-tip="Colour theme" aria-label="Colour theme">
-        <svg class="ic theme-icon"><use href="#i-monitor"></use></svg>
-        <span class="theme-name"></span>
-      </button>
+      <div class="foot-row">
+        <button class="ghost-btn" id="open-settings">
+          <svg class="ic"><use href="#i-settings"></use></svg><span>Settings</span>
+        </button>
+        <button class="ghost-btn theme" id="theme-toggle" data-tip="Colour theme" aria-label="Colour theme">
+          <svg class="ic theme-icon"><use href="#i-monitor"></use></svg>
+          <span class="theme-name"></span>
+        </button>
+      </div>
     </div>
   </aside>
 
@@ -207,6 +215,11 @@
       <div class="drop-veil" id="drop-veil" hidden><span>Drop to attach</span></div>
     </form>
   </main>
+
+  <!-- The canvas lives beside the chat rather than inside it, so going to
+       Workflows and back does not rebuild the thread, the composer and the
+       consent panel from scratch. -->
+  <div class="main flows-host" id="flows-host" hidden></div>
 </div>
 
 <div class="lightbox" id="lightbox" hidden>
@@ -317,6 +330,9 @@
   </menu>
 </dialog>
 
+<!-- Before app.js: modules run in order, and the chat app's router asks
+     window.Flows whether a route belongs to it. -->
+<script type="module" src="/flows.js"></script>
 <script type="module" src="/app.js"></script>
 </body>
 </html>
