@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 
 use crate::state::State;
-use crate::worker::{Event, Request};
 
 pub fn router(state: State) -> Router {
     Router::new()
@@ -512,167 +511,22 @@ async fn chat(
         // An unreadable data URL came from the browser, not from here.
         .map_err(ApiError::bad_request)?;
 
-    // Record the question, then assemble context from pinned facts, the recent
-    // window and retrieval — the same path the terminal client uses, so a
-    // conversation reads identically in both.
-    let (messages, user_message_id) = {
-        let store = state.store.lock().unwrap();
-
-        // Name the conversation after its first line, so the sidebar shows
-        // something readable instead of a wall of "New chat". The terminal
-        // client does the same on its first turn.
-        if store.message_count(body.conversation)? == 0 {
-            let title: String = body.message.trim().lines().next().unwrap_or("").chars().take(60).collect();
-            if !title.is_empty() {
-                store.rename_conversation(body.conversation, &title)?;
-            }
-        }
-
-        let id = store.append_message(body.conversation, "user", &body.message, 0)?;
-
-        // Kept so a reload still shows what the question was about. A failure
-        // here must not lose the message, so it is logged rather than raised.
-        if !images.is_empty() {
-            let stored: Vec<String> = images
-                .iter()
-                .filter_map(|src| match src {
-                    ozgent_core::ImageSource::Bytes { bytes, mime } => {
-                        crate::media::store(&state.paths, bytes.as_slice(), mime.as_deref())
-                            .map_err(|e| tracing::warn!("storing an attachment: {e}"))
-                            .ok()
-                    }
-                    _ => None,
-                })
-                .collect();
-            if !stored.is_empty() {
-                let _ = store.set_message_media(id, &stored);
-            }
-        }
-        store.put_embedding(
-            OwnerKind::Message,
-            id,
-            &state.embedder.embed(&body.message),
-        )?;
-
-        let budget = Budget {
-            total: 4096,
-            reserve_for_reply: 1024,
-            recent_messages: 12,
-            max_retrieved: 6,
-        };
-        let assembled = ContextBuilder::new(&store, &state.embedder)
-            .with_budget(budget)
-            .build(body.conversation, &body.message)?;
-
-        let config = state.config.lock().unwrap();
-        let system = config
-            .ui
-            .date_awareness
-            .then(|| ozgent_core::DateTime::now().prompt_line());
-        (assembled.to_messages(system.as_deref()), id)
-    };
-    let _ = user_message_id;
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    state
-        .worker
-        .submit(Request {
+    let events = crate::turn::start(
+        &state,
+        crate::turn::Turn {
+            conversation: body.conversation,
+            model: body.model,
+            message: body.message,
+            thinking,
+            tools: body.tools,
+            native_tools: None,
+            images,
             // The browser can show a permission card and answer it.
             can_ask: true,
-            model: body.model.clone(),
-            messages,
-            thinking,
-            max_tokens: None,
-            tools_enabled: body.tools,
-            native_tools: None,
-            client_tools: Vec::new(),
-            response_grammar: None,
-            overrides: None,
-            images,
-            out: tx,
-        })
-        // The inference thread is gone, which is ozgent's problem, not the
-        // caller's.
-        .map_err(|e| anyhow::anyhow!(e))?;
+        },
+    )?;
 
-    // A relay task, not the SSE stream itself, owns the reply.
-    //
-    // Persisting from inside the stream would lose the whole answer whenever
-    // the browser goes away mid-generation, because a dropped stream is never
-    // polled again. The relay keeps accumulating, writes what it has, and only
-    // then drops its end of the worker channel — which is what tells the
-    // inference thread to stop, so a closed tab still frees the GPU.
-    let persist = state.clone();
-    let conversation = body.conversation;
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-
-    tokio::spawn(async move {
-        let mut answer = String::new();
-        let mut thinking = String::new();
-        let mut activity: Vec<serde_json::Value> = Vec::new();
-
-        while let Some(event) = rx.recv().await {
-            match &event {
-                Event::Answer { text } => answer.push_str(text),
-                Event::Thinking { text } => thinking.push_str(text),
-                Event::ToolCall { name, arguments, .. } => activity.push(serde_json::json!({
-                    "name": name,
-                    "arguments": arguments,
-                })),
-                Event::ToolResult { name, ok, summary, ms, detail, .. } => {
-                    // Attach to the call this answers, so a reload replays the
-                    // pair rather than two loose halves.
-                    let slot = activity
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c["name"] == name.as_str() && c.get("ok").is_none());
-                    if let Some(call) = slot {
-                        call["ok"] = (*ok).into();
-                        call["ms"] = (*ms).into();
-                        call["summary"] = summary.clone().into();
-                        call["detail"] = bounded(detail);
-                    }
-                }
-                _ => {}
-            }
-            let finished = matches!(event, Event::Done { .. } | Event::Error { .. });
-            // A send failure means the browser disconnected. Stop relaying,
-            // but fall through to persist whatever arrived first.
-            let gone = sse_tx.send(event).is_err();
-            if finished || gone {
-                break;
-            }
-        }
-        drop(rx);
-
-        if answer.trim().is_empty() {
-            return;
-        }
-        let store = persist.store.lock().unwrap();
-        let trace = (!thinking.trim().is_empty()).then(|| thinking.trim().to_string());
-        let calls = (!activity.is_empty())
-            .then(|| serde_json::to_string(&activity).unwrap_or_default());
-        match store.append_message_full(
-            conversation,
-            "assistant",
-            answer.trim(),
-            trace.as_deref(),
-            calls.as_deref(),
-            None,
-            0,
-        ) {
-            Ok(id) => {
-                let _ = store.put_embedding(
-                    OwnerKind::Message,
-                    id,
-                    &persist.embedder.embed(answer.trim()),
-                );
-            }
-            Err(e) => tracing::error!("persisting the reply: {e}"),
-        }
-    });
-
-    let sse = futures_util::stream::unfold(sse_rx, |mut rx| async move {
+    let sse = futures_util::stream::unfold(events, |mut rx| async move {
         let event = rx.recv().await?;
         let json = serde_json::to_string(&event).unwrap_or_default();
         Some((Ok(SseEvent::default().data(json)), rx))
@@ -1092,7 +946,7 @@ async fn preview_recall(
 ///
 /// A search can return kilobytes per result; the conversation only needs
 /// enough to redraw the card, and an unbounded copy would bloat every row.
-fn bounded(detail: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn bounded(detail: &serde_json::Value) -> serde_json::Value {
     const MAX_RESULTS: usize = 10;
     const MAX_FIELD: usize = 400;
 

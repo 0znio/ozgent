@@ -35,6 +35,10 @@ pub struct Config {
 
     pub ui: UiConfig,
 
+    /// Messaging channels: Telegram, WhatsApp. Off, and admitting nobody,
+    /// until deliberately configured — see [`crate::channels`].
+    pub channels: crate::channels::ChannelsConfig,
+
     pub embedding: EmbeddingConfig,
 }
 

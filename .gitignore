@@ -5,3 +5,7 @@ __pycache__/
 
 # Release bundles: hundreds of megabytes, rebuilt by scripts/package.sh.
 /dist/
+
+# Installed by `ozgent channel install whatsapp`; ~30 MB of npm tree.
+/bridge/*/node_modules/
+/bridge/*/package-lock.json

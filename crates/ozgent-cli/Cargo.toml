@@ -16,6 +16,7 @@ ozgent-memory.workspace = true
 ozgent-render.workspace = true
 ozgent-tools.workspace = true
 ozgent-web.workspace = true
+ozgent-channels.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -28,6 +29,6 @@ tracing-subscriber.workspace = true
 
 [features]
 default = []
-cuda = ["ozgent-llama/cuda", "ozgent-web/cuda"]
-vulkan = ["ozgent-llama/vulkan", "ozgent-web/vulkan"]
-metal = ["ozgent-llama/metal", "ozgent-web/metal"]
+cuda = ["ozgent-llama/cuda", "ozgent-web/cuda", "ozgent-channels/cuda"]
+vulkan = ["ozgent-llama/vulkan", "ozgent-web/vulkan", "ozgent-channels/vulkan"]
+metal = ["ozgent-llama/metal", "ozgent-web/metal", "ozgent-channels/metal"]

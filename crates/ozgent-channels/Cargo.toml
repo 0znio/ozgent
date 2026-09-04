@@ -1,0 +1,29 @@
+[package]
+name = "ozgent-channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ozgent-core.workspace = true
+ozgent-memory.workspace = true
+ozgent-web.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "io-std"] }
+tracing.workspace = true
+pulldown-cmark.workspace = true
+# rustls rather than native-tls, for the same reason ozgent-hub uses it: no
+# OpenSSL headers to build against, so `cargo install ozgent` works on a bare
+# machine. `multipart` is not enabled — nothing here uploads a file yet.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "charset", "http2"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+
+[features]
+default = []
+cuda = ["ozgent-web/cuda"]
+vulkan = ["ozgent-web/vulkan"]
+metal = ["ozgent-web/metal"]

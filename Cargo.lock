@@ -1358,12 +1358,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "ozgent-channels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ozgent-core",
+ "ozgent-memory",
+ "ozgent-web",
+ "pulldown-cmark",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ozgent-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "ozgent-channels",
  "ozgent-core",
  "ozgent-hub",
  "ozgent-llama",

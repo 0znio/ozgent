@@ -1,0 +1,14 @@
+{
+  "name": "ozgent-wa-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Speaks WhatsApp on ozgent's behalf. Driven over stdio by ozgent-channels.",
+  "main": "index.mjs",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "qrcode-terminal": "0.12.0",
+    "pino": "9.5.0"
+  }
+}

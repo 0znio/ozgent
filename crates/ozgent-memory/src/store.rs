@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub struct Store {
     db: Connection,
@@ -29,6 +29,21 @@ pub struct Conversation {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: i64,
+}
+
+/// A messaging chat bound to a conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelChat {
+    /// `telegram`, `whatsapp`, and so on.
+    pub channel: String,
+    /// The provider's own identifier for the chat, as text: Telegram's is a
+    /// 64-bit integer and WhatsApp's is a JID, so neither type fits both.
+    pub chat_id: String,
+    pub conversation_id: i64,
+    /// A human label — the sender's name or number — so `ozgent channel list`
+    /// shows who a chat belongs to rather than an opaque id.
+    pub display: String,
+    pub last_seen_at: i64,
 }
 
 /// A stored message. `seq` orders messages within their conversation.
@@ -180,6 +195,9 @@ impl Store {
         if current < 4 {
             self.db.execute_batch(SCHEMA_V4)?;
         }
+        if current < 5 {
+            self.db.execute_batch(SCHEMA_V5)?;
+        }
 
         self.db
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -330,6 +348,81 @@ impl Store {
         self.db
             .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ----------------------------------------------------- channel chats
+
+    /// The conversation a messaging chat is bound to, if it still exists.
+    ///
+    /// Returns `None` both when the chat has never been seen and when the
+    /// conversation it pointed at has been deleted, because the caller does the
+    /// same thing in either case: start a new one.
+    pub fn channel_conversation(
+        &self,
+        channel: &str,
+        chat_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let found = self
+            .db
+            .query_row(
+                "SELECT conversation_id FROM channel_chats WHERE channel = ?1 AND chat_id = ?2",
+                params![channel, chat_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Point a chat at a conversation, replacing any earlier binding.
+    pub fn bind_channel_chat(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        conversation_id: i64,
+        display: &str,
+    ) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO channel_chats (channel, chat_id, conversation_id, display, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (channel, chat_id) DO UPDATE SET
+                 conversation_id = excluded.conversation_id,
+                 display         = excluded.display,
+                 last_seen_at    = excluded.last_seen_at",
+            params![channel, chat_id, conversation_id, display, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a chat's binding, so its next message starts a new conversation.
+    ///
+    /// The conversation itself is left alone: someone asking their assistant to
+    /// start fresh is not asking to erase what was said.
+    pub fn unbind_channel_chat(&self, channel: &str, chat_id: &str) -> Result<bool, StoreError> {
+        let n = self.db.execute(
+            "DELETE FROM channel_chats WHERE channel = ?1 AND chat_id = ?2",
+            params![channel, chat_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every chat bound on a channel, most recently active first.
+    pub fn channel_chats(&self, channel: &str) -> Result<Vec<ChannelChat>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT chat_id, conversation_id, display, last_seen_at
+               FROM channel_chats WHERE channel = ?1 ORDER BY last_seen_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![channel], |r| {
+                Ok(ChannelChat {
+                    channel: channel.to_string(),
+                    chat_id: r.get(0)?,
+                    conversation_id: r.get(1)?,
+                    display: r.get(2)?,
+                    last_seen_at: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // ----------------------------------------------------------- messages
@@ -861,6 +954,31 @@ ALTER TABLE conversations ADD COLUMN uuid TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS conversations_uuid ON conversations(uuid);
 ";
 
+/// The v5 step: a messaging chat is bound to a conversation.
+///
+/// Someone messaging ozgent from Telegram or WhatsApp is having one continuing
+/// conversation, not a series of unrelated questions, so the chat has to map to
+/// a stable `conversations` row — that is what gives a channel the same recent
+/// window, retrieval and pinned facts every other surface gets, and what makes
+/// a chat readable afterwards in the web interface.
+///
+/// The mapping is deliberately its own table rather than a column on
+/// `conversations`: a conversation may be reached from more than one place over
+/// its life, and `ON DELETE CASCADE` means deleting the conversation in the web
+/// interface unbinds the chat, which then starts a fresh one on the next
+/// message rather than writing into a hole.
+const SCHEMA_V5: &str = "
+CREATE TABLE channel_chats (
+    channel         TEXT    NOT NULL,
+    chat_id         TEXT    NOT NULL,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    display         TEXT    NOT NULL DEFAULT '',
+    last_seen_at    INTEGER NOT NULL,
+    PRIMARY KEY (channel, chat_id)
+);
+CREATE INDEX idx_channel_chats_conversation ON channel_chats(conversation_id);
+";
+
 /// A random UUID v4.
 ///
 /// Hand-rolled rather than pulling in a crate for sixteen bytes: the only
@@ -899,4 +1017,95 @@ fn new_uuid() -> String {
         "{}-{}-{}-{}-{}",
         h(&bytes[0..4]), h(&bytes[4..6]), h(&bytes[6..8]), h(&bytes[8..10]), h(&bytes[10..16])
     )
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open_in_memory().expect("opening an in-memory store")
+    }
+
+    #[test]
+    fn a_chat_remembers_which_conversation_it_belongs_to() {
+        let s = store();
+        let c = s.create_conversation("from telegram", None).unwrap();
+        s.bind_channel_chat("telegram", "4242", c, "Ada").unwrap();
+        assert_eq!(s.channel_conversation("telegram", "4242").unwrap(), Some(c));
+    }
+
+    #[test]
+    fn chats_do_not_cross_between_channels() {
+        // Telegram chat ids and WhatsApp JIDs are different namespaces that
+        // can collide as text; the same id on two channels is two people.
+        let s = store();
+        let a = s.create_conversation("a", None).unwrap();
+        let b = s.create_conversation("b", None).unwrap();
+        s.bind_channel_chat("telegram", "1", a, "").unwrap();
+        s.bind_channel_chat("whatsapp", "1", b, "").unwrap();
+        assert_eq!(s.channel_conversation("telegram", "1").unwrap(), Some(a));
+        assert_eq!(s.channel_conversation("whatsapp", "1").unwrap(), Some(b));
+    }
+
+    #[test]
+    fn rebinding_moves_the_chat_rather_than_failing() {
+        // What `/new` from a chat does: the next message must land somewhere
+        // else, and the row is a primary key, so this has to be an upsert.
+        let s = store();
+        let first = s.create_conversation("first", None).unwrap();
+        let second = s.create_conversation("second", None).unwrap();
+        s.bind_channel_chat("telegram", "1", first, "Ada").unwrap();
+        s.bind_channel_chat("telegram", "1", second, "Ada").unwrap();
+        assert_eq!(s.channel_conversation("telegram", "1").unwrap(), Some(second));
+        assert_eq!(s.channel_chats("telegram").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_the_conversation_unbinds_the_chat() {
+        // Otherwise a conversation deleted in the web interface leaves the
+        // chat pointing at a row that is gone, and the next message from that
+        // person fails its foreign key instead of starting fresh.
+        let s = store();
+        let c = s.create_conversation("gone", None).unwrap();
+        s.bind_channel_chat("telegram", "1", c, "").unwrap();
+        s.delete_conversation(c).unwrap();
+        assert_eq!(s.channel_conversation("telegram", "1").unwrap(), None);
+        assert!(s.channel_chats("telegram").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unbinding_keeps_what_was_said() {
+        let s = store();
+        let c = s.create_conversation("kept", None).unwrap();
+        s.append_message(c, "user", "hello", 0).unwrap();
+        s.bind_channel_chat("telegram", "1", c, "").unwrap();
+
+        assert!(s.unbind_channel_chat("telegram", "1").unwrap());
+        assert!(!s.unbind_channel_chat("telegram", "1").unwrap(), "already gone");
+        assert_eq!(s.channel_conversation("telegram", "1").unwrap(), None);
+        assert_eq!(s.messages(c).unwrap().len(), 1, "the conversation survives");
+    }
+
+    #[test]
+    fn chats_are_listed_most_recently_active_first() {
+        let s = store();
+        let a = s.create_conversation("a", None).unwrap();
+        let b = s.create_conversation("b", None).unwrap();
+        s.bind_channel_chat("telegram", "old", a, "Ada").unwrap();
+        s.bind_channel_chat("telegram", "new", b, "Grace").unwrap();
+        // `now()` has second resolution, so order the two explicitly rather
+        // than depending on the clock ticking between two inserts.
+        s.raw()
+            .execute(
+                "UPDATE channel_chats SET last_seen_at = 1 WHERE chat_id = 'old'",
+                [],
+            )
+            .unwrap();
+
+        let listed = s.channel_chats("telegram").unwrap();
+        assert_eq!(listed[0].chat_id, "new");
+        assert_eq!(listed[0].display, "Grace");
+        assert_eq!(listed[1].chat_id, "old");
+    }
 }

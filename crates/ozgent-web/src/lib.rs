@@ -9,6 +9,7 @@ pub mod media;
 pub mod openai;
 pub mod permission;
 pub mod state;
+pub mod turn;
 pub mod worker;
 
 use ozgent_core::{Config, Paths};
@@ -22,6 +23,18 @@ pub async fn serve(
     cli: ozgent_core::Options,
 ) -> anyhow::Result<()> {
     let state = state::App::new(paths, config, cli).await?;
+    serve_with(state, host, port).await
+}
+
+/// Serve an application that has already been built.
+///
+/// Split out so one process can run the web interface and the messaging
+/// gateway over the *same* [`state::App`]. That sharing is not a convenience:
+/// the inference thread, the model it has loaded, the tool host and the
+/// permission grants are all per-`App`, so two `App`s in one process would
+/// mean two copies of the model in VRAM and a permission answered in the
+/// browser having no effect on a question asked over Telegram.
+pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::Result<()> {
     let app = api::router(state).layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("{host}:{port}");

@@ -3,6 +3,7 @@
 //! processes, so every other crate can depend on it freely.
 
 pub mod accel;
+pub mod channels;
 pub mod chat;
 pub mod config;
 pub mod datetime;
@@ -14,6 +15,7 @@ pub mod registry;
 pub mod tokens;
 
 pub use accel::{CacheType, MoeOffload, PrefixReuse, Speculative, SpeculativeTuning};
+pub use channels::{ChannelsConfig, Kind as ChannelKind};
 pub use chat::{ImageSource, Message, Part, Role, ToolCall, ToolSpec};
 pub use config::Config;
 pub use options::ReasoningEffort;

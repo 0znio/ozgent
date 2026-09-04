@@ -9,6 +9,7 @@ members = [
     "crates/ozgent-llama",
     "crates/ozgent-mtmd-sys",
     "crates/ozgent-web",
+    "crates/ozgent-channels",
     "crates/ozgent-cli",
 ]
 
@@ -26,6 +27,7 @@ ozgent-memory = { path = "crates/ozgent-memory" }
 ozgent-hub = { path = "crates/ozgent-hub" }
 ozgent-llama = { path = "crates/ozgent-llama" }
 ozgent-web = { path = "crates/ozgent-web" }
+ozgent-channels = { path = "crates/ozgent-channels" }
 ozgent-mtmd-sys = { path = "crates/ozgent-mtmd-sys" }
 
 anyhow = "1"

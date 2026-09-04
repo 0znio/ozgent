@@ -10,7 +10,7 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
+use cli::{ChannelCommand, Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
 use ozgent_core::{Config, ModelRef, Paths};
 use ozgent_tools::{HostConfig, ToolHost};
 use std::path::PathBuf;
@@ -44,6 +44,10 @@ async fn main() -> Result<()> {
             // printed nothing and changed nothing.
             ozgent_web::serve(paths, config, &host, port, options.to_options()?).await
         }
+        Some(Command::Gateway { web, port, host, options }) => {
+            gateway(paths, config, web, &host, port, options.to_options()?).await
+        }
+        Some(Command::Channel { command }) => channel(&paths, config, command).await,
         Some(Command::Serve { port, host, api_key, options }) => {
             // The environment is the right place for a secret; a flag lands in
             // shell history and in `ps`.
@@ -1125,4 +1129,246 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// ------------------------------------------------------------------ channels
+
+/// Run the messaging gateway, and optionally the web interface beside it.
+///
+/// One [`App`](ozgent_web::state::App) serves both when `--web` is given, which
+/// is the point of doing it in one process: the inference thread, the loaded
+/// model, the tool host and the permission grants are all per-`App`, so two of
+/// them would mean two copies of the model in VRAM and an answer given in the
+/// browser having no effect on a question asked from a chat.
+async fn gateway(
+    paths: Paths,
+    config: Config,
+    web: bool,
+    host: &str,
+    port: u16,
+    options: ozgent_core::Options,
+) -> Result<()> {
+    if !config.channels.enabled {
+        anyhow::bail!(
+            "channels are switched off. Add this to {}:\n\n  [channels]\n  enabled = true\n\n\
+             Then turn one on — see `ozgent channel --help` and docs/channels.md.",
+            paths.config_file().display()
+        );
+    }
+    let state = ozgent_web::state::App::new(paths.clone(), config, options).await?;
+
+    if web {
+        let serving = ozgent_web::serve_with(state.clone(), host, port);
+        let answering = ozgent_channels::gateway::run(state, paths);
+        // Either one stopping ends the process: a gateway with no engine and a
+        // server with no channels are both half a program.
+        tokio::select! {
+            r = serving => r,
+            r = answering => r,
+        }
+    } else {
+        ozgent_channels::gateway::run(state, paths).await
+    }
+}
+
+async fn channel(paths: &Paths, mut config: Config, command: ChannelCommand) -> Result<()> {
+    use ozgent_core::channels::Kind;
+
+    let parse_kind = |name: &str| -> Result<Kind> {
+        Kind::parse(name)
+            .ok_or_else(|| anyhow::anyhow!("no channel called `{name}`. Try telegram or whatsapp."))
+    };
+
+    match command {
+        ChannelCommand::Status => {
+            channel_status(paths, &config);
+            Ok(())
+        }
+
+        ChannelCommand::Install { channel } => match parse_kind(&channel)? {
+            Kind::Telegram => {
+                println!("Telegram needs no install. Get a token from @BotFather and put it in");
+                println!("{}:", paths.config_file().display());
+                println!();
+                println!("  [channels]");
+                println!("  enabled = true");
+                println!();
+                println!("  [channels.telegram]");
+                println!("  enabled = true");
+                println!("  token   = \"…\"");
+                Ok(())
+            }
+            Kind::WhatsApp => {
+                let bridge = ozgent_channels::whatsapp::locate(
+                    config.channels.whatsapp.bridge.as_deref(),
+                    paths,
+                )?;
+                println!("Installing the WhatsApp bridge in {}", bridge.display());
+                ozgent_channels::whatsapp::install(&config.channels.whatsapp.node, &bridge).await?;
+                println!("Done. Next: ozgent channel login whatsapp");
+                Ok(())
+            }
+        },
+
+        ChannelCommand::Login { channel } => match parse_kind(&channel)? {
+            Kind::Telegram => {
+                anyhow::bail!(
+                    "Telegram is not linked by scanning; it uses a bot token. \
+                     Run `ozgent channel install telegram` to see how."
+                )
+            }
+            Kind::WhatsApp => {
+                let wa = &config.channels.whatsapp;
+                let bridge = ozgent_channels::whatsapp::locate(wa.bridge.as_deref(), paths)?;
+                if !ozgent_channels::whatsapp::is_installed(&bridge) {
+                    anyhow::bail!(
+                        "the bridge is not installed yet. Run `ozgent channel install whatsapp`."
+                    );
+                }
+                let state = paths.channel_dir("whatsapp").join("auth");
+                let who = ozgent_channels::whatsapp::login(&wa.node, &bridge, &state).await?;
+                println!();
+                println!("Linked {who}.");
+                println!();
+                println!("The credentials are in {}.", state.display());
+                println!("They can read and send your messages — treat that like a password.");
+                println!();
+                println!("Next: turn the channel on in {}:", paths.config_file().display());
+                println!();
+                println!("  [channels]");
+                println!("  enabled = true");
+                println!();
+                println!("  [channels.whatsapp]");
+                println!("  enabled = true");
+                Ok(())
+            }
+        },
+
+        ChannelCommand::Logout { channel } => {
+            let kind = parse_kind(&channel)?;
+            let state = paths.channel_dir(kind.as_str());
+            match kind {
+                Kind::WhatsApp => {
+                    ozgent_channels::whatsapp::logout(&state.join("auth"))?;
+                    println!("Unlinked. Remove the device from WhatsApp ▸ Linked devices too,");
+                    println!("so the session on their side is gone as well.");
+                }
+                Kind::Telegram => {
+                    config.channels.telegram.token.clear();
+                    config.save(paths)?;
+                    println!("Token cleared. It is still valid on Telegram's side —");
+                    println!("revoke it with @BotFather if it should stop working.");
+                }
+            }
+            Ok(())
+        }
+
+        ChannelCommand::Allow { channel, identity } => {
+            let kind = parse_kind(&channel)?;
+            if config.channels.admit(kind, &identity) {
+                config.save(paths)?;
+                println!("{identity} can now talk to {kind}.");
+            } else {
+                println!("{identity} was already allowed on {kind}.");
+            }
+            Ok(())
+        }
+
+        ChannelCommand::Deny { channel, identity } => {
+            let kind = parse_kind(&channel)?;
+            let allow = match kind {
+                Kind::Telegram => &mut config.channels.telegram.allow,
+                Kind::WhatsApp => &mut config.channels.whatsapp.allow,
+            };
+            let before = allow.len();
+            allow.retain(|a| !a.eq_ignore_ascii_case(identity.trim()));
+            if allow.len() == before {
+                println!("{identity} was not on the {kind} list.");
+                return Ok(());
+            }
+            config.save(paths)?;
+            println!("{identity} can no longer talk to {kind}.");
+            Ok(())
+        }
+    }
+}
+
+/// The chats bound to a channel, for `ozgent channel status`.
+///
+/// Opened read-only and closed again: the gateway may be running against the
+/// same file, and WAL lets a reader in while it writes.
+fn bound_chats(paths: &Paths, channel: &str) -> Result<Vec<ozgent_memory::ChannelChat>> {
+    let store = ozgent_memory::Store::open(paths.root().join("ozgent.db"))?;
+    Ok(store.channel_chats(channel)?)
+}
+
+fn channel_status(paths: &Paths, config: &Config) {
+    use ozgent_core::channels::{Kind, is_open_to_everyone};
+
+    println!("channels{}", if config.channels.enabled { "" } else { "  (switched off)" });
+    println!();
+
+    for kind in [Kind::Telegram, Kind::WhatsApp] {
+        let access = config.channels.access(kind);
+        let on = match kind {
+            Kind::Telegram => config.channels.telegram.enabled,
+            Kind::WhatsApp => config.channels.whatsapp.enabled,
+        };
+        println!("  {kind}");
+        println!("    enabled   {}", if on { "yes" } else { "no" });
+
+        match kind {
+            Kind::Telegram => {
+                // Never the token itself: it is a password, and this output
+                // gets pasted into issues.
+                let has = !config.channels.telegram.token.trim().is_empty()
+                    || std::env::var("OZGENT_TELEGRAM_TOKEN").is_ok();
+                println!("    token     {}", if has { "set" } else { "missing" });
+            }
+            Kind::WhatsApp => {
+                let linked = paths.channel_dir("whatsapp").join("auth").join("creds.json").is_file();
+                println!("    linked    {}", if linked { "yes" } else { "no" });
+                let installed = ozgent_channels::whatsapp::locate(
+                    config.channels.whatsapp.bridge.as_deref(),
+                    paths,
+                )
+                .map(|b| ozgent_channels::whatsapp::is_installed(&b))
+                .unwrap_or(false);
+                println!("    bridge    {}", if installed { "installed" } else { "not installed" });
+            }
+        }
+
+        if is_open_to_everyone(access.allow) {
+            println!("    allowed   EVERYONE — anyone who finds it can use this machine's tools");
+        } else if access.allow.is_empty() {
+            println!("    allowed   nobody");
+        } else {
+            println!("    allowed   {}", access.allow.join(", "));
+        }
+        match access.tools {
+            Some(list) if list.is_empty() => println!("    tools     none"),
+            Some(list) => println!("    tools     {}", list.join(", ")),
+            None => println!("    tools     all of them"),
+        }
+
+        match bound_chats(paths, kind.as_str()) {
+            Ok(chats) if !chats.is_empty() => {
+                println!("    chats     {}", chats.len());
+                for chat in chats.iter().take(5) {
+                    let who = if chat.display.is_empty() { &chat.chat_id } else { &chat.display };
+                    println!("              {who}");
+                }
+            }
+            _ => {}
+        }
+        println!();
+    }
+
+    let model = config
+        .channels
+        .model
+        .clone()
+        .or_else(|| config.default_model.clone())
+        .unwrap_or_else(|| "none set".into());
+    println!("  answering with  {model}");
 }

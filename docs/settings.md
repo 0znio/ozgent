@@ -147,6 +147,23 @@ is loaded — a new `ozgent chat`, or `/models` switching away and back.
 Everything else in the table above is per-turn and applies immediately, from
 the next message on.
 
+## Messaging channels
+
+`[channels]` is where Telegram and WhatsApp are configured. It is off, and
+admits nobody, until deliberately changed — see [channels.md](channels.md),
+which explains why that default is not merely cautious.
+
+```toml
+[channels]
+enabled = true
+model   = "coder"        # falls back to default_model
+
+[channels.telegram]
+enabled = true
+token   = "…"            # or $OZGENT_TELEGRAM_TOKEN
+allow   = ["@ada"]       # empty admits nobody
+```
+
 ## Seeing what is in force
 
 ```

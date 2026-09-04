@@ -125,6 +125,37 @@ pub enum Command {
         options: OptionFlags,
     },
 
+    /// Answer messages from Telegram and WhatsApp.
+    ///
+    /// Runs the channels turned on in `[channels]`. Nobody can talk to it
+    /// until they are on the allowlist, and the code printed at startup is how
+    /// the first person gets there:
+    ///
+    ///   ozgent gateway                    channels only
+    ///   ozgent gateway --web              the web interface as well, one model
+    ///
+    /// A chat can reach this machine's tools, subject to your permission
+    /// rules. See `docs/channels.md` before opening one up.
+    Gateway {
+        /// Also serve the web interface, sharing one loaded model.
+        #[arg(long)]
+        web: bool,
+        /// Port for `--web`.
+        #[arg(long, default_value_t = 7333)]
+        port: u16,
+        /// Address to bind for `--web`.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[command(flatten)]
+        options: OptionFlags,
+    },
+
+    /// Set up and inspect messaging channels.
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommand,
+    },
+
     /// Serve an OpenAI-compatible HTTP API.
     ///
     /// Point any OpenAI client at it: set the base URL and use any model name
@@ -284,6 +315,45 @@ pub enum Command {
         #[arg(long)]
         path: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelCommand {
+    /// Show what is configured, who is allowed, and what is linked.
+    #[command(alias = "list")]
+    Status,
+
+    /// Link a WhatsApp account by scanning a QR code.
+    ///
+    /// This connects your own account as a second device, the way WhatsApp Web
+    /// does. Automating a personal account is against WhatsApp's terms of
+    /// service and accounts have been banned for it.
+    Login {
+        /// `whatsapp`. Telegram needs a token from @BotFather instead.
+        channel: String,
+    },
+
+    /// Unlink an account and forget its credentials.
+    Logout { channel: String },
+
+    /// Install what a channel needs to run.
+    ///
+    /// WhatsApp has no Rust client, so it runs through a small Node program.
+    /// This installs that program's dependencies with npm.
+    Install { channel: String },
+
+    /// Allow someone to talk to a channel.
+    ///
+    ///   ozgent channel allow telegram 4242
+    ///   ozgent channel allow telegram @ada
+    Allow {
+        channel: String,
+        /// A user id, a handle, or a phone number.
+        identity: String,
+    },
+
+    /// Stop someone from talking to a channel.
+    Deny { channel: String, identity: String },
 }
 
 #[derive(Debug, Subcommand)]

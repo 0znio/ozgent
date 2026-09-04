@@ -74,6 +74,21 @@ impl Paths {
         self.root.join("logs")
     }
 
+    /// State a messaging channel keeps between runs.
+    ///
+    /// WhatsApp's is the reason this exists: linking a device produces
+    /// credentials that must survive a restart, or every start would ask for
+    /// the QR code again. Treat the contents like a logged-in session, because
+    /// that is exactly what they are.
+    pub fn channels_dir(&self) -> PathBuf {
+        self.root.join("channels")
+    }
+
+    /// Where one channel keeps its state.
+    pub fn channel_dir(&self, channel: &str) -> PathBuf {
+        self.channels_dir().join(channel)
+    }
+
     /// Directory holding every artifact for one model tag, e.g.
     /// `~/ozgent/models/gemma4/12b`. Deleting it removes the tag completely;
     /// deleting its parent removes every tag of that model.
