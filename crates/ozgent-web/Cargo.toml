@@ -9,7 +9,6 @@ ozgent-core.workspace = true
 ozgent-llama.workspace = true
 ozgent-memory.workspace = true
 ozgent-tools.workspace = true
-ozgent-flow.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

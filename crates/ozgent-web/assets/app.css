@@ -257,23 +257,12 @@ body {
   padding: 10px;
   border-top: 1px solid var(--line);
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   /* Keeps the last row clear of a phone's home indicator. */
   padding-bottom: max(10px, env(safe-area-inset-bottom));
 }
-.sidebar-foot .foot-row { display: flex; gap: 8px; }
-.sidebar-foot .ghost-btn { width: auto; flex: 0 0 auto; justify-content: flex-start; padding-left: var(--s3); }
-.sidebar-foot .foot-row .ghost-btn { flex: 1; }
+.sidebar-foot .ghost-btn { width: auto; flex: 1; justify-content: flex-start; padding-left: var(--s3); }
 .sidebar-foot .ghost-btn.theme { flex: 0 0 auto; justify-content: center; padding: 7px var(--s3); }
-
-/* The section you are looking at. Ink, not amber: which page is open is not
-   something happening, it is where you are. */
-.sidebar-foot .ghost-btn.current {
-  color: var(--ink);
-  background: var(--raised);
-  border-color: var(--ink-faint);
-}
 
 /* The theme control: an icon and a word, so its state is readable rather than
    inferred from which of two shapes is showing. */

@@ -16,6 +16,5 @@ pub use embed::{Embedder, HashingEmbedder, cosine};
 pub use facts::{Candidate, parse_extraction, store_candidates};
 pub use retrieve::{Hit, Retriever};
 pub use store::{
-    ChannelChat, Conversation, Fact, OwnerKind, Scope, StoredFlow, StoredMessage, StoredRun,
-    Store, StoreError,
+    ChannelChat, Conversation, Fact, OwnerKind, Scope, StoredMessage, Store, StoreError,
 };

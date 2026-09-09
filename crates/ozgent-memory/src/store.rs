@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub struct Store {
     db: Connection,
@@ -44,32 +44,6 @@ pub struct ChannelChat {
     /// shows who a chat belongs to rather than an opaque id.
     pub display: String,
     pub last_seen_at: i64,
-}
-
-/// A stored workflow. `definition` is the JSON the canvas edits.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredFlow {
-    pub id: i64,
-    /// Stable public identifier, safe to put in a URL.
-    pub uuid: String,
-    pub name: String,
-    pub definition: String,
-    /// Whether triggers other than a manual run may fire.
-    pub enabled: bool,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-/// One time a workflow ran. `record` is the JSON step-by-step detail.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredRun {
-    pub id: i64,
-    pub flow_id: i64,
-    pub trigger: String,
-    pub status: String,
-    pub record: String,
-    pub ms: i64,
-    pub created_at: i64,
 }
 
 /// A stored message. `seq` orders messages within their conversation.
@@ -224,8 +198,9 @@ impl Store {
         if current < 5 {
             self.db.execute_batch(SCHEMA_V5)?;
         }
-        if current < 6 {
-            self.db.execute_batch(SCHEMA_V6)?;
+        // 6 is deliberately absent; see SCHEMA_V7.
+        if current < 7 {
+            self.db.execute_batch(SCHEMA_V7)?;
         }
 
         self.db
@@ -452,141 +427,6 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    }
-
-    // ---------------------------------------------------------- workflows
-
-    pub fn create_flow(&self, name: &str, definition: &str) -> Result<StoredFlow, StoreError> {
-        let now = now();
-        let uuid = new_uuid();
-        self.db.execute(
-            "INSERT INTO flows (uuid, name, definition, enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![uuid, name, definition, now],
-        )?;
-        let id = self.db.last_insert_rowid();
-        Ok(StoredFlow {
-            id,
-            uuid,
-            name: name.to_string(),
-            definition: definition.to_string(),
-            enabled: false,
-            created_at: now,
-            updated_at: now,
-        })
-    }
-
-    pub fn list_flows(&self) -> Result<Vec<StoredFlow>, StoreError> {
-        let mut stmt = self.db.prepare(
-            "SELECT id, uuid, name, definition, enabled, created_at, updated_at
-               FROM flows ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map([], read_flow)?.collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn get_flow(&self, id: i64) -> Result<Option<StoredFlow>, StoreError> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT id, uuid, name, definition, enabled, created_at, updated_at
-                   FROM flows WHERE id = ?1",
-                params![id],
-                read_flow,
-            )
-            .optional()?)
-    }
-
-    pub fn flow_by_uuid(&self, uuid: &str) -> Result<Option<StoredFlow>, StoreError> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT id, uuid, name, definition, enabled, created_at, updated_at
-                   FROM flows WHERE uuid = ?1",
-                params![uuid],
-                read_flow,
-            )
-            .optional()?)
-    }
-
-    pub fn save_flow(
-        &self,
-        id: i64,
-        name: &str,
-        definition: &str,
-        enabled: bool,
-    ) -> Result<(), StoreError> {
-        self.db.execute(
-            "UPDATE flows SET name = ?2, definition = ?3, enabled = ?4, updated_at = ?5
-              WHERE id = ?1",
-            params![id, name, definition, enabled, now()],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_flow(&self, id: i64) -> Result<(), StoreError> {
-        self.db.execute("DELETE FROM flows WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    /// Every flow whose triggers are allowed to fire.
-    pub fn enabled_flows(&self) -> Result<Vec<StoredFlow>, StoreError> {
-        let mut stmt = self.db.prepare(
-            "SELECT id, uuid, name, definition, enabled, created_at, updated_at
-               FROM flows WHERE enabled = 1 ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], read_flow)?.collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Record a run, and forget the oldest once there are more than `keep`.
-    ///
-    /// Trimmed on write rather than by a sweep: a flow on a one-minute schedule
-    /// writes half a million rows a year, and the interesting ones are always
-    /// the most recent.
-    pub fn add_run(
-        &self,
-        flow_id: i64,
-        trigger: &str,
-        status: &str,
-        record: &str,
-        ms: i64,
-        keep: i64,
-    ) -> Result<i64, StoreError> {
-        self.db.execute(
-            "INSERT INTO flow_runs (flow_id, trigger, status, record, ms, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![flow_id, trigger, status, record, ms, now()],
-        )?;
-        let id = self.db.last_insert_rowid();
-        self.db.execute(
-            "DELETE FROM flow_runs WHERE flow_id = ?1 AND id NOT IN
-                 (SELECT id FROM flow_runs WHERE flow_id = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![flow_id, keep],
-        )?;
-        Ok(id)
-    }
-
-    pub fn runs_for(&self, flow_id: i64, limit: i64) -> Result<Vec<StoredRun>, StoreError> {
-        let mut stmt = self.db.prepare(
-            "SELECT id, flow_id, trigger, status, record, ms, created_at
-               FROM flow_runs WHERE flow_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows =
-            stmt.query_map(params![flow_id, limit], read_run)?.collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn get_run(&self, id: i64) -> Result<Option<StoredRun>, StoreError> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT id, flow_id, trigger, status, record, ms, created_at
-                   FROM flow_runs WHERE id = ?1",
-                params![id],
-                read_run,
-            )
-            .optional()?)
     }
 
     // ----------------------------------------------------------- messages
@@ -982,30 +822,6 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-fn read_flow(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFlow> {
-    Ok(StoredFlow {
-        id: r.get(0)?,
-        uuid: r.get(1)?,
-        name: r.get(2)?,
-        definition: r.get(3)?,
-        enabled: r.get::<_, i64>(4)? != 0,
-        created_at: r.get(5)?,
-        updated_at: r.get(6)?,
-    })
-}
-
-fn read_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun> {
-    Ok(StoredRun {
-        id: r.get(0)?,
-        flow_id: r.get(1)?,
-        trigger: r.get(2)?,
-        status: r.get(3)?,
-        record: r.get(4)?,
-        ms: r.get(5)?,
-        created_at: r.get(6)?,
-    })
-}
-
 const SCHEMA_V1: &str = r#"
 CREATE TABLE conversations (
     id          INTEGER PRIMARY KEY,
@@ -1167,41 +983,21 @@ CREATE TABLE channel_chats (
 CREATE INDEX idx_channel_chats_conversation ON channel_chats(conversation_id);
 ";
 
-/// The v6 step: workflows, and a record of every time one ran.
+/// The v7 step: remove the workflow tables.
 ///
-/// The definition is stored as JSON rather than decomposed into tables. A flow
-/// is edited as a whole by the canvas, saved as a whole, and never queried by
-/// its parts — so tables of nodes and edges would buy nothing and cost a
-/// migration every time a node kind gains a setting.
+/// There is no v6 in this build, and that gap is the point. A v6 existed
+/// briefly and created `flows` and `flow_runs` for a workflow editor that was
+/// then dropped as scope. Simply deleting that step would take
+/// [`SCHEMA_VERSION`] back to 5, and any database that had already reached 6
+/// would be refused on the next start as "newer than this build understands" —
+/// a working install broken by a feature being removed from it.
 ///
-/// Runs are the opposite: they are queried, by flow and by recency, so they get
-/// their own rows. The step-by-step detail inside one is JSON for the same
-/// reason as the definition.
-const SCHEMA_V6: &str = "
-CREATE TABLE flows (
-    id          INTEGER PRIMARY KEY,
-    uuid        TEXT    NOT NULL,
-    name        TEXT    NOT NULL,
-    definition  TEXT    NOT NULL,
-    -- Whether triggers other than `run this now` may fire. Off by default:
-    -- a half-drawn flow on a schedule would start running as it was being
-    -- built.
-    enabled     INTEGER NOT NULL DEFAULT 0,
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX flows_uuid ON flows(uuid);
-
-CREATE TABLE flow_runs (
-    id          INTEGER PRIMARY KEY,
-    flow_id     INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
-    trigger     TEXT    NOT NULL,
-    status      TEXT    NOT NULL,
-    record      TEXT    NOT NULL,
-    ms          INTEGER NOT NULL,
-    created_at  INTEGER NOT NULL
-);
-CREATE INDEX idx_flow_runs_flow ON flow_runs(flow_id, id DESC);
+/// So the ladder steps over 6 and lands on 7, which drops what 6 created. A
+/// database at 5 runs it as a no-op; one at 6 is cleaned up; a fresh one never
+/// makes the tables at all.
+const SCHEMA_V7: &str = "
+DROP TABLE IF EXISTS flow_runs;
+DROP TABLE IF EXISTS flows;
 ";
 
 /// A random UUID v4.
@@ -1336,109 +1132,90 @@ mod channel_tests {
 }
 
 #[cfg(test)]
-mod flow_tests {
+mod migration_tests {
     use super::*;
 
-    fn store() -> Store {
-        Store::open_in_memory().expect("opening an in-memory store")
+    /// A database as the short-lived v6 left it: the workflow tables present,
+    /// and `user_version` already past what this build would otherwise expect.
+    fn at_v6() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA_V1).unwrap();
+        db.execute_batch(SCHEMA_V2).unwrap();
+        db.execute_batch(SCHEMA_V3).unwrap();
+        db.execute_batch(SCHEMA_V4).unwrap();
+        db.execute_batch(SCHEMA_V5).unwrap();
+        db.execute_batch(
+            "CREATE TABLE flows (id INTEGER PRIMARY KEY, uuid TEXT, name TEXT);
+             CREATE TABLE flow_runs (id INTEGER PRIMARY KEY, flow_id INTEGER
+                 REFERENCES flows(id) ON DELETE CASCADE);",
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 6i64).unwrap();
+        db
     }
 
-    #[test]
-    fn a_flow_is_stored_and_read_back_whole() {
-        let s = store();
-        let definition = r#"{"name":"daily","nodes":[],"edges":[]}"#;
-        let made = s.create_flow("daily", definition).unwrap();
-
-        let found = s.get_flow(made.id).unwrap().unwrap();
-        assert_eq!(found.definition, definition);
-        assert!(!found.enabled, "a new flow does not fire on its own");
-        assert_eq!(s.flow_by_uuid(&made.uuid).unwrap().unwrap().id, made.id);
-    }
-
-    #[test]
-    fn a_new_flow_is_not_enabled() {
-        // A half-drawn flow on a schedule would start running as it is built.
-        let s = store();
-        s.create_flow("draft", "{}").unwrap();
-        assert!(s.enabled_flows().unwrap().is_empty());
-    }
-
-    #[test]
-    fn enabling_is_what_puts_a_flow_in_front_of_the_scheduler() {
-        let s = store();
-        let f = s.create_flow("nightly", "{}").unwrap();
-        s.save_flow(f.id, "nightly", "{\"nodes\":[]}", true).unwrap();
-
-        let enabled = s.enabled_flows().unwrap();
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].definition, "{\"nodes\":[]}");
-    }
-
-    #[test]
-    fn runs_are_listed_newest_first() {
-        let s = store();
-        let f = s.create_flow("f", "{}").unwrap();
-        for i in 0..3 {
-            s.add_run(f.id, "t", "ok", &format!("{{\"n\":{i}}}"), 10, 50).unwrap();
-        }
-        let runs = s.runs_for(f.id, 10).unwrap();
-        assert_eq!(runs.len(), 3);
-        assert_eq!(runs[0].record, "{\"n\":2}");
-    }
-
-    #[test]
-    fn only_the_most_recent_runs_are_kept() {
-        // A flow on a one-minute schedule writes half a million rows a year,
-        // and the interesting ones are always the newest.
-        let s = store();
-        let f = s.create_flow("f", "{}").unwrap();
-        for i in 0..12 {
-            s.add_run(f.id, "t", "ok", &format!("{{\"n\":{i}}}"), 1, 5).unwrap();
-        }
-        let runs = s.runs_for(f.id, 100).unwrap();
-        assert_eq!(runs.len(), 5);
-        assert_eq!(runs[0].record, "{\"n\":11}");
-        assert_eq!(runs[4].record, "{\"n\":7}", "the oldest kept");
-    }
-
-    #[test]
-    fn trimming_one_flows_runs_leaves_anothers_alone() {
-        let s = store();
-        let a = s.create_flow("a", "{}").unwrap();
-        let b = s.create_flow("b", "{}").unwrap();
-        for _ in 0..10 {
-            s.add_run(a.id, "t", "ok", "{}", 1, 2).unwrap();
-        }
-        s.add_run(b.id, "t", "ok", "{}", 1, 2).unwrap();
-
-        assert_eq!(s.runs_for(a.id, 100).unwrap().len(), 2);
-        assert_eq!(s.runs_for(b.id, 100).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn deleting_a_flow_takes_its_runs_with_it() {
-        let s = store();
-        let f = s.create_flow("f", "{}").unwrap();
-        let run = s.add_run(f.id, "t", "ok", "{}", 1, 50).unwrap();
-        s.delete_flow(f.id).unwrap();
-
-        assert!(s.get_flow(f.id).unwrap().is_none());
-        assert!(s.get_run(run).unwrap().is_none(), "orphaned run rows");
-    }
-
-    #[test]
-    fn flows_are_listed_most_recently_edited_first() {
-        let s = store();
-        let older = s.create_flow("older", "{}").unwrap();
-        let newer = s.create_flow("newer", "{}").unwrap();
-        // `now()` has second resolution, so order the two explicitly rather
-        // than depending on the clock ticking between two inserts.
-        s.raw()
-            .execute("UPDATE flows SET updated_at = 1 WHERE id = ?1", params![older.id])
+    fn tables(store: &Store) -> Vec<String> {
+        let mut stmt = store
+            .raw()
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
 
-        let listed = s.list_flows().unwrap();
-        assert_eq!(listed[0].id, newer.id);
-        assert_eq!(listed[1].id, older.id);
+    #[test]
+    fn a_database_left_at_the_removed_version_still_opens() {
+        // The failure this exists to prevent: removing a feature takes
+        // SCHEMA_VERSION backwards, and every install that had already run the
+        // newer build refuses to start with "newer than this build
+        // understands" — a working install broken by a deletion.
+        let store = Store::init(at_v6()).expect("a v6 database must still open");
+        let version: i64 = store.raw().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn the_workflow_tables_are_cleaned_up_rather_than_left_behind() {
+        let store = Store::init(at_v6()).unwrap();
+        let names = tables(&store);
+        assert!(!names.contains(&"flows".to_string()), "{names:?}");
+        assert!(!names.contains(&"flow_runs".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_fresh_database_never_makes_them_in_the_first_place() {
+        let store = Store::open_in_memory().unwrap();
+        let names = tables(&store);
+        assert!(!names.iter().any(|n| n.starts_with("flow")), "{names:?}");
+        // And everything that is still a feature is there.
+        for expected in ["conversations", "messages", "facts", "embeddings", "channel_chats"] {
+            assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_database_steps_over_the_gap_without_stopping_there() {
+        // A v4 database has never seen either step; it must arrive at the
+        // current version in one open, with channels present and flows absent.
+        let db = Connection::open_in_memory().unwrap();
+        for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4] {
+            db.execute_batch(step).unwrap();
+        }
+        db.pragma_update(None, "user_version", 4i64).unwrap();
+
+        let store = Store::init(db).unwrap();
+        assert!(tables(&store).contains(&"channel_chats".to_string()));
+        let version: i64 = store.raw().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_genuinely_newer_database_is_still_refused() {
+        // The guard must still work; stepping over 6 is not a licence to open
+        // anything.
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA_V1).unwrap();
+        db.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        assert!(matches!(Store::init(db), Err(StoreError::FutureSchema { .. })));
     }
 }

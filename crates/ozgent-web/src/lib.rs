@@ -5,7 +5,6 @@
 //! in the other.
 
 pub mod api;
-pub mod flow;
 pub mod media;
 pub mod openai;
 pub mod permission;
