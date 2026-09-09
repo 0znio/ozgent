@@ -192,10 +192,18 @@ has_nvidia_gpu() {
   return 1
 }
 
+# Needs both halves: the loader to run against, and glslc to compile the
+# shaders at build time. Globbed rather than piped, for the reason above.
 has_vulkan() {
+  local d f
   have glslc || return 1
   have vulkaninfo && return 0
-  ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' && return 0
+  for d in /usr/lib /usr/lib64 /usr/local/lib /usr/lib/x86_64-linux-gnu \
+           /usr/lib/aarch64-linux-gnu; do
+    for f in "$d"/libvulkan.so*; do
+      [ -e "$f" ] && return 0
+    done
+  done
   return 1
 }
 
@@ -226,38 +234,136 @@ esac
 
 # -------------------------------------------------------------- dependencies
 
-# Packages every backend needs: a C++ compiler, CMake for llama.cpp, git,
-# curl for rustup, and python3 for the tools.
-pkgs_for() {
-  case "$PM" in
-    pacman) echo "base-devel cmake git curl python pkgconf" ;;
-    apt)    echo "build-essential cmake git curl python3 pkg-config libclang-dev" ;;
-    dnf)    echo "gcc gcc-c++ make cmake git curl python3 pkgconf-pkg-config clang-devel" ;;
-    zypper) echo "gcc gcc-c++ make cmake git curl python3 pkg-config clang-devel" ;;
-    apk)    echo "build-base cmake git curl python3 pkgconf clang-dev" ;;
-    brew)   echo "cmake git python3" ;;
+# What each requirement is called, per package manager. Keyed by the thing
+# actually needed rather than by package name, because that is what can be
+# tested for — `cmake` either runs or it does not, whereas "is base-devel
+# installed" has no portable answer.
+pkg_for() {
+  case "$1:$PM" in
+    cmake:*)          echo "cmake" ;;
+    git:*)            echo "git" ;;
+    curl:*)           echo "curl" ;;
+
+    python:pacman)    echo "python" ;;
+    python:*)         echo "python3" ;;
+
+    compiler:pacman)  echo "base-devel" ;;
+    compiler:apt)     echo "build-essential" ;;
+    compiler:dnf)     echo "gcc gcc-c++ make" ;;
+    compiler:zypper)  echo "gcc gcc-c++ make" ;;
+    compiler:apk)     echo "build-base" ;;
+    compiler:brew)    echo "" ;;          # Xcode command line tools, not brew
+
+    # bindgen loads libclang at run time; without it the mtmd bindings fail
+    # with a message about a shared library rather than about a package.
+    libclang:pacman)  echo "clang" ;;
+    libclang:apt)     echo "libclang-dev" ;;
+    libclang:dnf)     echo "clang-devel" ;;
+    libclang:zypper)  echo "clang-devel" ;;
+    libclang:apk)     echo "clang-dev" ;;
+    libclang:brew)    echo "llvm" ;;
+
+    pkgconfig:pacman) echo "pkgconf" ;;
+    pkgconfig:apt)    echo "pkg-config" ;;
+    pkgconfig:dnf)    echo "pkgconf-pkg-config" ;;
+    pkgconfig:*)      echo "pkg-config" ;;
+
+    cuda:pacman)      echo "cuda" ;;
+    cuda:apt)         echo "nvidia-cuda-toolkit" ;;
+    cuda:*)           echo "" ;;          # not in the default repos
+
+    vulkan:pacman)    echo "vulkan-headers vulkan-icd-loader shaderc" ;;
+    vulkan:apt)       echo "libvulkan-dev glslc spirv-tools" ;;
+    vulkan:dnf)       echo "vulkan-headers vulkan-loader-devel glslc" ;;
+    vulkan:zypper)    echo "vulkan-devel shaderc" ;;
+    vulkan:*)         echo "" ;;
   esac
 }
 
-# bindgen needs libclang; the CUDA and Vulkan builds need their own toolchains.
-extra_pkgs_for() {
-  case "$BACKEND:$PM" in
-    cuda:pacman)  echo "cuda" ;;
-    cuda:apt)     echo "nvidia-cuda-toolkit" ;;
-    cuda:dnf)     echo "" ;;   # not in the default repos; handled below
-    cuda:zypper)  echo "" ;;
-    vulkan:pacman) echo "vulkan-headers vulkan-icd-loader shaderc" ;;
-    vulkan:apt)    echo "libvulkan-dev glslc spirv-tools" ;;
-    vulkan:dnf)    echo "vulkan-headers vulkan-loader-devel glslc" ;;
-    vulkan:zypper) echo "vulkan-devel shaderc" ;;
-    *) echo "" ;;
+have_compiler() { have c++ || have g++ || have clang++; }
+
+# A tool can be installed and still not run. A partial upgrade leaves the
+# binary in place linked against a library that is no longer there: `command
+# -v` says present, and the build says "is `cmake` not installed?" — both
+# wrong, in a way that costs an afternoon. So the ones the build depends on
+# are actually executed, and the loader's own complaint is shown.
+BROKEN_TOOL=""
+BROKEN_WHY=""
+runs() {
+  local out
+  if out="$("$@" 2>&1)"; then
+    return 0
+  fi
+  BROKEN_TOOL="$1"
+  BROKEN_WHY="$(printf '%s' "$out" | head -1)"
+  return 1
+}
+
+# Present, runnable, or broken — three outcomes, not two.
+check_runnable() {
+  local what="$1" label="$2"; shift 2
+  if ! have "$1"; then
+    NEEDED="$NEEDED $what"
+    warn "$label — missing"
+    return 0
+  fi
+  if runs "$@"; then
+    ok "$label"
+    return 0
+  fi
+  bad "$label is installed but will not run"
+  note "$BROKEN_WHY"
+  case "$BROKEN_WHY" in
+    *"error while loading shared libraries"*|*"cannot open shared object"*)
+      note "A library it needs is missing or the wrong version — usually a"
+      note "half-finished system upgrade. Bring the system up to date:"
+      case "$PM" in
+        pacman) note "  sudo pacman -Syu" ;;
+        apt)    note "  sudo apt update && sudo apt full-upgrade" ;;
+        dnf)    note "  sudo dnf upgrade" ;;
+        zypper) note "  sudo zypper dup" ;;
+        *)      note "  (however your distribution does a full upgrade)" ;;
+      esac
+      ;;
   esac
+  die "$1 cannot run. Fix that, then re-run ./install.sh."
+}
+
+# bindgen dlopen()s libclang at run time, so what matters is whether the
+# shared object exists — not whether a compiler is installed.
+#
+# Tested by expanding globs rather than by piping `ls` or `ldconfig` into
+# `grep`: this script runs under `pipefail`, and a pipeline whose first command
+# exits non-zero fails even when the grep matched. `ls a b` where only `a`
+# exists is exactly that, and it reported libclang missing on a machine that
+# had three copies of it.
+have_libclang() {
+  local d f
+  for d in /usr/lib /usr/lib64 /usr/local/lib /usr/lib/x86_64-linux-gnu \
+           /usr/lib/aarch64-linux-gnu /usr/lib/llvm*/lib \
+           /opt/homebrew/opt/llvm/lib /usr/local/opt/llvm/lib; do
+    for f in "$d"/libclang.so* "$d"/libclang.dylib; do
+      [ -e "$f" ] && return 0
+    done
+  done
+  if have llvm-config; then
+    d="$(llvm-config --libdir 2>/dev/null || true)"
+    [ -n "$d" ] && { [ -e "$d/libclang.so" ] || [ -e "$d/libclang.dylib" ]; } && return 0
+  fi
+  return 1
 }
 
 install_pkgs() {
   [ $# -eq 0 ] && return 0
   case "$PM" in
-    pacman) run $SUDO pacman -S --needed --noconfirm "$@" ;;
+    # `-Syu`, not `-S`. Arch does not support partial upgrades: installing a
+    # package against a stale database pulls in a build that expects libraries
+    # newer than the ones on disk, and the result is a binary that exists and
+    # will not load — `cmake: error while loading shared libraries`. Doing that
+    # to someone's machine while installing something else is not acceptable,
+    # so the system is brought up to date first. That is what the prompt warns
+    # about.
+    pacman) run $SUDO pacman -Syu --needed --noconfirm "$@" ;;
     apt)    run $SUDO apt-get update -qq && run $SUDO apt-get install -y "$@" ;;
     dnf)    run $SUDO dnf install -y "$@" ;;
     zypper) run $SUDO zypper --non-interactive install "$@" ;;
@@ -269,34 +375,64 @@ install_pkgs() {
 
 step "Dependencies"
 
-if [ "$SKIP_DEPS" = "1" ]; then
-  warn "skipped (--skip-deps)"
-elif [ -z "$PM" ]; then
-  warn "no known package manager; install these yourself:"
-  note "a C++ compiler, cmake, git, curl, python3, and libclang"
-else
-  # Only the missing ones, so a re-run is quiet.
-  want="$(pkgs_for) $(extra_pkgs_for)"
-  missing=""
-  need_cmd() { have "$1" || missing="$missing $2"; }
-  need_cmd cmake  cmake
-  need_cmd git    git
-  need_cmd curl   curl
-  need_cmd python3 python3
-  have cc || have gcc || have clang || missing="$missing compiler"
-
-  if [ -z "$missing" ] && [ "$BACKEND" = "cpu" ]; then
-    ok "everything needed is already here"
+# What this machine is missing, by requirement. Reported either way, so
+# "already installed" is visible rather than inferred from silence.
+NEEDED=""
+# The test is passed as a command and its arguments, not as one string: a
+# quoted "have cmake" is a command with a space in its name, and bash says so
+# in a way that reads exactly like cmake being absent.
+check() {
+  what="$1"; label="$2"; shift 2
+  if "$@"; then
+    ok "$label"
   else
-    # shellcheck disable=SC2086
-    set -- $want
+    NEEDED="$NEEDED $what"
+    warn "$label — missing"
+  fi
+}
+check_runnable cmake "cmake" cmake --version
+check compiler  "C++ compiler" have_compiler
+check git       "git"          have git
+check curl      "curl"         have curl
+check python    "python3"      have python3
+check libclang  "libclang"     have_libclang
+have pkg-config || have pkgconf || NEEDED="$NEEDED pkgconfig"
+
+case "$BACKEND" in
+  cuda)   find_nvcc || NEEDED="$NEEDED cuda" ;;
+  vulkan) has_vulkan || NEEDED="$NEEDED vulkan" ;;
+esac
+
+# shellcheck disable=SC2086
+set -- $NEEDED
+if [ $# -eq 0 ]; then
+  ok "nothing to install"
+elif [ "$SKIP_DEPS" = "1" ]; then
+  warn "missing:$NEEDED — but --skip-deps was given"
+elif [ -z "$PM" ]; then
+  bad "missing:$NEEDED, and there is no known package manager here"
+  note "Install them by hand, then re-run with --skip-deps."
+  exit 1
+else
+  packages=""
+  for requirement in "$@"; do
+    packages="$packages $(pkg_for "$requirement")"
+  done
+  # shellcheck disable=SC2086
+  set -- $packages
+  if [ $# -eq 0 ]; then
+    warn "missing:$NEEDED, but $PM has no package for it here"
+  else
     echo "  ${B}$PM${R} will install:"
     note "$*"
+    [ "$PM" = "pacman" ] && note "and update the rest of the system, because Arch does not support partial upgrades"
     if confirm "Install them?"; then
-      install_pkgs "$@" || warn "some packages failed; continuing and hoping"
-      ok "packages installed"
+      # Not "continuing and hoping": a package manager that failed turns into
+      # a compiler error ten minutes later, and the real reason is here.
+      install_pkgs "$@" || die "$PM could not install those. Fix that, then re-run."
+      ok "installed"
     else
-      warn "skipped — the build may fail"
+      warn "skipped — the build will probably fail"
     fi
   fi
 fi
@@ -395,6 +531,26 @@ fi
 # --------------------------------------------------------------------- build
 
 step "Building"
+
+# Checked here rather than trusted from the step above: packages can install
+# and still leave nothing on PATH — a distribution that puts the compiler
+# somewhere unusual, a `brew` that needs `brew link`, a sudo that succeeded for
+# a different user. Failing now names the missing tool; failing later produces
+# an error from inside a build script that names a crate instead.
+if [ "$DRY_RUN" != "1" ]; then
+  blocked=""
+  { have cmake && runs cmake --version; } || blocked="$blocked cmake"
+  have_compiler   || blocked="$blocked a-C++-compiler"
+  have_libclang   || blocked="$blocked libclang"
+  [ "$BACKEND" = "cuda" ] && { find_nvcc || blocked="$blocked nvcc"; }
+  if [ -n "$blocked" ]; then
+    bad "cannot build: not on PATH:$blocked"
+    note "Installed but not found? Check PATH, then re-run."
+    note "Or build without a GPU:  ./install.sh --backend cpu"
+    die "missing build tools."
+  fi
+  ok "toolchain: cmake $(cmake --version | head -1 | awk '{print $3}'), $( (c++ --version 2>/dev/null || g++ --version) | head -1 | cut -c1-40)"
+fi
 
 if [ -z "$JOBS" ]; then
   JOBS="$(nproc 2>/dev/null || echo 4)"
