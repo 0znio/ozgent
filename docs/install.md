@@ -1,7 +1,15 @@
 # Installing ozgent on another machine
 
-Nothing is compiled on the target. The bundle carries a prebuilt binary, the
-Python tools it spawns, and an installer.
+Two ways, for two situations.
+
+**From source**, on a machine that can compile: clone the repository and run
+`./install.sh`. It handles the distribution's packages, the GPU backend, the
+build and the install. That is the normal path and this document is not about
+it — `./install.sh --help` is.
+
+**From a bundle**, for a machine that cannot or should not compile: the rest of
+this page. Nothing is compiled on the target; the bundle carries a prebuilt
+binary, the Python tools it spawns, and an installer.
 
 ## Build the bundle (on a machine with the toolchain)
 

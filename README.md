@@ -46,18 +46,38 @@ about to do — *before* it spends a minute generating the file contents.
 
 ## Install
 
-### From source
-
-Needs [Rust](https://rustup.rs) 1.85+, a C++ compiler and CMake. Python 3 is
-only needed for the tools.
-
 ```bash
 git clone https://github.com/0znio/ozgent
 cd ozgent
-cargo build --release --features cuda     # or vulkan, metal, or drop --features for CPU
+./install.sh
 ```
 
-The binary is `target/release/ozgent`; put it on your `PATH`.
+That works out your distribution, installs what the build needs, picks a GPU
+backend, compiles, and links `ozgent` onto your `PATH`. It is safe to re-run.
+
+Use `./install.sh --dry-run` first if you want to see what it would do.
+
+| | |
+|---|---|
+| `--backend cuda\|vulkan\|metal\|cpu` | override the detection |
+| `--prefix ~/.local` | install somewhere else |
+| `--skip-deps` | don't install system packages |
+| `--uninstall` | remove it again |
+
+Debian, Ubuntu, Arch, Fedora, openSUSE, Alpine and macOS are handled; anything
+else needs `--skip-deps` and a C++ compiler, CMake, git and Python 3.
+
+<details>
+<summary>Or build it yourself</summary>
+
+Needs [Rust](https://rustup.rs) 1.85+, a C++ compiler and CMake.
+
+```bash
+cargo build --release --features cuda   # or vulkan, metal, or nothing for CPU
+```
+
+The binary is `target/release/ozgent`.
+</details>
 
 ### On another machine
 
