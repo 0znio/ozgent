@@ -13,18 +13,22 @@ copies, and the reason for each is in its own `OZGENT.md`.
 These are third-party works redistributed here. ozgent's own MIT licence in the
 repository root covers ozgent, not them.
 
-## Before publishing
+## The licence files here
 
 The crates.io packages these were taken from do not carry their upstream
-licence files, so the copies here do not either. MIT requires the copyright and
-permission notice to travel with the code, so add them:
+licence files, so these were fetched from the upstream repositories — MIT and
+Apache-2.0 both require the notice to travel with the code, and the copyright
+line is part of the notice.
 
-    curl -o llama-cpp-sys-2/llama.cpp/LICENSE \
-      https://raw.githubusercontent.com/ggml-org/llama.cpp/master/LICENSE
-    curl -o llama-cpp-2/LICENSE \
-      https://raw.githubusercontent.com/utilityai/llama-cpp-rs/main/LICENSE
-    cp llama-cpp-2/LICENSE llama-cpp-sys-2/LICENSE
+| file | from |
+|---|---|
+| `llama-cpp-sys-2/llama.cpp/LICENSE` | [ggml-org/llama.cpp](https://raw.githubusercontent.com/ggml-org/llama.cpp/master/LICENSE) |
+| `llama-cpp-{2,sys-2}/LICENSE-MIT` | [utilityai/llama-cpp-rs](https://raw.githubusercontent.com/utilityai/llama-cpp-rs/main/LICENSE-MIT) |
+| `llama-cpp-{2,sys-2}/LICENSE-APACHE` | [utilityai/llama-cpp-rs](https://raw.githubusercontent.com/utilityai/llama-cpp-rs/main/LICENSE-APACHE) |
 
-Take them from the upstream repositories rather than writing them out here: the
-copyright line is part of the notice, and guessing it is worse than not having
-one.
+llama-cpp-rs is dual-licensed, so both files are kept: taking only one would be
+choosing on the user's behalf, which is the opposite of what "MIT OR Apache-2.0"
+means.
+
+The nested `llama.cpp/vendor/*` directories (cpp-httplib, nlohmann/json,
+miniaudio, stb) carry their own notices where upstream shipped them.
