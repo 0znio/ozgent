@@ -50,6 +50,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_SOURCE");
+    println!("cargo:source={}", source.display());
 }
 
 /// Every mtmd translation unit except the ones that build executables.
@@ -115,6 +116,18 @@ fn llama_cpp_source() -> Option<PathBuf> {
         return Some(PathBuf::from(explicit));
     }
 
+    // The workspace patches `llama-cpp-sys-2` to `vendor/`, so the tree in
+    // this repository is by definition the one being compiled. Checked first
+    // because it is the only lookup that cannot fail for a reason outside this
+    // repository: the two below depend on cmake having installed its package
+    // config in a particular place, or on a copy of the crate happening to be
+    // unpacked in the registry — and a machine that has never built the
+    // unpatched crate has no such copy. That is exactly a fresh clone, which
+    // is to say every clone but the author's.
+    if let Some(vendored) = vendored_source() {
+        return Some(vendored);
+    }
+
     // `llama-cpp-sys-2` declares `links = "llama"`, so its metadata reaches us
     // as DEP_LLAMA_*. Its cmake build directory records where it configured
     // from, which is the vendored source we need.
@@ -151,6 +164,21 @@ fn llama_cpp_source() -> Option<PathBuf> {
         }
     }
     best
+}
+
+/// `vendor/llama-cpp-sys-2/llama.cpp`, found by walking up from this crate.
+///
+/// Walked rather than hard-coded as `../../vendor/...` so that moving this
+/// crate within the workspace does not silently break the build.
+fn vendored_source() -> Option<PathBuf> {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
+    for dir in manifest.ancestors().take(6) {
+        let candidate = dir.join("vendor/llama-cpp-sys-2/llama.cpp");
+        if candidate.join("tools/mtmd/mtmd.cpp").is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn home_registry() -> Option<PathBuf> {
