@@ -1,1 +1,0 @@
-(w, _)|(w, _)| w as usize).unwrap_or(80)
