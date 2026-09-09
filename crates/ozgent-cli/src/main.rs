@@ -534,11 +534,17 @@ async fn pull(
             }
             Event::FileStart { name, index, total, size } => {
                 eprintln!("[{index}/{total}] {name}");
-                *bar.lock().unwrap() = Some(ozgent_hub::Bar::new(name, size, 28));
+                *bar.lock().unwrap() =
+                    Some(ozgent_hub::Bar::new(name, size, terminal_columns(), use_colour()));
             }
             Event::FileProgress { done, total, .. } => {
                 let mut guard = bar.lock().unwrap();
                 if let Some(b) = guard.as_mut() {
+                    // Re-read every draw so a resize mid-download is followed.
+                    // A line wider than the terminal wraps, and the redraw
+                    // then scrolls a screenful of bars instead of replacing
+                    // one.
+                    b.set_columns(terminal_columns());
                     // The bar decides when a redraw is due; on a fast link a
                     // write per chunk would cost more than the transfer.
                     if let Some(line) = b.update(done) {
@@ -1486,4 +1492,22 @@ async fn mcp(config: &Config) -> Result<()> {
         println!("Nothing is enabled.");
     }
     Ok(())
+}
+
+/// The terminal's width, or a conservative default when there is no terminal.
+///
+/// Eighty is the safe fallback: too wide and the line wraps into the scrolling
+/// mess this exists to prevent, too narrow only wastes space.
+fn terminal_columns() -> usize {
+    ozgent_render::crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
+/// Whether to colour the progress line.
+///
+/// Off when stderr is not a terminal — a log file full of escape sequences is
+/// worse than a plain one — and off when NO_COLOR is set, which is the
+/// convention every other tool honours.
+fn use_colour() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
 }

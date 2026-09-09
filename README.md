@@ -88,7 +88,7 @@ an installer — nothing is compiled on the target. See
 ### First run
 
 ```bash
-ozgent pull unsloth/Qwen3.5-4B-GGUF:Q4_K_M   # any GGUF repo on Hugging Face
+ozgent pull unsloth/Qwen3.5-4B-GGUF:Q4_K_M   # any GGUF repo, fetched in parallel
 ozgent list                                  # what you have
 ozgent default Qwen3.5-4B:Q4_K_M             # use it when none is named
 ozgent                                       # chat

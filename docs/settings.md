@@ -180,6 +180,24 @@ command = "npx"
 args    = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/notes"]
 ```
 
+## Downloads
+
+`ozgent pull` fetches a model as several ranges at once, which is several times
+faster than one connection — Hugging Face serves a single stream at a few MB/s
+however fast your link is.
+
+| | |
+|---|---|
+| `$OZGENT_DOWNLOAD_CONNECTIONS` | how many at once (default 8, max 32) |
+
+Set it to `1` for one connection, which is what a proxy or a rate-limited
+mirror may want.
+
+An interrupted download resumes. The file is fetched in 16 MB slices and a
+`.part.ranges` file beside it records which ones landed, so stopping costs at
+most the slices in flight rather than the whole file. A server that does not
+serve ranges is detected and falls back to a single connection.
+
 ## Seeing what is in force
 
 ```
