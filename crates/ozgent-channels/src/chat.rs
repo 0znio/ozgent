@@ -36,6 +36,15 @@ pub struct Msg {
     /// True in a group. Kept because "who may talk to ozgent" and "where may
     /// ozgent talk" are different questions with different answers.
     pub group: bool,
+
+    /// This is the account ozgent itself is logged in as, talking to itself.
+    ///
+    /// Only WhatsApp can produce it, because only WhatsApp links a *person's*
+    /// account rather than giving ozgent an identity of its own. It is the one
+    /// case that skips the allowlist: the sender is the person who scanned the
+    /// QR code, so asking them to also write their own number down would be a
+    /// rule with nobody on the other side of it.
+    pub own: bool,
 }
 
 impl Msg {
@@ -188,6 +197,7 @@ mod tests {
             text: String::new(),
             images: Vec::new(),
             group: false,
+            own: false,
         };
         assert_eq!(m.identities(), vec!["42"]);
         m.handle = Some("ada".into());

@@ -167,7 +167,9 @@ fn start(
                     Err(e) => return report(e.to_string()),
                 };
                 let state = paths.channel_dir("whatsapp").join("auth");
-                if let Err(e) = crate::whatsapp::run(wa.node, bridge, state, tx, rx).await {
+                if let Err(e) =
+                    crate::whatsapp::run(wa.node, bridge, state, wa.self_chat, tx, rx).await
+                {
                     report(e.to_string());
                 }
             });
@@ -324,9 +326,25 @@ async fn route(
 
 /// Whether this sender may talk to this channel.
 fn admitted(shared: &Arc<Shared>, kind: Kind, msg: &Msg) -> bool {
-    let config = snapshot(&shared.app);
+    admits_message(&snapshot(&shared.app), kind, msg)
+}
+
+/// The whole admission decision, as a function of the configuration alone.
+///
+/// Separated from the shared state so it can be tested directly: this is the
+/// rule that decides whether a stranger on the internet reaches this machine's
+/// tools, and it should not be reachable only through a running gateway.
+pub fn admits_message(config: &Config, kind: Kind, msg: &Msg) -> bool {
     if msg.group && kind == Kind::WhatsApp && !config.channels.whatsapp.groups {
         return false;
+    }
+    // Your own chat with yourself. The bridge only reports one when the
+    // setting is on, and the sender is the account that scanned the QR — so
+    // requiring them to also write their own number in `allow` would be a rule
+    // with nobody on the other side of it, and a confusing silence for anyone
+    // who turned the setting on and expected it to work.
+    if msg.own {
+        return true;
     }
     channels::admits(config.channels.access(kind).allow, &msg.identities())
 }
@@ -782,6 +800,69 @@ mod tests {
 
         let many: std::collections::HashSet<String> = (0..50).map(|_| pairing_code()).collect();
         assert!(many.len() > 40, "codes repeat: {} distinct of 50", many.len());
+    }
+
+    fn message(over: fn(&mut Msg)) -> Msg {
+        let mut m = Msg {
+            chat: "c".into(),
+            sender_id: "1555".into(),
+            handle: None,
+            name: "someone".into(),
+            text: "hello".into(),
+            images: Vec::new(),
+            group: false,
+            own: false,
+        };
+        over(&mut m);
+        m
+    }
+
+    #[test]
+    fn a_stranger_is_not_admitted() {
+        let config = Config::default();
+        assert!(!admits_message(&config, Kind::WhatsApp, &message(|_| {})));
+        assert!(!admits_message(&config, Kind::Telegram, &message(|_| {})));
+    }
+
+    #[test]
+    fn your_own_chat_with_yourself_needs_no_allowlist_entry() {
+        // The sender is the account that scanned the QR code. Requiring them
+        // to also write their own number down would be a rule with nobody on
+        // the other side of it, and reads as ozgent silently ignoring you.
+        let config = Config::default();
+        assert!(admits_message(&config, Kind::WhatsApp, &message(|m| m.own = true)));
+    }
+
+    #[test]
+    fn a_group_is_never_admitted_by_the_self_chat_rule() {
+        // `own` skips the allowlist, so it must not combine with a group —
+        // that would be a way for someone never allowlisted to steer ozgent
+        // through a group the operator is also in.
+        let config = Config::default();
+        let in_a_group = message(|m| {
+            m.own = true;
+            m.group = true;
+        });
+        assert!(!admits_message(&config, Kind::WhatsApp, &in_a_group));
+    }
+
+    #[test]
+    fn an_allowlisted_number_is_admitted_on_its_own_channel_only() {
+        let mut config = Config::default();
+        config.channels.whatsapp.allow = vec!["1555".into()];
+        assert!(admits_message(&config, Kind::WhatsApp, &message(|_| {})));
+        assert!(!admits_message(&config, Kind::Telegram, &message(|_| {})));
+    }
+
+    #[test]
+    fn a_group_is_answered_only_when_groups_are_switched_on() {
+        let mut config = Config::default();
+        config.channels.whatsapp.allow = vec!["1555".into()];
+        let group = message(|m| m.group = true);
+        assert!(!admits_message(&config, Kind::WhatsApp, &group));
+
+        config.channels.whatsapp.groups = true;
+        assert!(admits_message(&config, Kind::WhatsApp, &group));
     }
 
     #[test]

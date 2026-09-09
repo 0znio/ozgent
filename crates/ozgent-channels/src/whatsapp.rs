@@ -99,7 +99,13 @@ fn which_npm(node: &str) -> String {
 }
 
 /// Start the bridge process.
-fn spawn(node: &str, bridge: &Path, state: &Path, login: bool) -> anyhow::Result<Child> {
+fn spawn(
+    node: &str,
+    bridge: &Path,
+    state: &Path,
+    login: bool,
+    self_chat: bool,
+) -> anyhow::Result<Child> {
     std::fs::create_dir_all(state)?;
     let mut cmd = Process::new(node);
     cmd.arg(bridge.join("index.mjs"))
@@ -115,6 +121,9 @@ fn spawn(node: &str, bridge: &Path, state: &Path, login: bool) -> anyhow::Result
     if login {
         cmd.arg("--login").arg("1");
     }
+    // Passed rather than read by the bridge, so the one place that decides
+    // whether your own notes become prompts is `config.toml`.
+    cmd.arg("--self-chat").arg(if self_chat { "1" } else { "0" });
     cmd.spawn()
         .map_err(|e| anyhow::anyhow!("could not run {node}: {e}. Is Node installed?"))
 }
@@ -124,7 +133,7 @@ fn spawn(node: &str, bridge: &Path, state: &Path, login: bool) -> anyhow::Result
 /// Returns the account it linked. Runs to completion rather than in the
 /// background: linking is something a person does once, watching.
 pub async fn login(node: &str, bridge: &Path, state: &Path) -> anyhow::Result<String> {
-    let mut child = spawn(node, bridge, state, true)?;
+    let mut child = spawn(node, bridge, state, true, false)?;
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut lines = BufReader::new(stdout).lines();
     drain_stderr(&mut child);
@@ -168,6 +177,7 @@ pub async fn run(
     node: String,
     bridge: PathBuf,
     state: PathBuf,
+    self_chat: bool,
     tx: Sender<Inbound>,
     mut rx: UnboundedReceiver<Command>,
 ) -> anyhow::Result<()> {
@@ -176,7 +186,7 @@ pub async fn run(
             "the WhatsApp bridge is not installed. Run `ozgent channel install whatsapp`."
         );
     }
-    let mut child = spawn(&node, &bridge, &state, false)?;
+    let mut child = spawn(&node, &bridge, &state, false, self_chat)?;
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut stdin = child.stdin.take().expect("stdin was piped");
     drain_stderr(&mut child);
@@ -322,6 +332,7 @@ fn read_event(line: &str) -> Option<Event> {
                 text,
                 images,
                 group: value.get("group").and_then(|v| v.as_bool()).unwrap_or(false),
+                own: value.get("own").and_then(|v| v.as_bool()).unwrap_or(false),
             }))
         }
         _ => None,
@@ -371,6 +382,56 @@ fn describe(word: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bridge_never_answers_itself() {
+        // The filter lives in JavaScript because the bridge does, and it is
+        // the one piece where a mistake is unbounded rather than untidy: in
+        // the self-chat every message is `fromMe`, so a wrong test means
+        // ozgent answers its own answer forever on a real account. Run here so
+        // `cargo test` covers it; skipped when node is missing, since the
+        // bridge is optional.
+        let paths = ozgent_core::Paths::with_root("/nowhere/ozgent");
+        let bridge = locate(None, &paths).expect("the repository's bridge");
+        let run = std::process::Command::new("node")
+            .arg("--test")
+            .arg("filter.test.mjs")
+            .current_dir(&bridge)
+            .output();
+
+        let Ok(out) = run else {
+            eprintln!("skipping: node is not installed");
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn the_self_chat_is_reported_so_the_gateway_can_admit_it() {
+        let line = r#"{"type":"message","chat":"1555@s.whatsapp.net","sender":"1555","jid":"1555@s.whatsapp.net","name":"me","text":"remind me to call","own":true}"#;
+        let Some(Event::Message(m)) = read_event(line) else { panic!("not a message") };
+        assert!(m.own);
+    }
+
+    #[test]
+    fn a_message_without_the_flag_is_not_treated_as_your_own() {
+        // `own` skips the allowlist entirely, so its absence must never be
+        // read as true — an older bridge, or a field that failed to parse,
+        // must fail closed.
+        for line in [
+            r#"{"type":"message","chat":"c","sender":"1","name":"A","text":"hi"}"#,
+            r#"{"type":"message","chat":"c","sender":"1","name":"A","text":"hi","own":null}"#,
+            r#"{"type":"message","chat":"c","sender":"1","name":"A","text":"hi","own":"yes"}"#,
+        ] {
+            let Some(Event::Message(m)) = read_event(line) else { panic!("not a message") };
+            assert!(!m.own, "{line}");
+        }
+    }
 
     #[test]
     fn a_message_carries_both_names_the_sender_goes_by() {

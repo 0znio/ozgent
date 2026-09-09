@@ -312,7 +312,9 @@ async fn read_message(api: &Telegram, message: &serde_json::Value) -> Option<Msg
         return None;
     }
 
-    Some(Msg { chat: chat_id, sender_id, handle, name, text, images, group })
+    // Never true here: a Telegram bot has an identity of its own and cannot
+    // be the person messaging it. Only WhatsApp links a person's account.
+    Some(Msg { chat: chat_id, sender_id, handle, name, text, images, group, own: false })
 }
 
 /// Download the photo on a message, at the largest size within the cap.

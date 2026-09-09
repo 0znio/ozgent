@@ -7,6 +7,7 @@
 import { createRequire } from 'node:module'
 import { mkdirSync } from 'node:fs'
 import { createInterface } from 'node:readline'
+import { decide, numberOf, textOf } from './filter.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -77,6 +78,10 @@ for (let i = 2; i < process.argv.length; i += 2) {
 const stateDir = args.get('state') || process.env.OZGENT_WA_STATE
 // `login` exits as soon as the device is linked; the gateway keeps running.
 const once = args.has('login')
+// Answer in the chat you have with yourself. Off unless asked for: plenty of
+// people use that chat as a notepad, and having an assistant reply to a
+// shopping list is not a feature.
+const selfChat = args.get('self-chat') === '1'
 
 if (!stateDir) {
   send({ type: 'fatal', reason: 'no --state directory given' })
@@ -86,28 +91,27 @@ mkdirSync(stateDir, { recursive: true })
 
 /** Messages this process has sent, by the token ozgent gave them. */
 const sent = new Map()
+/**
+ * Ids of messages this process sent, so its own replies are not read back as
+ * new questions. Only matters in the self-chat, where everything — ours and
+ * yours alike — is `fromMe`. Bounded, because a long-running gateway would
+ * otherwise grow this forever.
+ */
+const ourIds = new Set()
+const OUR_IDS_KEPT = 500
+
+function remember (key) {
+  if (!key || !key.id) return
+  ourIds.add(key.id)
+  if (ourIds.size > OUR_IDS_KEPT) ourIds.delete(ourIds.values().next().value)
+}
+
+/** This account's own JID, which is also the id of the self-chat. */
+let selfJid = null
 let sock = null
 let stopping = false
 
 // ------------------------------------------------------------------ helpers
-
-/** The phone number behind a JID, digits only. */
-function numberOf (jid) {
-  if (!jid) return ''
-  return String(jid).split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-}
-
-function textOf (message) {
-  if (!message) return ''
-  return (
-    message.conversation ||
-    (message.extendedTextMessage && message.extendedTextMessage.text) ||
-    (message.imageMessage && message.imageMessage.caption) ||
-    (message.videoMessage && message.videoMessage.caption) ||
-    (message.documentMessage && message.documentMessage.caption) ||
-    ''
-  )
-}
 
 // A vision model resizes to a few hundred pixels, so a larger download buys
 // nothing — and the sender is remote, so the size is not ours to trust.
@@ -160,6 +164,9 @@ async function connect () {
 
     if (connection === 'open') {
       const me = sock.user && sock.user.id
+      // The JID carries a device suffix (`:12`) that chat ids never have, so
+      // it is rebuilt from the number to be comparable with `remoteJid`.
+      selfJid = numberOf(me) ? `${numberOf(me)}@s.whatsapp.net` : null
       send({ type: 'ready', who: numberOf(me) ? '+' + numberOf(me) : 'this account' })
       if (once) {
         // Give the credentials a moment to finish being written before the
@@ -193,14 +200,10 @@ async function connect () {
     // `append` is history being filled in behind us, not something just said.
     if (type !== 'notify') return
     for (const m of messages) {
-      if (!m.message || (m.key && m.key.fromMe)) continue
+      const verdict = decide(m, { selfChat, selfJid, ourIds })
+      if (!verdict) continue
+      const { chat, senderJid, group, own } = verdict
 
-      const chat = m.key.remoteJid || ''
-      // Status updates are broadcast to everyone; they are not a conversation.
-      if (chat === 'status@broadcast') continue
-
-      const group = chat.endsWith('@g.us')
-      const senderJid = group ? m.key.participant : chat
       const text = textOf(m.message)
       const image = await imageOf(m)
       if (!text.trim() && !image) continue
@@ -213,6 +216,10 @@ async function connect () {
         name: m.pushName || numberOf(senderJid) || 'someone',
         text,
         group,
+        // True only for your own chat with yourself: the account that scanned
+        // the QR, which ozgent is logged in as. ozgent admits that without an
+        // allowlist entry, because it is definitionally the operator.
+        own,
         image
       })
     }
@@ -240,7 +247,10 @@ async function handle (command) {
 
     case 'post': {
       const result = await sock.sendMessage(command.chat, { text: command.text })
-      if (result && result.key) sent.set(command.token, { key: result.key, chat: command.chat })
+      if (result && result.key) {
+        sent.set(command.token, { key: result.key, chat: command.chat })
+        remember(result.key)
+      }
       break
     }
 
@@ -249,7 +259,8 @@ async function handle (command) {
       const known = sent.get(command.token)
       if (!known) break
       try {
-        await sock.sendMessage(known.chat, { text: command.text, edit: known.key })
+        const result = await sock.sendMessage(known.chat, { text: command.text, edit: known.key })
+        if (result && result.key) remember(result.key)
       } catch (e) {
         // WhatsApp refuses to edit a message past about fifteen minutes, and
         // caps how many times one may be edited. A refused edit is a cosmetic

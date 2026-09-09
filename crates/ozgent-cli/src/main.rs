@@ -1240,6 +1240,12 @@ async fn channel(paths: &Paths, mut config: Config, command: ChannelCommand) -> 
                 println!();
                 println!("  [channels.whatsapp]");
                 println!("  enabled = true");
+                println!();
+                println!("To talk to it in your own chat with yourself, add:");
+                println!();
+                println!("  self_chat = true");
+                println!();
+                println!("Leave that off if you use that chat as a notepad.");
                 Ok(())
             }
         },
@@ -1328,6 +1334,14 @@ fn channel_status(paths: &Paths, config: &Config) {
             Kind::WhatsApp => {
                 let linked = paths.channel_dir("whatsapp").join("auth").join("creds.json").is_file();
                 println!("    linked    {}", if linked { "yes" } else { "no" });
+                println!(
+                    "    self-chat {}",
+                    if config.channels.whatsapp.self_chat {
+                        "on — your own notes are answered"
+                    } else {
+                        "off"
+                    }
+                );
                 let installed = ozgent_channels::whatsapp::locate(
                     config.channels.whatsapp.bridge.as_deref(),
                     paths,

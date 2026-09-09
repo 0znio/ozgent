@@ -199,6 +199,20 @@ pub struct WhatsApp {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge: Option<PathBuf>,
 
+    /// Answer in the chat you have with yourself.
+    ///
+    /// The bridge links your own account, so ozgent *is* your number: your own
+    /// "Message yourself" chat is the natural place to talk to it, on the
+    /// number you already have and with no second SIM.
+    ///
+    /// Off by default, and the reason is not caution about security. Plenty of
+    /// people use that chat as a notepad, and an assistant that starts
+    /// answering a shopping list has broken something that was working.
+    ///
+    /// The self-chat needs no `allow` entry: it is, definitionally, the
+    /// account that scanned the QR code.
+    pub self_chat: bool,
+
     /// Answer chats you are in but were not addressed in — group chats.
     ///
     /// Off by default and deliberately awkward to turn on: a bot that replies
@@ -216,6 +230,7 @@ impl Default for WhatsApp {
             stream: true,
             node: "node".into(),
             bridge: None,
+            self_chat: false,
             groups: false,
         }
     }
@@ -362,6 +377,7 @@ mod tests {
             enabled = true
             allow = ["15551234567"]
             stream = false
+            self_chat = true
             groups = true
             node = "/opt/node/bin/node"
             bridge = "/srv/ozgent/bridge/whatsapp"
@@ -370,6 +386,7 @@ mod tests {
         assert_eq!(config.channels.model.as_deref(), Some("coder"));
         assert_eq!(config.channels.telegram.allow.len(), 2);
         assert!(!config.channels.whatsapp.stream);
+        assert!(config.channels.whatsapp.self_chat);
         assert!(config.channels.whatsapp.groups);
         assert_eq!(config.channels.active(), vec![Kind::Telegram, Kind::WhatsApp]);
     }

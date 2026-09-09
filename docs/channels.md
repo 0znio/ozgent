@@ -105,6 +105,40 @@ and allow yourself:
 
     ozgent channel allow whatsapp 15551234567
 
+### Talking to it in your own chat
+
+Because the bridge links *your* account, ozgent is your number — it is not a
+separate contact you message. The natural place to talk to it is therefore the
+chat WhatsApp gives you with yourself ("Message yourself"), on the number you
+already have and with no second SIM:
+
+```toml
+[channels.whatsapp]
+enabled   = true
+self_chat = true
+```
+
+Then just type in that chat. Nothing else is needed — the self-chat needs no
+`allow` entry, because the sender is the account that scanned the QR code.
+
+With `self_chat = true` and `allow` left empty, ozgent answers **only you** and
+ignores everyone who messages your number. That is probably the setup you want.
+
+It is off by default for one reason: plenty of people use that chat as a
+notepad, and an assistant that starts replying to a shopping list has broken
+something that was working.
+
+Everything in that chat is "from you" as far as WhatsApp is concerned —
+including ozgent's own replies — so the bridge tracks the messages it sent and
+ignores its own edits, or it would answer itself in a loop. That filter is
+`bridge/whatsapp/filter.mjs` and is tested on its own.
+
+### Answering other people
+
+If you leave `self_chat` off and allowlist someone else, ozgent replies to them
+**as you**, from your number. That is a different thing from a personal
+assistant, and worth being deliberate about.
+
 There are no buttons on WhatsApp, so a permission question arrives as numbered
 options and is answered by typing a number.
 
@@ -171,12 +205,13 @@ tools   = []        # omit the key entirely to offer every tool
 stream  = true      # edit one message as the reply is written
 
 [channels.whatsapp]
-enabled = false
-allow   = []        # phone numbers (digits) or full JIDs
-tools   = []
-stream  = true
-groups  = false     # answer in group chats
-node    = "node"    # interpreter for the bridge
+enabled   = false
+allow     = []      # phone numbers (digits) or full JIDs
+tools     = []
+stream    = true
+self_chat = false   # answer in your own "Message yourself" chat
+groups    = false   # answer in group chats
+node      = "node"  # interpreter for the bridge
 # bridge = "/path/to/bridge/whatsapp"   # found beside the executable otherwise
 ```
 
@@ -184,6 +219,9 @@ node    = "node"    # interpreter for the bridge
 conversation. It never prints the token.
 
 ## When something is wrong
+
+**WhatsApp ignores what I type to myself.** `self_chat` is off by default;
+turn it on. `ozgent channel status` says which it is.
 
 **Nothing is answered.** Almost always the allowlist. `ozgent channel status`
 says who is on it. A message from someone not on it is logged and otherwise
