@@ -586,7 +586,13 @@ fi
 
 # ------------------------------------------------------------------ install
 
-step "Installing"
+# Saying which it is answers the question anyone re-running this has.
+if [ -x "$LIBDIR/bin/ozgent" ]; then
+  step "Updating the install at $LIBDIR"
+  note "replacing $("$LIBDIR/bin/ozgent" --version 2>/dev/null || echo "an earlier build")"
+else
+  step "Installing"
+fi
 
 writable_or_sudo() {
   if [ -w "$(dirname "$1")" ] || mkdir -p "$1" 2>/dev/null; then echo ""; else echo "$SUDO"; fi
@@ -598,10 +604,26 @@ run $AS mkdir -p "$LIBDIR/bin" "$PREFIX/bin"
 # Replaced wholesale rather than merged, so a file from an older version
 # cannot survive into a new install.
 run $AS rm -rf "$LIBDIR/python" "$LIBDIR/docs"
+
+# Unlinked before it is replaced. Copying over a binary that is currently
+# executing fails with ETXTBSY — "text file busy" — so updating while
+# `ozgent web` or `ozgent gateway` is running would otherwise stop here.
+# Unlinking never fails that way, and a process already running keeps the
+# inode it started from until it exits.
+run $AS rm -f "$LIBDIR/bin/ozgent"
 run $AS cp "$BINARY" "$LIBDIR/bin/ozgent"
 run $AS cp -r "$SRC/python" "$LIBDIR/python"
 [ -d "$SRC/docs" ] && run $AS cp -r "$SRC/docs" "$LIBDIR/docs"
-[ -d "$SRC/bridge" ] && run $AS cp -r "$SRC/bridge" "$LIBDIR/bridge"
+
+# Updated in place rather than replaced, for two reasons. `cp -r a/bridge
+# b/bridge` copies *into* the target once it exists, so a second run would
+# nest it as b/bridge/bridge. And `ozgent channel install whatsapp` puts a
+# node_modules under here — thirty megabytes the user was told to install,
+# which an update should not silently throw away.
+if [ -d "$SRC/bridge" ]; then
+  run $AS mkdir -p "$LIBDIR/bridge"
+  run $AS cp -a "$SRC/bridge/." "$LIBDIR/bridge/"
+fi
 run $AS chmod 755 "$LIBDIR/bin/ozgent"
 
 # The binary finds its Python tools by walking up from its own path, which is

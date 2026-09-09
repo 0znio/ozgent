@@ -1006,24 +1006,32 @@ DROP TABLE IF EXISTS flows;
 /// requirements are the version/variant bits and enough entropy that two
 /// conversations never collide.
 fn new_uuid() -> String {
-    let mut bytes = [0u8; 16];
-    // Two independent sources so a coarse clock cannot produce a duplicate:
-    // the nanosecond timestamp, and the address of a fresh allocation.
+    // A counter, a clock and the process id, in that order of importance.
+    //
+    // The counter is what actually guarantees uniqueness: two calls in the
+    // same process differ in it no matter what the clock did. The previous
+    // version claimed two independent sources — the clock and the address of a
+    // fresh allocation — but the allocator hands back the *same* address every
+    // time when the box is freed immediately, so there was only ever one
+    // source. A loop fast enough to read the same nanosecond twice then
+    // produced the same id twice, which is exactly what a continuous
+    // integration runner does.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let entropy = {
-        let boxed = Box::new(0u8);
-        let addr = Box::into_raw(boxed) as usize;
-        // SAFETY: reclaimed immediately; only its address was wanted.
-        unsafe { drop(Box::from_raw(addr as *mut u8)) };
-        addr as u128
-    };
-    let mixed = nanos ^ (entropy.rotate_left(64)) ^ (std::process::id() as u128) << 96;
-    bytes.copy_from_slice(&mixed.to_be_bytes());
 
-    // Stir, so adjacent timestamps do not produce adjacent-looking ids.
+    // The counter occupies bits nothing else writes, so distinct calls always
+    // produce a distinct value here. The clock and the pid separate processes,
+    // which the counter cannot: two of them start at zero.
+    let mixed = nanos ^ (sequence << 64) ^ ((std::process::id() as u128) << 96);
+    let mut bytes = mixed.to_be_bytes();
+
+    // Stir, so adjacent ids do not look adjacent — the point of a public
+    // identifier is that it says nothing about how many came before it.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (i, b) in bytes.iter_mut().enumerate() {
         hash ^= *b as u64;
@@ -1039,6 +1047,56 @@ fn new_uuid() -> String {
         h(&bytes[0..4]), h(&bytes[4..6]), h(&bytes[6..8]), h(&bytes[8..10]), h(&bytes[10..16])
     )
 }
+
+#[cfg(test)]
+mod uuid_tests {
+    use super::new_uuid;
+
+    #[test]
+    fn ids_are_unique_however_fast_they_are_asked_for() {
+        // The failure this replaces needed no more than a loop and a coarse
+        // clock, and it surfaced as a UNIQUE constraint violation in a test
+        // that created fifty conversations. Fifty was not enough to catch it
+        // on every machine; this is.
+        const N: usize = 200_000;
+        let ids: std::collections::HashSet<String> = (0..N).map(|_| new_uuid()).collect();
+        assert_eq!(ids.len(), N, "{} duplicates", N - ids.len());
+    }
+
+    #[test]
+    fn ids_are_unique_across_threads() {
+        // `create_conversation` is reachable from the web server, the terminal
+        // and the messaging gateway at once.
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..10_000).map(|_| new_uuid()).collect::<Vec<_>>()))
+            .collect();
+        let all: Vec<String> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let unique: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "{} duplicates", all.len() - unique.len());
+    }
+
+    #[test]
+    fn an_id_is_shaped_like_a_uuid_v4() {
+        let id = new_uuid();
+        assert_eq!(id.len(), 36, "{id}");
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12], "{id}");
+        assert!(parts[2].starts_with('4'), "version nibble: {id}");
+        assert!(matches!(&parts[3][..1], "8" | "9" | "a" | "b"), "variant nibble: {id}");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{id}");
+    }
+
+    #[test]
+    fn consecutive_ids_do_not_look_consecutive() {
+        // A public identifier that counts up tells anyone holding one how many
+        // exist, which is the reason it is not the row id.
+        let a = new_uuid();
+        let b = new_uuid();
+        let differing = a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count();
+        assert!(differing > 8, "too similar:\n  {a}\n  {b}");
+    }
+}
+
 
 #[cfg(test)]
 mod channel_tests {
