@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # llama.cpp is compiled from source by llama-cpp-sys-2, so CMake and a
+      # C++ toolchain are the real prerequisites here — not Rust.
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+      # That first llama.cpp build is ten minutes; every run after it is
+      # seconds. Without this the workflow is unusable.
+      - uses: Swatinem/rust-cache@v2
+
+      # No GPU feature: the CI runner has no card, and the CPU build exercises
+      # the same Rust.
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest -q
+        working-directory: python
