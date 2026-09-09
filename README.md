@@ -52,7 +52,7 @@ Needs [Rust](https://rustup.rs) 1.85+, a C++ compiler and CMake. Python 3 is
 only needed for the tools.
 
 ```bash
-git clone https://github.com/euc1idia/ozgent
+git clone https://github.com/0znio/ozgent
 cd ozgent
 cargo build --release --features cuda     # or vulkan, metal, or drop --features for CPU
 ```
@@ -204,4 +204,5 @@ Early. It works, it is tested, and the interfaces still move.
 it, and **has no password** — use `--host 127.0.0.1` on a network you don't
 trust.
 
-MIT licensed.
+MIT licensed. `vendor/` carries patched copies of llama.cpp and its Rust
+bindings, under their own licences — see [vendor/README.md](vendor/README.md).
