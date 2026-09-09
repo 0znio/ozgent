@@ -8,7 +8,9 @@
 pub mod preamble;
 pub mod host;
 pub mod protocol;
+pub mod source;
 
 pub use host::{HostConfig, HostError, ToolCallError, ToolHost, resolve_runtime};
 pub use protocol::{PROTOCOL_VERSION, RpcError, ToolManifest};
 pub use preamble::{MEDIA_RULE, first_line, tool_preamble};
+pub use source::{Boxed, Shadowed, Toolbox, ToolSource};

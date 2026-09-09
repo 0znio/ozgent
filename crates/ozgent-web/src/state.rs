@@ -29,6 +29,10 @@ pub async fn discover_tools(
 
     let host_config = ozgent_tools::HostConfig::from_config(&tools_config, paths)?;
     let host = ozgent_tools::ToolHost::start(host_config).await?;
+    // MCP servers too: the settings page lists what the model can actually
+    // reach, and a tool from a server is no less a tool.
+    let (sources, _) = ozgent_mcp::connect_all(&config.mcp).await;
+    let host = ozgent_tools::Toolbox::new(Some(host), sources);
 
     let mut out: Vec<ToolSummary> = host
         .tools()
@@ -126,10 +130,24 @@ impl App {
     }
 }
 
-/// Start the Python tool worker for the server's lifetime.
+/// Start the Python tool worker and every MCP server, for the server's life.
 pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools> {
     let host_config = ozgent_tools::HostConfig::from_config(&config.tools, paths)?;
-    let host = ozgent_tools::ToolHost::start(host_config).await?;
+    let python = ozgent_tools::ToolHost::start(host_config).await?;
+    // A server that will not start is reported and skipped: one bad entry in
+    // config.toml must not take away the tools that do work.
+    let (sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
+    for problem in &problems {
+        tracing::warn!("mcp: {problem}");
+    }
+
+    let host = ozgent_tools::Toolbox::new(Some(python), sources);
+    for shadowed in host.shadowed() {
+        tracing::warn!(
+            "{} from {} is not offered: {} already has that name",
+            shadowed.name, shadowed.from, shadowed.kept
+        );
+    }
     tracing::info!("tools ready: {} available", host.tools().len());
     Ok(Tools {
         host: std::sync::Arc::new(host),

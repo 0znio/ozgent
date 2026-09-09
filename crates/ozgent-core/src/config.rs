@@ -39,6 +39,9 @@ pub struct Config {
     /// until deliberately configured — see [`crate::channels`].
     pub channels: crate::channels::ChannelsConfig,
 
+    /// Tools offered by Model Context Protocol servers — see [`crate::mcp`].
+    pub mcp: crate::mcp::McpConfig,
+
     pub embedding: EmbeddingConfig,
 }
 

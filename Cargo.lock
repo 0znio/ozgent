@@ -1384,6 +1384,7 @@ dependencies = [
  "ozgent-core",
  "ozgent-hub",
  "ozgent-llama",
+ "ozgent-mcp",
  "ozgent-memory",
  "ozgent-render",
  "ozgent-tools",
@@ -1432,6 +1433,20 @@ dependencies = [
  "minijinja-contrib",
  "ozgent-core",
  "ozgent-mtmd-sys",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ozgent-mcp"
+version = "0.1.0"
+dependencies = [
+ "ozgent-core",
+ "ozgent-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -1492,6 +1507,7 @@ dependencies = [
  "image",
  "ozgent-core",
  "ozgent-llama",
+ "ozgent-mcp",
  "ozgent-memory",
  "ozgent-tools",
  "serde",

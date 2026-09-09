@@ -1,0 +1,20 @@
+[package]
+name = "ozgent-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ozgent-core.workspace = true
+ozgent-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "time"] }
+tracing.workspace = true
+# rustls rather than native-tls, as everywhere else: no OpenSSL headers to
+# build against, so `cargo install ozgent` works on a bare machine.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "charset", "http2"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

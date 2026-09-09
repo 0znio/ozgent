@@ -15,7 +15,7 @@
 //! blocks on the GPU.
 
 use ozgent_core::{Config, Message, Paths, ThinkingMode};
-use ozgent_tools::ToolHost;
+use ozgent_tools::Toolbox;
 use std::sync::Arc;
 use ozgent_llama::engine::{Engine, StopReason};
 use ozgent_llama::thinking::{Chunk, ThinkingFilter};
@@ -148,7 +148,10 @@ pub type LoadedProjector<'a> = ozgent_llama::mtmd::Projector<'a>;
 /// runtime handle rather than blocking the executor that serves HTTP.
 #[derive(Clone)]
 pub struct Tools {
-    pub host: Arc<ToolHost>,
+    /// Everything the model can call: ozgent's own Python tools and whatever
+    /// the configured MCP servers offer, merged so nothing above this layer
+    /// has to know which is which.
+    pub host: Arc<Toolbox>,
     pub runtime: tokio::runtime::Handle,
 }
 

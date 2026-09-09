@@ -12,7 +12,7 @@ use ozgent_llama::thinking::{Chunk, ThinkingFilter};
 use ozgent_llama::toolcall;
 use ozgent_memory::{Budget, ContextBuilder, HashingEmbedder, OwnerKind, Store};
 use ozgent_render::{Style, Theme};
-use ozgent_tools::ToolHost;
+use ozgent_tools::Toolbox;
 use crate::tui::{Submission, Ui};
 use std::io::Write;
 
@@ -75,7 +75,7 @@ pub struct Chat<'a> {
     session: Session<'a>,
     store: Store,
     embedder: Box<dyn ozgent_memory::Embedder>,
-    tools: Option<ToolHost>,
+    tools: Option<Toolbox>,
     /// The conversation being written to, once there is one.
     ///
     /// `None` until the first message. Opening a chat and closing it again

@@ -15,6 +15,7 @@ ozgent-llama.workspace = true
 ozgent-memory.workspace = true
 ozgent-render.workspace = true
 ozgent-tools.workspace = true
+ozgent-mcp.workspace = true
 ozgent-web.workspace = true
 ozgent-channels.workspace = true
 anyhow.workspace = true

@@ -38,6 +38,11 @@ its own user.
 | `run_command` | run one allowed program | execute | `shell = true` + allowlist |
 | `get_temperature` | example tool | read | — |
 
+Tools can also come from [MCP servers](mcp.md). They go through everything
+below unchanged, with one difference stated there: a server's claim that a tool
+is read-only is not believed unless you mark that server trusted, so out of the
+box every tool from a server asks.
+
 ## Deciding what runs
 
 When a tool asks, the terminal shows the question on the bar above the status

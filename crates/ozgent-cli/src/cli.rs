@@ -286,6 +286,13 @@ pub enum Command {
         command: ToolsCommand,
     },
 
+    /// Show the Model Context Protocol servers and what they offer.
+    ///
+    /// Connects to each one exactly as a chat would, so what it prints is what
+    /// the model will actually be given — including the servers that failed,
+    /// and why.
+    Mcp,
+
     /// Read or change configuration.
     Config {
         #[command(subcommand)]

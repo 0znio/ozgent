@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{ChannelCommand, Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
 use ozgent_core::{Config, ModelRef, Paths};
-use ozgent_tools::{HostConfig, ToolHost};
+use ozgent_tools::{HostConfig, ToolHost, Toolbox};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
             gateway(paths, config, web, &host, port, options.to_options()?).await
         }
         Some(Command::Channel { command }) => channel(&paths, config, command).await,
+        Some(Command::Mcp) => mcp(&config).await,
         Some(Command::Serve { port, host, api_key, options }) => {
             // The environment is the right place for a secret; a flag lands in
             // shell history and in `ps`.
@@ -591,8 +592,8 @@ async fn tools(paths: &Paths, config: &Config, command: ToolsCommand) -> Result<
             println!(
                 "{} tools · python {} · worker {}",
                 host.tools().len(),
-                host.python_version(),
-                host.worker_version()
+                host.python().map(|p| p.python_version()).unwrap_or("—"),
+                host.python().map(|p| p.worker_version()).unwrap_or("—")
             );
             for t in host.tools() {
                 println!("\n{}", t.name);
@@ -600,7 +601,7 @@ async fn tools(paths: &Paths, config: &Config, command: ToolsCommand) -> Result<
                 // that visible, and tells anyone adding their own where the
                 // built-ins live to copy from.
                 if let Some(source) = host.source_of(&t.name) {
-                    println!("  {}", shorten_home(source));
+                    println!("  {}", shorten_home(&source));
                 }
                 if !t.description.is_empty() {
                     for line in t.description.lines() {
@@ -633,11 +634,23 @@ async fn tools(paths: &Paths, config: &Config, command: ToolsCommand) -> Result<
     result
 }
 
-pub(crate) async fn start_tools(paths: &Paths, config: &Config) -> Result<ToolHost> {
+/// Everything the model can call: ozgent's own Python tools, plus whatever
+/// the configured MCP servers offer.
+///
+/// A server that will not start is reported and skipped rather than fatal —
+/// one broken entry in `config.toml` must not take away the tools that work,
+/// and must certainly not stop `ozgent chat` opening.
+pub(crate) async fn start_tools(paths: &Paths, config: &Config) -> Result<Toolbox> {
     let host_config = HostConfig::from_config(&config.tools, paths)?;
-    ToolHost::start(host_config)
+    let python = ToolHost::start(host_config)
         .await
-        .context("starting the Python tool worker")
+        .context("starting the Python tool worker")?;
+
+    let (sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
+    for problem in &problems {
+        eprintln!("warning: mcp: {problem}");
+    }
+    Ok(Toolbox::new(Some(python), sources))
 }
 
 // --------------------------------------------------------------- config
@@ -710,9 +723,25 @@ async fn doctor(paths: &Paths, config: &Config) -> Result<()> {
     println!("tools");
     match start_tools(paths, config).await {
         Ok(host) => {
-            println!("  python        {}", host.python_version());
-            println!("  worker        {}", host.worker_version());
+            if let Some(python) = host.python() {
+                println!("  python        {}", python.python_version());
+                println!("  worker        {}", python.worker_version());
+            }
             println!("  tools loaded  {}", host.tools().len());
+            // Only the servers that actually connected. One that did not
+            // has already said why, a line above, and listing it here as
+            // "0 tools" reads as a server that works and offers nothing.
+            for (name, _) in config.mcp.active() {
+                let from = format!("mcp:{name}");
+                let count = host
+                    .tools()
+                    .iter()
+                    .filter(|t| host.source_of(&t.name).as_deref() == Some(from.as_str()))
+                    .count();
+                if count > 0 {
+                    println!("  {name:<13} {count} tools");
+                }
+            }
             for e in host.load_errors() {
                 println!("  warning       {e}");
             }
@@ -1385,4 +1414,76 @@ fn channel_status(paths: &Paths, config: &Config) {
         .or_else(|| config.default_model.clone())
         .unwrap_or_else(|| "none set".into());
     println!("  answering with  {model}");
+}
+
+// ---------------------------------------------------------------------- mcp
+
+/// Show every configured MCP server and what it offers.
+///
+/// Connects for real rather than reading the file back: "it is in config.toml"
+/// and "the model can call it" are different claims, and the gap between them
+/// is exactly what this command exists to show.
+async fn mcp(config: &Config) -> Result<()> {
+    if !config.mcp.enabled {
+        println!("MCP is switched off. Add to {}:", "config.toml");
+        println!();
+        println!("  [mcp]");
+        println!("  enabled = true");
+        println!();
+        println!("Then a server, e.g.:");
+        println!();
+        println!("  [mcp.servers.files]");
+        println!("  command = \"npx\"");
+        println!("  args    = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]");
+        return Ok(());
+    }
+    if config.mcp.servers.is_empty() {
+        println!("MCP is on, but no servers are configured.");
+        return Ok(());
+    }
+
+    println!("connecting…");
+    println!();
+    let (sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
+
+    for source in &sources {
+        // `mcp:<name>` — the name is what its tools are prefixed with.
+        let name = source.origin().strip_prefix("mcp:").unwrap_or(source.origin());
+        let trusted = config
+            .mcp
+            .servers
+            .get(name)
+            .is_some_and(|s| s.trust_hints);
+        println!("{name}");
+        println!(
+            "  hints         {}",
+            if trusted { "trusted — read-only tools run unasked" } else { "not trusted — every tool asks" }
+        );
+        println!("  tools         {}", source.tools().len());
+        for tool in source.tools() {
+            let rule = config.permissions.rule_for(&tool.name, tool.effect);
+            println!("    {:<34} {:<8} {rule}", tool.name, tool.effect.to_string());
+            if !tool.description.is_empty() {
+                println!("      {}", ozgent_tools::first_line(&tool.description));
+            }
+        }
+        println!();
+    }
+
+    if !problems.is_empty() {
+        println!("could not be used");
+        for problem in &problems {
+            println!("  {problem}");
+        }
+        println!();
+    }
+
+    for source in &sources {
+        source.shutdown().await;
+    }
+
+    if sources.is_empty() && problems.is_empty() {
+        println!("Nothing is enabled.");
+    }
+    Ok(())
 }

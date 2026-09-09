@@ -164,6 +164,22 @@ token   = "…"            # or $OZGENT_TELEGRAM_TOKEN
 allow   = ["@ada"]       # empty admits nobody
 ```
 
+## MCP servers
+
+`[mcp]` connects ozgent to Model Context Protocol servers, whose tools then sit
+alongside its own. Off by default, and every tool from a server asks before it
+runs unless that server is marked trusted — see [mcp.md](mcp.md), which
+explains why a server's own `readOnlyHint` is not taken at face value.
+
+```toml
+[mcp]
+enabled = true
+
+[mcp.servers.files]
+command = "npx"
+args    = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/notes"]
+```
+
 ## Seeing what is in force
 
 ```
