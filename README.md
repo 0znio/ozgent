@@ -55,14 +55,16 @@ cd ozgent
 ```
 
 That works out your distribution, installs what the build needs, picks a GPU
-backend, compiles, and links `ozgent` onto your `PATH`. It is safe to re-run.
+backend, compiles, and installs to `/usr/local` — `sudo` asks for your
+password for that last step only. It is safe to re-run, and re-running is how
+you update.
 
 Use `./install.sh --dry-run` first if you want to see what it would do.
 
 | | |
 |---|---|
 | `--backend cuda\|vulkan\|metal\|cpu` | override the detection |
-| `--prefix ~/.local` | install somewhere else |
+| `--prefix ~/.local` | install somewhere you own instead (no sudo) |
 | `--skip-deps` | don't install system packages |
 | `--uninstall` | remove it again |
 

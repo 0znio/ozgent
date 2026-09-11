@@ -6,7 +6,7 @@
 #
 #   ./install.sh                     figure everything out
 #   ./install.sh --backend cpu       no GPU
-#   ./install.sh --prefix ~/.local   somewhere else
+#   ./install.sh --prefix ~/.local   somewhere else (no sudo needed)
 #   ./install.sh --uninstall         remove it again
 #
 # This is the from-source installer. `scripts/install.sh` is a different thing:
@@ -27,7 +27,7 @@ usage() {
   cat <<'USAGE'
 Usage: ./install.sh [options]
 
-  --prefix DIR     where to install (default: /usr/local as root, else ~/.local)
+  --prefix DIR     where to install (default: /usr/local, using sudo to copy)
   --backend NAME   cuda | vulkan | metal | cpu | auto   (default: auto)
   --jobs N         parallel compile jobs (default: chosen from RAM and cores)
   --skip-deps      do not install system packages
@@ -96,17 +96,32 @@ confirm() {
 
 # ---------------------------------------------------------------- locations
 
-if [ -z "$PREFIX" ]; then
-  if [ "$(id -u)" -eq 0 ]; then PREFIX=/usr/local; else PREFIX="$HOME/.local"; fi
-fi
+# /usr/local, like every other program installed from source: on every
+# user's PATH, in every shell, with no line to add to a dotfile. Only the copy
+# into it needs root; the build runs as you. `--prefix ~/.local` is there for
+# a machine where sudo is not an option.
+PREFIX="${PREFIX:-/usr/local}"
 LIBDIR="$PREFIX/lib/ozgent"
 BINLINK="$PREFIX/bin/ozgent"
+
+# Where earlier versions of this script installed by default when not run as
+# root. Found and cleared on the way to the new place — left behind, its link
+# would sit earlier on PATH than /usr/local/bin and keep running the old build.
+LEGACY_PREFIX="${OZGENT_LEGACY_PREFIX:-$HOME/.local}"
 
 # sudo only where it is actually needed, and not at all as root.
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   if have sudo; then SUDO="sudo"; elif have doas; then SUDO="doas"; fi
 fi
+
+# Whether `$1/lib/ozgent` is an install this script made, and `$1/bin/ozgent`
+# the link it made to it — the only thing ever removed from a prefix that is
+# not the one being installed to.
+ours() {
+  [ -x "$1/lib/ozgent/bin/ozgent" ] && [ -L "$1/bin/ozgent" ] &&
+    [ "$(readlink "$1/bin/ozgent")" = "$1/lib/ozgent/bin/ozgent" ]
+}
 
 # ---------------------------------------------------------------- uninstall
 
@@ -121,6 +136,10 @@ if [ "$UNINSTALL" = "1" ]; then
       ok "removed $target"; removed=1
     fi
   done
+  if [ "$PREFIX" != "$LEGACY_PREFIX" ] && ours "$LEGACY_PREFIX"; then
+    run rm -rf "$LEGACY_PREFIX/lib/ozgent" "$LEGACY_PREFIX/bin/ozgent"
+    ok "removed the older install in $LEGACY_PREFIX"; removed=1
+  fi
   [ "$removed" = "0" ] && warn "nothing installed at $PREFIX"
   note "Your models and settings in ~/ozgent were left alone."
   note "Remove them too with:  rm -rf ~/ozgent"
@@ -595,10 +614,14 @@ else
 fi
 
 writable_or_sudo() {
-  if [ -w "$(dirname "$1")" ] || mkdir -p "$1" 2>/dev/null; then echo ""; else echo "$SUDO"; fi
+  if [ -w "$1" ] || { [ ! -e "$1" ] && mkdir -p "$1" 2>/dev/null; }; then echo ""; else echo "$SUDO"; fi
 }
 AS="$(writable_or_sudo "$PREFIX")"
-[ -n "$AS" ] && note "$PREFIX needs elevation; using $AS"
+if [ -n "$AS" ]; then
+  note "$PREFIX belongs to root; $AS will ask for your password to copy the files"
+elif [ ! -w "$PREFIX" ]; then
+  die "cannot write to $PREFIX and there is no sudo or doas. Run as root, or: ./install.sh --prefix ~/.local"
+fi
 
 run $AS mkdir -p "$LIBDIR/bin" "$PREFIX/bin"
 # Replaced wholesale rather than merged, so a file from an older version
@@ -626,6 +649,19 @@ if [ -d "$SRC/bridge" ]; then
 fi
 run $AS chmod 755 "$LIBDIR/bin/ozgent"
 
+# Moving from the old default. The WhatsApp bridge's node_modules is carried
+# over first — the user installed it on purpose and should not have to again.
+if [ "$PREFIX" != "$LEGACY_PREFIX" ] && ours "$LEGACY_PREFIX"; then
+  old_modules="$LEGACY_PREFIX/lib/ozgent/bridge/whatsapp/node_modules"
+  if [ -d "$old_modules" ] && [ ! -d "$LIBDIR/bridge/whatsapp/node_modules" ]; then
+    run $AS mkdir -p "$LIBDIR/bridge/whatsapp"
+    run $AS cp -a "$old_modules" "$LIBDIR/bridge/whatsapp/"
+  fi
+  run rm -rf "$LEGACY_PREFIX/lib/ozgent" "$LEGACY_PREFIX/bin/ozgent"
+  ok "moved from $LEGACY_PREFIX to $PREFIX (the old copy is removed)"
+  MOVED=1
+fi
+
 # The binary finds its Python tools by walking up from its own path, which is
 # why bin/ozgent is a link into LIBDIR rather than a copy.
 run $AS ln -sfn "$LIBDIR/bin/ozgent" "$BINLINK"
@@ -640,6 +676,12 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 step "Checking"
+
+# The shell remembers where it last found `ozgent`; after a move it would
+# keep looking in the old place.
+if [ "${MOVED:-0}" = "1" ]; then
+  note "if 'ozgent' says 'no such file' in an open shell, run: hash -r"
+fi
 
 "$BINLINK" --version >/dev/null 2>&1 || die "installed, but it will not run. Try: $BINLINK --version"
 ok "$("$BINLINK" --version)"

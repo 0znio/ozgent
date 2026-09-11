@@ -14,7 +14,7 @@ usage() {
   cat <<'USAGE'
 Usage: ./install.sh [--prefix DIR] [--force]
 
-  --prefix DIR   where to install (default: /usr/local as root, else ~/.local)
+  --prefix DIR   where to install (default: /usr/local, using sudo to copy)
   --force        install even if a requirement check fails
   --uninstall    remove a previous installation and exit
 
@@ -34,11 +34,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$PREFIX" ]; then
-  if [ "$(id -u)" -eq 0 ]; then PREFIX=/usr/local; else PREFIX="$HOME/.local"; fi
-fi
+# /usr/local, like other programs: on everyone's PATH with nothing to add to a
+# dotfile. The copy uses sudo when the directory is root's.
+PREFIX="${PREFIX:-/usr/local}"
 LIBDIR="$PREFIX/lib/ozgent"
 BINLINK="$PREFIX/bin/ozgent"
+AS=""
+if [ "$(id -u)" -ne 0 ] && ! { [ -w "$PREFIX" ] || { [ ! -e "$PREFIX" ] && mkdir -p "$PREFIX" 2>/dev/null; }; }; then
+  if command -v sudo >/dev/null 2>&1; then AS=sudo
+  elif command -v doas >/dev/null 2>&1; then AS=doas
+  else
+    echo "cannot write to $PREFIX and there is no sudo or doas. Run as root, or: --prefix ~/.local" >&2
+    exit 1
+  fi
+fi
 
 ok()   { printf '  \033[32mok\033[0m    %s\n' "$*"; }
 warn() { printf '  \033[33mwarn\033[0m  %s\n' "$*"; }
@@ -46,7 +55,7 @@ bad()  { printf '  \033[31mno\033[0m    %s\n' "$*"; }
 
 if [ "$UNINSTALL" = "1" ]; then
   echo "removing ozgent from $PREFIX"
-  rm -rf "$LIBDIR"; rm -f "$BINLINK"
+  $AS rm -rf "$LIBDIR"; $AS rm -f "$BINLINK"
   ok "removed. ~/ozgent (models, settings, logs) was left alone."
   exit 0
 fi
@@ -125,27 +134,33 @@ fi
 
 # ----------------------------------------------------------------- install
 echo
-if ! mkdir -p "$LIBDIR" 2>/dev/null; then
-  echo "cannot write to $PREFIX. Try: sudo ./install.sh, or --prefix ~/.local" >&2
-  exit 1
-fi
-mkdir -p "$PREFIX/bin"
+[ -n "$AS" ] && echo "$PREFIX belongs to root; $AS will ask for your password to copy the files"
+$AS mkdir -p "$LIBDIR" "$PREFIX/bin"
 
 # Replace wholesale rather than merge, so an old file from a previous version
 # cannot survive into a new install.
-rm -rf "$LIBDIR/bin" "$LIBDIR/python" "$LIBDIR/docs"
-cp -r "$HERE/bin" "$LIBDIR/bin"
-cp -r "$HERE/python" "$LIBDIR/python"
-[ -d "$HERE/docs" ] && cp -r "$HERE/docs" "$LIBDIR/docs"
-[ -f "$HERE/BUNDLE" ] && cp "$HERE/BUNDLE" "$LIBDIR/BUNDLE"
+$AS rm -rf "$LIBDIR/bin" "$LIBDIR/python" "$LIBDIR/docs"
+$AS cp -r "$HERE/bin" "$LIBDIR/bin"
+$AS cp -r "$HERE/python" "$LIBDIR/python"
+[ -d "$HERE/docs" ] && $AS cp -r "$HERE/docs" "$LIBDIR/docs"
+[ -f "$HERE/BUNDLE" ] && $AS cp "$HERE/BUNDLE" "$LIBDIR/BUNDLE"
 # Kept alongside so uninstalling does not require finding the bundle again.
-cp "$HERE/install.sh" "$LIBDIR/install.sh" 2>/dev/null || true
-chmod 755 "$LIBDIR/install.sh" 2>/dev/null || true
-chmod 755 "$LIBDIR/bin/ozgent"
+$AS cp "$HERE/install.sh" "$LIBDIR/install.sh" 2>/dev/null || true
+$AS chmod 755 "$LIBDIR/install.sh" 2>/dev/null || true
+$AS chmod 755 "$LIBDIR/bin/ozgent"
 
 # The binary locates its tools by walking up from its own path, so the symlink
 # must point into LIBDIR rather than the binary being copied to bin/.
-ln -sfn "$LIBDIR/bin/ozgent" "$BINLINK"
+$AS ln -sfn "$LIBDIR/bin/ozgent" "$BINLINK"
+
+# An earlier version of this script defaulted to ~/.local when not root. Its
+# link would sit before /usr/local/bin on PATH and keep running the old build.
+old="$HOME/.local"
+if [ "$PREFIX" != "$old" ] && [ -L "$old/bin/ozgent" ] &&
+   [ "$(readlink "$old/bin/ozgent")" = "$old/lib/ozgent/bin/ozgent" ]; then
+  rm -rf "$old/lib/ozgent" "$old/bin/ozgent"
+  ok "removed the older install in $old"
+fi
 ok "installed to $LIBDIR"
 ok "linked $BINLINK"
 

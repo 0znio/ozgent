@@ -26,7 +26,7 @@ of rebuilding.
 ```bash
 tar xzf ozgent-0.1.0-linux-x86_64-cuda.tar.gz
 cd ozgent-0.1.0-linux-x86_64-cuda
-./install.sh                 # /usr/local as root, ~/.local otherwise
+./install.sh                 # /usr/local (sudo asks for the copy step)
 ```
 
 Options: `--prefix DIR`, `--force` to install despite a failed check,
