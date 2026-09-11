@@ -41,6 +41,17 @@ pub fn describe(value: &serde_json::Value) -> Option<String> {
             None => format!("{symbol} {range}: {bars} bars"),
         });
     }
+    if action == "technicals" {
+        let symbol = obj.get("symbol").and_then(|s| s.as_str()).unwrap_or("?");
+        let mut parts = vec![format!("{symbol} technicals")];
+        if let Some(r) = obj.get("rsi_14").and_then(|r| r.as_f64()) {
+            parts.push(format!("RSI {r:.0}"));
+        }
+        if let Some(p) = value.pointer("/price_vs/sma200").and_then(|p| p.as_f64()) {
+            parts.push(format!("{p:+.1}% vs 200-day"));
+        }
+        return Some(parts.join(" · "));
+    }
     if action == "fundamentals" {
         let symbol = obj.get("symbol").and_then(|s| s.as_str()).unwrap_or("?");
         let sections = obj.keys().filter(|k| *k != "action" && *k != "symbol").count();
@@ -123,5 +134,14 @@ mod tests {
     fn an_unknown_shape_is_left_to_the_caller() {
         assert!(describe(&json!({"path": "x"})).is_none());
         assert!(describe(&json!("text")).is_none());
+    }
+
+    #[test]
+    fn technicals_are_summarised_by_their_headline_readings() {
+        let v = serde_json::json!({
+            "action": "technicals", "symbol": "NVDA", "rsi_14": 61.7,
+            "price_vs": {"sma200": 12.34},
+        });
+        assert_eq!(describe(&v).as_deref(), Some("NVDA technicals · RSI 62 · +12.3% vs 200-day"));
     }
 }

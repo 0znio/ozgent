@@ -155,6 +155,9 @@ mod real {
 
     /// Enumerate every device the compiled-in backends found.
     pub fn devices() -> Vec<Device> {
+        // Listing devices brings the backends up, which prints CUDA's banner;
+        // routed into ozgent's log like everything else llama.cpp says.
+        crate::llamalog::capture();
         llama_cpp_2::list_llama_ggml_backend_devices()
             .into_iter()
             .map(|d| Device {

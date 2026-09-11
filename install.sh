@@ -640,7 +640,7 @@ run $AS cp -r "$SRC/python" "$LIBDIR/python"
 
 # Updated in place rather than replaced, for two reasons. `cp -r a/bridge
 # b/bridge` copies *into* the target once it exists, so a second run would
-# nest it as b/bridge/bridge. And `ozgent channel install whatsapp` puts a
+# nest it as b/bridge/bridge. And `ozgent gateway whatsapp` puts a
 # node_modules under here — thirty megabytes the user was told to install,
 # which an update should not silently throw away.
 if [ -d "$SRC/bridge" ]; then

@@ -11,9 +11,9 @@ disk.
 
 ```bash
 ozgent                    # chat in the terminal
-ozgent web                # chat in a browser
+ozgent web                # chat in a browser — and answer Telegram and WhatsApp
 ozgent serve              # OpenAI- and Anthropic-compatible API on :7337
-ozgent gateway            # answer messages on Telegram and WhatsApp
+ozgent gateway telegram   # set up a chat app by answering a few questions
 ```
 
 ---
@@ -25,7 +25,7 @@ They run models. ozgent runs models **and does the work around them**.
 |  | ozgent | Ollama | LM Studio |
 |---|---|---|---|
 | Runs tools for you | built in — search, fetch, files, shell, markets, Reddit | you write the client | you wire it up |
-| Agents you call with `@name` | yes, with their own tools | — | — |
+| Agents you call with `@name` | yes, with their own tools — or the model hands over itself | — | — |
 | **Asks before writing or running** | yes, before the content is even generated | — | — |
 | MCP servers | yes | — | yes |
 | Full-screen terminal UI | yes | plain prompt | — |
@@ -34,6 +34,7 @@ They run models. ozgent runs models **and does the work around them**.
 | Chat from your phone | Telegram, WhatsApp | — | — |
 | Remembers across chats | facts + retrieval | — | — |
 | Context sized to your VRAM | worked out for you, and reported | set by hand | set by hand |
+| "Will it fit?" before downloading | context per size, from the file's header | — | size only |
 | Licence | MIT | MIT | closed source |
 
 *Both projects move fast; check their docs if a row matters to you.*
@@ -91,11 +92,13 @@ an installer — nothing is compiled on the target. See
 
 ### First run
 
-In the browser: `ozgent web`, then the **download button** next to the model
-picker. Search Hugging Face, pick a size — it says which fit your GPU — and
-watch it arrive. Downloads keep going if you close the tab.
+In the browser: `ozgent admin setup` once to choose a password, then
+`ozgent web` and open **Admin → Models**. Search Hugging Face and pick a size —
+before downloading anything it reads each file's header and tells you how much
+context that size leaves room for on *your* GPU. Or install a `.gguf` you
+already have. Downloads keep going if you close the tab.
 
-<img src="docs/images/web-models.png" alt="the Models dialog" width="480">
+![Admin → Models](docs/images/admin-models.png)
 
 Or from the terminal:
 
@@ -106,7 +109,8 @@ ozgent default Qwen3.5-4B:Q4_K_M             # use it when none is named
 ozgent                                       # chat
 ```
 
-`ozgent pull <repo> --list` shows a repo's quantisations without downloading.
+`ozgent pull <repo> --list` shows a repo's quantisations, and the context each
+leaves room for on this GPU, without downloading.
 `ozgent doctor` reports your GPU, backends and anything misconfigured.
 
 ---
@@ -124,6 +128,7 @@ bar showing the model, context used, and tokens/sec.
 - **Drag over text** to select it — it's copied when you let go. `/copy` copies
   the whole last reply.
 - **Type `@`** for the agents; Tab or Enter picks one.
+- Loading a model shows a progress bar, not a frozen line.
 
 ### Tools that run, with a prompt first
 
@@ -133,7 +138,7 @@ The model decides; you approve.
 |---|---|---|
 | `web_search` | searches the web or the news | a Brave or Tavily key, or none for DuckDuckGo |
 | `fetch_url` | reads a page — the article, not the menus | — |
-| `yahoo_finance` | quotes, price history, fundamentals, news | — |
+| `yahoo_finance` | quotes, price history, technicals (RSI, MACD, averages, support/resistance), fundamentals, news | — |
 | `reddit` | searches posts, reads threads | optional app key for full speed |
 | `read_file` · `list_dir` | read your files | — |
 | `write_file` | writes a file | asks first |
@@ -147,6 +152,11 @@ The model decides; you approve.
 
 Reads run without asking. Writes and commands ask. Answer *always* once and it
 becomes a rule you can edit later.
+
+In the browser, **Web** beside the message box switches searching on and off,
+and **Tools** opens a switch per tool.
+
+<img src="docs/images/web-tools.png" alt="the Tools tray" width="560">
 
 Adding your own is a Python file in `~/ozgent/tools`:
 
@@ -182,6 +192,9 @@ name, so you can see who did the work.
 @stock-guru @sentiment-analyser AMD — the numbers, then the mood
 ```
 
+Or don't name one: when a request is squarely an agent's job — "how is NVDA
+doing?" — the model hands it over itself, with the same `@name` label.
+
 Type `@` for the list. Make your own in **Settings → Agents** or with
 `ozgent agent new <name>`; they work over the API and on Telegram and WhatsApp
 too. → [docs/agents.md](docs/agents.md)
@@ -205,16 +218,37 @@ claim is written by the thing that wants to be run.
 
 ### Chat from your phone
 
-Telegram (a bot token) and WhatsApp (link your own account). Nobody can talk to
-it until you allow them.
+Telegram (a bot) or WhatsApp (your own account, linked like WhatsApp Web).
+Setting one up is answering a few questions — nothing to edit by hand:
 
 ```bash
-ozgent channel install whatsapp   # one npm install
-ozgent channel login whatsapp     # scan a QR with your phone
-ozgent gateway                    # prints a pairing code
+ozgent gateway telegram   # paste the token from @BotFather, send the bot a code, done
+ozgent gateway whatsapp   # scan a QR, say which numbers may message it
 ```
 
+Nobody can talk to it until you allow them, and you choose which tools a chat
+may use and whether tool calls can be approved from the phone. Run the same
+command again to change anything — who is allowed, tools, the token, signing
+out — or do it all on **/admin**, where WhatsApp's QR code appears on the page.
+`ozgent web` answers the chats while it runs, and applies changes without a
+restart.
+
+![the gateway on the admin page](docs/images/admin-gateway.png)
+
 → [docs/channels.md](docs/channels.md)
+
+### An admin page, behind a password
+
+`/admin` holds what should not be one click away from anyone on your network:
+the gateway and model downloads.
+
+```bash
+ozgent admin setup    # choose the password (only an Argon2id hash is stored)
+ozgent admin reset    # forgot it: a new one, every browser signed out
+```
+
+Wrong guesses are slowed and then locked out; `ozgent admin reset` on the
+machine is always the way back in.
 
 ### It remembers
 
@@ -240,8 +274,9 @@ port, over the model it already has loaded.
 
 ### Context sized to your hardware
 
-Ask for a 1m context on an 8 GB card and ozgent works out what actually fits,
-uses it, and tells you — instead of failing with a null pointer.
+Every model opens with 32k of context unless you say otherwise. Ask for a 1m
+context on an 8 GB card and ozgent works out what actually fits, uses it, and
+tells you — instead of failing with a null pointer.
 
 Three inference modes: `gpu` (fastest, smallest context), `gpu_ram` (bigger
 context, slower), `ram` (no GPU at all).
@@ -262,7 +297,7 @@ ozgent web --inference-mode gpu_ram
 | [tools.md](docs/tools.md) | the built-in tools and the permission rules |
 | [agents.md](docs/agents.md) | `@agents`: the built-in ones and making your own |
 | [mcp.md](docs/mcp.md) | connecting MCP servers |
-| [channels.md](docs/channels.md) | Telegram and WhatsApp |
+| [channels.md](docs/channels.md) | Telegram and WhatsApp, and the admin page |
 | [api.md](docs/api.md) | the HTTP API, endpoint by endpoint |
 | [install.md](docs/install.md) | deploying to another machine |
 
@@ -273,8 +308,8 @@ ozgent web --inference-mode gpu_ram
 Early. It works, it is tested, and the interfaces still move.
 
 `ozgent web` binds `0.0.0.0` by default so a phone on the same wifi can reach
-it, and **has no password** — use `--host 127.0.0.1` on a network you don't
-trust.
+it. The chat itself **has no password** — only `/admin` does — so use
+`--host 127.0.0.1` on a network you don't trust.
 
 MIT licensed. `vendor/` carries patched copies of llama.cpp and its Rust
 bindings, under their own licences — see [vendor/README.md](vendor/README.md).

@@ -109,6 +109,79 @@ impl Telegram {
     }
 }
 
+/// Someone who sent the bot a setup code.
+#[derive(Debug, Clone)]
+pub struct Claimant {
+    pub id: String,
+    pub username: Option<String>,
+    pub name: String,
+    pub chat: String,
+}
+
+impl Telegram {
+    /// Wait for a private message containing `code`, and say who sent it.
+    ///
+    /// How the terminal setup learns the owner's user id without asking them
+    /// to look it up: they send the code shown on their own screen, so the
+    /// sender is known to be the person at this machine. Everything else that
+    /// arrives meanwhile is ignored. `None` when the time runs out.
+    pub async fn wait_for_code(&self, code: &str, within: Duration) -> anyhow::Result<Option<Claimant>> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut offset: Option<i64> = None;
+        let code = code.to_ascii_uppercase();
+        while tokio::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs();
+            let body = serde_json::json!({
+                "timeout": left.clamp(1, 20),
+                "offset": offset,
+                "allowed_updates": ["message"],
+            });
+            let updates = match self.call("getUpdates", body).await {
+                Ok(v) => v,
+                Err(ApiError::Api { status: 409, .. }) => anyhow::bail!(
+                    "another program is reading this bot's messages right now (a running ozgent?)"
+                ),
+                Err(e) => {
+                    tracing::debug!("telegram setup: {e}");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            for update in updates.as_array().into_iter().flatten() {
+                if let Some(id) = update.get("update_id").and_then(|v| v.as_i64()) {
+                    offset = Some(id + 1);
+                }
+                let Some(message) = update.get("message") else { continue };
+                let private = message.pointer("/chat/type").and_then(|v| v.as_str()) == Some("private");
+                let text = message.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !private || !text.to_ascii_uppercase().contains(&code) {
+                    continue;
+                }
+                let Some(from) = message.get("from") else { continue };
+                let found = Claimant {
+                    id: from.get("id").and_then(|v| v.as_i64()).map(|i| i.to_string()).unwrap_or_default(),
+                    username: from.get("username").and_then(|v| v.as_str()).map(|u| format!("@{u}")),
+                    name: from.get("first_name").and_then(|v| v.as_str()).unwrap_or("you").to_string(),
+                    chat: message.pointer("/chat/id").and_then(|v| v.as_i64()).map(|i| i.to_string()).unwrap_or_default(),
+                };
+                // Acknowledge what was read, so the gateway does not answer
+                // the setup message when it starts.
+                let _ = self
+                    .call("getUpdates", serde_json::json!({ "offset": offset, "timeout": 0 }))
+                    .await;
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send one plain message, outside the gateway.
+    pub async fn say(&self, chat: &str, text: &str) -> anyhow::Result<()> {
+        self.call("sendMessage", serde_json::json!({ "chat_id": chat, "text": text })).await?;
+        Ok(())
+    }
+}
+
 /// What went wrong with a Bot API call.
 #[derive(Debug)]
 enum ApiError {
@@ -159,8 +232,8 @@ pub async fn run(
     let api = std::sync::Arc::new(Telegram::new(token));
     let who = api.identify().await.map_err(|e| {
         anyhow::anyhow!(
-            "{e}\n\nThe token in [channels.telegram] was refused. Get one from @BotFather, \
-             or set $OZGENT_TELEGRAM_TOKEN."
+            "{e}\n\nTelegram refused the bot token. Get a new one from @BotFather and set it \
+             with `ozgent gateway telegram token`, or on /admin."
         )
     })?;
     let _ = tx.send(Inbound::Ready { who }).await;
@@ -461,6 +534,8 @@ async fn send_loop(
                 sent.message.remove(&token);
                 sent.text.remove(&token);
             }
+
+            Command::Logout => {}
         }
     }
 }

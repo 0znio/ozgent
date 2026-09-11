@@ -92,6 +92,9 @@
   <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M4 7h16M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7M6.5 7l.8 12A1.5 1.5 0 0 0 8.8 20h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12"/>
   </symbol>
+  <symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14.7 6.3a4 4 0 0 0-5.4 5.1L4 16.7V20h3.3l5.3-5.3a4 4 0 0 0 5.1-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>
+  </symbol>
   <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6L12 3Z"/>
     <path d="M9.5 12.2 11.3 14l3.4-3.6"/>
@@ -125,6 +128,10 @@
       <button class="ghost-btn" id="open-settings">
         <svg class="ic"><use href="#i-settings"></use></svg><span>Settings</span>
       </button>
+      <!-- Models and the Telegram/WhatsApp gateway, behind a password. -->
+      <a class="ghost-btn" id="open-admin" href="/admin">
+        <svg class="ic"><use href="#i-shield"></use></svg><span>Admin</span>
+      </a>
       <button class="ghost-btn theme" id="theme-toggle" data-tip="Colour theme" aria-label="Colour theme">
         <svg class="ic theme-icon"><use href="#i-monitor"></use></svg>
         <span class="theme-name"></span>
@@ -138,10 +145,6 @@
         <svg class="ic"><use href="#i-menu"></use></svg>
       </button>
       <select id="model" class="select" aria-label="Model"></select>
-      <button class="icon-btn" id="open-models" data-tip="Get and manage models" aria-label="Models">
-        <svg class="ic"><use href="#i-download"></use></svg>
-        <span class="md-badge" id="md-badge" hidden></span>
-      </button>
       <select id="thinking" class="select" aria-label="Reasoning">
         <option value="auto">Reasoning: auto</option>
         <option value="on">Reasoning: on</option>
@@ -170,6 +173,19 @@
         <svg class="ic"><use href="#i-down"></use></svg><span>Latest</span>
       </button>
       <div class="quick" id="quick" hidden></div>
+      <!-- Which tools the model may reach for. Switched here, remembered by
+           this browser; an agent called by name keeps its own. -->
+      <div class="tools-tray" id="tools-tray" role="dialog" aria-label="Tools" hidden>
+        <div class="tools-tray-head">
+          <span class="tools-tray-title">Tools</span>
+          <span class="hint inline">for the model in this browser · agents keep their own</span>
+          <span class="spacer"></span>
+          <button type="button" class="linky" id="tools-all-on">all on</button>
+          <button type="button" class="linky" id="tools-all-off">all off</button>
+        </div>
+        <div class="tools-tray-list" id="tools-tray-list"></div>
+        <p class="hint tools-tray-foot">Web search and reading pages are the <b>Web</b> switch. What each tool may do without asking is in Settings → Permissions.</p>
+      </div>
 
       <!-- The turn is stopped on this, so it sits where the answer will be
            given: attached to the top of the composer. Two lines and two
@@ -205,11 +221,16 @@
                   data-tip="Model settings" aria-label="Model settings">
             <svg class="ic"><use href="#i-sliders"></use></svg>
           </button>
-          <!-- A state, so it is drawn as one: filled when the model may reach
-               the network and the filesystem, outlined when it may not. -->
-          <button type="button" id="tools-toggle" class="pill-toggle" aria-pressed="true"
-                  data-tip="Let the model search and read files" aria-label="Toggle tools">
-            <svg class="ic"><use href="#i-globe"></use></svg><span class="pill-label">Tools on</span>
+          <!-- A state, so it is drawn as one: filled when the model may use the
+               web, outlined and struck through when it may not. -->
+          <button type="button" id="web-toggle" class="pill-toggle" aria-pressed="true"
+                  data-tip="Let the model search the web and read pages" aria-label="Toggle the web">
+            <svg class="ic"><use href="#i-globe"></use></svg><span class="pill-label">Web</span>
+          </button>
+          <!-- Every other tool, one switch each, in a tray. -->
+          <button type="button" id="tools-open" class="pill-toggle tools-open" aria-expanded="false"
+                  data-tip="Choose which tools the model may use" aria-label="Tools">
+            <svg class="ic"><use href="#i-wrench"></use></svg><span class="pill-label">Tools</span>
           </button>
           <span class="spacer"></span>
           <span class="hint inline" id="attach-hint">paste or drop to attach</span>
@@ -232,58 +253,6 @@
   <img id="lightbox-img" alt="">
 </div>
 
-<!-- Models: find one on Hugging Face, download it, remove what is installed.
-     Downloads belong to the server, so this can be closed while they run. -->
-<dialog id="models" class="settings md-dialog">
-  <div class="settings-head">
-    <h2>Models</h2>
-    <button class="icon-btn" id="close-models" aria-label="Close">
-      <svg class="ic"><use href="#i-close"></use></svg>
-    </button>
-  </div>
-
-  <div class="md-body">
-    <section class="md-section">
-      <h3 class="sub">Get a model</h3>
-      <form class="md-search" id="md-search-form" autocomplete="off">
-        <svg class="ic"><use href="#i-search"></use></svg>
-        <input type="text" id="md-query" class="text-input"
-               placeholder="Search Hugging Face, or paste owner/repo" spellcheck="false">
-      </form>
-      <p class="hint" id="md-search-note">GGUF repositories only — those are what llama.cpp runs.</p>
-      <div class="md-results" id="md-results"></div>
-
-      <div class="md-repo" id="md-repo" hidden>
-        <div class="md-repo-head">
-          <span class="md-repo-id" id="md-repo-id"></span>
-          <span class="md-chip" id="md-repo-vision" hidden>vision</span>
-          <span class="md-chip md-warn" id="md-repo-gated" hidden>gated</span>
-          <button type="button" class="linky" id="md-repo-back">back to results</button>
-        </div>
-        <p class="hint" id="md-gpu"></p>
-        <div class="md-quants" id="md-quants" role="radiogroup" aria-label="Quantisation"></div>
-        <div class="md-pull-row">
-          <label class="md-alias">
-            <span>Short name</span>
-            <input type="text" id="md-alias" class="text-input" placeholder="optional, e.g. qwen" maxlength="40">
-          </label>
-          <button type="button" class="primary-btn" id="md-pull">Download</button>
-        </div>
-        <p class="error" id="md-repo-error" hidden></p>
-      </div>
-    </section>
-
-    <section class="md-section" id="md-jobs-section" hidden>
-      <h3 class="sub">Downloads</h3>
-      <div class="md-jobs" id="md-jobs"></div>
-    </section>
-
-    <section class="md-section">
-      <h3 class="sub">Installed</h3>
-      <div class="md-installed" id="md-installed"></div>
-    </section>
-  </div>
-</dialog>
 
 <dialog id="settings" class="settings">
   <div class="settings-head">

@@ -21,6 +21,7 @@ axum.workspace = true
 tower-http.workspace = true
 futures-util.workspace = true
 image.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [features]
 default = []

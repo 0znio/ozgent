@@ -6,6 +6,7 @@
 //! to hunt for a file URL.
 
 pub mod download;
+pub mod gguf;
 pub mod hf;
 pub mod import;
 pub mod install;

@@ -217,16 +217,51 @@ pub async fn repo(Query(query): Query<RepoQuery>) -> Result<Json<serde_json::Val
     let gpu = vram();
     let memory = gpu.as_ref().map(|(bytes, _)| *bytes);
     let suggested = ozgent_hub::recommend(&rows, projector.unwrap_or(0), memory);
+
+    // How much context each size leaves room for, from the model's own
+    // header: a few hundred kilobytes read by range from the smallest file,
+    // since every size of one model shares the same shape. A repo whose
+    // header cannot be read still lists its sizes, without the estimate.
+    let shape = match (memory, rows.first()) {
+        (Some(_), Some(smallest)) => {
+            let first = info
+                .files
+                .iter()
+                .filter(|f| f.is_gguf() && !f.is_mmproj())
+                .filter(|f| ozgent_hub::quant_of(&f.path).as_deref() == Some(smallest.quant.as_str()))
+                .map(|f| f.path.clone())
+                .min();
+            match first {
+                Some(path) => match ozgent_hub::gguf::fetch_shape(&client, &info.id, &request.revision, &path).await {
+                    Ok(shape) => Some(shape),
+                    Err(e) => {
+                        tracing::info!("reading the header of {}/{path}: {e}", info.id);
+                        None
+                    }
+                },
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
     let quants: Vec<serde_json::Value> = rows
         .iter()
         .enumerate()
         .map(|(i, q)| {
-            let fits = memory.map(|m| q.bytes + projector.unwrap_or(0) < m * 85 / 100);
+            let weights = q.bytes + projector.unwrap_or(0);
+            let fits = memory.map(|m| weights < m * 85 / 100);
+            let context = shape
+                .as_ref()
+                .zip(memory)
+                .and_then(|(s, m)| ozgent_hub::gguf::context_that_fits(s, weights, m));
             serde_json::json!({
                 "quant": q.quant,
                 "bytes": q.bytes,
                 "shards": q.shards,
                 "fits": fits,
+                "context_fits": context.map(|(c, _)| c),
+                "kv_cache": context.map(|(_, t)| format!("{t:?}").to_lowercase()),
                 "recommended": Some(i) == suggested,
                 "name": ozgent_hub::derive_ref(&info.id, &q.quant),
             })
@@ -243,6 +278,7 @@ pub async fn repo(Query(query): Query<RepoQuery>) -> Result<Json<serde_json::Val
         // Asked here rather than guessed later: a repo whose files are not
         // GGUF cannot be pulled at all, and the page should say so up front.
         "runnable": !rows.is_empty(),
+        "context_train": shape.as_ref().map(|s| s.context_train),
     })))
 }
 

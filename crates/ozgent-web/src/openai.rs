@@ -683,6 +683,8 @@ async fn chat_completions(
             overrides: Some(options_from(&request)),
             images,
             agents: resolved.agents,
+            tools_off: Vec::new(),
+            handoff: Vec::new(),
             out: tx,
         })
         .map_err(ApiError::internal)?;
@@ -851,6 +853,7 @@ async fn collect(
             // to answer. The worker knows that and refuses without waiting;
             // the refusal arrives as the tool's result.
             Event::Ready { .. }
+            | Event::Loading { .. }
             | Event::ToolCall { .. }
             | Event::ToolCallStarted { .. }
             | Event::ToolResult { .. }
@@ -1022,6 +1025,7 @@ fn stream_chunks(
             // as a tool call would invite it to run the same call again.
             Event::ToolCall { .. }
             | Event::Ready { .. }
+            | Event::Loading { .. }
             | Event::ToolResult { .. }
             | Event::ToolCallStarted { .. }
             | Event::Permission { .. }

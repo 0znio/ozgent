@@ -50,7 +50,7 @@ try {
   send({
     type: 'fatal',
     reason:
-      'the WhatsApp bridge is not installed. Run `ozgent channel install whatsapp`, ' +
+      'the WhatsApp bridge is not installed. Run `ozgent gateway whatsapp`, ' +
       'or `npm install` in the bridge directory. (' + e.message + ')'
   })
   process.exit(1)
@@ -157,8 +157,10 @@ async function connect () {
     const { connection, lastDisconnect, qr } = update
 
     if (qr) {
+      // Both forms: the drawing for a terminal, the raw text for a page
+      // that draws its own image.
       qrcode.generate(qr, { small: true }, (ascii) => {
-        send({ type: 'qr', ascii })
+        send({ type: 'qr', ascii, data: qr })
       })
     }
 
@@ -187,7 +189,7 @@ async function connect () {
         send({
           type: 'fatal',
           reason:
-            'this device was unlinked from WhatsApp. Run `ozgent channel login whatsapp` to link it again.'
+            'this device was unlinked from WhatsApp. Run `ozgent gateway whatsapp`, or use /admin, to link it again.'
         })
         process.exit(1)
       }

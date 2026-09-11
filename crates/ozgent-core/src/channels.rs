@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Everything under `[channels]`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChannelsConfig {
     /// Master switch. Off means `ozgent gateway` refuses to start and
@@ -57,11 +57,13 @@ impl ChannelsConfig {
                 allow: &self.telegram.allow,
                 tools: self.telegram.tools.as_deref(),
                 stream: self.telegram.stream,
+                approve: self.telegram.approve,
             },
             Kind::WhatsApp => Access {
                 allow: &self.whatsapp.allow,
                 tools: self.whatsapp.tools.as_deref(),
                 stream: self.whatsapp.stream,
+                approve: self.whatsapp.approve,
             },
         }
     }
@@ -82,6 +84,123 @@ impl ChannelsConfig {
         }
         allow.push(identity.to_string());
         true
+    }
+
+    /// Take an identity off a channel's list. True when it was on it.
+    ///
+    /// Matched the way [`admits`] matches, so an entry written as `@Ada` is
+    /// removed by `ada`: a rule that could only be removed by retyping it
+    /// exactly would outlive the operator's attempt to remove it.
+    pub fn revoke(&mut self, kind: Kind, identity: &str) -> bool {
+        let norm = |s: &str| s.trim().trim_start_matches(['@', '+']).to_ascii_lowercase();
+        let target = norm(identity);
+        let allow = self.allow_mut(kind);
+        let before = allow.len();
+        allow.retain(|a| norm(a) != target);
+        allow.len() != before
+    }
+
+    pub fn allow_mut(&mut self, kind: Kind) -> &mut Vec<String> {
+        match kind {
+            Kind::Telegram => &mut self.telegram.allow,
+            Kind::WhatsApp => &mut self.whatsapp.allow,
+        }
+    }
+
+    pub fn tools_mut(&mut self, kind: Kind) -> &mut Option<Vec<String>> {
+        match kind {
+            Kind::Telegram => &mut self.telegram.tools,
+            Kind::WhatsApp => &mut self.whatsapp.tools,
+        }
+    }
+
+    pub fn enabled(&self, kind: Kind) -> bool {
+        match kind {
+            Kind::Telegram => self.telegram.enabled,
+            Kind::WhatsApp => self.whatsapp.enabled,
+        }
+    }
+
+    /// Switch one channel on or off. Switching one on also turns on the
+    /// master switch: "turn Telegram on" does not mean "and leave it off".
+    pub fn set_enabled(&mut self, kind: Kind, on: bool) {
+        match kind {
+            Kind::Telegram => self.telegram.enabled = on,
+            Kind::WhatsApp => self.whatsapp.enabled = on,
+        }
+        if on {
+            self.enabled = true;
+        }
+    }
+
+    pub fn set_approve(&mut self, kind: Kind, on: bool) {
+        match kind {
+            Kind::Telegram => self.telegram.approve = on,
+            Kind::WhatsApp => self.whatsapp.approve = on,
+        }
+    }
+}
+
+/// Turn what someone typed into an allowlist entry for a channel.
+///
+/// The one place both the terminal setup and the admin page go through, so a
+/// number typed as `+91 98765-43210` is stored the way the bridge reports it
+/// (`919876543210`) whichever of them it was typed into. Anything that could
+/// not be a sender on that channel is refused with the reason, rather than
+/// saved as a rule that silently matches nobody.
+pub fn normalise_identity(kind: Kind, input: &str) -> Result<String, String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Err("nothing was entered".into());
+    }
+    if t == "*" {
+        return Ok("*".into());
+    }
+    match kind {
+        Kind::WhatsApp => {
+            if t.contains('@') {
+                // A full JID, which the bridge also reports and matches.
+                let (user, server) = t.split_once('@').unwrap_or((t, ""));
+                if user.is_empty() || server.is_empty() {
+                    return Err(format!("{t:?} is not a WhatsApp id"));
+                }
+                return Ok(t.to_ascii_lowercase());
+            }
+            if t.chars().any(|c| !(c.is_ascii_digit() || " +-().".contains(c))) {
+                return Err(format!(
+                    "{t:?} is not a phone number. Write it with the country code, like +91 98765 43210"
+                ));
+            }
+            let digits: String = t.chars().filter(char::is_ascii_digit).collect();
+            let digits = digits.trim_start_matches("00").to_string();
+            // E.164: at most fifteen digits, country code included. Fewer than
+            // eight cannot be a number with its country code.
+            if !(8..=15).contains(&digits.len()) {
+                return Err(format!(
+                    "{t:?} has {} digits. Include the country code, like +91 98765 43210",
+                    digits.len()
+                ));
+            }
+            Ok(digits)
+        }
+        Kind::Telegram => {
+            if let Some(handle) = t.strip_prefix('@').or_else(|| {
+                t.chars().next().filter(char::is_ascii_alphabetic).map(|_| t)
+            }) {
+                let ok = (5..=32).contains(&handle.len())
+                    && handle.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ok {
+                    return Err(format!(
+                        "{t:?} is not a Telegram username (5–32 letters, digits or _)"
+                    ));
+                }
+                return Ok(format!("@{handle}"));
+            }
+            if !t.chars().all(|c| c.is_ascii_digit()) || t.len() > 20 {
+                return Err(format!("{t:?} is not a Telegram user id (digits) or @username"));
+            }
+            Ok(t.to_string())
+        }
     }
 }
 
@@ -125,9 +244,11 @@ pub struct Access<'a> {
     pub allow: &'a [String],
     pub tools: Option<&'a [String]>,
     pub stream: bool,
+    /// Whether a person on this channel may approve a tool call that asks.
+    pub approve: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Telegram {
     pub enabled: bool,
@@ -161,6 +282,12 @@ pub struct Telegram {
     /// Edit one message as the reply is generated, instead of sending it whole
     /// when it is finished.
     pub stream: bool,
+
+    /// Let an allowed person approve a tool call that asks first.
+    ///
+    /// Off, anything your permission rules would ask about is refused on this
+    /// channel; only what they allow outright runs.
+    pub approve: bool,
 }
 
 impl Default for Telegram {
@@ -171,11 +298,12 @@ impl Default for Telegram {
             allow: Vec::new(),
             tools: None,
             stream: true,
+            approve: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WhatsApp {
     pub enabled: bool,
@@ -189,6 +317,9 @@ pub struct WhatsApp {
     pub tools: Option<Vec<String>>,
 
     pub stream: bool,
+
+    /// Let an allowed person approve a tool call that asks first.
+    pub approve: bool,
 
     /// Interpreter used to run the bridge. WhatsApp has no documented protocol
     /// and no Rust client; the bridge is a small Node program driving the same
@@ -228,6 +359,7 @@ impl Default for WhatsApp {
             allow: Vec::new(),
             tools: None,
             stream: true,
+            approve: true,
             node: "node".into(),
             bridge: None,
             self_chat: false,
@@ -377,6 +509,7 @@ mod tests {
             enabled = true
             allow = ["15551234567"]
             stream = false
+            approve = false
             self_chat = true
             groups = true
             node = "/opt/node/bin/node"
@@ -418,6 +551,49 @@ mod tests {
         assert_eq!(back.channels.telegram.tools.as_deref(), Some(&["web_search".to_string()][..]));
         assert!(back.channels.whatsapp.groups);
         assert_eq!(back.channels.active(), vec![Kind::Telegram]);
+    }
+
+    #[test]
+    fn a_phone_number_is_stored_the_way_the_bridge_reports_it() {
+        for typed in ["+91 98765 43210", "919876543210", "0091-98765-43210", "+91 (98765) 43210"] {
+            assert_eq!(normalise_identity(Kind::WhatsApp, typed).unwrap(), "919876543210", "{typed}");
+        }
+        assert!(normalise_identity(Kind::WhatsApp, "98765").is_err(), "no country code");
+        assert!(normalise_identity(Kind::WhatsApp, "call me").is_err());
+        assert_eq!(
+            normalise_identity(Kind::WhatsApp, "919876543210@s.whatsapp.net").unwrap(),
+            "919876543210@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn a_telegram_entry_is_an_id_or_a_username() {
+        assert_eq!(normalise_identity(Kind::Telegram, " 4242 ").unwrap(), "4242");
+        assert_eq!(normalise_identity(Kind::Telegram, "@ada_l").unwrap(), "@ada_l");
+        assert_eq!(normalise_identity(Kind::Telegram, "ada_l").unwrap(), "@ada_l");
+        assert!(normalise_identity(Kind::Telegram, "@ada").is_err(), "too short to be a username");
+        assert!(normalise_identity(Kind::Telegram, "42-42").is_err());
+        assert!(normalise_identity(Kind::Telegram, "").is_err());
+    }
+
+    #[test]
+    fn revoking_matches_the_way_admitting_does() {
+        let mut c = ChannelsConfig::default();
+        c.admit(Kind::Telegram, "@Ada_L");
+        c.admit(Kind::WhatsApp, "919876543210");
+        assert!(c.revoke(Kind::Telegram, "ada_l"));
+        assert!(c.revoke(Kind::WhatsApp, "+919876543210"));
+        assert!(!c.revoke(Kind::WhatsApp, "919876543210"), "already gone");
+        assert!(c.telegram.allow.is_empty() && c.whatsapp.allow.is_empty());
+    }
+
+    #[test]
+    fn switching_a_channel_on_switches_channels_on() {
+        let mut c = ChannelsConfig::default();
+        c.set_enabled(Kind::WhatsApp, true);
+        assert!(c.enabled && c.whatsapp.enabled);
+        c.set_enabled(Kind::WhatsApp, false);
+        assert!(c.enabled, "the master switch is left for the other channel");
     }
 
     #[test]

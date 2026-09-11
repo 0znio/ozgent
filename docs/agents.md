@@ -33,6 +33,25 @@ three):
 @stock-guru @sentiment-analyser NVDA — numbers, then the mood
 ```
 
+## Without the `@`
+
+You don't have to name an agent. The model is offered one extra tool,
+`ask_agent`, describing each agent, and when a request is squarely one of
+their jobs it hands it over — "how is NVDA doing?" goes to `@stock-guru` by
+itself. From then on it is exactly as if you had typed the mention: the
+agent's instructions, only the agent's tools, and its report as the reply,
+headed with its name.
+
+It is a handover, not a borrowing: the main model does not get the agent's
+tools, and it answers simple questions itself. Switch it off with the
+**hand off to @agents** switch in the web interface's Tools tray, or for
+everything with:
+
+```toml
+[tools]
+handoff = false
+```
+
 ## The rules
 
 - **It sees only its own tools.** The rest are never shown to the model, and a

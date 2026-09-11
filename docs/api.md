@@ -355,8 +355,9 @@ Served by `ozgent web`. These are what the browser interface talks to. They are
 **not OpenAI-compatible and not a stable API** — they change with the UI. Use
 `/v1` for anything you want to keep working.
 
-No authentication. `ozgent web` binds `0.0.0.0` by default so a phone on the
-same network can reach it; `--host 127.0.0.1` keeps it to this machine.
+No authentication, except for the `/admin` routes below. `ozgent web` binds
+`0.0.0.0` by default so a phone on the same network can reach it;
+`--host 127.0.0.1` keeps it to this machine.
 
 All bodies are JSON. Failures are `{"error": "..."}` with `400` when the
 request was wrong and `500` when ozgent was.
@@ -367,6 +368,7 @@ request was wrong and `500` when ozgent was.
 |---|---|---|
 | `GET` | `/`, `/new`, `/chat` | the interface (same HTML; the browser routes) |
 | `GET` | `/app.css`, `/app.js` | its assets, compiled into the binary |
+| `GET` | `/admin`, `/admin.js` | the admin page |
 | `GET` | `/media/{name}` | an image that was attached to a message |
 
 ## Models
@@ -443,13 +445,19 @@ links — row ids are sequential and leak how many conversations exist.
 { "conversation": 3, "model": "Qwen3.5-4B:Q4_K_M", "message": "hello",
   "thinking": "on" | "off" | "auto",
   "tools": true,
+  "tools_off": ["run_command", "ask_agent"],
   "images": ["data:image/png;base64,…"] }
 ```
+
+`tools_off` leaves those tools out for the main model this turn — what the
+composer's Web switch and Tools tray send. An agent called by name keeps its
+own tools regardless.
 
 Each SSE `data:` line is one event, tagged by `type`:
 
 | type | fields | |
 |---|---|---|
+| `loading` | `model`, `progress` | loading the weights, `progress` 0 to 1 |
 | `ready` | `model`, `context` | the model is loaded; generation starts |
 | `thinking` | `text` | a chunk of reasoning |
 | `answer` | `text` | a chunk of the reply |
@@ -457,7 +465,7 @@ Each SSE `data:` line is one event, tagged by `type`:
 | `permission` | `id`, `name`, `arguments`, `effect` | waiting for you — answer with `/api/permissions/decide` |
 | `tool_call` | `id`, `name`, `arguments` | the call is about to run |
 | `tool_result` | `id`, `name`, `ok`, `summary`, `ms`, `detail` | how it went |
-| `agent_start` | `name`, `description`, `tools`, `missing` | an agent has taken over; events until `agent_end` are its |
+| `agent_start` | `name`, `description`, `tools`, `missing` | an agent has taken over — named by you, or handed the request by the model; events until `agent_end` are its |
 | `agent_end` | `name`, `ok`, `ms`, `calls`, `rounds` | the agent finished; `ok` is false when it produced no report |
 | `done` | `generated`, `tokens_per_second`, `prompt`, `prompt_ms`, `reused`, `stop` | |
 | `error` | `message` | |
@@ -476,8 +484,9 @@ cards and agent blocks back between the right paragraphs on reload.
 
 ## Getting models
 
-Behind the Models dialog. The same machinery as `ozgent pull`: the listing,
-the quantisation choice, the parallel resumable downloader.
+Behind **Admin → Models**, and so behind the admin session (see below). The
+same machinery as `ozgent pull`: the listing, the quantisation choice, the
+parallel resumable downloader.
 
 ### `GET /api/hub/search?q=`
 
@@ -487,11 +496,19 @@ GGUF repositories on Hugging Face matching `q`, most downloaded first:
 ### `GET /api/hub/repo?repo=owner/name`
 
 What a repository offers: `quants` (each with `quant`, `bytes`, `shards`,
-`fits`, `recommended`, and the `name` it would install as), `vision` and
-`projector_bytes`, `gated`, `runnable` (false when it has no GGUF at all),
-and the `gpu` sizes are judged against. `fits` compares with the GPU's
-*total* memory at 85%, since the loaded model is unloaded to make room.
-`recommended` is Q4_K_M when it fits, otherwise the largest that does.
+`fits`, `context_fits`, `kv_cache`, `recommended`, and the `name` it would
+install as), `vision` and `projector_bytes`, `gated`, `runnable` (false when
+it has no GGUF at all), `context_train`, and the `gpu` sizes are judged
+against. `fits` compares with the GPU's *total* memory at 85%, since the
+loaded model is unloaded to make room. `recommended` is Q4_K_M when it fits,
+otherwise the largest that does.
+
+`context_fits` is how many tokens of context fit on the GPU beside that size,
+and `kv_cache` the cache type that gets there — worked out from the model's
+own header, read by byte range from the smallest file (a few hundred KB)
+before anything is downloaded, with the same sizing the engine uses at load.
+`null` when there is no GPU, the weights alone do not fit, or the header could
+not be read.
 
 ### `POST /api/hub/pull`
 
@@ -520,6 +537,19 @@ default is cleared and the response says so (`"cleared_default": true`).
 
 `GET /api/models` marks `embedding` models (read from the file's own header),
 which the chat picker leaves out, and gives each model's `context_train`.
+
+### `PUT /api/admin/models/upload?name=file.gguf` · `POST /api/admin/models/import`
+
+Installing a GGUF from the browser's machine: the file is the raw request
+body, streamed to disk and refused at the first four bytes if it is not GGUF.
+Returns `{"id", "name", "bytes"}`. Then `{"weights": id, "mmproj": id|null,
+"alias": "name"|null}` to `/import` installs it — a hard link on the same
+filesystem, so no second copy — and returns `{"model", "vision"}`. Uploads
+not installed within six hours are swept.
+
+### `POST /api/admin/models/default`
+
+`{"model": "name"}` — make it the default.
 
 ## Agents
 
@@ -601,6 +631,12 @@ strand the engine.
 
 `available` includes tools from MCP servers, named `<server>_<tool>`.
 
+### `GET /api/tools/active`
+
+The tools the running host has, cheaply — for the composer's tray:
+`[{"name", "label"?, "description", "effect", "rule"}]`. Includes
+`ask_agent` when the model may hand requests to agents.
+
 ### `PUT /api/tools`
 
 ```json
@@ -643,8 +679,47 @@ not a fragment, or everything you left out goes back to its default. It saves
 to disk and drops the loaded model, so the next turn picks up the new settings.
 `204` on success.
 
-Handle with care: this is the same document that holds your provider keys, your
-channel allowlists and your MCP servers, and `GET` returns it in full.
+Handle with care: this is the same document that holds your provider keys and
+your MCP servers. `[channels]` and `[web]` are left out of `GET` and ignored in
+`PUT`: they belong to `/admin`, and this endpoint has no password.
+
+---
+
+# `/admin`
+
+The gateway and model downloads, behind a password set on the machine with
+`ozgent admin setup`. Stored as an Argon2id hash in `[web]
+admin_password_hash`; the password itself is never stored.
+
+Signing in sets an `ozgent_admin` cookie (`HttpOnly`, `SameSite=Strict`, 12
+hours from the last use). Every request that changes something must also send
+`x-ozgent-admin: 1`, which a form on another site cannot. Five wrong passwords
+from one address lock it out for fifteen minutes, thirty from anywhere lock
+everyone; `ozgent admin reset` on the machine sets a new password, signs every
+browser out and lifts the lock.
+
+| | |
+|---|---|
+| `GET /api/admin/session` | `{"configured", "signed_in", "invalid"}` — no session needed |
+| `POST /api/admin/login` | `{"password"}` → sets the cookie; `401` wrong, `429` locked |
+| `DELETE /api/admin/session` | sign out |
+| `POST /api/admin/password` | `{"current", "new"}` — signs every other browser out |
+
+### Gateway
+
+| | |
+|---|---|
+| `GET /api/admin/gateway` | everything the page shows: each channel's settings and `runtime` (`phase`: `off`, `installing`, `starting`, `linking`, `connected`, `failed`, `elsewhere`; `who`; `detail`), the pairing code, the tools and their rules, the models |
+| `PUT /api/admin/gateway` | `{"model": "name"|null}` — the model chats get |
+| `PUT /api/admin/gateway/{telegram\|whatsapp}` | any of `enabled`, `allow` (the whole list; each entry checked), `tools` (`null` for all, a list for only those), `approve`, `stream`; WhatsApp also `self_chat`, `groups` |
+| `POST /api/admin/gateway/telegram/token` | `{"token"}` — checked with Telegram, then saved; returns `{"bot"}` |
+| `POST /api/admin/gateway/whatsapp/link` | installs the bridge if needed and starts linking |
+| `GET /api/admin/gateway/qr` | the current linking code as SVG, while there is one |
+| `POST /api/admin/gateway/{channel}/signout` | forget the token, or unlink the device on WhatsApp's side too |
+| `POST /api/admin/gateway/{channel}/restart` | reconnect, clearing a failure |
+| `POST /api/admin/gateway/pairing` | a new pairing code |
+
+Changes apply to the running channels at once; there is nothing to restart.
 
 ---
 

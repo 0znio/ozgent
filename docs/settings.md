@@ -34,7 +34,7 @@ worse than saying so.
 
 | flag | `/config` key | `config.toml` | what it does |
 |---|---|---|---|
-| `--ctx`, `-c`, `--context` | `ctx` | `context_length` | context length in tokens |
+| `--ctx`, `-c`, `--context` | `ctx` | `context_length` | context length in tokens; 32k unless set, then lowered to what the model was trained on and what fits in memory |
 | `--temperature`, `-t`, `--temp` | `temperature` | `temperature` | lower is more focused |
 | `--top-p` | `top_p` | `top_p` | nucleus sampling |
 | `--top-k` | `top_k` | `top_k` | consider only the K likeliest; 0 disables |
@@ -66,6 +66,21 @@ ozgent default --clear      go back to naming one each time
 
 It is also Settings → General in the web interface, and `default_model` in
 `config.toml`. All four are the same value.
+
+## The web interface and the admin page
+
+```toml
+[web]
+admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$…"   # written by `ozgent admin setup`
+
+[tools]
+handoff = true    # the model may pass a request to an @agent by itself
+```
+
+The admin password is never stored — only an Argon2id hash of it, set with
+`ozgent admin setup` and replaced with `ozgent admin reset` if it is
+forgotten. A password typed straight into this file is refused, not trusted.
+`config.toml` is written readable only by you, since it can hold a bot token.
 
 ## When the context you asked for is not the one you get
 

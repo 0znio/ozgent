@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>ozgent admin</title>
+  <script>
+    try {
+      var saved = localStorage.getItem("ozgent-theme");
+      if (saved === "light" || saved === "dark") {
+        document.documentElement.setAttribute("data-theme", saved);
+      }
+    } catch (e) { /* private browsing; fall back to the system preference */ }
+  </script>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="adm">
+
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <path d="M6 6l12 12M18 6L6 18"/>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/>
+  </symbol>
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15 6l-6 6 6 6"/>
+  </symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6l7-3z"/>
+  </symbol>
+  <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14l3-3 3 3"/>
+  </symbol>
+</svg>
+
+<!-- Signed out: one card, and nothing else to look at. -->
+<main class="adm-gate" id="gate" hidden>
+  <div class="adm-card adm-signin">
+    <div class="adm-mark"><span class="mark">ozgent</span><span class="adm-tag">admin</span></div>
+
+    <form id="signin" autocomplete="on">
+      <label class="adm-field">
+        <span>Password</span>
+        <input type="password" id="password" class="text-input" autocomplete="current-password" required autofocus>
+      </label>
+      <button type="submit" class="primary-btn" id="signin-btn">Sign in</button>
+      <p class="error" id="signin-error" hidden></p>
+    </form>
+
+    <div id="not-set" hidden>
+      <p>This page has no password yet. On the machine running ozgent, run:</p>
+      <pre class="adm-cmd">ozgent admin setup</pre>
+      <p class="hint">Then reload this page. The password is stored as a hash, never in the clear.</p>
+    </div>
+
+    <p class="hint adm-forgot" id="forgot">Forgot it? Run <code>ozgent admin reset</code> on the machine.</p>
+    <a class="linky adm-back-link" href="/">back to the chat</a>
+  </div>
+</main>
+
+<!-- Signed in. -->
+<div class="adm-shell" id="shell" hidden>
+  <header class="adm-top">
+    <a class="icon-btn" href="/" aria-label="Back to the chat" data-tip="Back to the chat">
+      <svg class="ic"><use href="#i-back"></use></svg>
+    </a>
+    <span class="mark">ozgent</span><span class="adm-tag">admin</span>
+    <nav class="adm-nav" role="tablist" aria-label="Sections">
+      <button type="button" class="tab" role="tab" data-view="gateway" aria-selected="true">Gateway</button>
+      <button type="button" class="tab" role="tab" data-view="models" aria-selected="false">Models</button>
+      <button type="button" class="tab" role="tab" data-view="account" aria-selected="false">Password</button>
+    </nav>
+    <span class="spacer"></span>
+    <button type="button" class="ghost-btn auto" id="signout">Sign out</button>
+  </header>
+
+  <!-- ------------------------------------------------------------ gateway -->
+  <section class="adm-view" id="view-gateway">
+    <div class="adm-head">
+      <h1>Gateway</h1>
+      <p class="adm-lede">Talk to ozgent from Telegram and WhatsApp. Nobody can message it until you allow them here.</p>
+    </div>
+
+    <div class="adm-banner" id="gw-banner" hidden></div>
+
+    <div class="adm-strip" id="gw-strip">
+      <div class="adm-strip-item">
+        <span class="adm-k">Pairing code</span>
+        <span class="adm-v"><code id="gw-pairing">—</code>
+          <button type="button" class="linky" id="gw-new-code">new code</button></span>
+        <span class="hint inline">Someone not on a list can send <code>/pair</code> and this code to be let in. It works once.</span>
+      </div>
+      <label class="adm-strip-item">
+        <span class="adm-k">Answers with</span>
+        <select id="gw-model" class="select"></select>
+      </label>
+    </div>
+
+    <div class="adm-channels">
+      <!-- Telegram -->
+      <article class="adm-card adm-channel" id="ch-telegram" data-kind="telegram">
+        <header class="adm-ch-head">
+          <h2>Telegram</h2>
+          <span class="adm-pill" data-role="pill">off</span>
+          <span class="spacer"></span>
+          <label class="switch" data-tip="Answer messages on Telegram">
+            <input type="checkbox" data-role="enabled" aria-label="Answer on Telegram"><span class="track"></span>
+          </label>
+        </header>
+        <p class="adm-detail" data-role="detail" hidden></p>
+
+        <div class="adm-row">
+          <div class="adm-row-label">Bot</div>
+          <div class="adm-row-body" data-role="account"></div>
+        </div>
+        <form class="adm-row adm-token" data-role="token-form" hidden>
+          <div class="adm-row-label">Bot token</div>
+          <div class="adm-row-body">
+            <ol class="adm-steps">
+              <li>In Telegram, open <b>@BotFather</b> and send <code>/newbot</code>.</li>
+              <li>Paste the token it gives you, like <code>123456789:AAH…</code></li>
+            </ol>
+            <div class="adm-inline">
+              <input type="password" class="text-input" data-role="token" placeholder="bot token" autocomplete="off" spellcheck="false">
+              <button type="submit" class="primary-btn" data-role="token-save">Connect</button>
+              <button type="button" class="ghost-btn auto" data-role="token-cancel" hidden>Cancel</button>
+            </div>
+            <p class="error" data-role="token-error" hidden></p>
+          </div>
+        </form>
+        <div class="adm-configured" data-role="configured"></div>
+      </article>
+
+      <!-- WhatsApp -->
+      <article class="adm-card adm-channel" id="ch-whatsapp" data-kind="whatsapp">
+        <header class="adm-ch-head">
+          <h2>WhatsApp</h2>
+          <span class="adm-pill" data-role="pill">off</span>
+          <span class="spacer"></span>
+          <label class="switch" data-tip="Answer messages on WhatsApp">
+            <input type="checkbox" data-role="enabled" aria-label="Answer on WhatsApp"><span class="track"></span>
+          </label>
+        </header>
+        <p class="adm-detail" data-role="detail" hidden></p>
+
+        <div class="adm-row">
+          <div class="adm-row-label">Account</div>
+          <div class="adm-row-body" data-role="account"></div>
+        </div>
+
+        <div class="adm-link" data-role="link" hidden>
+          <div class="adm-qr-wrap">
+            <img class="adm-qr" data-role="qr" alt="WhatsApp linking code" width="264" height="264">
+            <div class="adm-qr-wait" data-role="qr-wait">
+              <div class="adm-bar indeterminate"><span></span></div>
+              <span data-role="qr-wait-text">starting WhatsApp…</span>
+            </div>
+          </div>
+          <div class="adm-link-text">
+            <ol class="adm-steps">
+              <li>On your phone, open <b>WhatsApp ▸ Settings ▸ Linked devices</b>.</li>
+              <li>Tap <b>Link a device</b> and point the camera at this code.</li>
+            </ol>
+            <p class="hint">The code changes every 20 seconds; this page follows it.</p>
+            <div class="adm-countdown">
+              <div class="adm-bar"><span data-role="qr-left-bar"></span></div>
+              <span class="adm-mono" data-role="qr-left"></span>
+            </div>
+            <button type="button" class="ghost-btn auto" data-role="link-cancel">Cancel</button>
+            <p class="hint adm-warn-note">This links your own account as a second device. Automating a personal account is against WhatsApp's terms and accounts have been banned; use a number you can afford to lose.</p>
+          </div>
+        </div>
+
+        <div class="adm-configured" data-role="configured"></div>
+      </article>
+    </div>
+
+    <template id="tpl-configured">
+      <div class="adm-row">
+        <div class="adm-row-label">Who can message it</div>
+        <div class="adm-row-body">
+          <label class="adm-check" data-role="self-row" hidden>
+            <span class="switch"><input type="checkbox" data-role="self-chat"><span class="track"></span></span>
+            <span><b>Your own chat</b> — answer what you write in “Message yourself”</span>
+          </label>
+          <ul class="adm-chips" data-role="allow"></ul>
+          <form class="adm-inline" data-role="allow-form">
+            <input type="text" class="text-input" data-role="allow-input" autocomplete="off" spellcheck="false">
+            <button type="submit" class="ghost-btn auto">Allow</button>
+          </form>
+          <p class="error" data-role="allow-error" hidden></p>
+          <p class="hint" data-role="allow-hint"></p>
+        </div>
+      </div>
+
+      <div class="adm-row">
+        <div class="adm-row-label">Tools</div>
+        <div class="adm-row-body">
+          <div class="adm-seg" role="radiogroup" data-role="tools-mode">
+            <button type="button" role="radio" data-mode="all">All</button>
+            <button type="button" role="radio" data-mode="some">Only these</button>
+            <button type="button" role="radio" data-mode="none">None</button>
+          </div>
+          <div class="adm-tools" data-role="tools"></div>
+          <p class="hint" data-role="tools-hint"></p>
+        </div>
+      </div>
+
+      <div class="adm-row">
+        <div class="adm-row-label">Approvals</div>
+        <div class="adm-row-body">
+          <label class="adm-check">
+            <span class="switch"><input type="checkbox" data-role="approve"><span class="track"></span></span>
+            <span>Let people here approve a tool that asks first — writing a file, running a command. Off: anything that would ask is refused.</span>
+          </label>
+          <label class="adm-check" data-role="groups-row" hidden>
+            <span class="switch"><input type="checkbox" data-role="groups"><span class="track"></span></span>
+            <span>Answer in group chats. Anyone allowed can then steer ozgent where the whole group sees it.</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="adm-actions">
+        <button type="button" class="ghost-btn auto" data-role="restart">Reconnect</button>
+        <button type="button" class="ghost-btn auto" data-role="change"></button>
+        <span class="spacer"></span>
+        <button type="button" class="ghost-btn auto md-danger" data-role="signout">Sign out</button>
+      </div>
+    </template>
+  </section>
+
+  <!-- ------------------------------------------------------------- models -->
+  <section class="adm-view" id="view-models" hidden>
+    <div class="adm-head">
+      <h1>Models</h1>
+      <p class="adm-lede">Download from Hugging Face, or install a GGUF file you already have. Downloads keep going if you close this page.</p>
+    </div>
+
+    <div class="adm-card">
+      <h3 class="sub">Get a model</h3>
+      <form class="md-search" id="md-search-form" autocomplete="off">
+        <svg class="ic"><use href="#i-search"></use></svg>
+        <input type="text" id="md-query" class="text-input"
+               placeholder="Search Hugging Face, or paste owner/repo" spellcheck="false">
+      </form>
+      <p class="hint" id="md-search-note">GGUF repositories only — those are what llama.cpp runs.</p>
+      <div class="md-results" id="md-results"></div>
+
+      <div class="md-repo" id="md-repo" hidden>
+        <div class="md-repo-head">
+          <span class="md-repo-id" id="md-repo-id"></span>
+          <span class="md-chip" id="md-repo-vision" hidden>vision</span>
+          <span class="md-chip md-warn" id="md-repo-gated" hidden>gated</span>
+          <button type="button" class="linky" id="md-repo-back">back to results</button>
+        </div>
+        <p class="hint" id="md-gpu"></p>
+        <div class="md-quants" id="md-quants" role="radiogroup" aria-label="Quantisation"></div>
+        <div class="md-pull-row">
+          <label class="md-alias">
+            <span>Short name</span>
+            <input type="text" id="md-alias" class="text-input" placeholder="optional, e.g. qwen" maxlength="40">
+          </label>
+          <button type="button" class="primary-btn" id="md-pull">Download</button>
+        </div>
+        <p class="error" id="md-repo-error" hidden></p>
+      </div>
+    </div>
+
+    <div class="adm-card">
+      <h3 class="sub">Install from a file</h3>
+      <p class="hint adm-flush">A <code>.gguf</code> file from your computer. For a vision model, add its projector (<code>mmproj</code>) file too.</p>
+      <form class="adm-upload" id="up-form">
+        <label class="adm-file">
+          <input type="file" id="up-weights" accept=".gguf">
+          <svg class="ic"><use href="#i-file"></use></svg>
+          <span class="adm-file-name" id="up-weights-name">Choose the model file…</span>
+        </label>
+        <label class="adm-file adm-file-small">
+          <input type="file" id="up-mmproj" accept=".gguf">
+          <span class="adm-file-name" id="up-mmproj-name">Projector (optional)</span>
+        </label>
+        <div class="md-pull-row">
+          <label class="md-alias">
+            <span>Short name</span>
+            <input type="text" id="up-alias" class="text-input" placeholder="optional, e.g. mymodel" maxlength="40">
+          </label>
+          <button type="submit" class="primary-btn" id="up-go" disabled>Install</button>
+        </div>
+        <div class="md-job" id="up-progress" hidden>
+          <div class="md-job-head"><span class="md-job-name" id="up-what"></span><span class="md-job-pct" id="up-pct"></span></div>
+          <div class="md-track"><span class="md-fill" id="up-fill"></span></div>
+          <div class="md-job-foot"><span class="md-job-line" id="up-line"></span><span class="md-job-acts"><button type="button" class="linky" id="up-cancel">Cancel</button></span></div>
+        </div>
+        <p class="error" id="up-error" hidden></p>
+      </form>
+    </div>
+
+    <div class="adm-card" id="md-jobs-section" hidden>
+      <h3 class="sub">Downloads</h3>
+      <div class="md-jobs" id="md-jobs"></div>
+    </div>
+
+    <div class="adm-card">
+      <h3 class="sub">Installed</h3>
+      <div class="md-installed" id="md-installed"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------ account -->
+  <section class="adm-view" id="view-account" hidden>
+    <div class="adm-head">
+      <h1>Password</h1>
+      <p class="adm-lede">Changing it signs out every other browser.</p>
+    </div>
+    <form class="adm-card adm-password" id="pw-form" autocomplete="on">
+      <input type="text" autocomplete="username" value="admin" hidden>
+      <label class="adm-field"><span>Current password</span>
+        <input type="password" id="pw-current" class="text-input" autocomplete="current-password" required></label>
+      <label class="adm-field"><span>New password</span>
+        <input type="password" id="pw-new" class="text-input" autocomplete="new-password" minlength="8" required></label>
+      <label class="adm-field"><span>New password, again</span>
+        <input type="password" id="pw-again" class="text-input" autocomplete="new-password" minlength="8" required></label>
+      <div class="adm-actions">
+        <button type="submit" class="primary-btn">Change password</button>
+        <span class="hint inline" id="pw-note"></span>
+      </div>
+      <p class="hint">Forgot it? <code>ozgent admin reset</code> on the machine sets a new one. <code>ozgent admin disable</code> closes this page.</p>
+    </form>
+  </section>
+</div>
+
+<script type="module" src="/admin.js"></script>
+</body>
+</html>

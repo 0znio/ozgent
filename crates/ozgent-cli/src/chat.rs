@@ -119,6 +119,8 @@ pub struct Chat<'a> {
     scope: Option<Scope>,
     /// The last reply's text, for `/copy`.
     last_reply: String,
+    /// Agents the model may hand this turn to itself, through `ask_agent`.
+    handoff: Vec<ozgent_core::Agent>,
 }
 
 /// An agent at work: what it is, and what it was given.
@@ -137,6 +139,8 @@ struct Rounds {
     activity: Vec<serde_json::Value>,
     /// Calls that actually ran.
     calls: usize,
+    /// The model handed the turn to this agent, with this task.
+    handoff: Option<(ozgent_core::Agent, String)>,
 }
 
 /// Start a chat.
@@ -209,10 +213,8 @@ async fn run_one(
 
     // Painted before the load rather than after, because the load is the long
     // part and a blank screen for twenty seconds looks like a hang.
-    ui.say(format!("loading {model_ref}…"));
-    ui.render();
     let started = std::time::Instant::now();
-    let engine = Engine::load(&manifest.primary_weights(&dir), &opts)?;
+    let engine = load_with_bar(ui, &model_ref.to_string(), manifest.primary_weights(&dir), &opts)?;
     ui.say(format!(
         "{} layers ({} on gpu) in {:.1}s",
         engine.n_layer(),
@@ -276,6 +278,7 @@ async fn run_one(
         config: config.clone(),
         scope: None,
         last_reply: String::new(),
+        handoff: Vec::new(),
     };
     // The @ panel needs the agents before the first keystroke.
     chat.ui.set_agents(ozgent_core::AgentCatalog::load(paths));
@@ -542,11 +545,49 @@ impl<'a> Chat<'a> {
         self.ui.set_agents(catalog);
 
         let (text, thinking, activity) = if agents.is_empty() {
+            // The model may hand the turn to an agent itself.
+            self.handoff = if self.config.tools.handoff && self.tools.is_some() {
+                catalog_agents(&self.paths)
+            } else {
+                Vec::new()
+            };
+            if !self.engine.template_handles_tools() && self.tools.is_some() {
+                let offered = self.offered();
+                self.session.set_tools(&offered);
+            }
             let messages = self.build_context(Some(conversation), &extracted.text)?;
-            let rounds = self.rounds(messages, ozgent_web::worker::MAX_TOOL_ROUNDS).await?;
-            (rounds.reply.text, rounds.reply.thinking, rounds.activity)
+            let rounds = self.rounds(messages, ozgent_web::worker::MAX_TOOL_ROUNDS).await;
+            self.handoff.clear();
+            let rounds = rounds?;
+            match rounds.handoff {
+                None => (rounds.reply.text, rounds.reply.thinking, rounds.activity),
+                Some((agent, task)) => {
+                    let note = ozgent_core::agents::handoff_note(&task);
+                    let before = rounds.reply.text.trim().to_string();
+                    let (report, _, mut activity) =
+                        self.run_agents(conversation, &extracted.text, &[agent], Some(&note)).await?;
+                    // What the model said before handing over stays, above
+                    // the agent's report; the report's offsets move past it.
+                    let (text, shift) = if before.is_empty() {
+                        (report, 0)
+                    } else {
+                        let shift = before.encode_utf16().count() + 2;
+                        (format!("{before}\n\n{report}"), shift)
+                    };
+                    for entry in activity.iter_mut() {
+                        for key in ["at", "end"] {
+                            if let Some(n) = entry.get(key).and_then(|v| v.as_u64()) {
+                                entry[key] = (n + shift as u64).into();
+                            }
+                        }
+                    }
+                    let mut all = rounds.activity;
+                    all.extend(activity);
+                    (text, rounds.reply.thinking, all)
+                }
+            }
         } else {
-            self.run_agents(conversation, &extracted.text, &agents).await?
+            self.run_agents(conversation, &extracted.text, &agents, None).await?
         };
 
         // What happened on the way, in the shape the web interface replays,
@@ -575,7 +616,13 @@ impl<'a> Chat<'a> {
     fn offered(&self) -> Vec<ozgent_core::ToolSpec> {
         match &self.scope {
             Some(scope) => scope.offered.clone(),
-            None => self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default(),
+            None => {
+                let mut all = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
+                if self.tools.is_some() {
+                    all.extend(ozgent_core::agents::handoff_spec(&self.handoff));
+                }
+                all
+            }
         }
     }
 
@@ -620,6 +667,16 @@ impl<'a> Chat<'a> {
             }
             reply.text = parsed.text.clone();
 
+            // Handing the turn to an agent ends the model's part of it.
+            if self.scope.is_none() {
+                if let Some(call) = parsed.calls.iter().find(|c| c.name == ozgent_core::agents::HANDOFF_TOOL) {
+                    if let Ok((agent, task)) = ozgent_core::agents::read_handoff(&call.arguments, &self.handoff) {
+                        self.ui.settle();
+                        return Ok(Rounds { reply, activity, calls, handoff: Some((agent.clone(), task)) });
+                    }
+                }
+            }
+
             for call in &parsed.calls {
                 self.show_call(call);
                 let started = std::time::Instant::now();
@@ -628,7 +685,22 @@ impl<'a> Chat<'a> {
                 // running it. The host has it — it simply was not on the
                 // table — and running it anyway would make an agent's list a
                 // suggestion rather than a limit.
-                let (result, ok, summary) = if !names.contains(&call.name) {
+                let (result, ok, summary) = if call.name == ozgent_core::agents::HANDOFF_TOOL
+                    && self.scope.is_none()
+                    && names.contains(&call.name)
+                {
+                    // Reached only when the agent it named does not exist.
+                    self.ui.settle();
+                    let reason = ozgent_core::agents::read_handoff(&call.arguments, &self.handoff)
+                        .err()
+                        .unwrap_or_default();
+                    let outcome: Result<serde_json::Value, ozgent_tools::ToolCallError> =
+                        Err(ozgent_tools::ToolCallError::Invalid { name: call.name.clone(), reason });
+                    self.show_result(&outcome, started.elapsed());
+                    let text = outcome.unwrap_err().for_model();
+                    let summary = ozgent_tools::first_line(&text).to_string();
+                    (text, false, summary)
+                } else if !names.contains(&call.name) {
                     self.ui.settle();
                     let outcome: Result<serde_json::Value, ozgent_tools::ToolCallError> =
                         Err(ozgent_tools::ToolCallError::NotOffered {
@@ -730,7 +802,7 @@ impl<'a> Chat<'a> {
             }
             reply = self.generate(&messages)?;
         }
-        Ok(Rounds { reply, activity, calls })
+        Ok(Rounds { reply, activity, calls, handoff: None })
     }
 
     /// Hand the turn to each agent the message named, in order.
@@ -743,6 +815,7 @@ impl<'a> Chat<'a> {
         conversation: i64,
         query: &str,
         agents: &[ozgent_core::Agent],
+        note: Option<&str>,
     ) -> Result<(String, Option<String>, Vec<serde_json::Value>)> {
         let available = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
         let saved = self.opts.clone();
@@ -774,6 +847,9 @@ impl<'a> Chat<'a> {
             let started = std::time::Instant::now();
             let outcome = match self.build_context(Some(conversation), query) {
                 Ok(mut messages) => {
+                    if let Some(note) = note {
+                        messages.push(Message::system(note));
+                    }
                     messages.extend(earlier.iter().cloned());
                     self.rounds(messages, agent.definition.rounds()).await
                 }
@@ -940,6 +1016,17 @@ impl<'a> Chat<'a> {
                 (Some(note), None) => Some(note.clone()),
                 (None, b) => b.clone(),
             },
+        };
+        // The agents, named where the model reads its instructions, when it
+        // may hand a turn to one; see `handoff_prompt`.
+        let system = if self.scope.is_none() && !self.handoff.is_empty() && self.tools.is_some() {
+            let line = ozgent_core::agents::handoff_prompt(&self.handoff);
+            Some(match system {
+                Some(s) if !s.is_empty() => format!("{s}\n\n{line}"),
+                _ => line,
+            })
+        } else {
+            system
         };
         Ok(ctx.to_messages(system.as_deref()))
     }
@@ -2550,9 +2637,73 @@ Editing      Shift-Enter for a new line (Alt-Enter or Ctrl-J in terminals
 Paste an image path or URL in a message and it is picked up automatically.
 Type @ for the agents; Tab or Enter picks one.";
 
+/// Every agent, for the model to hand a turn to. Read per turn, so one saved a
+/// moment ago is included.
+fn catalog_agents(paths: &Paths) -> Vec<ozgent_core::Agent> {
+    ozgent_core::AgentCatalog::load(paths).all().to_vec()
+}
+
+/// Load a model on another thread while this one draws how far along it is.
+///
+/// llama.cpp reports progress per tensor, from inside the load call; drawing
+/// from there would mean touching the screen from its callback. So the load
+/// runs beside, the fraction goes through an atomic, and this thread keeps
+/// the line moving — a large model takes long enough that a frozen line reads
+/// as a hang.
+fn load_with_bar(
+    ui: &mut Ui,
+    name: &str,
+    weights: std::path::PathBuf,
+    opts: &ozgent_core::Resolved,
+) -> Result<Engine> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let done = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&done);
+    let opts = opts.clone();
+    let loading = std::thread::spawn(move || {
+        Engine::load_reporting(&weights, &opts, move |p| seen.store((p * 1000.0) as u32, Ordering::Relaxed))
+    });
+    let mut shown = u32::MAX;
+    while !loading.is_finished() {
+        let per_mille = done.load(Ordering::Relaxed).min(1000);
+        if per_mille / 10 != shown {
+            shown = per_mille / 10;
+            ui.begin_activity(format!("loading {name}  {}", progress_bar(per_mille as f32 / 1000.0, 24)));
+        }
+        ui.tick();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+    let engine = loading.join().map_err(|_| anyhow::anyhow!("the model loader crashed"))?;
+    // llama.cpp's last report is short of one, so a finished load would
+    // otherwise stand at 99%.
+    if engine.is_ok() {
+        ui.begin_activity(format!("loading {name}  {}", progress_bar(1.0, 24)));
+    }
+    ui.settle();
+    let engine = engine?;
+    Ok(engine)
+}
+
+/// `█████░░░░░  42%`: a bar a terminal can draw in any font.
+pub fn progress_bar(fraction: f32, width: usize) -> String {
+    let f = fraction.clamp(0.0, 1.0);
+    let full = (f * width as f32).round() as usize;
+    format!("{}{} {:>3}%", "█".repeat(full), "░".repeat(width - full), (f * 100.0).floor() as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_progress_bar_fills_and_says_how_far() {
+        assert_eq!(progress_bar(0.0, 4), "░░░░   0%");
+        assert_eq!(progress_bar(0.5, 4), "██░░  50%");
+        assert_eq!(progress_bar(1.0, 4), "████ 100%");
+        assert_eq!(progress_bar(2.0, 4), "████ 100%");
+    }
 
     #[test]
     fn a_multiline_argument_stays_on_one_row() {

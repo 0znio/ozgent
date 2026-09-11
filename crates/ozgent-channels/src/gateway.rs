@@ -15,13 +15,26 @@
 //!   inference thread is waiting inside `permit`, so the answer arrives on the
 //!   receiving side and is delivered straight to the pending map. Routing it
 //!   through the chat's queue would put it behind the very turn it unblocks.
+//!
+//! It is also a supervisor. Channels are started, stopped and restarted while
+//! it runs — from `/admin`, or because `config.toml` changed under it — so
+//! setting up a channel never means restarting ozgent. [`Gateway::apply`] is
+//! the one place that compares what is configured with what is running.
+//!
+//! Only one process may answer the channels: two would fight over the
+//! Telegram token (it allows one reader) and the WhatsApp session (a second
+//! connection replaces the first). A lock file decides which; the other is
+//! told who has it, and takes over if that process goes away.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ozgent_core::channels::{self, Kind};
 use ozgent_core::permission::{Choice, Effect};
 use ozgent_core::{Config, Paths};
+use ozgent_web::admin::{Fut, GatewayControl, GatewayView, Phase, Runtime};
 use ozgent_web::state::State;
 use ozgent_web::turn::{self, Turn};
 use ozgent_web::worker::Event;
@@ -36,6 +49,16 @@ use crate::split::{TELEGRAM_LIMIT, WHATSAPP_LIMIT};
 /// A chat, on a channel. The store keys bound conversations the same way.
 type Key = (Kind, String);
 
+const KINDS: [Kind; 2] = [Kind::Telegram, Kind::WhatsApp];
+
+/// How long a WhatsApp linking code is shown before giving up. WhatsApp
+/// replaces the code every twenty seconds and stops after a few minutes.
+const LINK_FOR: Duration = Duration::from_secs(180);
+
+/// How often a process that does not hold the channels checks whether it can
+/// take them over, and a linking code is checked for expiry.
+const TICK: Duration = Duration::from_secs(5);
+
 /// A question posted to a chat and not yet answered.
 struct Ask {
     /// The tool call id the inference thread is blocked on.
@@ -45,11 +68,45 @@ struct Ask {
     tool: String,
 }
 
+/// A channel that is running.
+struct Instance {
+    /// Which start this is. Events from an instance that has since been
+    /// stopped carry an older number and are dropped.
+    generation: u64,
+    /// The settings it was started with that need a restart to change.
+    fingerprint: String,
+    handle: tokio::task::AbortHandle,
+}
+
+/// Where the terminal output of the gateway goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// `ozgent gateway`: the terminal is the only place to see anything, so
+    /// connections, failures and the pairing code are printed.
+    Terminal,
+    /// Inside `ozgent web`: connections and failures are printed, the rest is
+    /// on `/admin`.
+    Web,
+}
+
 struct Shared {
     app: State,
     paths: Paths,
+    mode: Mode,
     tokens: Tokens,
-    senders: HashMap<Kind, UnboundedSender<Command>>,
+    senders: Mutex<HashMap<Kind, UnboundedSender<Command>>>,
+    instances: Mutex<HashMap<Kind, Instance>>,
+    runtime: Mutex<HashMap<Kind, Runtime>>,
+    /// The settings a channel failed with. It is not started again with the
+    /// same ones — that would fail the same way, forever — until they change
+    /// or someone presses restart.
+    failed_with: Mutex<HashMap<Kind, String>>,
+    /// When WhatsApp linking was asked for; `None` when it was not.
+    linking: Mutex<Option<Instant>>,
+    generation: AtomicU64,
+    inbound: Sender<(Kind, u64, Inbound)>,
+    /// Held for as long as this process answers the channels.
+    lock: Mutex<Option<std::fs::File>>,
     /// Questions in flight, by the token their buttons carry.
     asks: Mutex<HashMap<u64, Ask>>,
     /// The question a chat is waiting on, so a *typed* answer is read as an
@@ -62,122 +119,511 @@ struct Shared {
     pairing: Mutex<String>,
 }
 
-/// Run every configured channel until the process is stopped.
-pub async fn run(app: State, paths: Paths) -> anyhow::Result<()> {
-    let config = snapshot(&app);
-    let active = config.channels.active();
-    if active.is_empty() {
-        anyhow::bail!(
-            "no channel is switched on. Set `[channels] enabled = true` and turn one on — \
-             see `ozgent channel --help`."
-        );
-    }
+/// The running gateway. Cheap to clone; every clone is the same gateway.
+#[derive(Clone)]
+pub struct Gateway {
+    shared: Arc<Shared>,
+}
 
-    let (inbound_tx, mut inbound_rx) = channel::<(Kind, Inbound)>(64);
-    let mut senders = HashMap::new();
-
-    for kind in &active {
-        let (command_tx, command_rx) = unbounded_channel::<Command>();
-        senders.insert(*kind, command_tx);
-
-        // Each channel speaks plain `Inbound`; the kind is added here so a
-        // channel never has to know what else is running.
-        let (tagged_tx, mut tagged_rx) = channel::<Inbound>(64);
-        let to_gateway = inbound_tx.clone();
-        let kind = *kind;
-        tokio::spawn(async move {
-            while let Some(event) = tagged_rx.recv().await {
-                if to_gateway.send((kind, event)).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        start(kind, &config, &paths, tagged_tx, command_rx, inbound_tx.clone());
-    }
-    drop(inbound_tx);
-
+/// Start the gateway inside this process and register it with the web app,
+/// so `/admin` can control it. Channels that are set up start straight away.
+pub fn start(app: State, paths: Paths, mode: Mode) -> Gateway {
+    let (inbound_tx, inbound_rx) = channel::<(Kind, u64, Inbound)>(64);
     let shared = Arc::new(Shared {
-        app,
+        app: app.clone(),
         paths,
+        mode,
         tokens: Tokens::default(),
-        senders,
+        senders: Mutex::new(HashMap::new()),
+        instances: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(HashMap::new()),
+        failed_with: Mutex::new(HashMap::new()),
+        linking: Mutex::new(None),
+        generation: AtomicU64::new(1),
+        inbound: inbound_tx,
+        lock: Mutex::new(None),
         asks: Mutex::new(HashMap::new()),
         waiting: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
         pairing: Mutex::new(pairing_code()),
     });
+    let gateway = Gateway { shared };
 
-    announce(&shared, &config, &active);
-
-    let mut chats: HashMap<Key, UnboundedSender<Msg>> = HashMap::new();
-    // A channel that has reported a terminal failure. When the last one goes,
-    // so does the gateway: a process that stays up answering nothing looks
-    // like it is working, and is the worst of the possible outcomes.
-    let mut dead: Vec<Kind> = Vec::new();
-
-    while let Some((kind, event)) = inbound_rx.recv().await {
-        if matches!(event, Inbound::Failed { .. }) && !dead.contains(&kind) {
-            dead.push(kind);
+    tokio::spawn(receive(gateway.shared.clone(), inbound_rx));
+    // Changes other programs make to config.toml arrive through here, and
+    // each one ends in `apply`.
+    ozgent_web::state::watch_config(&app);
+    tokio::spawn({
+        let gateway = gateway.clone();
+        async move {
+            loop {
+                tokio::time::sleep(TICK).await;
+                gateway.tick();
+            }
         }
-        route(&shared, &mut chats, kind, event).await;
-        if dead.len() == active.len() {
-            anyhow::bail!("every channel stopped; nothing is being answered");
-        }
+    });
+
+    let _ = app.gateway.set(Arc::new(gateway.clone()));
+    gateway.apply();
+    gateway
+}
+
+/// `ozgent gateway`: answer the channels from this terminal until stopped.
+pub async fn run(app: State, paths: Paths) -> anyhow::Result<()> {
+    let config = snapshot(&app);
+    let linked = whatsapp_linked(&paths);
+    let ready: Vec<Kind> = KINDS
+        .into_iter()
+        .filter(|k| wanted(&config, *k, linked, false, &paths))
+        .collect();
+    if ready.is_empty() {
+        anyhow::bail!(
+            "no channel is set up yet. Set one up with:\n\n  \
+             ozgent gateway telegram\n  ozgent gateway whatsapp\n\n\
+             Or run `ozgent web` and use http://localhost:7333/admin."
+        );
     }
+    let gateway = start(app, paths, Mode::Terminal);
+    if let Some(other) = gateway.holder() {
+        anyhow::bail!(
+            "the channels are already being answered by {other}. Stop that first — only one \
+             program can hold a bot token or a WhatsApp session."
+        );
+    }
+    announce(&gateway.shared, &config, &ready);
+    std::future::pending::<()>().await;
     Ok(())
 }
 
-/// Start one channel's own task.
-fn start(
-    kind: Kind,
-    config: &Config,
-    paths: &Paths,
-    tx: Sender<Inbound>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
-    failures: Sender<(Kind, Inbound)>,
-) {
-    // A channel that cannot start must say so on the same path everything else
-    // is reported on, or `ozgent gateway` prints a banner and then sits there
-    // silently doing nothing.
-    let report = move |reason: String| {
-        tokio::spawn(async move {
-            let _ = failures.send((kind, Inbound::Failed { reason })).await;
-        });
-    };
+impl Gateway {
+    fn note(&self, text: impl std::fmt::Display) {
+        note(&self.shared, text);
+    }
 
-    match kind {
-        Kind::Telegram => {
-            // The environment wins, for anyone who would rather not have a
-            // password in a file that gets copied around.
-            let token = std::env::var("OZGENT_TELEGRAM_TOKEN")
-                .unwrap_or_else(|_| config.channels.telegram.token.clone());
-            tokio::spawn(async move {
-                if let Err(e) = crate::telegram::run(token, tx, rx).await {
-                    report(e.to_string());
-                }
-            });
+    /// Who holds the channels, when it is not this process.
+    fn holder(&self) -> Option<String> {
+        if self.shared.lock.lock().unwrap().is_some() {
+            return None;
         }
-        Kind::WhatsApp => {
-            let wa = config.channels.whatsapp.clone();
-            let paths = paths.clone();
-            tokio::spawn(async move {
-                let bridge = match crate::whatsapp::locate(wa.bridge.as_deref(), &paths) {
-                    Ok(b) => b,
-                    Err(e) => return report(e.to_string()),
-                };
-                let state = paths.channel_dir("whatsapp").join("auth");
-                if let Err(e) =
-                    crate::whatsapp::run(wa.node, bridge, state, wa.self_chat, tx, rx).await
-                {
-                    report(e.to_string());
+        let path = lock_path(&self.shared.paths);
+        let pid = std::fs::read_to_string(&path).unwrap_or_default();
+        let pid = pid.trim();
+        Some(if pid.is_empty() {
+            "another ozgent".to_string()
+        } else {
+            format!("another ozgent (process {pid})")
+        })
+    }
+
+    /// Take the lock if nobody has it. True when this process holds it.
+    fn acquire(&self) -> bool {
+        let mut held = self.shared.lock.lock().unwrap();
+        if held.is_some() {
+            return true;
+        }
+        let path = lock_path(&self.shared.paths);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).read(true).open(&path)
+        else {
+            return false;
+        };
+        if file.try_lock().is_err() {
+            return false;
+        }
+        use std::io::{Seek, Write};
+        let mut f = &file;
+        let _ = f.set_len(0);
+        let _ = f.seek(std::io::SeekFrom::Start(0));
+        let _ = write!(f, "{}", std::process::id());
+        *held = Some(file);
+        true
+    }
+
+    fn set_runtime(&self, kind: Kind, change: impl FnOnce(&mut Runtime)) {
+        let mut all = self.shared.runtime.lock().unwrap();
+        change(all.entry(kind).or_default());
+    }
+
+    fn phase(&self, kind: Kind) -> Phase {
+        self.shared.runtime.lock().unwrap().get(&kind).map(|r| r.phase).unwrap_or_default()
+    }
+
+    /// Periodic housekeeping: take over the channels when the process that had
+    /// them has gone, and give up on a linking code nobody scanned.
+    fn tick(&self) {
+        if self.shared.lock.lock().unwrap().is_none() {
+            self.apply();
+        }
+        let started = *self.shared.linking.lock().unwrap();
+        if let Some(started) = started {
+            if started.elapsed() > LINK_FOR && self.phase(Kind::WhatsApp) != Phase::Connected {
+                *self.shared.linking.lock().unwrap() = None;
+                self.stop(Kind::WhatsApp);
+                self.set_runtime(Kind::WhatsApp, |r| {
+                    r.phase = Phase::Failed;
+                    r.qr = None;
+                    r.detail = Some("the code was not scanned in time. Link again for a new one.".into());
+                });
+                self.note("whatsapp: the linking code was not scanned in time");
+            }
+        }
+    }
+
+    fn start_channel(&self, kind: Kind, config: &Config, fingerprint: String) {
+        let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        let (command_tx, command_rx) = unbounded_channel::<Command>();
+        let (tagged_tx, mut tagged_rx) = channel::<Inbound>(64);
+
+        // Each channel speaks plain `Inbound`; kind and generation are added
+        // here so a channel never has to know what else is running.
+        let to_gateway = self.shared.inbound.clone();
+        tokio::spawn(async move {
+            while let Some(event) = tagged_rx.recv().await {
+                if to_gateway.send((kind, generation, event)).await.is_err() {
+                    break;
                 }
+            }
+        });
+
+        // A channel that cannot start must say so on the same path everything
+        // else is reported on, or it would sit there silently doing nothing.
+        let failures = self.shared.inbound.clone();
+        let report = move |reason: String| async move {
+            let _ = failures.send((kind, generation, Inbound::Failed { reason })).await;
+        };
+
+        let task = match kind {
+            Kind::Telegram => {
+                // The environment wins, for anyone who would rather not have a
+                // password in a file that gets copied around.
+                let token = telegram_token(config);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::telegram::run(token, tagged_tx, command_rx).await {
+                        report(e.to_string()).await;
+                    }
+                })
+            }
+            Kind::WhatsApp => {
+                let wa = config.channels.whatsapp.clone();
+                let paths = self.shared.paths.clone();
+                tokio::spawn(async move {
+                    let bridge = match crate::whatsapp::locate(wa.bridge.as_deref(), &paths) {
+                        Ok(b) => b,
+                        Err(e) => return report(e.to_string()).await,
+                    };
+                    let state = paths.channel_dir("whatsapp").join("auth");
+                    if let Err(e) =
+                        crate::whatsapp::run(wa.node, bridge, state, wa.self_chat, tagged_tx, command_rx)
+                            .await
+                    {
+                        report(e.to_string()).await;
+                    }
+                })
+            }
+        };
+
+        self.shared.senders.lock().unwrap().insert(kind, command_tx);
+        self.shared.instances.lock().unwrap().insert(
+            kind,
+            Instance { generation, fingerprint, handle: task.abort_handle() },
+        );
+        self.set_runtime(kind, |r| {
+            r.phase = Phase::Starting;
+            r.detail = None;
+            r.qr = None;
+        });
+    }
+
+    /// Stop a channel. Aborting the task drops the bridge process with it
+    /// (`kill_on_drop`) and ends a Telegram long poll mid-wait.
+    fn stop(&self, kind: Kind) {
+        self.shared.senders.lock().unwrap().remove(&kind);
+        if let Some(instance) = self.shared.instances.lock().unwrap().remove(&kind) {
+            instance.handle.abort();
+        }
+        self.set_runtime(kind, |r| {
+            r.phase = Phase::Off;
+            r.qr = None;
+            r.who = None;
+            r.detail = None;
+        });
+    }
+
+    fn current_generation(&self, kind: Kind) -> Option<u64> {
+        self.shared.instances.lock().unwrap().get(&kind).map(|i| i.generation)
+    }
+}
+
+impl GatewayControl for Gateway {
+    fn view(&self) -> GatewayView {
+        let hosted = self.shared.lock.lock().unwrap().is_some();
+        let runtime = self.shared.runtime.lock().unwrap().clone();
+        let config = snapshot(&self.shared.app);
+        let mut telegram = runtime.get(&Kind::Telegram).cloned().unwrap_or_default();
+        let mut whatsapp = runtime.get(&Kind::WhatsApp).cloned().unwrap_or_default();
+        whatsapp.linked = whatsapp_linked(&self.shared.paths);
+        whatsapp.link_left = self
+            .shared
+            .linking
+            .lock()
+            .unwrap()
+            .map(|started| LINK_FOR.saturating_sub(started.elapsed()).as_secs());
+        whatsapp.installed = crate::whatsapp::locate(config.channels.whatsapp.bridge.as_deref(), &self.shared.paths)
+            .ok()
+            .map(|b| crate::whatsapp::is_installed(&b));
+        if !hosted {
+            for r in [&mut telegram, &mut whatsapp] {
+                r.phase = Phase::Elsewhere;
+            }
+        }
+        GatewayView {
+            hosted,
+            elsewhere: self.holder(),
+            pairing: hosted.then(|| self.shared.pairing.lock().unwrap().clone()),
+            telegram,
+            whatsapp,
+        }
+    }
+
+    fn apply(&self) {
+        if !self.acquire() {
+            return;
+        }
+        let config = snapshot(&self.shared.app);
+        let linking = self.shared.linking.lock().unwrap().is_some();
+        let linked = whatsapp_linked(&self.shared.paths);
+
+        for kind in KINDS {
+            let want = wanted(&config, kind, linked, linking, &self.shared.paths);
+            let fingerprint = fingerprint(kind, &config);
+            let running = self
+                .shared
+                .instances
+                .lock()
+                .unwrap()
+                .get(&kind)
+                .map(|i| i.fingerprint.clone());
+
+            match (want, running) {
+                (true, None) => {
+                    let failed = self.shared.failed_with.lock().unwrap().get(&kind).cloned();
+                    if failed.as_deref() != Some(fingerprint.as_str()) {
+                        self.shared.failed_with.lock().unwrap().remove(&kind);
+                        self.start_channel(kind, &config, fingerprint);
+                    }
+                }
+                (true, Some(was)) if was != fingerprint => {
+                    self.note(format!("{kind}: settings changed, restarting"));
+                    self.stop(kind);
+                    self.shared.failed_with.lock().unwrap().remove(&kind);
+                    self.start_channel(kind, &config, fingerprint);
+                }
+                (true, Some(_)) => {}
+                (false, Some(_)) => {
+                    self.stop(kind);
+                    self.note(format!("{kind}: stopped"));
+                }
+                (false, None) => {
+                    // Switched off clears a failure; merely not ready yet (no
+                    // token, not linked) keeps it on show.
+                    if !config.channels.enabled || !config.channels.enabled(kind) {
+                        self.shared.failed_with.lock().unwrap().remove(&kind);
+                        self.set_runtime(kind, |r| {
+                            if r.phase != Phase::Installing {
+                                *r = Runtime::default();
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn restart(&self, kind: Kind) {
+        self.stop(kind);
+        self.shared.failed_with.lock().unwrap().remove(&kind);
+        self.apply();
+    }
+
+    fn new_pairing_code(&self) -> String {
+        let code = pairing_code();
+        *self.shared.pairing.lock().unwrap() = code.clone();
+        code
+    }
+
+    fn check_telegram<'a>(&'a self, token: &'a str) -> Fut<'a, Result<String, String>> {
+        Box::pin(async move {
+            crate::telegram::Telegram::new(token.to_string()).identify().await.map_err(|e| e.to_string())
+        })
+    }
+
+    fn link_whatsapp(&self) -> Fut<'_, Result<(), String>> {
+        Box::pin(async move {
+            if !self.acquire() {
+                return Err(format!(
+                    "{} is answering the channels. Link from that one, or stop it first.",
+                    self.holder().unwrap_or_default()
+                ));
+            }
+            let config = snapshot(&self.shared.app);
+            let wa = config.channels.whatsapp.clone();
+            let bridge = crate::whatsapp::locate(wa.bridge.as_deref(), &self.shared.paths)
+                .map_err(|e| e.to_string())?;
+
+            // Installing takes a minute; the page watches it happen rather
+            // than waiting on one long request.
+            let gateway = self.clone();
+            tokio::spawn(async move {
+                if !crate::whatsapp::is_installed(&bridge) {
+                    gateway.set_runtime(Kind::WhatsApp, |r| {
+                        r.phase = Phase::Installing;
+                        r.detail = Some("installing the WhatsApp bridge (npm install)".into());
+                    });
+                    gateway.note("whatsapp: installing the bridge");
+                    if let Err(e) = crate::whatsapp::install_quietly(&wa.node, &bridge).await {
+                        gateway.set_runtime(Kind::WhatsApp, |r| {
+                            r.phase = Phase::Failed;
+                            r.detail = Some(e.to_string());
+                        });
+                        return;
+                    }
+                }
+                *gateway.shared.linking.lock().unwrap() = Some(Instant::now());
+                let saved = {
+                    let mut c = gateway.shared.app.config.lock().unwrap_or_else(|e| e.into_inner());
+                    c.channels.set_enabled(Kind::WhatsApp, true);
+                    c.save(&gateway.shared.paths)
+                };
+                if let Err(e) = saved {
+                    gateway.set_runtime(Kind::WhatsApp, |r| {
+                        r.phase = Phase::Failed;
+                        r.detail = Some(format!("saving the settings: {e}"));
+                    });
+                    return;
+                }
+                // A stopped or failed bridge is started fresh, so it asks for
+                // a code rather than reusing a dead session.
+                gateway.stop(Kind::WhatsApp);
+                gateway.shared.failed_with.lock().unwrap().remove(&Kind::WhatsApp);
+                gateway.apply();
             });
+            Ok(())
+        })
+    }
+
+    fn unlink_whatsapp(&self) -> Fut<'_, Result<(), String>> {
+        Box::pin(async move {
+            if !self.acquire() {
+                return Err(format!(
+                    "{} is answering the channels. Sign out from that one, or stop it first.",
+                    self.holder().unwrap_or_default()
+                ));
+            }
+            *self.shared.linking.lock().unwrap() = None;
+            let config = snapshot(&self.shared.app);
+            let state = self.shared.paths.channel_dir("whatsapp").join("auth");
+
+            // A running bridge is already connected: ask it to sign out, and
+            // give it a moment to be told yes.
+            let sender = self.shared.senders.lock().unwrap().get(&Kind::WhatsApp).cloned();
+            let result = if let Some(tx) = sender.filter(|_| self.phase(Kind::WhatsApp) == Phase::Connected) {
+                let _ = tx.send(Command::Logout);
+                for _ in 0..40 {
+                    let done = self
+                        .shared
+                        .instances
+                        .lock()
+                        .unwrap()
+                        .get(&Kind::WhatsApp)
+                        .is_none_or(|i| i.handle.is_finished());
+                    if done {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                self.stop(Kind::WhatsApp);
+                crate::whatsapp::logout(&state).map_err(|e| e.to_string())
+            } else {
+                self.stop(Kind::WhatsApp);
+                match crate::whatsapp::locate(config.channels.whatsapp.bridge.as_deref(), &self.shared.paths) {
+                    Ok(bridge) => crate::whatsapp::unlink(&config.channels.whatsapp.node, &bridge, &state)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(_) => crate::whatsapp::logout(&state).map_err(|e| e.to_string()),
+                }
+            };
+            self.set_runtime(Kind::WhatsApp, |r| *r = Runtime::default());
+            self.note("whatsapp: signed out");
+            result
+        })
+    }
+}
+
+/// Whether a channel should be running, as far as the settings go.
+fn wanted(config: &Config, kind: Kind, linked: bool, linking: bool, _paths: &Paths) -> bool {
+    if !config.channels.enabled || !config.channels.enabled(kind) {
+        return false;
+    }
+    match kind {
+        Kind::Telegram => !telegram_token(config).trim().is_empty(),
+        // An unlinked bridge would ask for a code nobody is looking at, again
+        // and again; it runs unlinked only while someone asked to link.
+        Kind::WhatsApp => linked || linking,
+    }
+}
+
+/// The settings a running channel cannot pick up without a restart.
+fn fingerprint(kind: Kind, config: &Config) -> String {
+    match kind {
+        Kind::Telegram => telegram_token(config),
+        Kind::WhatsApp => {
+            let wa = &config.channels.whatsapp;
+            format!("{}|{:?}|{}", wa.node, wa.bridge, wa.self_chat)
         }
     }
 }
 
-/// What the operator sees when the gateway starts.
+fn telegram_token(config: &Config) -> String {
+    std::env::var("OZGENT_TELEGRAM_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| config.channels.telegram.token.clone())
+}
+
+/// Whether WhatsApp credentials are saved on this machine.
+pub fn whatsapp_linked(paths: &Paths) -> bool {
+    paths.channel_dir("whatsapp").join("auth").join("creds.json").is_file()
+}
+
+/// The lock that says which process answers the channels.
+pub fn lock_path(paths: &Paths) -> std::path::PathBuf {
+    paths.channels_dir().join("gateway.lock")
+}
+
+/// Who holds the channels right now, if anyone does: for the terminal setup,
+/// which must not link a WhatsApp session a running server is using.
+pub fn held_elsewhere(paths: &Paths) -> Option<String> {
+    let path = lock_path(paths);
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).ok()?;
+    if file.try_lock().is_ok() {
+        let _ = file.unlock();
+        return None;
+    }
+    let pid = std::fs::read_to_string(&path).unwrap_or_default();
+    Some(match pid.trim() {
+        "" => "another ozgent".to_string(),
+        pid => format!("another ozgent (process {pid})"),
+    })
+}
+
+fn note(_shared: &Shared, text: impl std::fmt::Display) {
+    tracing::info!("gateway: {text}");
+    println!("  {text}");
+}
+
+/// What the operator sees when `ozgent gateway` starts.
 ///
 /// Long, because every line of it is something that will otherwise be found
 /// out the hard way: which channels are live, who can reach them, and that a
@@ -188,10 +634,14 @@ fn announce(shared: &Arc<Shared>, config: &Config, active: &[Kind]) {
         let access = config.channels.access(*kind);
         let who = if channels::is_open_to_everyone(access.allow) {
             "ANYONE".to_string()
-        } else if access.allow.is_empty() {
+        } else if access.allow.is_empty() && !(*kind == Kind::WhatsApp && config.channels.whatsapp.self_chat) {
             "nobody yet".to_string()
         } else {
-            format!("{} allowed", access.allow.len())
+            let mut n = access.allow.len();
+            if *kind == Kind::WhatsApp && config.channels.whatsapp.self_chat {
+                n += 1;
+            }
+            format!("{n} allowed")
         };
         println!("  {kind:<9}  {who}");
     }
@@ -200,48 +650,33 @@ fn announce(shared: &Arc<Shared>, config: &Config, active: &[Kind]) {
     let open = active
         .iter()
         .any(|k| channels::is_open_to_everyone(config.channels.access(*k).allow));
-    let empty = active.iter().all(|k| config.channels.access(*k).allow.is_empty());
-
     if open {
         println!("  WARNING: a channel admits everyone. Anyone who finds it can use this");
-        println!("  machine's tools, subject only to your permission rules. Replace `*`");
-        println!("  in [channels] with the ids that should be allowed.");
+        println!("  machine's tools, subject only to your permission rules. Change it with");
+        println!("  `ozgent gateway <channel>`.");
         println!();
     }
-    if empty {
-        println!("  Nobody is allowed yet, so nothing will be answered.");
-    }
-    println!("  To allow someone, have them send:   /pair {}", shared.pairing.lock().unwrap());
+    println!("  To allow someone else, have them send:   /pair {}", shared.pairing.lock().unwrap());
     println!("  The code works once, and changes after it is used.");
+    println!("  Changes made with `ozgent gateway <channel>` or /admin apply without a restart.");
     println!();
     println!("press ctrl-c to stop");
 }
 
-/// A short code, from the clock and an allocation address.
+/// A short code from the operating system's random source.
 ///
-/// Not a secret worth attacking — it is read off a terminal and typed within
-/// the minute — but it must not be guessable from the outside, which rules out
-/// anything derived from the time alone.
+/// Read off a terminal or the admin page and typed within the minute, so it
+/// only needs to be unguessable from outside, not long.
 fn pairing_code() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let entropy = {
-        let boxed = Box::new(0u8);
-        let addr = Box::into_raw(boxed) as usize;
-        // SAFETY: reclaimed immediately; only its address was wanted.
-        unsafe { drop(Box::from_raw(addr as *mut u8)) };
-        addr
-    };
-    let mut n = (nanos as usize) ^ entropy.rotate_left(17);
     // No vowels and no look-alikes, so a code read aloud or off a screen is
     // typed back correctly.
     const ALPHABET: &[u8] = b"3479CDFHJKMNPRTWXY";
+    let hex = ozgent_core::secret::random_token(8);
+    let mut n = u64::from_str_radix(&hex, 16).unwrap_or(0);
     let mut out = String::new();
     for _ in 0..6 {
-        out.push(ALPHABET[n % ALPHABET.len()] as char);
-        n /= ALPHABET.len();
+        out.push(ALPHABET[(n % ALPHABET.len() as u64) as usize] as char);
+        n /= ALPHABET.len() as u64;
     }
     out
 }
@@ -259,20 +694,81 @@ fn limit(kind: Kind) -> usize {
 
 // ------------------------------------------------------------------ routing
 
+/// Every channel's events, one at a time.
+async fn receive(shared: Arc<Shared>, mut rx: tokio::sync::mpsc::Receiver<(Kind, u64, Inbound)>) {
+    let gateway = Gateway { shared: shared.clone() };
+    let mut chats: HashMap<Key, UnboundedSender<Msg>> = HashMap::new();
+    while let Some((kind, generation, event)) = rx.recv().await {
+        // From an instance that has since been stopped or replaced.
+        if gateway.current_generation(kind) != Some(generation) {
+            continue;
+        }
+        route(&gateway, &mut chats, kind, event).await;
+    }
+}
+
 async fn route(
-    shared: &Arc<Shared>,
+    gateway: &Gateway,
     chats: &mut HashMap<Key, UnboundedSender<Msg>>,
     kind: Kind,
     event: Inbound,
 ) {
+    let shared = &gateway.shared;
     match event {
-        Inbound::Ready { who } => println!("  {kind}: connected as {who}"),
-        Inbound::Notice { text } => println!("  {kind}: {text}"),
+        Inbound::Ready { who } => {
+            gateway.note(format!("{kind}: connected as {who}"));
+            if kind == Kind::WhatsApp {
+                *shared.linking.lock().unwrap() = None;
+            }
+            gateway.set_runtime(kind, |r| {
+                r.phase = Phase::Connected;
+                r.who = Some(who);
+                r.qr = None;
+                r.detail = None;
+            });
+        }
+        Inbound::Notice { text } => {
+            gateway.note(format!("{kind}: {text}"));
+            gateway.set_runtime(kind, |r| r.detail = Some(text));
+        }
+        Inbound::Qr { data } => {
+            // Only while someone asked to link; otherwise a lost session
+            // would sit there offering codes to nobody.
+            if shared.linking.lock().unwrap().is_none() {
+                gateway.stop(kind);
+                gateway.set_runtime(kind, |r| {
+                    r.phase = Phase::Failed;
+                    r.detail = Some("WhatsApp is not linked any more. Link it again.".into());
+                });
+                gateway.note("whatsapp: not linked any more; link it again with `ozgent gateway whatsapp` or /admin");
+                return;
+            }
+            gateway.set_runtime(kind, |r| {
+                r.phase = Phase::Linking;
+                r.qr = Some(data);
+                r.detail = Some("scan the code with WhatsApp ▸ Linked devices ▸ Link a device".into());
+            });
+        }
         Inbound::Failed { reason } => {
-            // Printed as well as logged: the operator is looking at a terminal
-            // that has just stopped doing anything.
-            eprintln!("  {kind}: {reason}");
+            // Printed as well as logged: the operator may be looking at a
+            // terminal that has just stopped doing anything.
             tracing::error!("{kind}: {reason}");
+            if shared.mode == Mode::Terminal {
+                eprintln!("  {kind}: {reason}");
+            }
+            let fingerprint = shared.instances.lock().unwrap().remove(&kind).map(|i| i.fingerprint);
+            shared.senders.lock().unwrap().remove(&kind);
+            if let Some(f) = fingerprint {
+                shared.failed_with.lock().unwrap().insert(kind, f);
+            }
+            if kind == Kind::WhatsApp {
+                *shared.linking.lock().unwrap() = None;
+            }
+            gateway.set_runtime(kind, |r| {
+                r.phase = Phase::Failed;
+                r.qr = None;
+                r.detail = Some(reason);
+            });
         }
         Inbound::Answer { token, choice, .. } => answer(shared, token, choice).await,
         Inbound::Message(msg) => {
@@ -387,8 +883,10 @@ async fn offer_pairing(shared: &Arc<Shared>, kind: Kind, msg: &Msg) {
 
     match saved {
         Ok(()) => {
-            println!("  {kind}: allowed {} ({identity})", msg.name);
-            println!("  next pairing code: /pair {}", shared.pairing.lock().unwrap());
+            note(shared, format!("{kind}: allowed {} ({identity})", msg.name));
+            if shared.mode == Mode::Terminal {
+                println!("  next pairing code: /pair {}", shared.pairing.lock().unwrap());
+            }
             say(
                 shared,
                 kind,
@@ -433,7 +931,8 @@ async fn answer(shared: &Arc<Shared>, token: u64, choice: Choice) {
 
 /// Take a question's buttons away and say how it ended.
 async fn settle(shared: &Arc<Shared>, kind: Kind, chat: &str, token: u64, markdown: &str) {
-    if let Some(tx) = shared.senders.get(&kind) {
+    let tx = shared.senders.lock().unwrap().get(&kind).cloned();
+    if let Some(tx) = tx {
         let _ = tx.send(Command::Settle {
             chat: chat.to_string(),
             token,
@@ -616,7 +1115,7 @@ async fn turn_for(shared: Arc<Shared>, kind: Kind, chat: String, msg: Msg) {
         }
     };
 
-    let Some(tx) = shared.senders.get(&kind).cloned() else { return };
+    let Some(tx) = shared.senders.lock().unwrap().get(&kind).cloned() else { return };
     let access = config.channels.access(kind);
     let _ = tx.send(Command::Typing { chat: chat.clone() });
 
@@ -632,8 +1131,12 @@ async fn turn_for(shared: Arc<Shared>, kind: Kind, chat: String, msg: Msg) {
             // browser gets: consent arriving over a chat is consent from
             // whoever holds that account, not from whoever owns this machine.
             native_tools: access.tools.map(<[String]>::to_vec),
+            tools_off: Vec::new(),
             images: msg.images.clone(),
-            can_ask: true,
+            // The operator can switch approvals off for a channel: then only
+            // what the rules allow outright runs, and anything that would ask
+            // is refused.
+            can_ask: access.approve,
         },
     );
     let mut events = match started {
@@ -742,7 +1245,8 @@ pub fn describe(arguments: &serde_json::Value) -> String {
 
 /// Say one thing, outside any turn.
 async fn say(shared: &Arc<Shared>, kind: Kind, chat: &str, markdown: &str) {
-    if let Some(tx) = shared.senders.get(&kind) {
+    let tx = shared.senders.lock().unwrap().get(&kind).cloned();
+    if let Some(tx) = tx {
         let _ = tx.send(Command::Post {
             chat: chat.to_string(),
             token: shared.tokens.next(),

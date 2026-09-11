@@ -43,6 +43,9 @@ pub struct Turn {
     /// everything not named, which is how a channel keeps the shell away from
     /// a conversation happening on someone's phone.
     pub native_tools: Option<Vec<String>>,
+    /// Tools the person switched off for the main model. Unlike
+    /// `native_tools`, an agent called by name keeps its own.
+    pub tools_off: Vec<String>,
     pub images: Vec<ImageSource>,
     /// Whether there is a person on the other end who can answer a permission
     /// question.
@@ -112,11 +115,15 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
 
     // Read per turn, so an agent saved in Settings a moment ago can be
     // called in the very next message. A handful of small files.
-    let agents: Vec<ozgent_core::Agent> = ozgent_core::AgentCatalog::load(&state.paths)
-        .mentioned(&turn.message)
-        .into_iter()
-        .cloned()
-        .collect();
+    let catalog = ozgent_core::AgentCatalog::load(&state.paths);
+    let agents: Vec<ozgent_core::Agent> = catalog.mentioned(&turn.message).into_iter().cloned().collect();
+    // The model may hand a request to an agent itself — but not when the
+    // person already named one, and not when handing off is switched off.
+    let handoff = if agents.is_empty() && state.config.lock().unwrap().tools.handoff {
+        catalog.all().to_vec()
+    } else {
+        Vec::new()
+    };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     state
@@ -134,6 +141,8 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             overrides: None,
             images: turn.images,
             agents,
+            tools_off: turn.tools_off,
+            handoff,
             out: tx,
         })
         // The inference thread is gone, which is ozgent's problem, not the

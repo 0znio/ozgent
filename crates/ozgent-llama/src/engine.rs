@@ -99,6 +99,17 @@ const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
 impl Engine {
     /// Load a GGUF file with the given resolved settings.
     pub fn load(path: &Path, opts: &Resolved) -> Result<Self, EngineError> {
+        Self::load_reporting(path, opts, |_| {})
+    }
+
+    /// [`Engine::load`], calling `progress` with how far along it is, from 0
+    /// to 1. Loading a large model takes long enough that a person watching
+    /// needs to see it moving.
+    pub fn load_reporting(
+        path: &Path,
+        opts: &Resolved,
+        mut progress: impl FnMut(f32) + 'static,
+    ) -> Result<Self, EngineError> {
         let backend = backend()?;
         if !path.exists() {
             return Err(EngineError::Missing { path: path.display().to_string() });
@@ -115,7 +126,11 @@ impl Engine {
             .with_n_gpu_layers(requested_layers)
             .with_use_mmap(opts.use_mmap)
             .with_use_mlock(opts.use_mlock)
-            .with_main_gpu(opts.main_gpu as i32));
+            .with_main_gpu(opts.main_gpu as i32)
+            .with_progress_callback(move |p| {
+                progress(p.clamp(0.0, 1.0));
+                true
+            }));
 
         // `auto` was the default and did nothing: the planner in backend.rs was
         // written and tested but never called, so the option documented as

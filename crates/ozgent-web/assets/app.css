@@ -263,6 +263,10 @@ body {
 }
 .sidebar-foot .ghost-btn { width: auto; flex: 1; justify-content: flex-start; padding-left: var(--s3); }
 .sidebar-foot .ghost-btn.theme { flex: 0 0 auto; justify-content: center; padding: 7px var(--s3); }
+/* Settings and Admin share a row; the theme takes the next, rather than
+   squeezing three buttons into a 260px column. */
+.sidebar-foot { flex-wrap: wrap; }
+.sidebar-foot .ghost-btn.theme { flex: 1 1 100%; justify-content: flex-start; padding-left: var(--s3); }
 
 /* The theme control: an icon and a word, so its state is readable rather than
    inferred from which of two shapes is showing. */
@@ -1796,4 +1800,285 @@ body {
   .md-pull-row { flex-direction: column; align-items: stretch; }
   .md-model { grid-template-columns: 1fr; }
   .md-model-acts { grid-column: 1; grid-row: auto; }
+}
+
+/* ================================================================ admin
+ *
+ * /admin is a control room, not a chat: scanned and operated. So state is
+ * carried in form as well as words — a pill per channel whose colour is the
+ * one semantic signal (amber while something is happening, green connected,
+ * red failed) — and every machine fact (an id, a number, a code) is in mono.
+ * Same tokens as the chat, so the two read as one program.
+ */
+
+body.adm { min-height: 100vh; min-height: 100dvh; }
+
+.adm-tag {
+  font-family: var(--mono); font-size: var(--t-micro); letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-faint);
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px;
+}
+.adm-mono { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.adm .hint.inline { margin: 0; }
+.adm .hint.adm-flush { margin-top: 0; }
+
+/* --- signed out ------------------------------------------------------- */
+
+.adm-gate {
+  min-height: 100vh; min-height: 100dvh;
+  display: grid; place-items: center;
+  padding: var(--s5) var(--s4);
+}
+.adm-card {
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: var(--s5);
+}
+.adm-signin { width: min(380px, 100%); display: flex; flex-direction: column; gap: var(--s4); }
+.adm-signin form { display: flex; flex-direction: column; gap: var(--s3); }
+.adm-signin .primary-btn { padding: 9px var(--s4); }
+.adm-mark { display: flex; align-items: center; gap: var(--s2); }
+.adm-mark .mark, .adm-top .mark { font-weight: 700; letter-spacing: -.01em; font-size: 17px; }
+.adm-field { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--t-small); color: var(--ink-soft); }
+.adm-field .text-input { font-size: 15px; padding: 8px 11px; }
+.adm-cmd {
+  font-family: var(--mono); font-size: 14px; margin: 0;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: var(--s2) var(--s3);
+}
+.adm-forgot { margin: 0; }
+.adm-back-link { align-self: flex-start; font-size: var(--t-small); }
+
+/* --- shell ------------------------------------------------------------ */
+
+.adm-shell { max-width: 920px; margin: 0 auto; padding: 0 var(--s4) var(--s8); }
+.adm-top {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+  padding: var(--s3) 0; background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.adm-top .spacer { flex: 1; }
+.adm-nav { display: flex; gap: 2px; margin-left: var(--s4); }
+.adm-nav .tab { font-size: 14px; }
+
+.adm-view { display: flex; flex-direction: column; gap: var(--s4); padding-top: var(--s5); }
+.adm-head h1 { margin: 0; font-size: var(--t-display); letter-spacing: -.02em; text-wrap: balance; }
+.adm-lede { margin: var(--s1) 0 0; color: var(--ink-soft); max-width: 62ch; }
+.adm-view .sub { font-size: 15px; margin: 0 0 var(--s2); }
+
+.adm-banner {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: var(--accent-soft); color: var(--ink);
+  border-radius: var(--radius); padding: var(--s2) var(--s3); font-size: 14px;
+}
+.adm-banner.bad { border-color: color-mix(in srgb, var(--danger) 50%, var(--line)); background: color-mix(in srgb, var(--danger) 10%, var(--bg)); }
+
+.adm-strip {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--s3) var(--s5);
+  padding: var(--s3) var(--s4);
+  border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--panel);
+}
+.adm-strip-item { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.adm-k {
+  font-family: var(--mono); font-size: var(--t-micro); letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-faint);
+}
+.adm-v { display: flex; align-items: baseline; gap: var(--s3); }
+.adm-v code { font-family: var(--mono); font-size: 20px; font-weight: 700; letter-spacing: .12em; }
+.adm-strip .select { max-width: 100%; }
+
+/* --- channels --------------------------------------------------------- */
+
+.adm-channels { display: flex; flex-direction: column; gap: var(--s4); }
+.adm-channel { display: flex; flex-direction: column; gap: 0; padding: 0; overflow: hidden; }
+.adm-ch-head {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
+}
+.adm-ch-head h2 { margin: 0; font-size: 17px; }
+.adm-ch-head .spacer { flex: 1; }
+
+.adm-pill {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1;
+  padding: 5px 9px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--ink-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%;
+}
+.adm-pill::before { content: "● "; }
+.adm-pill.live { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.adm-pill.good { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.adm-pill.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.adm-pill.live::before { animation: adm-pulse 1.2s ease-in-out infinite; }
+@keyframes adm-pulse { 50% { opacity: .25; } }
+
+.adm-detail {
+  margin: 0; padding: var(--s2) var(--s4);
+  font-size: 13px; color: var(--ink-soft);
+  border-bottom: 1px solid var(--line-soft); background: var(--panel);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.adm-detail.bad { color: var(--danger); }
+.adm-detail.good { color: var(--ok); }
+
+.adm-row {
+  display: grid; grid-template-columns: 170px 1fr; gap: var(--s4);
+  padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
+  margin: 0;
+}
+.adm-row-label { font-size: 13px; color: var(--ink-soft); padding-top: 5px; }
+.adm-row-body { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; align-items: flex-start; }
+.adm-row-body > .adm-mono, .adm-row-body > .hint.inline { padding-top: 5px; }
+.adm-row-body > .hint.inline { font-size: 13.5px; }
+.adm-inline { display: flex; gap: var(--s2); width: 100%; flex-wrap: wrap; }
+.adm-inline .text-input { flex: 1 1 220px; font-size: 14px; padding: 7px 10px; }
+.adm-steps { margin: 0; padding-left: 1.2em; font-size: 13.5px; color: var(--ink-soft); display: flex; flex-direction: column; gap: 2px; }
+.adm-steps code { font-family: var(--mono); font-size: 12.5px; }
+
+.adm-chips { display: flex; flex-wrap: wrap; gap: var(--s2); margin: 0; padding: 0; list-style: none; }
+.adm-chips:empty { display: none; }
+.adm-chip-item {
+  display: inline-flex; align-items: center; gap: 2px;
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 2px 4px 2px 10px; background: var(--panel);
+}
+.adm-chip-item.bad { border-color: var(--danger); color: var(--danger); }
+.adm-chip-x {
+  border: 0; background: none; color: var(--ink-faint); cursor: pointer;
+  font-size: 16px; line-height: 1; width: 22px; height: 22px; border-radius: 50%;
+}
+.adm-chip-x:hover { color: var(--danger); background: var(--line-soft); }
+
+.adm-check { display: flex; align-items: flex-start; gap: var(--s3); font-size: 13.5px; color: var(--ink-soft); cursor: pointer; }
+.adm-check .switch { margin-top: 1px; }
+.adm-check b { color: var(--ink); font-weight: 600; }
+
+.adm-seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.adm-seg button {
+  border: 0; background: transparent; color: var(--ink-soft); font: inherit; font-size: 13px;
+  padding: 6px 14px; cursor: pointer;
+}
+.adm-seg button + button { border-left: 1px solid var(--line); }
+.adm-seg button[aria-checked="true"] { background: var(--ink); color: var(--bg); font-weight: 600; }
+.adm-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: var(--s1) var(--s3); width: 100%; }
+.adm-tool { display: flex; align-items: center; gap: var(--s2); padding: 4px 0; cursor: pointer; }
+.adm-tool .md-chip { margin-left: auto; }
+
+.adm-actions { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; padding: var(--s3) var(--s4); }
+.adm-actions .spacer { flex: 1; }
+.adm-password .adm-actions { padding: var(--s2) 0 0; }
+
+/* --- linking ---------------------------------------------------------- */
+
+.adm-link {
+  display: grid; grid-template-columns: auto 1fr; gap: var(--s5); align-items: start;
+  padding: var(--s4); border-bottom: 1px solid var(--line-soft);
+}
+.adm-qr-wrap {
+  width: 264px; height: 264px; border-radius: var(--radius);
+  background: #fff; display: grid; place-items: center; overflow: hidden;
+  border: 1px solid var(--line);
+}
+.adm-qr { display: block; width: 264px; height: 264px; image-rendering: pixelated; }
+.adm-qr-wait { display: flex; flex-direction: column; align-items: center; gap: var(--s2); width: 70%; color: #3a4248; font-size: 13px; text-align: center; }
+.adm-link-text { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.adm-countdown { display: flex; align-items: center; gap: var(--s3); }
+.adm-countdown .adm-bar { flex: 1; }
+.adm-warn-note { font-size: 12px; }
+.adm-link-text .ghost-btn { align-self: flex-start; }
+
+/* --- progress -----------------------------------------------------------
+   Two kinds, and they mean different things: a filling bar is a known amount
+   of work, and moves; an indeterminate one says "working, length unknown"
+   (npm installing, a file header being read). Amber either way — both are
+   something happening right now. */
+.adm-progress { display: flex; flex-direction: column; gap: var(--s2); width: 100%; }
+.adm-bar { height: 4px; border-radius: 999px; background: var(--line-soft); overflow: hidden; position: relative; width: 100%; }
+.adm-bar > span { display: block; height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width 600ms var(--ease); }
+.adm-bar.indeterminate > span, .md-track.indeterminate .md-fill {
+  position: absolute; width: 35% !important; left: -35%;
+  background: var(--accent);
+  animation: adm-slide 1.3s var(--ease) infinite;
+}
+.md-track.indeterminate { position: relative; }
+@keyframes adm-slide { to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  .adm-bar.indeterminate > span, .md-track.indeterminate .md-fill { animation: none; left: 0; width: 100% !important; opacity: .5; }
+  .adm-pill.live::before { animation: none; }
+}
+
+/* --- install from a file ---------------------------------------------- */
+
+.adm-upload { display: flex; flex-direction: column; gap: var(--s3); }
+.adm-file {
+  position: relative; display: flex; align-items: center; gap: var(--s3);
+  border: 1px dashed var(--ink-faint); border-radius: var(--radius);
+  padding: var(--s4); cursor: pointer; color: var(--ink-soft);
+}
+.adm-file:hover { border-color: var(--ink); color: var(--ink); }
+.adm-file:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.adm-file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.adm-file .ic { width: 22px; height: 22px; flex: none; }
+.adm-file-name { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.adm-file-small { padding: var(--s2) var(--s4); border-style: dotted; }
+.adm-upload .md-job { margin-top: 0; }
+
+.adm-password { display: flex; flex-direction: column; gap: var(--s3); max-width: 460px; }
+
+@media (max-width: 640px) {
+  .adm-nav { margin-left: 0; order: 5; width: 100%; }
+  .adm-row { grid-template-columns: 1fr; gap: var(--s1); }
+  .adm-row-label { padding-top: 0; }
+  .adm-link { grid-template-columns: 1fr; justify-items: center; }
+  .adm-card { padding: var(--s4); }
+  .adm-channel { padding: 0; }
+  .adm-head h1 { font-size: var(--t-title); }
+}
+a.ghost-btn { text-decoration: none; }
+
+/* Loading a model: a known amount of work, so a filling bar. */
+.load-box { display: flex; flex-direction: column; gap: 4px; max-width: 360px; margin-bottom: var(--s2); }
+.load-head { display: flex; justify-content: space-between; gap: var(--s3); font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+.load-pct { color: var(--accent); font-variant-numeric: tabular-nums; }
+.load-box .md-track { margin: 0; }
+.load-box .md-fill { background: var(--accent); }
+
+/* --- the tools tray ------------------------------------------------------
+   Opens above the composer, like the quick panel: a list of switches, one
+   per tool. The Tools pill says how many are off, so a turned-off tool is
+   visible without opening anything. */
+.tools-open.some-off { color: var(--ink); border-style: solid; }
+.tools-tray {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--raised);
+  box-shadow: var(--shadow);
+  padding: var(--s3) var(--s4);
+  margin-bottom: 8px;
+  max-height: min(560px, 62vh);
+  display: flex; flex-direction: column; gap: var(--s2);
+}
+.tools-tray-head { display: flex; align-items: baseline; gap: var(--s3); flex-wrap: wrap; }
+.tools-tray-head .spacer { flex: 1; }
+.tools-tray-title { font-weight: 600; font-size: 14px; }
+.tools-tray-list { overflow-y: auto; display: flex; flex-direction: column; }
+.tray-tool {
+  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: var(--s3);
+  padding: 7px 2px; border-bottom: 1px solid var(--line-soft); cursor: pointer;
+}
+.tray-tool:last-child { border-bottom: 0; }
+.tray-text { display: flex; flex-direction: column; min-width: 0; }
+.tray-name { font-family: var(--mono); font-size: 13px; }
+.tray-desc { font-size: 12px; color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tray-chip {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; white-space: nowrap;
+}
+.tray-chip.ask { color: var(--ink-soft); }
+.tray-chip.deny { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); }
+.tools-tray-foot { margin: 0; font-size: 11.5px; }
+@media (max-width: 640px) {
+  .tools-tray-head .hint { display: none; }
+  .tray-chip { display: none; }
 }

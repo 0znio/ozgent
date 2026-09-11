@@ -465,6 +465,10 @@ pub enum ToolCallError {
     /// agent reaching past its list. Nobody refused it; it was never there.
     #[error("{name} is not available here")]
     NotOffered { name: String, offered: Vec<String> },
+    /// The call was understood and could not be done as asked — handing to
+    /// an agent that does not exist, say. The reason is for the model.
+    #[error("{name}: {reason}")]
+    Invalid { name: String, reason: String },
 }
 
 impl ToolCallError {
@@ -500,6 +504,7 @@ impl ToolCallError {
                 "{name} is not one of your tools. You can use: {}. Carry on with those.",
                 offered.join(", ")
             ),
+            Self::Invalid { name, reason } => format!("Error from {name}: {reason}"),
         }
     }
 }

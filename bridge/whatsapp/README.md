@@ -5,8 +5,8 @@ program that speaks it on ozgent's behalf, driven over stdin/stdout by
 `ozgent-channels` — the same shape as the Python tool worker: a child process,
 newline-delimited JSON, and nothing shared but the pipe.
 
-    ozgent channel login whatsapp     scan the QR once
-    ozgent gateway                    run it
+    ozgent gateway whatsapp           install this, scan the QR, choose who may message
+    ozgent web                        answer messages (or `ozgent gateway` without the browser)
 
 ## What it is and is not
 
@@ -18,8 +18,8 @@ also its whole risk profile:
   Accounts have been banned for it. Use a number you can afford to lose.
 - The link is a full login. The credentials under
   `~/ozgent/channels/whatsapp/auth` can read and send your messages. Treat that
-  directory like a password file; `ozgent channel logout whatsapp` removes it
-  and unlinks the device.
+  directory like a password file; `ozgent gateway whatsapp signout` unlinks
+  the device on WhatsApp's side and removes it.
 - WhatsApp's official route for programs is the Cloud API, which is a business
   product with a webhook and an approved-template rule. It has neither of these
   risks and none of this convenience.

@@ -90,6 +90,32 @@ pub async fn install(node: &str, bridge: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install the bridge's dependencies without writing to the terminal: for a
+/// server, where npm's progress output would land in the middle of its own.
+/// A failure carries the end of npm's output, which is where npm says why.
+pub async fn install_quietly(node: &str, bridge: &Path) -> anyhow::Result<()> {
+    if Process::new(node).arg("--version").output().await.is_err() {
+        anyhow::bail!(
+            "Node.js is not installed, and the WhatsApp bridge needs it. Install Node 18 or \
+             newer with your package manager, then try again."
+        );
+    }
+    let npm = which_npm(node);
+    let out = Process::new(&npm)
+        .args(["install", "--no-audit", "--no-fund", "--loglevel=error"])
+        .current_dir(bridge)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not run {npm}: {e}. Is npm installed?"))?;
+    if !out.status.success() {
+        let text = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = text.lines().rev().take(6).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        anyhow::bail!("npm install failed in {}:\n{}", bridge.display(), tail.join("\n"));
+    }
+    Ok(())
+}
+
 fn which_npm(node: &str) -> String {
     let path = Path::new(node);
     match path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -143,7 +169,7 @@ pub async fn login(node: &str, bridge: &Path, state: &Path) -> anyhow::Result<St
 
     while let Some(line) = lines.next_line().await? {
         match read_event(&line) {
-            Some(Event::Qr { ascii }) => {
+            Some(Event::Qr { ascii, .. }) => {
                 println!("{ascii}");
                 println!("  On your phone: WhatsApp ▸ Settings ▸ Linked devices ▸ Link a device");
                 println!("  The code refreshes every 20 seconds; a new one will appear.");
@@ -164,7 +190,61 @@ pub async fn login(node: &str, bridge: &Path, state: &Path) -> anyhow::Result<St
     anyhow::bail!("the bridge stopped before the device was linked")
 }
 
-/// Unlink this machine and forget the credentials.
+/// Sign the linked device out on WhatsApp's side, then forget it here.
+///
+/// Connects with the saved credentials only to say goodbye, so the device
+/// disappears from the phone's Linked devices list instead of lingering there
+/// as a session nobody holds. If that cannot be done — no network, or the
+/// session is already dead — the local credentials are still removed and the
+/// error says what is left to do by hand.
+pub async fn unlink(node: &str, bridge: &Path, state: &Path) -> anyhow::Result<()> {
+    let signed_out = if state.join("creds.json").is_file() && is_installed(bridge) {
+        tokio::time::timeout(std::time::Duration::from_secs(25), say_goodbye(node, bridge, state))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("WhatsApp did not answer in time")))
+    } else {
+        Ok(())
+    };
+    logout(state)?;
+    signed_out.map_err(|e| {
+        anyhow::anyhow!(
+            "forgot the device here, but could not sign it out on WhatsApp ({e}). \
+             Remove it on your phone: WhatsApp ▸ Linked devices"
+        )
+    })
+}
+
+async fn say_goodbye(node: &str, bridge: &Path, state: &Path) -> anyhow::Result<()> {
+    let mut child = spawn(node, bridge, state, false, false)?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    drain_stderr(&mut child);
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines.next_line().await? {
+        match read_event(&line) {
+            Some(Event::Ready { .. }) => {
+                stdin.write_all(b"{\"type\":\"logout\"}\n").await?;
+                stdin.flush().await?;
+                // The bridge exits once WhatsApp has confirmed.
+                let _ = child.wait().await;
+                return Ok(());
+            }
+            // Asking for a QR code means there was no session left to end.
+            Some(Event::Qr { .. }) => {
+                let _ = child.kill().await;
+                return Ok(());
+            }
+            Some(Event::Fatal { reason }) => {
+                let _ = child.kill().await;
+                anyhow::bail!("{reason}");
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("the bridge stopped before it could sign out")
+}
+
+/// Forget the credentials on this machine.
 pub fn logout(state: &Path) -> anyhow::Result<()> {
     if state.exists() {
         std::fs::remove_dir_all(state)?;
@@ -183,7 +263,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     if !is_installed(&bridge) {
         anyhow::bail!(
-            "the WhatsApp bridge is not installed. Run `ozgent channel install whatsapp`."
+            "the WhatsApp bridge is not installed. Run `ozgent gateway whatsapp`, which installs it."
         );
     }
     let mut child = spawn(&node, &bridge, &state, false, self_chat)?;
@@ -198,10 +278,7 @@ pub async fn run(
             while let Ok(Some(line)) = lines.next_line().await {
                 let Some(event) = read_event(&line) else { continue };
                 let inbound = match event {
-                    Event::Qr { .. } => Inbound::Notice {
-                        text: "WhatsApp is not linked. Run `ozgent channel login whatsapp`."
-                            .into(),
-                    },
+                    Event::Qr { data, .. } => Inbound::Qr { data },
                     Event::Ready { who } => Inbound::Ready { who },
                     Event::Notice { text } => Inbound::Notice { text },
                     Event::Fatal { reason } => Inbound::Failed { reason },
@@ -250,6 +327,7 @@ pub async fn run(
                 let text = render(&markdown, Flavour::WhatsApp);
                 vec![serde_json::json!({ "type": "settle", "token": token, "text": text })]
             }
+            Command::Logout => vec![serde_json::json!({ "type": "logout" })],
         };
 
         for line in lines {
@@ -283,7 +361,7 @@ fn drain_stderr(child: &mut Child) {
 /// What the bridge says.
 #[derive(Debug)]
 enum Event {
-    Qr { ascii: String },
+    Qr { ascii: String, data: String },
     Ready { who: String },
     Notice { text: String },
     Message(Msg),
@@ -300,7 +378,7 @@ fn read_event(line: &str) -> Option<Event> {
     let text_at = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     match value.get("type").and_then(|v| v.as_str())? {
-        "qr" => Some(Event::Qr { ascii: text_at("ascii") }),
+        "qr" => Some(Event::Qr { ascii: text_at("ascii"), data: text_at("data") }),
         "ready" => Some(Event::Ready { who: text_at("who") }),
         "notice" => Some(Event::Notice { text: text_at("text") }),
         "fatal" => Some(Event::Fatal { reason: text_at("reason") }),

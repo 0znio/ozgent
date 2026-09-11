@@ -40,7 +40,7 @@ pub struct ChannelChat {
     /// 64-bit integer and WhatsApp's is a JID, so neither type fits both.
     pub chat_id: String,
     pub conversation_id: i64,
-    /// A human label — the sender's name or number — so `ozgent channel list`
+    /// A human label — the sender's name or number — so `ozgent gateway status`
     /// shows who a chat belongs to rather than an opaque id.
     pub display: String,
     pub last_seen_at: i64,

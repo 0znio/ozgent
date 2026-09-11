@@ -68,6 +68,14 @@ pub struct Request {
     /// turn. When set, each runs in turn with its own instructions, tools and
     /// rules, and their reports are the reply.
     pub agents: Vec<ozgent_core::Agent>,
+    /// Tools the person switched off for the main model, by name. A
+    /// preference rather than a limit: unlike `native_tools` it does not
+    /// narrow an agent called by name, whose tools are part of the choice to
+    /// call it.
+    pub tools_off: Vec<String>,
+    /// Agents the model may hand the request to itself, through the
+    /// `ask_agent` tool. Empty when that is switched off or not offered here.
+    pub handoff: Vec<ozgent_core::Agent>,
     pub out: UnboundedSender<Event>,
 }
 
@@ -76,6 +84,9 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Model load finished; generation is about to start.
+    /// Loading the weights, `progress` from 0 to 1. Sent before `Ready` when
+    /// a turn has to wait for a model to load.
+    Loading { model: String, progress: f32 },
     Ready { model: String, context: u32 },
     Thinking { text: String },
     Answer { text: String },
@@ -343,7 +354,19 @@ fn serve_model(
         .resolve();
 
     let weights = found.manifest.primary_weights(&found.dir);
-    let engine = match Engine::load(&weights, &resolved) {
+    // Reported in whole percents: llama.cpp calls back per tensor, hundreds
+    // of times, and a page only needs to see it move.
+    let out = first.out.clone();
+    let name = found.model.to_string();
+    let _ = out.send(Event::Loading { model: name.clone(), progress: 0.0 });
+    let mut last = 0u32;
+    let engine = match Engine::load_reporting(&weights, &resolved, move |p| {
+        let pct = (p * 100.0) as u32;
+        if pct > last {
+            last = pct;
+            let _ = out.send(Event::Loading { model: name.clone(), progress: p });
+        }
+    }) {
         Ok(e) => e,
         Err(e) => {
             let _ = first.out.send(Event::Error {
@@ -661,6 +684,9 @@ fn turn(
 
         let mut messages = request.messages.clone();
         prepare(&mut messages, &offered, native_tools, projector, &images, observation.as_deref());
+        if offered.iter().any(|s| s.name == ozgent_core::agents::HANDOFF_TOOL) {
+            append_system(&mut messages, &ozgent_core::agents::handoff_prompt(&request.handoff));
+        }
         if !install(engine, session, &offered, request.response_grammar.as_deref(), request) {
             return Ok(());
         }
@@ -668,97 +694,28 @@ fn turn(
             engine, session, resolved, thinking, tools.as_ref(), permissions, projector, &images,
             request, messages, &offered, &client_owned, MAX_TOOL_ROUNDS, None,
         )?;
-    } else {
-        // What each agent may be shown. A channel's allowlist narrows agents
-        // too: consent arriving over a chat is consent from whoever holds that
-        // account, and an agent is not a way round the list.
-        let available: Vec<ozgent_core::ToolSpec> = tools
-            .as_ref()
-            .map(|t| t.host.tools().to_vec())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| request.native_tools.as_ref().is_none_or(|list| list.contains(&s.name)))
-            .collect();
-        let date = snapshot(&permissions.config)
-            .ui
-            .date_awareness
-            .then(|| ozgent_core::DateTime::now().prompt_line());
 
-        // Each agent sees the conversation as it stood, plus the reports of
-        // any agent that ran before it in this message.
-        let mut conversation = request.messages.clone();
-        for (index, agent) in request.agents.iter().enumerate() {
-            let (offered, missing) = agent.offer(&available);
-            let _ = request.out.send(Event::AgentStart {
-                name: agent.name.clone(),
-                description: agent.definition.description.clone(),
-                tools: offered.iter().map(|s| s.name.clone()).collect(),
-                missing: missing.clone(),
-            });
-
-            // Sampling is the agent's where it says, the turn's otherwise.
-            let mut tuned = resolved.clone();
-            if let Some(t) = agent.definition.temperature {
-                tuned.temperature = t;
-            }
-            if let Some(m) = agent.definition.max_tokens {
-                tuned.max_tokens = m;
-            }
-            session.set_options(&tuned);
-            if !install(engine, session, &offered, None, request) {
-                break;
-            }
-
-            let mut messages = conversation.clone();
-            let system = agent.system_prompt(date.as_deref(), &missing);
-            // The agent's instructions replace the chat's system prompt rather
-            // than joining it: a persona written for the chat, or a client's
-            // description of tools the agent does not have, would contradict
-            // the job it was called to do.
-            messages.retain(|m| m.role != ozgent_core::Role::System);
-            messages.insert(0, Message::system(system));
-            // Images belong to the first agent: they are evaluated into the
-            // cache once, with that agent's prompt around them.
-            let (media_images, media_note) = if index == 0 {
-                (&images[..], observation.as_deref())
-            } else {
-                (&[][..], None)
-            };
-            prepare(&mut messages, &offered, native_tools, projector, media_images, media_note);
-
-            let started = std::time::Instant::now();
-            let outcome = rounds(
-                engine,
-                session,
-                &tuned,
-                agent.definition.thinking.unwrap_or(thinking),
-                tools.as_ref(),
-                permissions,
-                projector,
-                media_images,
-                request,
-                messages,
-                &offered,
-                &Default::default(),
-                agent.definition.rounds(),
-                Some(agent),
+        // The model passed the request to an agent: it answers from here,
+        // exactly as if the user had named it. The images were already read
+        // into this turn, so the agent gets the observation instead.
+        if let Some((agent, task)) = totals.handoff.take() {
+            let note = ozgent_core::agents::handoff_note(&task);
+            let outcome = run_agents(
+                engine, session, resolved, thinking, tools.as_ref(), permissions, projector,
+                &[], observation.as_deref(), request, std::slice::from_ref(&agent), Some(&note),
             )?;
-            let _ = request.out.send(Event::AgentEnd {
-                name: agent.name.clone(),
-                ok: !outcome.text.trim().is_empty(),
-                ms: started.elapsed().as_millis() as u64,
-                calls: outcome.calls,
-                rounds: outcome.rounds,
-            });
-            conversation.push(Message::assistant(outcome.text.clone()));
+            let before = std::mem::take(&mut totals.text);
             totals.absorb(outcome);
-            if request.out.is_closed() {
-                break;
+            if !before.trim().is_empty() {
+                totals.text = format!("{before}\n\n{}", totals.text);
             }
         }
-        // The next request on this session must not inherit the last agent's
-        // temperature.
-        session.set_options(resolved);
+    } else {
+        let outcome = run_agents(
+            engine, session, resolved, thinking, tools.as_ref(), permissions, projector,
+            &images, observation.as_deref(), request, &request.agents, None,
+        )?;
+        totals.absorb(outcome);
     }
 
     if request.response_grammar.is_some() {
@@ -777,25 +734,144 @@ fn turn(
     Ok(())
 }
 
+/// Run agents one after another, each with its own instructions and tools.
+/// Each sees the conversation, plus `note` when there is one, plus the
+/// reports of the agents before it.
+#[allow(clippy::too_many_arguments)]
+fn run_agents(
+    engine: &Engine,
+    session: &mut ozgent_llama::engine::Session<'_>,
+    resolved: &ozgent_core::options::Resolved,
+    thinking: ThinkingMode,
+    tools: Option<&Tools>,
+    permissions: &Permissions,
+    projector: Option<&LoadedProjector<'_>>,
+    images: &[ozgent_llama::mtmd::Media],
+    observation: Option<&str>,
+    request: &Request,
+    agents: &[ozgent_core::Agent],
+    note: Option<&str>,
+) -> anyhow::Result<Outcome> {
+    let native_tools = engine.template_handles_tools();
+    let mut totals = Outcome::default();
+    // What each agent may be shown. A channel's allowlist narrows agents
+    // too: consent arriving over a chat is consent from whoever holds that
+    // account, and an agent is not a way round the list.
+    let available: Vec<ozgent_core::ToolSpec> = tools
+        .map(|t| t.host.tools().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| request.native_tools.as_ref().is_none_or(|list| list.contains(&s.name)))
+        .collect();
+    let date = snapshot(&permissions.config)
+        .ui
+        .date_awareness
+        .then(|| ozgent_core::DateTime::now().prompt_line());
+
+    let mut conversation = request.messages.clone();
+    if let Some(note) = note {
+        conversation.push(Message::system(note));
+    }
+    for (index, agent) in agents.iter().enumerate() {
+        let (offered, missing) = agent.offer(&available);
+        let _ = request.out.send(Event::AgentStart {
+            name: agent.name.clone(),
+            description: agent.definition.description.clone(),
+            tools: offered.iter().map(|s| s.name.clone()).collect(),
+            missing: missing.clone(),
+        });
+
+        // Sampling is the agent's where it says, the turn's otherwise.
+        let mut tuned = resolved.clone();
+        if let Some(t) = agent.definition.temperature {
+            tuned.temperature = t;
+        }
+        if let Some(m) = agent.definition.max_tokens {
+            tuned.max_tokens = m;
+        }
+        session.set_options(&tuned);
+        if !install(engine, session, &offered, None, request) {
+            break;
+        }
+
+        let mut messages = conversation.clone();
+        let system = agent.system_prompt(date.as_deref(), &missing);
+        // The agent's instructions replace the chat's system prompt rather
+        // than joining it: a persona written for the chat, or a client's
+        // description of tools the agent does not have, would contradict the
+        // job it was called to do. A handoff note is kept: it is the job.
+        let keep = note.map(str::to_string);
+        messages.retain(|m| m.role != ozgent_core::Role::System || Some(m.text_content()) == keep);
+        messages.insert(0, Message::system(system));
+        // Images belong to the first agent: they are evaluated into the cache
+        // once, with that agent's prompt around them.
+        let (media_images, media_note) = if index == 0 { (images, observation) } else { (&[][..], None) };
+        prepare(&mut messages, &offered, native_tools, projector, media_images, media_note);
+
+        let started = std::time::Instant::now();
+        let outcome = rounds(
+            engine,
+            session,
+            &tuned,
+            agent.definition.thinking.unwrap_or(thinking),
+            tools,
+            permissions,
+            projector,
+            media_images,
+            request,
+            messages,
+            &offered,
+            &Default::default(),
+            agent.definition.rounds(),
+            Some(agent),
+        )?;
+        let _ = request.out.send(Event::AgentEnd {
+            name: agent.name.clone(),
+            ok: !outcome.text.trim().is_empty(),
+            ms: started.elapsed().as_millis() as u64,
+            calls: outcome.calls,
+            rounds: outcome.rounds,
+        });
+        conversation.push(Message::assistant(outcome.text.clone()));
+        totals.absorb(outcome);
+        if request.out.is_closed() {
+            break;
+        }
+    }
+    // The next request on this session must not inherit the last agent's
+    // temperature.
+    session.set_options(resolved);
+    Ok(totals)
+}
+
 /// The built-in tools a plain turn offers, or `None` after reporting that the
 /// request named one that does not exist.
 fn offer(tools: Option<&Tools>, request: &Request) -> Option<Vec<ozgent_core::ToolSpec>> {
     let Some(t) = tools.filter(|_| request.tools_enabled) else { return Some(Vec::new()) };
-    let Some(allowed) = &request.native_tools else { return Some(t.host.tools().to_vec()) };
-    // A name that matches nothing is a caller mistake worth reporting:
-    // silently dropping it would leave them believing a tool is available
-    // when the model was never told about it.
-    let available: Vec<&str> = t.host.tools().iter().map(|s| s.name.as_str()).collect();
-    if let Some(unknown) = allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str())) {
-        let _ = request.out.send(Event::Error {
-            message: format!(
-                "no built-in tool named {unknown:?}. Available: {}",
-                available.join(", ")
-            ),
-        });
-        return None;
+    let mut out: Vec<ozgent_core::ToolSpec> = match &request.native_tools {
+        None => t.host.tools().to_vec(),
+        Some(allowed) => {
+            // A name that matches nothing is a caller mistake worth reporting:
+            // silently dropping it would leave them believing a tool is
+            // available when the model was never told about it.
+            let available: Vec<&str> = t.host.tools().iter().map(|s| s.name.as_str()).collect();
+            if let Some(unknown) = allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str())) {
+                let _ = request.out.send(Event::Error {
+                    message: format!(
+                        "no built-in tool named {unknown:?}. Available: {}",
+                        available.join(", ")
+                    ),
+                });
+                return None;
+            }
+            t.host.tools().iter().filter(|s| allowed.iter().any(|a| a == &s.name)).cloned().collect()
+        }
+    };
+    out.retain(|s| !request.tools_off.contains(&s.name));
+    if !request.tools_off.iter().any(|n| n == ozgent_core::agents::HANDOFF_TOOL) {
+        out.extend(ozgent_core::agents::handoff_spec(&request.handoff));
     }
-    Some(t.host.tools().iter().filter(|s| allowed.iter().any(|a| a == &s.name)).cloned().collect())
+    Some(out)
 }
 
 /// Put the tools and the grammar for this run on the session.
@@ -887,6 +963,17 @@ fn prepare(
     }
 }
 
+/// Add to the system message, or start one.
+fn append_system(messages: &mut Vec<Message>, text: &str) {
+    match messages.first_mut() {
+        Some(m) if m.role == ozgent_core::Role::System => {
+            let existing = m.text_content();
+            *m = Message::system(format!("{existing}\n\n{text}"));
+        }
+        _ => messages.insert(0, Message::system(text)),
+    }
+}
+
 /// What one run of rounds produced, and what it cost.
 struct Outcome {
     /// The visible reply of the last round.
@@ -903,6 +990,8 @@ struct Outcome {
     /// Tool calls that actually ran.
     calls: usize,
     rounds: usize,
+    /// The model handed the request to this agent, with this task.
+    handoff: Option<(ozgent_core::Agent, String)>,
 }
 
 impl Default for Outcome {
@@ -918,6 +1007,7 @@ impl Default for Outcome {
             handed_back: false,
             calls: 0,
             rounds: 0,
+            handoff: None,
         }
     }
 }
@@ -1049,6 +1139,28 @@ fn rounds(
                 .collect();
             Message::assistant(format!("{}{calls}", parsed.text))
         });
+
+        // The model handing the request to an agent ends its part of the
+        // turn: the agent answers from here, as if the user had named it.
+        // A call naming an agent that does not exist is answered with the
+        // list, so the model can correct it or answer itself.
+        if agent.is_none() {
+            if let Some(call) = parsed.calls.iter().find(|c| c.name == ozgent_core::agents::HANDOFF_TOOL) {
+                match ozgent_core::agents::read_handoff(&call.arguments, &request.handoff) {
+                    Ok((to, task)) => {
+                        out.handoff = Some((to.clone(), task));
+                        // Only the text before the call is the main model's.
+                        messages.pop();
+                        break;
+                    }
+                    Err(e) => {
+                        let err = ozgent_tools::ToolCallError::Invalid { name: call.name.clone(), reason: e };
+                        record(request, session, &mut messages, call, Err(err), 0);
+                        continue;
+                    }
+                }
+            }
+        }
 
         // A call the caller owns ends the turn: this process has no code for
         // it, so the call is handed back to be run there. Checked before the
@@ -1734,6 +1846,8 @@ mod tests {
             overrides: None,
             images: Vec::new(),
             agents: Vec::new(),
+            tools_off: Vec::new(),
+            handoff: Vec::new(),
             out,
         });
         assert!(result.is_err());

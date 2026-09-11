@@ -515,9 +515,123 @@ pub fn typing_mention(before_caret: &str) -> Option<(usize, &str)> {
         .then_some((at, typed))
 }
 
+// ------------------------------------------------------------------ handoff
+
+/// The tool the main model uses to pass a request to an agent itself.
+///
+/// Calling it is the model typing the `@mention` for the user: the rest of
+/// the turn goes to that agent, with its own instructions and only its own
+/// tools, and its report is the reply — labelled with its name, exactly as a
+/// mention would be. It is not a way for the main model to borrow the agent's
+/// tools: those stay the agent's.
+pub const HANDOFF_TOOL: &str = "ask_agent";
+
+/// The `ask_agent` tool, describing every agent the model may hand to.
+/// `None` when there are none.
+pub fn handoff_spec(agents: &[Agent]) -> Option<crate::ToolSpec> {
+    if agents.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = agents
+        .iter()
+        .map(|a| format!("- {}: {}", a.name, a.definition.description))
+        .collect();
+    let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    Some(crate::ToolSpec {
+        name: HANDOFF_TOOL.to_string(),
+        description: format!(
+            "Hand the user's request to a specialist agent, who does the work with its own \
+             tools and a tested method, and answers the user directly in your place. When the \
+             request is one of the jobs below, hand it over instead of doing that job yourself \
+             with your own tools — the agent does it more thoroughly. Answer small talk and \
+             questions you can settle in one step yourself. Agents:\n{}",
+            list.join("\n")
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "enum": names,
+                    "description": "Which agent.",
+                },
+                "task": {
+                    "type": "string",
+                    "description": "What the agent should do, with everything it needs from the conversation — names, tickers, dates, what the user wants back.",
+                },
+            },
+            "required": ["agent", "task"],
+        }),
+        output_schema: None,
+        effect: crate::permission::Effect::Read,
+    })
+}
+
+/// Read an `ask_agent` call: which agent, and the task. An error says what
+/// was wrong, for the model to correct.
+pub fn read_handoff<'a>(
+    arguments: &serde_json::Value,
+    agents: &'a [Agent],
+) -> Result<(&'a Agent, String), String> {
+    let name = arguments.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let name = name.trim_start_matches('@');
+    let agent = agents.iter().find(|a| a.name == name).ok_or_else(|| {
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        format!("no agent called {name:?}. The agents are: {}", names.join(", "))
+    })?;
+    let task = arguments.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    Ok((agent, task))
+}
+
+/// The system prompt's line about handing off, when `ask_agent` is offered.
+///
+/// A tool description alone was not enough: a small model given both the
+/// agent and the agent's tools reached for the tools every time. Naming the
+/// agents where the model reads its instructions is what makes the choice one
+/// it actually weighs.
+pub fn handoff_prompt(agents: &[Agent]) -> String {
+    let list: Vec<String> = agents
+        .iter()
+        .map(|a| format!("- {}: {}", a.name, a.definition.description))
+        .collect();
+    format!(
+        "Specialist agents can take a request off your hands with the {HANDOFF_TOOL} tool:\n{}\n\
+         When the user's request is one of these jobs, call {HANDOFF_TOOL} with that agent and a \
+         clear task instead of doing the job yourself with your own tools. Otherwise answer \
+         yourself.",
+        list.join("\n")
+    )
+}
+
+/// What the agent is told about why it is running, when the model handed the
+/// request to it rather than the user naming it.
+pub fn handoff_note(task: &str) -> String {
+    if task.is_empty() {
+        "The assistant handed the user's latest request to you. Do it.".to_string()
+    } else {
+        format!("The assistant handed the user's latest request to you, with this task:\n{task}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_handoff_tool_names_every_agent_and_reads_back() {
+        let catalog = Catalog::builtin();
+        let spec = handoff_spec(catalog.all()).expect("built-in agents exist");
+        assert_eq!(spec.name, HANDOFF_TOOL);
+        for a in catalog.all() {
+            assert!(spec.description.contains(&a.name), "{}", a.name);
+        }
+        let (agent, task) =
+            read_handoff(&serde_json::json!({"agent": "@stock-guru", "task": " NVDA "}), catalog.all()).unwrap();
+        assert_eq!(agent.name, "stock-guru");
+        assert_eq!(task, "NVDA");
+        assert!(read_handoff(&serde_json::json!({"agent": "nobody"}), catalog.all()).is_err());
+        assert!(handoff_spec(&[]).is_none());
+    }
 
     fn spec(name: &str, effect: Effect) -> ToolSpec {
         ToolSpec {

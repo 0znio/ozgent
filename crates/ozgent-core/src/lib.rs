@@ -14,6 +14,7 @@ pub mod options;
 pub mod paths;
 pub mod permission;
 pub mod registry;
+pub mod secret;
 pub mod tokens;
 
 pub use agents::{Agent, Catalog as AgentCatalog};

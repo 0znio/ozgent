@@ -36,13 +36,21 @@ its own user.
 | `fetch_url` | read a page, article, JSON API, or feed | read | `network` + host allowlist |
 | `write_file` | create or modify a file | write | `write = true`, confined to `root` |
 | `run_command` | run one allowed program | execute | `shell = true` + allowlist |
-| `yahoo_finance` | quotes, price history, fundamentals, news, symbol search | read | — |
+| `yahoo_finance` | quotes, price history, technical indicators, fundamentals, news, symbol search | read | — |
 | `reddit` | search posts, list a subreddit, read a thread | read | optional app credentials |
 
 **`yahoo_finance`** needs no key. One tool with an `action` — `quote`,
-`history`, `fundamentals`, `news`, `search` — because a small model picks the
-right action from one description far more reliably than the right tool out
-of five. Every number comes back raw, never as Yahoo's `"3.2T"`.
+`history`, `technicals`, `fundamentals`, `news`, `search` — because a small
+model picks the right action from one description far more reliably than the
+right tool out of six. Every number comes back raw, never as Yahoo's `"3.2T"`.
+
+`technicals` computes, from two years of daily prices: 20/50/200-day and
+12/26 EMA averages, RSI(14), MACD(12,26,9), Bollinger bands, ATR, support and
+resistance from recent swing points, the 52-week range, returns over a week to
+a year, and the volume trend. Textbook definitions (Wilder's smoothing for RSI
+and ATR), so every number can be checked against a charting site — plus
+plain-words `signals` ("RSI 74: overbought by the usual 70 rule") that a small
+model would otherwise misread from the raw numbers.
 
 **`reddit`** works without setup, but slowly: Reddit refuses anonymous API
 calls, so it reads the public feeds, which allow about one request a minute
@@ -59,6 +67,12 @@ username = "your_name"     # Reddit asks apps to name who runs them
 Every result says which route it came from, and a spent rate limit is
 reported with how long until the next request rather than retried into a
 longer one.
+
+**Choosing tools per chat.** In the web interface the **Web** switch next to
+the message box turns searching and page-reading on and off, and **Tools**
+opens a tray with a switch for every other tool — remembered by that browser.
+They decide what the model may reach for; an agent you call by name keeps its
+own tools.
 
 Tools can also come from [MCP servers](mcp.md). They go through everything
 below unchanged, with one difference stated there: a server's claim that a tool

@@ -49,6 +49,11 @@ const CHOICES = [
 
 const state = {
   conversation: null, streaming: false, abort: null, files: [], tools: true,
+  // The composer's switches, remembered by this browser.
+  web: readStored("ozgent-web", true),
+  toolsOff: readStored("ozgent-tools-off", []),
+  /// Tools the server has running, for the tray.
+  available: [],
   /// Every agent, for the @ panel and for marking mentions in the thread.
   agents: [],
   /// Row id to public id, so a route can be written without another request.
@@ -1552,6 +1557,7 @@ async function send(text) {
   view.cursor(true);
   setStreaming(true);
   el.stat.textContent = "loading model...";
+  let loadBox = null;
 
   // Keyed by call id, not a single "current card". A batch is announced in
   // full before any of it is awaited, so with one variable the first result
@@ -1577,6 +1583,7 @@ async function send(text) {
         message: text,
         thinking: el.thinking.value,
         tools: state.tools,
+        tools_off: toolsOff(),
         images,
       }),
     });
@@ -1600,7 +1607,25 @@ async function send(text) {
         if (!line) continue;
         const event = JSON.parse(line.slice(5).trim());
 
-        if (event.type === "ready") {
+        if (event.type === "loading") {
+          // A bar, not just words: loading a large model takes long enough
+          // that "loading model..." alone reads as a hang.
+          if (!loadBox) {
+            loadBox = document.createElement("div");
+            loadBox.className = "load-box";
+            loadBox.innerHTML =
+              '<div class="load-head"><span class="load-name"></span><span class="load-pct"></span></div>' +
+              '<div class="md-track"><span class="md-fill"></span></div>';
+            body.prepend(loadBox);
+          }
+          const pct = Math.floor(event.progress * 100);
+          loadBox.querySelector(".load-name").textContent = `loading ${event.model}`;
+          loadBox.querySelector(".load-pct").textContent = `${pct}%`;
+          loadBox.querySelector(".md-fill").style.width = `${pct}%`;
+          el.stat.textContent = `loading model · ${pct}%`;
+        } else if (event.type === "ready") {
+          loadBox?.remove();
+          loadBox = null;
           el.stat.textContent = "generating";
           // The window is fixed when the weights load, so it is known now and
           // does not change again until the model is reloaded.
@@ -2491,408 +2516,15 @@ async function loadModels() {
 
 // ----------------------------------------------------------------- models
 
-/// Sizes the way a person reads them: 2.7 GB, not 2899102720.
-function bytesText(n) {
-  if (!n && n !== 0) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
-  return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+/// Getting and removing models lives on /admin, behind its password; the
+/// chat only needs to know whether there is anything to chat with.
+function noModelsYet() {
+  const empty = $("empty");
+  if (!empty) return;
+  empty.querySelector("p").innerHTML =
+    'No models installed yet. Get one on the <a href="/admin#models">admin page</a> — ' +
+    "search Hugging Face or install a .gguf you have — or run <code>ozgent pull</code>.";
 }
-
-function countText(n) {
-  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(0)}k` : String(n);
-}
-
-function durationText(seconds) {
-  if (!isFinite(seconds) || seconds <= 0) return "";
-  if (seconds < 60) return `${Math.ceil(seconds)} s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} s`;
-  return `${Math.floor(seconds / 3600)} h ${Math.round((seconds % 3600) / 60)} min`;
-}
-
-const hub = {
-  installed: [],
-  jobs: [],
-  repo: null,
-  chosen: null,
-  timer: null,
-  searchTimer: null,
-  /// Which jobs were running at the last poll, so a finish can be noticed.
-  running: new Set(),
-};
-
-/// A repository id as someone would paste it: owner/name, optionally :QUANT,
-/// or a huggingface.co URL.
-function asRepo(text) {
-  const t = text.trim().replace(/^https?:\/\/(www\.)?huggingface\.co\//, "").replace(/\/+$/, "");
-  return /^[\w.-]+\/[\w.-]+(:[\w.-]+)?$/.test(t) ? t : null;
-}
-
-async function openModels() {
-  $("models").showModal();
-  hub.installed = await api("/api/models");
-  renderInstalled();
-  await pollJobs();
-  $("md-query").focus();
-}
-
-function closeModels() {
-  $("models").close();
-}
-
-async function searchHub(query) {
-  const box = $("md-results");
-  const note = $("md-search-note");
-  const direct = asRepo(query);
-  $("md-repo").hidden = true;
-  box.hidden = false;
-  box.replaceChildren();
-  if (direct) {
-    // A pasted id opens straight away; searching for it would only find it.
-    box.append(resultRow({ id: direct.split(":")[0], downloads: null, vision: false }, "open"));
-  }
-  if (query.trim().length < 2) { note.textContent = "GGUF repositories only — those are what llama.cpp runs."; return; }
-  note.textContent = "searching…";
-  try {
-    const data = await api(`/api/hub/search?q=${encodeURIComponent(query.trim())}`);
-    // The page may have moved on while this was in flight.
-    if ($("md-query").value.trim() !== query.trim()) return;
-    for (const r of data.results) {
-      if (direct && r.id.toLowerCase() === direct.split(":")[0].toLowerCase()) continue;
-      box.append(resultRow(r));
-    }
-    note.textContent = data.results.length
-      ? `${data.results.length} repositories, most downloaded first`
-      : "nothing found. Try the model's family name, like qwen3.5 or gemma";
-  } catch (e) {
-    note.textContent = e.message;
-  }
-}
-
-function resultRow(r, action) {
-  const row = document.createElement("button");
-  row.type = "button";
-  row.className = "md-result";
-  row.innerHTML =
-    '<span class="md-result-id"></span><span class="md-chips"></span><span class="md-result-meta"></span>';
-  row.querySelector(".md-result-id").textContent = r.id;
-  if (r.vision) row.querySelector(".md-chips").innerHTML = '<span class="md-chip">vision</span>';
-  row.querySelector(".md-result-meta").textContent =
-    action === "open" ? "open this repository" : `${countText(r.downloads ?? 0)} downloads`;
-  row.addEventListener("click", () => openRepo(r.id));
-  return row;
-}
-
-async function openRepo(id) {
-  const panel = $("md-repo");
-  const error = $("md-repo-error");
-  $("md-results").hidden = true;
-  panel.hidden = false;
-  error.hidden = true;
-  $("md-repo-id").textContent = id;
-  $("md-quants").innerHTML = '<p class="hint">reading the repository…</p>';
-  $("md-pull").disabled = true;
-  try {
-    const repo = await api(`/api/hub/repo?repo=${encodeURIComponent(id)}`);
-    hub.repo = repo;
-    $("md-repo-id").textContent = repo.id;
-    $("md-repo-vision").hidden = !repo.vision;
-    $("md-repo-gated").hidden = !repo.gated;
-    const allFit = repo.quants.length && repo.quants.every((q) => q.fits === true);
-    $("md-gpu").textContent = repo.gpu
-      ? `Judged against ${repo.gpu.name} (${bytesText(repo.gpu.memory)}): ` +
-        (allFit ? "every size here fits." : "sizes marked \u201cpartly on CPU\u201d run, but slower.") +
-        (repo.vision ? ` The vision projector adds ${bytesText(repo.projector_bytes)}.` : "")
-      : "No GPU found: every size runs on the CPU, and smaller is faster.";
-    renderQuants();
-    if (!repo.runnable) {
-      error.textContent = "This repository has no GGUF files, so there is nothing llama.cpp can run.";
-      error.hidden = false;
-    }
-  } catch (e) {
-    $("md-quants").replaceChildren();
-    error.textContent = e.message;
-    error.hidden = false;
-  }
-}
-
-function renderQuants() {
-  const box = $("md-quants");
-  box.replaceChildren();
-  const have = new Set(hub.installed.map((m) => m.reference.toLowerCase()));
-  const pick = hub.repo.quants.find((q) => q.recommended) ?? hub.repo.quants[0];
-  hub.chosen = pick?.quant ?? null;
-  for (const q of hub.repo.quants) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "md-quant";
-    row.setAttribute("role", "radio");
-    const installed = have.has(q.name.toLowerCase());
-    row.innerHTML =
-      '<span class="md-quant-name"></span><span class="md-quant-size"></span><span class="md-chips"></span>';
-    row.querySelector(".md-quant-name").textContent = q.quant;
-    row.querySelector(".md-quant-size").textContent =
-      bytesText(q.bytes) + (q.shards > 1 ? ` · ${q.shards} files` : "");
-    const chips = [];
-    if (q.recommended) chips.push('<span class="md-chip md-good">recommended</span>');
-    // Only the exception is marked: a chip saying "fits" on twenty rows
-    // says nothing twenty times.
-    if (q.fits === false) chips.push('<span class="md-chip md-faint">partly on CPU</span>');
-    if (installed) chips.push('<span class="md-chip">installed</span>');
-    row.querySelector(".md-chips").innerHTML = chips.join("");
-    row.dataset.quant = q.quant;
-    row.addEventListener("click", () => { hub.chosen = q.quant; syncQuants(); });
-    box.append(row);
-  }
-  syncQuants();
-  // The list scrolls on its own; start it at the suggestion.
-  box.querySelector('[aria-checked="true"]')?.scrollIntoView({ block: "center" });
-}
-
-function syncQuants() {
-  for (const row of $("md-quants").querySelectorAll(".md-quant")) {
-    row.setAttribute("aria-checked", String(row.dataset.quant === hub.chosen));
-  }
-  const q = hub.repo?.quants.find((x) => x.quant === hub.chosen);
-  const pull = $("md-pull");
-  const installed = q && hub.installed.some((m) => m.reference.toLowerCase() === q.name.toLowerCase());
-  const downloading = q && hub.jobs.some((j) =>
-    (j.status === "resolving" || j.status === "downloading") &&
-    j.repo.toLowerCase() === hub.repo.id.toLowerCase() &&
-    (j.quant ?? "").toUpperCase() === q.quant.toUpperCase());
-  pull.disabled = !q || installed || downloading;
-  pull.textContent = !q
-    ? "Download"
-    : installed
-      ? `${q.quant} is installed`
-      : downloading
-        ? `${q.quant} is downloading`
-        : `Download ${q.quant} · ${bytesText(q.bytes + (hub.repo.projector_bytes ?? 0))}`;
-}
-
-async function startPull(repo, quant, alias) {
-  const error = $("md-repo-error");
-  error.hidden = true;
-  try {
-    await api("/api/hub/pull", { method: "POST", body: JSON.stringify({ repo, quant, alias }) });
-    $("md-alias").value = "";
-    await pollJobs();
-  } catch (e) {
-    error.textContent = e.message;
-    error.hidden = false;
-  }
-}
-
-/// Read every download's state, and keep reading while any is running.
-///
-/// Polling rather than a stream, because a download is the server's, not
-/// this page's: a reload or a second tab must find it exactly where it is.
-async function pollJobs() {
-  clearTimeout(hub.timer);
-  try {
-    hub.jobs = await api("/api/hub/pulls");
-  } catch {
-    hub.jobs = [];
-  }
-  const active = hub.jobs.filter((j) => j.status === "resolving" || j.status === "downloading");
-  // A download that just finished changes what is installed.
-  const finished = [...hub.running].filter((id) => !active.some((j) => j.id === id));
-  hub.running = new Set(active.map((j) => j.id));
-  if (finished.length) {
-    hub.installed = await api("/api/models");
-    renderInstalled();
-    if (hub.repo) renderQuants();
-    await loadModels();
-  }
-  renderJobs();
-  renderBadge(active);
-  if (hub.repo && !$("md-repo").hidden) syncQuants();
-  if (active.length || $("models").open) {
-    hub.timer = setTimeout(pollJobs, active.length ? 700 : 3000);
-  }
-}
-
-/// Progress on the toolbar button, so a download is visible with the
-/// dialog closed.
-function renderBadge(active) {
-  const badge = $("md-badge");
-  if (!active.length) { badge.hidden = true; return; }
-  const done = active.reduce((a, j) => a + j.done, 0);
-  const total = active.reduce((a, j) => a + j.total, 0);
-  badge.hidden = false;
-  badge.textContent = total ? `${Math.floor((done / total) * 100)}%` : "…";
-  $("open-models").dataset.tip = `${active.length} download${active.length === 1 ? "" : "s"} running`;
-}
-
-function renderJobs() {
-  const box = $("md-jobs");
-  $("md-jobs-section").hidden = !hub.jobs.length;
-  box.replaceChildren();
-  for (const j of hub.jobs) {
-    const row = document.createElement("div");
-    row.className = `md-job ${j.status}`;
-    const share = j.total ? Math.min(1, j.done / j.total) : 0;
-    const running = j.status === "resolving" || j.status === "downloading";
-    let line;
-    if (j.status === "resolving") line = "reading the repository…";
-    else if (j.status === "downloading") {
-      const left = j.bytes_per_second > 0 ? durationText((j.total - j.done) / j.bytes_per_second) : "";
-      line = [
-        `${bytesText(j.done)} of ${bytesText(j.total)}`,
-        j.bytes_per_second > 0 ? `${bytesText(j.bytes_per_second)}/s` : "starting",
-        left && `${left} left`,
-        j.file_count > 1 && `file ${j.file_index} of ${j.file_count}`,
-      ].filter(Boolean).join(" · ");
-    } else if (j.status === "done") line = `installed · ${bytesText(j.total)}`;
-    else if (j.status === "cancelled") line = "cancelled · what arrived is kept, and downloading again resumes";
-    else line = j.error ?? "failed";
-
-    row.innerHTML =
-      '<div class="md-job-head"><span class="md-job-name"></span><span class="md-job-pct"></span></div>' +
-      '<div class="md-track"><span class="md-fill"></span></div>' +
-      '<div class="md-job-foot"><span class="md-job-line"></span><span class="md-job-acts"></span></div>';
-    row.querySelector(".md-job-name").textContent = j.model ?? `${j.repo}${j.quant ? `:${j.quant}` : ""}`;
-    row.querySelector(".md-job-pct").textContent = running && j.total ? `${Math.floor(share * 100)}%` : "";
-    row.querySelector(".md-fill").style.width = `${(j.status === "done" ? 1 : share) * 100}%`;
-    row.querySelector(".md-job-line").textContent = line;
-
-    const acts = row.querySelector(".md-job-acts");
-    const button = (label, fn, cls = "linky") => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = cls;
-      b.textContent = label;
-      b.addEventListener("click", fn);
-      acts.append(b);
-    };
-    if (running) {
-      button("Cancel", async () => { await api(`/api/hub/pulls/${j.id}`, { method: "DELETE" }); pollJobs(); });
-    } else {
-      if (j.status === "done") button("Use it", () => useModel(j.alias || j.model));
-      if (j.status === "failed" || j.status === "cancelled") {
-        button(j.status === "failed" ? "Retry" : "Resume", async () => {
-          await api(`/api/hub/pulls/${j.id}`, { method: "DELETE" });
-          startPull(j.repo, j.quant, j.alias);
-        });
-      }
-      button("Dismiss", async () => { await api(`/api/hub/pulls/${j.id}`, { method: "DELETE" }); pollJobs(); });
-    }
-    box.append(row);
-  }
-}
-
-function renderInstalled() {
-  const box = $("md-installed");
-  box.replaceChildren();
-  if (!hub.installed.length) {
-    box.innerHTML = '<p class="hint">Nothing installed yet. Search above to get a model.</p>';
-    return;
-  }
-  for (const m of hub.installed) {
-    const row = document.createElement("div");
-    row.className = "md-model";
-    row.innerHTML =
-      '<div class="md-model-main"><span class="md-model-name"></span><span class="md-chips"></span></div>' +
-      '<div class="md-model-meta"></div>' +
-      '<div class="md-model-acts"></div>';
-    row.querySelector(".md-model-name").textContent = m.alias || m.reference;
-    const chips = [];
-    if (m.is_default) chips.push('<span class="md-chip md-good">default</span>');
-    if (m.vision) chips.push('<span class="md-chip">vision</span>');
-    if (m.embedding) chips.push('<span class="md-chip md-faint">embedding</span>');
-    row.querySelector(".md-chips").innerHTML = chips.join("");
-    row.querySelector(".md-model-meta").textContent = [
-      m.alias ? m.reference : null,
-      bytesText(m.size_bytes),
-      m.context_train ? `${countText(m.context_train)} context` : null,
-    ].filter(Boolean).join(" · ");
-
-    const acts = row.querySelector(".md-model-acts");
-    if (!m.embedding) {
-      const use = document.createElement("button");
-      use.type = "button";
-      use.className = "ghost-btn auto";
-      use.textContent = "Use";
-      use.addEventListener("click", () => useModel(m.alias || m.reference));
-      acts.append(use);
-    }
-    const del = document.createElement("button");
-    del.type = "button";
-    del.className = "ghost-btn auto md-danger";
-    del.textContent = "Delete";
-    del.addEventListener("click", () => confirmDelete(row, m));
-    acts.append(del);
-    box.append(row);
-  }
-}
-
-/// Ask on the row itself: deleting gigabytes deserves a second click, and a
-/// browser confirm() box is an interruption that says nothing about size.
-function confirmDelete(row, m) {
-  const acts = row.querySelector(".md-model-acts");
-  acts.replaceChildren();
-  const ask = document.createElement("span");
-  ask.className = "md-ask";
-  ask.textContent = `Delete ${bytesText(m.size_bytes)} from disk?`;
-  const yes = document.createElement("button");
-  yes.type = "button";
-  yes.className = "ghost-btn auto md-danger";
-  yes.textContent = "Delete";
-  const no = document.createElement("button");
-  no.type = "button";
-  no.className = "ghost-btn auto";
-  no.textContent = "Keep";
-  no.addEventListener("click", renderInstalled);
-  yes.addEventListener("click", async () => {
-    yes.disabled = true;
-    try {
-      const out = await api(`/api/models/${encodeURIComponent(m.reference)}`, { method: "DELETE" });
-      hub.installed = await api("/api/models");
-      renderInstalled();
-      if (hub.repo) renderQuants();
-      await loadModels();
-      if (out.cleared_default) el.stat.textContent = "that was the default model; none is set now";
-    } catch (e) {
-      ask.textContent = e.message;
-      ask.classList.add("error");
-    }
-  });
-  acts.append(ask, no, yes);
-}
-
-/// Switch the chat to a model and close the dialog.
-function useModel(name) {
-  const opt = [...el.model.options].find((o) => o.value === name || o.textContent.includes(name));
-  if (opt) {
-    el.model.value = opt.value;
-    el.model.dispatchEvent(new Event("change"));
-  }
-  closeModels();
-  el.input.focus();
-}
-
-$("open-models").addEventListener("click", openModels);
-$("close-models").addEventListener("click", closeModels);
-$("md-query").addEventListener("input", () => {
-  clearTimeout(hub.searchTimer);
-  hub.searchTimer = setTimeout(() => searchHub($("md-query").value), 350);
-});
-$("md-search-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  clearTimeout(hub.searchTimer);
-  const direct = asRepo($("md-query").value);
-  if (direct) openRepo(direct.split(":")[0]);
-  else searchHub($("md-query").value);
-});
-$("md-repo-back").addEventListener("click", () => {
-  $("md-repo").hidden = true;
-  $("md-results").hidden = false;
-});
-$("md-pull").addEventListener("click", () => {
-  if (hub.repo && hub.chosen) startPull(hub.repo.id, hub.chosen, $("md-alias").value.trim() || null);
-});
 
 // ------------------------------------------------------------------- boot
 
@@ -2901,15 +2533,14 @@ async function boot() {
   // script in the document head, before anything was painted.
   applyTheme(storedTheme());
   syncTools();
+  loadAvailable();
   // Before the conversation is drawn, so its mentions are marked.
   await loadAgents();
   const models = await loadModels();
   await loadConversations();
   await openRoute();
-  // A download started before a reload is still running on the server.
-  pollJobs();
   // Nothing to chat with yet: the one useful thing is getting a model.
-  if (!models.some((m) => !m.embedding)) openModels();
+  if (!models.some((m) => !m.embedding)) noModelsYet();
 }
 
 window.addEventListener("popstate", openRoute);
@@ -2953,25 +2584,143 @@ el.send.addEventListener("click", (e) => {
   state.abort?.abort();
 });
 
-/// Put the tools control in step with the state it reports.
+/// A stored preference, or the default when there is none or storage is off.
+function readStored(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStored(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private browsing */ }
+}
+
+/// Searching and reading pages: the Web switch, not the tray.
+const WEB_TOOLS = ["web_search", "fetch_url"];
+
+/// What this turn leaves out, by name: the tray's choices, and the web tools
+/// when Web is off. Only names the server has, so a tool uninstalled since
+/// is not sent back as an unknown one.
+function toolsOff() {
+  const off = new Set(state.toolsOff);
+  if (!state.web) WEB_TOOLS.forEach((t) => off.add(t));
+  return [...off];
+}
+
+/// Put the Web control in step with the state it reports.
 ///
 /// Three cues, because one is not enough to read at a glance: the hue, the
 /// label's own words, and a globe that is struck through when off.
 function syncTools() {
-  const button = $("tools-toggle");
-  button.setAttribute("aria-pressed", String(state.tools));
-  button.querySelector(".pill-label").textContent = state.tools ? "Tools on" : "Tools off";
-  setIcon(button.querySelector(".ic"), state.tools ? "i-globe" : "i-globe-off");
+  const button = $("web-toggle");
+  button.setAttribute("aria-pressed", String(state.web));
+  button.querySelector(".pill-label").textContent = state.web ? "Web" : "No web";
+  setIcon(button.querySelector(".ic"), state.web ? "i-globe" : "i-globe-off");
   // `data-tip` is what the page draws; `title` waits a second and renders in
   // the desktop's own style, and setting it here left the visible tip stale.
-  button.dataset.tip = state.tools
-    ? "Tools on: the model may search the web and read files"
-    : "Tools off: the model answers from what it knows";
+  button.dataset.tip = state.web
+    ? "Web on: the model may search the web and read pages"
+    : "Web off: no searching, no pages";
+  const others = state.available.filter((t) => !WEB_TOOLS.includes(t.name));
+  const off = others.filter((t) => state.toolsOff.includes(t.name)).length;
+  const open = $("tools-open");
+  open.querySelector(".pill-label").textContent = off ? `Tools · ${off} off` : "Tools";
+  open.classList.toggle("some-off", off > 0);
 }
 
-$("tools-toggle").addEventListener("click", () => {
-  state.tools = !state.tools;
+$("web-toggle").addEventListener("click", () => {
+  state.web = !state.web;
+  writeStored("ozgent-web", state.web);
   syncTools();
+});
+
+/// Load what the server has running. Cheap: it reads the live tool host.
+async function loadAvailable() {
+  try {
+    state.available = await api("/api/tools/active");
+  } catch {
+    state.available = [];
+  }
+  // Forget choices about tools that are gone.
+  const names = new Set(state.available.map((t) => t.name));
+  state.toolsOff = state.toolsOff.filter((n) => names.has(n));
+  syncTools();
+}
+
+const EFFECT = { read: "reads", write: "writes", execute: "runs programs", unknown: "unknown" };
+
+function renderTray() {
+  const list = $("tools-tray-list");
+  list.replaceChildren();
+  const others = state.available.filter((t) => !WEB_TOOLS.includes(t.name));
+  if (!others.length) {
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "No other tools are running. Tools can be switched on in Settings → Tools.";
+    list.append(p);
+    return;
+  }
+  for (const t of others) {
+    const row = document.createElement("label");
+    row.className = "tray-tool";
+    const sw = document.createElement("span");
+    sw.className = "switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !state.toolsOff.includes(t.name);
+    input.setAttribute("aria-label", t.name);
+    input.addEventListener("change", () => {
+      const off = new Set(state.toolsOff);
+      if (input.checked) off.delete(t.name); else off.add(t.name);
+      state.toolsOff = [...off];
+      writeStored("ozgent-tools-off", state.toolsOff);
+      syncTools();
+    });
+    const track = document.createElement("span");
+    track.className = "track";
+    sw.append(input, track);
+    const text = document.createElement("span");
+    text.className = "tray-text";
+    const name = document.createElement("span");
+    name.className = "tray-name";
+    name.textContent = t.label ?? t.name;
+    const desc = document.createElement("span");
+    desc.className = "tray-desc";
+    desc.textContent = t.description;
+    text.append(name, desc);
+    const chip = document.createElement("span");
+    chip.className = `tray-chip ${t.rule}`;
+    chip.textContent = t.rule === "allow" ? EFFECT[t.effect] ?? t.effect : `${EFFECT[t.effect] ?? t.effect} · ${t.rule === "ask" ? "asks" : "refused"}`;
+    row.append(sw, text, chip);
+    list.append(row);
+  }
+}
+
+function setTray(open) {
+  $("tools-tray").hidden = !open;
+  $("tools-open").setAttribute("aria-expanded", String(open));
+  if (open) renderTray();
+}
+
+$("tools-open").addEventListener("click", async () => {
+  const open = $("tools-tray").hidden;
+  if (open) await loadAvailable();
+  setTray(open);
+});
+for (const [id, on] of [["tools-all-on", true], ["tools-all-off", false]]) {
+  $(id).addEventListener("click", () => {
+    state.toolsOff = on ? [] : state.available.filter((t) => !WEB_TOOLS.includes(t.name)).map((t) => t.name);
+    writeStored("ozgent-tools-off", state.toolsOff);
+    renderTray();
+    syncTools();
+  });
+}
+document.addEventListener("click", (e) => {
+  if ($("tools-tray").hidden) return;
+  if (!e.target.closest("#tools-tray, #tools-open")) setTray(false);
 });
 
 $("lightbox").addEventListener("click", (e) => {
@@ -2982,6 +2731,7 @@ $("lightbox-close").addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("lightbox").hidden) closeLightbox();
+  else if (!$("tools-tray").hidden) setTray(false);
   else if (el.sidebar.classList.contains("open")) setDrawer(false);
 });
 

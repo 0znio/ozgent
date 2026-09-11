@@ -373,6 +373,8 @@ pub async fn messages(
             }),
             images,
             agents: resolved.agents,
+            tools_off: Vec::new(),
+            handoff: Vec::new(),
             out: tx,
         })
         .map_err(AnthropicError::internal)?;

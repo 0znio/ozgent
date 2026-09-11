@@ -125,18 +125,20 @@ pub enum Command {
         options: OptionFlags,
     },
 
-    /// Answer messages from Telegram and WhatsApp.
+    /// Telegram and WhatsApp: set up, manage, and answer messages.
     ///
-    /// Runs the channels turned on in `[channels]`. Nobody can talk to it
-    /// until they are on the allowlist, and the code printed at startup is how
-    /// the first person gets there:
+    ///   ozgent gateway telegram           set up Telegram, or change it
+    ///   ozgent gateway whatsapp           link WhatsApp, or change it
+    ///   ozgent gateway status             what is set up and who is allowed
+    ///   ozgent gateway                    answer messages from this terminal
     ///
-    ///   ozgent gateway                    channels only
-    ///   ozgent gateway --web              the web interface as well, one model
-    ///
-    /// A chat can reach this machine's tools, subject to your permission
-    /// rules. See `docs/channels.md` before opening one up.
+    /// `ozgent web` answers them too, and its /admin page does everything
+    /// these commands do. Nobody can message ozgent until you allow them.
+    /// See docs/channels.md before opening one up.
+    #[command(alias = "channel", alias = "channels")]
     Gateway {
+        #[command(subcommand)]
+        command: Option<GatewayCommand>,
         /// Also serve the web interface, sharing one loaded model.
         #[arg(long)]
         web: bool,
@@ -150,10 +152,18 @@ pub enum Command {
         options: OptionFlags,
     },
 
-    /// Set up and inspect messaging channels.
-    Channel {
+    /// The password for the web interface's /admin page.
+    ///
+    ///   ozgent admin setup      choose the password
+    ///   ozgent admin reset      forgot it? choose a new one here
+    ///   ozgent admin status     is it set, and where to open it
+    ///   ozgent admin disable    close /admin again
+    ///
+    /// Only a hash of the password is stored (Argon2id). Whoever can run
+    /// commands as you on this machine can reset it; that is the way back in.
+    Admin {
         #[command(subcommand)]
-        command: ChannelCommand,
+        command: AdminCommand,
     },
 
     /// List, show, create and edit agents.
@@ -361,42 +371,64 @@ pub enum AgentCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ChannelCommand {
-    /// Show what is configured, who is allowed, and what is linked.
+pub enum GatewayCommand {
+    /// What is set up, what is running, and who is allowed.
     #[command(alias = "list")]
     Status,
-
-    /// Link a WhatsApp account by scanning a QR code.
-    ///
-    /// This connects your own account as a second device, the way WhatsApp Web
-    /// does. Automating a personal account is against WhatsApp's terms of
-    /// service and accounts have been banned for it.
-    Login {
-        /// `whatsapp`. Telegram needs a token from @BotFather instead.
-        channel: String,
+    /// Set up Telegram, or change it once it is.
+    Telegram {
+        #[command(subcommand)]
+        action: Option<ChannelAction>,
     },
-
-    /// Unlink an account and forget its credentials.
-    Logout { channel: String },
-
-    /// Install what a channel needs to run.
-    ///
-    /// WhatsApp has no Rust client, so it runs through a small Node program.
-    /// This installs that program's dependencies with npm.
-    Install { channel: String },
-
-    /// Allow someone to talk to a channel.
-    ///
-    ///   ozgent channel allow telegram 4242
-    ///   ozgent channel allow telegram @ada
-    Allow {
-        channel: String,
-        /// A user id, a handle, or a phone number.
-        identity: String,
+    /// Link WhatsApp, or change it once it is.
+    #[command(alias = "wa")]
+    Whatsapp {
+        #[command(subcommand)]
+        action: Option<ChannelAction>,
     },
+}
 
-    /// Stop someone from talking to a channel.
-    Deny { channel: String, identity: String },
+/// Something to change on one channel. With none, a menu asks.
+#[derive(Debug, Subcommand)]
+pub enum ChannelAction {
+    /// Walk through setting it up from the start.
+    Setup,
+    /// Who may message it.
+    #[command(alias = "list")]
+    Allowed,
+    /// Let someone message it: a phone number with its country code, a
+    /// Telegram user id, or a @username.
+    Allow { who: Vec<String> },
+    /// Stop someone from messaging it.
+    #[command(alias = "remove")]
+    Deny { who: Vec<String> },
+    /// Which tools it may use: `all`, `none`, or names separated by commas.
+    Tools { tools: Option<String> },
+    /// Telegram: set a new bot token. Asked for when not given, so it stays out
+    /// of your shell history.
+    Token { token: Option<String> },
+    /// WhatsApp: link this machine to an account (or to a different one).
+    Link,
+    /// Sign out: forget the bot token, or unlink the WhatsApp device.
+    #[command(alias = "logout")]
+    Signout,
+    /// Answer messages on this channel.
+    On,
+    /// Stop answering on this channel, keeping its settings.
+    Off,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdminCommand {
+    /// Choose the admin password.
+    Setup,
+    /// Choose a new password when the old one is forgotten. Signs every
+    /// browser out and lifts any lockout.
+    Reset,
+    /// Whether a password is set, and where the page is.
+    Status,
+    /// Remove the password, which closes /admin.
+    Disable,
 }
 
 #[derive(Debug, Subcommand)]

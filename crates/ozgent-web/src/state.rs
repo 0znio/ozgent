@@ -70,9 +70,77 @@ pub struct App {
     /// Model downloads started from the browser. They belong to the server,
     /// so closing the tab that started one does not stop it.
     pub pulls: crate::hub::SharedPulls,
+    /// The messaging gateway, when this process runs one. Set once, by
+    /// whoever starts it; `/admin` reaches it through here.
+    pub gateway: std::sync::OnceLock<Arc<dyn crate::admin::GatewayControl>>,
+    /// Admin sessions and failed sign-ins.
+    pub admin: crate::admin::Guard,
+    watching: std::sync::atomic::AtomicBool,
 }
 
 pub type State = Arc<App>;
+
+/// How often `config.toml` is checked for changes made elsewhere.
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Follow changes other programs make to `config.toml`.
+///
+/// `ozgent gateway telegram` and `ozgent admin reset` run as separate
+/// processes and write the file; a running server holds the configuration in
+/// memory and would otherwise go on using what it read at startup. Only the
+/// sections that are safe to swap underneath a running server are taken —
+/// `[channels]` and `[web]` — and the gateway is then brought in line.
+///
+/// Idempotent: both the web server and the gateway call it.
+pub fn watch_config(state: &State) {
+    use std::sync::atomic::Ordering;
+    if state.watching.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let path = state.paths.config_file();
+        let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut seen = modified(&path);
+        let mut warned = false;
+        loop {
+            tokio::time::sleep(WATCH_EVERY).await;
+            let now = modified(&path);
+            if now == seen {
+                continue;
+            }
+            let fresh = match Config::load(&state.paths) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Mid-write, or a hand edit with a typo. Tried again on
+                    // the next change; said once rather than every tick.
+                    if !warned {
+                        tracing::warn!("config.toml changed but does not load: {e}");
+                        warned = true;
+                    }
+                    continue;
+                }
+            };
+            warned = false;
+            seen = now;
+            let changed = {
+                let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+                let changed = config.channels != fresh.channels || config.web != fresh.web;
+                if changed {
+                    config.channels = fresh.channels;
+                    config.web = fresh.web;
+                }
+                changed
+            };
+            if changed {
+                tracing::info!("config.toml changed: channel and admin settings reloaded");
+            }
+            if let Some(gateway) = state.gateway.get() {
+                gateway.apply();
+            }
+        }
+    });
+}
 
 impl App {
     pub async fn new(
@@ -130,6 +198,9 @@ impl App {
             embedder: HashingEmbedder::default(),
             worker,
             pulls: Default::default(),
+            gateway: std::sync::OnceLock::new(),
+            admin: Default::default(),
+            watching: Default::default(),
         }))
     }
 }

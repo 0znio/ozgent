@@ -33,17 +33,12 @@ pub fn router(state: State) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/models/{model}/options", get(model_options).put(set_model_options))
         .route("/api/tools", get(tools).put(set_tool_config))
+        .route("/api/tools/active", get(active_tools))
         .route("/api/permissions", get(get_permissions).put(put_permissions))
         .route("/api/permissions/decide", post(decide_permission))
         .route("/api/conversations/{id}/facts", get(facts).post(add_fact))
         .route("/api/conversations/{id}/recall", post(preview_recall))
         .route("/api/facts/{id}", patch(pin_fact).delete(forget_fact))
-        .route("/api/hub/search", get(crate::hub::search))
-        .route("/api/hub/repo", get(crate::hub::repo))
-        .route("/api/hub/pull", post(crate::hub::pull))
-        .route("/api/hub/pulls", get(crate::hub::pulls))
-        .route("/api/hub/pulls/{id}", delete(crate::hub::cancel))
-        .route("/api/models/{model}", delete(crate::hub::remove))
         .route("/api/agents", get(list_agents))
         .route("/api/agents/{name}", axum::routing::put(save_agent).delete(delete_agent))
         .route("/api/chat", post(chat))
@@ -524,14 +519,48 @@ async fn messages(
 
 // ----------------------------------------------------------------- settings
 
+#[cfg(test)]
+mod public_settings_tests {
+    #[test]
+    fn the_open_settings_page_never_sees_admin_or_channel_secrets() {
+        let mut c = ozgent_core::Config::default();
+        c.channels.telegram.token = "123:secret".into();
+        c.channels.telegram.allow = vec!["4242".into()];
+        c.web.admin_password_hash = Some("$argon2id$…".into());
+        let shown = serde_json::to_string(&super::public(&c)).unwrap();
+        assert!(!shown.contains("secret") && !shown.contains("argon2") && !shown.contains("4242"), "{shown}");
+    }
+}
+
+/// The settings page's view of the configuration: everything except what
+/// belongs to `/admin`.
+///
+/// This page has no password, so it must neither show nor change `[channels]`
+/// (a bot token, and who in the world may reach this machine's tools) or
+/// `[web]` (the admin password hash). Sending them would hand out the token;
+/// accepting them back would let anyone who can load this page replace the
+/// admin password or open the allowlist, and skip `/admin` altogether.
+fn public(config: &ozgent_core::Config) -> ozgent_core::Config {
+    let mut c = config.clone();
+    c.channels = Default::default();
+    c.web = Default::default();
+    c
+}
+
 async fn get_settings(AxumState(state): AxumState<State>) -> Json<ozgent_core::Config> {
-    Json(state.config.lock().unwrap().clone())
+    Json(public(&state.config.lock().unwrap()))
 }
 
 async fn put_settings(
     AxumState(state): AxumState<State>,
-    Json(body): Json<ozgent_core::Config>,
+    Json(mut body): Json<ozgent_core::Config>,
 ) -> ApiResult<StatusCode> {
+    {
+        // Whatever the page sent for these is ignored; the server's own stand.
+        let current = state.config.lock().unwrap();
+        body.channels = current.channels.clone();
+        body.web = current.web.clone();
+    }
     body.save(&state.paths)?;
     *state.config.lock().unwrap() = body;
     // The worker captured the old config at spawn; drop the model so the next
@@ -560,6 +589,9 @@ struct ChatRequest {
     /// Attached images, as `data:` URLs or bare base64.
     #[serde(default)]
     images: Vec<String>,
+    /// Tools switched off in the composer's tools tray, by name.
+    #[serde(default)]
+    tools_off: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -594,6 +626,7 @@ async fn chat(
             thinking,
             tools: body.tools,
             native_tools: None,
+            tools_off: body.tools_off,
             images,
             // The browser can show a permission card and answer it.
             can_ask: true,
@@ -734,6 +767,57 @@ struct ProviderInfo {
 /// truth for what each one does.
 const SEARCH_PROVIDERS: [(&str, bool); 3] =
     [("brave", true), ("tavily", true), ("duckduckgo", false)];
+
+/// One tool the model can be offered right now, for the composer's tray.
+#[derive(Serialize)]
+struct ActiveTool {
+    name: String,
+    /// A friendlier name, where the tool's own is an identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// The first sentence of what it does.
+    description: String,
+    effect: String,
+    /// What the permission rules say: allow, ask or deny.
+    rule: String,
+}
+
+/// The tools that are running, read from the live host — unlike `/api/tools`,
+/// which starts an interpreter to find everything installed. Includes
+/// `ask_agent` when the model may hand requests to agents.
+async fn active_tools(AxumState(state): AxumState<State>) -> Json<Vec<ActiveTool>> {
+    let config = state.config.lock().unwrap().clone();
+    if !config.tools.enabled {
+        return Json(Vec::new());
+    }
+    let mut out: Vec<ActiveTool> = crate::worker::current_tools(&state.tools)
+        .map(|t| {
+            t.host
+                .tools()
+                .iter()
+                .filter(|s| !config.tools.disabled.contains(&s.name))
+                .map(|s| ActiveTool {
+                    name: s.name.clone(),
+                    label: None,
+                    description: ozgent_tools::first_line(&s.description).to_string(),
+                    effect: format!("{:?}", s.effect).to_lowercase(),
+                    rule: config.permissions.rule_for(&s.name, s.effect).to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    if config.tools.handoff && !ozgent_core::AgentCatalog::load(&state.paths).all().is_empty() {
+        out.push(ActiveTool {
+            name: ozgent_core::agents::HANDOFF_TOOL.to_string(),
+            label: Some("hand off to @agents".into()),
+            description: "Let the model pass a question to an agent when it fits one".into(),
+            effect: "read".into(),
+            rule: "allow".into(),
+        });
+    }
+    Json(out)
+}
 
 async fn tools(AxumState(state): AxumState<State>) -> ApiResult<Json<ToolsView>> {
     // Cloned rather than borrowed: discovering tools is async, and holding a

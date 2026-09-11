@@ -66,6 +66,8 @@ pub enum Inbound {
     /// Something the operator has to see on the terminal — a QR code to scan,
     /// a reconnection. Not a failure, and not the model's business.
     Notice { text: String },
+    /// A WhatsApp linking code to scan: the raw text the QR image encodes.
+    Qr { data: String },
     Message(Box<Msg>),
     /// A tapped button.
     ///
@@ -94,6 +96,9 @@ pub enum Command {
     Ask { chat: String, token: u64, question: Box<Question> },
     /// Replace a question with its outcome, taking any buttons away.
     Settle { chat: String, token: u64, markdown: String },
+    /// Sign this device out on the provider's side, then stop. Only WhatsApp
+    /// has a session to end; a bot token is revoked with @BotFather.
+    Logout,
 }
 
 /// A permission question, as a chat has to show it.

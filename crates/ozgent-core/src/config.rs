@@ -43,6 +43,31 @@ pub struct Config {
     pub mcp: crate::mcp::McpConfig,
 
     pub embedding: EmbeddingConfig,
+
+    /// The web interface.
+    pub web: WebConfig,
+}
+
+/// `[web]`: settings for `ozgent web` itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    /// An Argon2id hash of the password for `/admin`, where the messaging
+    /// gateway is controlled and models are downloaded and deleted. Set it
+    /// with `ozgent admin setup`; the password itself is never stored.
+    ///
+    /// Never set from a browser: a page that could set its own password could
+    /// be claimed by whoever reached it first. Unset, `/admin` is closed and
+    /// says how to open it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_password_hash: Option<String>,
+}
+
+impl WebConfig {
+    /// The stored admin password hash, if one is set and is not blank.
+    pub fn admin_hash(&self) -> Option<&str> {
+        self.admin_password_hash.as_deref().map(str::trim).filter(|p| !p.is_empty())
+    }
 }
 
 /// The model used for embeddings.
@@ -83,6 +108,10 @@ pub struct ToolsConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
 
+    /// Let the model hand a request to an `@agent` by itself, through the
+    /// `ask_agent` tool, when the request is squarely that agent's job.
+    pub handoff: bool,
+
     /// Opaque per-tool settings, keyed by tool name. Passed through verbatim.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, toml::Value>,
@@ -97,6 +126,7 @@ impl Default for ToolsConfig {
             timeout_seconds: 30,
             max_calls_per_turn: 8,
             disabled: Vec::new(),
+            handoff: true,
             config: BTreeMap::new(),
         }
     }
@@ -160,7 +190,23 @@ impl Config {
         }
         let text = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::Serialize { source: Box::new(e) })?;
-        std::fs::write(&path, text).map_err(|e| ConfigError::Io { path, source: e })
+        // Written beside and renamed over, so a program reading it at the
+        // same moment — a running server following changes — sees the old
+        // file or the new one, never half of one.
+        // Through a symlink to the real file, or the rename would replace a
+        // dotfiles link with a plain file.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let partial = path.with_extension("toml.partial");
+        std::fs::write(&partial, text).map_err(|e| ConfigError::Io { path: partial.clone(), source: e })?;
+        // Readable by its owner only: it can hold a bot token and the admin
+        // password hash, and a home directory is not always private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&partial, &path).map_err(|e| ConfigError::Io { path, source: e })?;
+        Ok(())
     }
 
     /// The config-file half of the options stack: global defaults with any

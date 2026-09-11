@@ -5,12 +5,13 @@ mod input;
 mod cli;
 mod logging;
 mod permission;
+mod setup;
 mod status;
 mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AgentCommand, ChannelCommand, Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
+use cli::{AgentCommand, Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
 use ozgent_core::{Config, ModelRef, Paths};
 use ozgent_tools::{HostConfig, ToolHost, Toolbox};
 use std::path::PathBuf;
@@ -42,12 +43,19 @@ async fn main() -> Result<()> {
             }
             // The flags were parsed and thrown away: `ozgent web --ctx 32k`
             // printed nothing and changed nothing.
-            ozgent_web::serve(paths, config, &host, port, options.to_options()?).await
+            let state = ozgent_web::state::App::new(paths.clone(), config, options.to_options()?).await?;
+            // The gateway runs inside the web server, so /admin can control
+            // it and both share one loaded model.
+            ozgent_channels::gateway::start(state.clone(), paths, ozgent_channels::gateway::Mode::Web);
+            ozgent_web::serve_with(state, &host, port).await
         }
-        Some(Command::Gateway { web, port, host, options }) => {
+        Some(Command::Gateway { command: Some(command), .. }) => {
+            setup::gateway(&paths, config, command).await
+        }
+        Some(Command::Gateway { command: None, web, port, host, options }) => {
             gateway(paths, config, web, &host, port, options.to_options()?).await
         }
-        Some(Command::Channel { command }) => channel(&paths, config, command).await,
+        Some(Command::Admin { command }) => setup::admin(&paths, config, command),
         Some(Command::Agent { command }) => agent(&paths, command),
         Some(Command::Mcp) => mcp(&config).await,
         Some(Command::Serve { port, host, api_key, options }) => {
@@ -403,6 +411,7 @@ fn choose_quant(
     rows: &[(String, u64, usize)],
     mmproj: Option<u64>,
     free_vram: Option<u64>,
+    shape: Option<&ozgent_hub::gguf::Shape>,
 ) -> Result<Option<String>> {
     use std::io::{IsTerminal, Write};
     if rows.is_empty() || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
@@ -425,9 +434,10 @@ fn choose_quant(
     for (i, (q, bytes, shards)) in rows.iter().enumerate() {
         let shards = if *shards > 1 { format!(" · {shards} shards") } else { String::new() };
         let note = match free_vram {
-            Some(_) if fits(*bytes) => "  fits in VRAM",
-            Some(_) => "  larger than VRAM, will offload to CPU",
-            None => "",
+            Some(_) if shape.is_some() => format!("  {}", fit_note(shape, *bytes + projector, gpu_memory())),
+            Some(_) if fits(*bytes) => "  fits in VRAM".to_string(),
+            Some(_) => "  larger than VRAM, will offload to CPU".to_string(),
+            None => String::new(),
         };
         let mark = if i == default { ">" } else { " " };
         eprintln!("{mark} {:>2}. {:<10} {:>9}{shards}{note}", i + 1, q, ozgent_hub::human(*bytes));
@@ -456,6 +466,44 @@ fn choose_quant(
         .find(|(q, _, _)| q.eq_ignore_ascii_case(line))
         .with_context(|| format!("{line:?} is not one of the available quantisations"))?;
     Ok(Some(found.0.clone()))
+}
+
+/// The GPU's total memory: what the next model will have, whatever is loaded.
+fn gpu_memory() -> Option<u64> {
+    ozgent_llama::backend::devices()
+        .into_iter()
+        .filter(|d| d.is_gpu())
+        .map(|d| d.memory_total as u64)
+        .max()
+}
+
+/// The model's shape, from the header of its smallest file, read by range.
+async fn header_shape(
+    client: &ozgent_hub::Client,
+    info: &ozgent_hub::RepoInfo,
+    revision: &str,
+    rows: &[(String, u64, usize)],
+) -> Option<ozgent_hub::gguf::Shape> {
+    let smallest = rows.iter().min_by_key(|r| r.1)?;
+    let path = info
+        .files
+        .iter()
+        .filter(|f| f.is_gguf() && !f.is_mmproj())
+        .filter(|f| ozgent_hub::quant_of(&f.path).as_deref() == Some(smallest.0.as_str()))
+        .map(|f| f.path.clone())
+        .min()?;
+    ozgent_hub::gguf::fetch_shape(client, &info.id, revision, &path).await.ok()
+}
+
+/// "64k context" — what a size leaves room for on this GPU.
+fn fit_note(shape: Option<&ozgent_hub::gguf::Shape>, bytes: u64, gpu: Option<u64>) -> String {
+    match (shape, gpu) {
+        (Some(s), Some(g)) => match ozgent_hub::gguf::context_that_fits(s, bytes, g) {
+            Some((ctx, _)) => format!("{} context", ozgent_core::format_count(ctx)),
+            None => "partly on CPU".to_string(),
+        },
+        _ => String::new(),
+    }
 }
 
 async fn pull(
@@ -490,9 +538,21 @@ async fn pull(
         println!("{} ({} files)", info.id, info.files.len());
         if info.gated { println!("  gated: accept the licence on Hugging Face and set HF_TOKEN"); }
         println!();
-        println!("{:<12} {:>10}  {}", "QUANT", "SIZE", "SHARDS");
-        for (q, size, shards) in quant_rows(&info) {
-            println!("{q:<12} {:>10}  {shards}", human(size));
+        let rows = quant_rows(&info);
+        let mmproj = info.files.iter().find(|f| f.is_mmproj()).map(|f| f.size).unwrap_or(0);
+        let gpu = gpu_memory();
+        let shape = header_shape(&client, &info, &request.revision, &rows).await;
+        if gpu.is_some() && shape.is_some() {
+            println!("{:<12} {:>10}  {:<6}  {}", "QUANT", "SIZE", "SHARDS", "CONTEXT ON THIS GPU");
+        } else {
+            println!("{:<12} {:>10}  {}", "QUANT", "SIZE", "SHARDS");
+        }
+        for (q, size, shards) in rows {
+            let fit = fit_note(shape.as_ref(), size + mmproj, gpu);
+            println!("{q:<12} {:>10}  {shards:<6}  {fit}", human(size));
+        }
+        if let Some(s) = &shape {
+            println!("\ntrained for {} tokens of context", ozgent_core::format_count(s.context_train));
         }
         if let Some(mm) = info.files.iter().find(|f| f.is_mmproj()) {
             println!("\nvision projector: {} ({})", mm.path, human(mm.size));
@@ -507,7 +567,8 @@ async fn pull(
         let rows = quant_rows(&info);
         let mmproj = info.files.iter().find(|f| f.is_mmproj()).map(|f| f.size);
         let free_vram = ozgent_llama::backend::best_gpu().map(|d| d.memory_free as u64);
-        request.quant = choose_quant(&rows, mmproj, free_vram)?;
+        let shape = header_shape(&client, &info, &request.revision, &rows).await;
+        request.quant = choose_quant(&rows, mmproj, free_vram, shape.as_ref())?;
     }
 
     // Progress is drawn on stderr, in place, so piped stdout stays clean.
@@ -1176,243 +1237,13 @@ async fn gateway(
     port: u16,
     options: ozgent_core::Options,
 ) -> Result<()> {
-    if !config.channels.enabled {
-        anyhow::bail!(
-            "channels are switched off. Add this to {}:\n\n  [channels]\n  enabled = true\n\n\
-             Then turn one on — see `ozgent channel --help` and docs/channels.md.",
-            paths.config_file().display()
-        );
-    }
     let state = ozgent_web::state::App::new(paths.clone(), config, options).await?;
-
     if web {
-        let serving = ozgent_web::serve_with(state.clone(), host, port);
-        let answering = ozgent_channels::gateway::run(state, paths);
-        // Either one stopping ends the process: a gateway with no engine and a
-        // server with no channels are both half a program.
-        tokio::select! {
-            r = serving => r,
-            r = answering => r,
-        }
+        ozgent_channels::gateway::start(state.clone(), paths, ozgent_channels::gateway::Mode::Terminal);
+        ozgent_web::serve_with(state, host, port).await
     } else {
         ozgent_channels::gateway::run(state, paths).await
     }
-}
-
-async fn channel(paths: &Paths, mut config: Config, command: ChannelCommand) -> Result<()> {
-    use ozgent_core::channels::Kind;
-
-    let parse_kind = |name: &str| -> Result<Kind> {
-        Kind::parse(name)
-            .ok_or_else(|| anyhow::anyhow!("no channel called `{name}`. Try telegram or whatsapp."))
-    };
-
-    match command {
-        ChannelCommand::Status => {
-            channel_status(paths, &config);
-            Ok(())
-        }
-
-        ChannelCommand::Install { channel } => match parse_kind(&channel)? {
-            Kind::Telegram => {
-                println!("Telegram needs no install. Get a token from @BotFather and put it in");
-                println!("{}:", paths.config_file().display());
-                println!();
-                println!("  [channels]");
-                println!("  enabled = true");
-                println!();
-                println!("  [channels.telegram]");
-                println!("  enabled = true");
-                println!("  token   = \"…\"");
-                Ok(())
-            }
-            Kind::WhatsApp => {
-                let bridge = ozgent_channels::whatsapp::locate(
-                    config.channels.whatsapp.bridge.as_deref(),
-                    paths,
-                )?;
-                println!("Installing the WhatsApp bridge in {}", bridge.display());
-                ozgent_channels::whatsapp::install(&config.channels.whatsapp.node, &bridge).await?;
-                println!("Done. Next: ozgent channel login whatsapp");
-                Ok(())
-            }
-        },
-
-        ChannelCommand::Login { channel } => match parse_kind(&channel)? {
-            Kind::Telegram => {
-                anyhow::bail!(
-                    "Telegram is not linked by scanning; it uses a bot token. \
-                     Run `ozgent channel install telegram` to see how."
-                )
-            }
-            Kind::WhatsApp => {
-                let wa = &config.channels.whatsapp;
-                let bridge = ozgent_channels::whatsapp::locate(wa.bridge.as_deref(), paths)?;
-                if !ozgent_channels::whatsapp::is_installed(&bridge) {
-                    anyhow::bail!(
-                        "the bridge is not installed yet. Run `ozgent channel install whatsapp`."
-                    );
-                }
-                let state = paths.channel_dir("whatsapp").join("auth");
-                let who = ozgent_channels::whatsapp::login(&wa.node, &bridge, &state).await?;
-                println!();
-                println!("Linked {who}.");
-                println!();
-                println!("The credentials are in {}.", state.display());
-                println!("They can read and send your messages — treat that like a password.");
-                println!();
-                println!("Next: turn the channel on in {}:", paths.config_file().display());
-                println!();
-                println!("  [channels]");
-                println!("  enabled = true");
-                println!();
-                println!("  [channels.whatsapp]");
-                println!("  enabled = true");
-                println!();
-                println!("To talk to it in your own chat with yourself, add:");
-                println!();
-                println!("  self_chat = true");
-                println!();
-                println!("Leave that off if you use that chat as a notepad.");
-                Ok(())
-            }
-        },
-
-        ChannelCommand::Logout { channel } => {
-            let kind = parse_kind(&channel)?;
-            let state = paths.channel_dir(kind.as_str());
-            match kind {
-                Kind::WhatsApp => {
-                    ozgent_channels::whatsapp::logout(&state.join("auth"))?;
-                    println!("Unlinked. Remove the device from WhatsApp ▸ Linked devices too,");
-                    println!("so the session on their side is gone as well.");
-                }
-                Kind::Telegram => {
-                    config.channels.telegram.token.clear();
-                    config.save(paths)?;
-                    println!("Token cleared. It is still valid on Telegram's side —");
-                    println!("revoke it with @BotFather if it should stop working.");
-                }
-            }
-            Ok(())
-        }
-
-        ChannelCommand::Allow { channel, identity } => {
-            let kind = parse_kind(&channel)?;
-            if config.channels.admit(kind, &identity) {
-                config.save(paths)?;
-                println!("{identity} can now talk to {kind}.");
-            } else {
-                println!("{identity} was already allowed on {kind}.");
-            }
-            Ok(())
-        }
-
-        ChannelCommand::Deny { channel, identity } => {
-            let kind = parse_kind(&channel)?;
-            let allow = match kind {
-                Kind::Telegram => &mut config.channels.telegram.allow,
-                Kind::WhatsApp => &mut config.channels.whatsapp.allow,
-            };
-            let before = allow.len();
-            allow.retain(|a| !a.eq_ignore_ascii_case(identity.trim()));
-            if allow.len() == before {
-                println!("{identity} was not on the {kind} list.");
-                return Ok(());
-            }
-            config.save(paths)?;
-            println!("{identity} can no longer talk to {kind}.");
-            Ok(())
-        }
-    }
-}
-
-/// The chats bound to a channel, for `ozgent channel status`.
-///
-/// Opened read-only and closed again: the gateway may be running against the
-/// same file, and WAL lets a reader in while it writes.
-fn bound_chats(paths: &Paths, channel: &str) -> Result<Vec<ozgent_memory::ChannelChat>> {
-    let store = ozgent_memory::Store::open(paths.root().join("ozgent.db"))?;
-    Ok(store.channel_chats(channel)?)
-}
-
-fn channel_status(paths: &Paths, config: &Config) {
-    use ozgent_core::channels::{Kind, is_open_to_everyone};
-
-    println!("channels{}", if config.channels.enabled { "" } else { "  (switched off)" });
-    println!();
-
-    for kind in [Kind::Telegram, Kind::WhatsApp] {
-        let access = config.channels.access(kind);
-        let on = match kind {
-            Kind::Telegram => config.channels.telegram.enabled,
-            Kind::WhatsApp => config.channels.whatsapp.enabled,
-        };
-        println!("  {kind}");
-        println!("    enabled   {}", if on { "yes" } else { "no" });
-
-        match kind {
-            Kind::Telegram => {
-                // Never the token itself: it is a password, and this output
-                // gets pasted into issues.
-                let has = !config.channels.telegram.token.trim().is_empty()
-                    || std::env::var("OZGENT_TELEGRAM_TOKEN").is_ok();
-                println!("    token     {}", if has { "set" } else { "missing" });
-            }
-            Kind::WhatsApp => {
-                let linked = paths.channel_dir("whatsapp").join("auth").join("creds.json").is_file();
-                println!("    linked    {}", if linked { "yes" } else { "no" });
-                println!(
-                    "    self-chat {}",
-                    if config.channels.whatsapp.self_chat {
-                        "on — your own notes are answered"
-                    } else {
-                        "off"
-                    }
-                );
-                let installed = ozgent_channels::whatsapp::locate(
-                    config.channels.whatsapp.bridge.as_deref(),
-                    paths,
-                )
-                .map(|b| ozgent_channels::whatsapp::is_installed(&b))
-                .unwrap_or(false);
-                println!("    bridge    {}", if installed { "installed" } else { "not installed" });
-            }
-        }
-
-        if is_open_to_everyone(access.allow) {
-            println!("    allowed   EVERYONE — anyone who finds it can use this machine's tools");
-        } else if access.allow.is_empty() {
-            println!("    allowed   nobody");
-        } else {
-            println!("    allowed   {}", access.allow.join(", "));
-        }
-        match access.tools {
-            Some(list) if list.is_empty() => println!("    tools     none"),
-            Some(list) => println!("    tools     {}", list.join(", ")),
-            None => println!("    tools     all of them"),
-        }
-
-        match bound_chats(paths, kind.as_str()) {
-            Ok(chats) if !chats.is_empty() => {
-                println!("    chats     {}", chats.len());
-                for chat in chats.iter().take(5) {
-                    let who = if chat.display.is_empty() { &chat.chat_id } else { &chat.display };
-                    println!("              {who}");
-                }
-            }
-            _ => {}
-        }
-        println!();
-    }
-
-    let model = config
-        .channels
-        .model
-        .clone()
-        .or_else(|| config.default_model.clone())
-        .unwrap_or_else(|| "none set".into());
-    println!("  answering with  {model}");
 }
 
 // ---------------------------------------------------------------------- mcp

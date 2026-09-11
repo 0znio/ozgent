@@ -1,155 +1,187 @@
 # Talking to ozgent from Telegram and WhatsApp
 
-A channel lets you message ozgent from your phone. It runs the same engine, the
-same model registry, the same memory store and the same permission rules as
+The gateway lets you message ozgent from your phone. It runs the same engine,
+the same model registry, the same memory and the same permission rules as
 everything else — so a conversation started on a phone is in the web interface
-when you get back to your desk, and an answer given in the browser applies to a
-question asked from a chat.
+when you get back to your desk.
 
-    ozgent gateway              answer messages
-    ozgent gateway --web        and serve the web interface, sharing one model
+```
+ozgent gateway telegram     set up Telegram, or change it
+ozgent gateway whatsapp     link WhatsApp, or change it
+ozgent gateway status       what is set up, what is running, who is allowed
+```
+
+Setting a channel up is answering a few questions. Nothing needs editing by
+hand, and nothing needs a restart: `ozgent web` answers the channels while it
+runs, and picks up every change within a couple of seconds — whether it was
+made with these commands or on its **/admin** page.
+
+![the gateway on the admin page](images/admin-gateway.png)
 
 ## Read this part first
 
 Every other way to reach ozgent needs someone at this machine, or on a network
-you chose to bind to. A bot handle is reachable by anyone in the world who types
-it, and behind it sit `write_file` and `run_command`.
+you chose. A bot handle is reachable by anyone in the world who types it, and
+behind it sit `write_file` and `run_command`.
 
-So two things are off until you turn them on, and neither has a convenient
-default:
+So **nobody is allowed until you name them.** An empty list admits nobody —
+not everyone. Someone you allow is, for practical purposes, as trusted as
+someone sitting at this keyboard: they can approve tool calls, and the
+approval question goes to *them*, not to you. Allow people you would hand the
+laptop to.
 
-- **`[channels] enabled` is false.** No channel starts.
-- **The allowlist is empty, which admits nobody.** Not "everyone until you
-  restrict it" — nobody, until you name someone.
+You can narrow that per channel, and both setups ask:
 
-An allowlisted person is, for practical purposes, as trusted as someone sitting
-at this keyboard. They can approve tool calls, and the approval prompt goes to
-*them*, not to you. Allowlist people you would hand the laptop to.
-
-You can narrow that. `tools` under a channel offers only the tools you name,
-whatever the permission rules would otherwise allow:
-
-```toml
-[channels.telegram]
-tools = ["web_search", "fetch_url", "read_file"]   # no shell, no writing
-```
+- **Tools** — all of them, only the ones you pick, or none.
+- **Approvals** — whether someone in the chat may approve a tool that asks
+  first (writing a file, running a command). Off, anything that would ask is
+  refused, and only what your rules allow outright runs.
 
 ## Telegram
 
-Nothing to install. Telegram is polled over an outbound HTTPS connection, so it
-works from a laptop behind a router — no domain, no certificate, no port
+Nothing to install. Telegram is polled over an outbound connection, so it
+works on a laptop behind a router — no domain, no certificate, no port
 forwarding.
 
-1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and keep the
-   token it gives you.
-2. Put it in `~/ozgent/configs/config.toml`:
+```
+$ ozgent gateway telegram
+Telegram
 
-   ```toml
-   [channels]
-   enabled = true
+  1. In Telegram, open @BotFather and send /newbot. Answer its two questions.
+  2. It replies with a token like 123456789:AAH… — paste it below.
 
-   [channels.telegram]
-   enabled = true
-   token   = "123456:AA…"
-   ```
+  bot token (hidden): ••••••••••••••••••••••••••••••••••••••••••••••
+  ✓ this is @my_ozgent_bot
 
-   Or leave `token` out and set `$OZGENT_TELEGRAM_TOKEN`, which keeps it out of
-   a file that gets copied around.
-3. `ozgent gateway`. It prints a pairing code.
-4. Message your bot `/pair <code>`. You are now on the allowlist, and the code
-   is replaced — it works once.
+Who should be able to message @my_ozgent_bot?
+  1  only me
+  2  me and other people
+  3  only other people
+> [1]
 
-You can also skip the pairing and write yourself in directly:
+  Now, from your own Telegram, send this to @my_ozgent_bot:
 
-    ozgent channel allow telegram 4242        # by user id
-    ozgent channel allow telegram @ada        # by handle
+      OZ4F9A1C
+```
+
+Sending that code is how ozgent learns your user id without you having to look
+it up — the code is on your screen, so whoever sends it is you. (You can type
+your numeric id instead; @userinfobot tells you it.) Then it asks about
+tools and approvals, and you're done.
+
+The token is checked with Telegram before anything is saved, so a typo is an
+error on the spot rather than a channel that silently fails later. It is
+stored in `config.toml` (readable only by you), or set
+`$OZGENT_TELEGRAM_TOKEN` to keep it out of the file.
 
 Permission questions arrive as buttons. Typing `yes`, `session`, `always` or
-`no` — or `1` to `4` — does the same thing, which is often easier than scrolling
-back to the message the buttons are on.
+`no` — or `1` to `4` — does the same thing.
 
 ## WhatsApp
 
 WhatsApp publishes no protocol and has no Rust client. ozgent talks to it
-through a small Node program that links your own account as a second device, the
-way WhatsApp Web does.
+through a small Node program that links your own account as a second device,
+the way WhatsApp Web does. Setup installs it for you (once, about a minute) —
+you need Node 18 or newer.
 
 **This has real costs, and they are not hypothetical:**
 
 - Automating a personal account is against WhatsApp's terms of service.
   Accounts have been banned for it. Use a number you can afford to lose.
-- ozgent stops being a single binary. Node must be installed.
 - The credentials under `~/ozgent/channels/whatsapp/auth` are a full login to
   your account. Treat that directory like a password file.
 
-Meta's official route for programs is the Cloud API, which has none of these
-problems — and cannot talk to the number you already have, needs a public
-webhook, and will not let you start a conversation outside a 24-hour window
-without an approved template. That trade is why this is the personal-account
-route.
+```
+$ ozgent gateway whatsapp
+  Link WhatsApp? [Y/n]
+  (a QR code)
+  On your phone: WhatsApp ▸ Settings ▸ Linked devices ▸ Link a device
+  ✓ linked +91 98765 43210
 
-    ozgent channel install whatsapp     npm install, once
-    ozgent channel login whatsapp       scan the QR with your phone
-
-Then turn it on:
-
-```toml
-[channels]
-enabled = true
-
-[channels.whatsapp]
-enabled = true
+  Which phone numbers may message it? With the country code, separated by commas.
+  Your own number (+91 98765 43210) means your "Message yourself" chat.
+  > +91 98765 43210
+  ✓ your own "Message yourself" chat will be answered
 ```
 
-and allow yourself:
+On `/admin` it's the **Link WhatsApp** button: the QR code appears on the page
+and follows WhatsApp as it changes the code every twenty seconds.
 
-    ozgent channel allow whatsapp 15551234567
+### Your own chat, or other people
 
-### Talking to it in your own chat
+Because the bridge links *your* account, ozgent *is* your number. The natural
+place to talk to it is the chat WhatsApp gives you with yourself ("Message
+yourself") — enter your own number and that is what you get. It is off unless
+you ask, because plenty of people use that chat as a notepad.
 
-Because the bridge links *your* account, ozgent is your number — it is not a
-separate contact you message. The natural place to talk to it is therefore the
-chat WhatsApp gives you with yourself ("Message yourself"), on the number you
-already have and with no second SIM:
+Enter someone else's number and ozgent replies to them **as you**, from your
+number. That is a different thing from a personal assistant; be deliberate.
 
-```toml
-[channels.whatsapp]
-enabled   = true
-self_chat = true
-```
-
-Then just type in that chat. Nothing else is needed — the self-chat needs no
-`allow` entry, because the sender is the account that scanned the QR code.
-
-With `self_chat = true` and `allow` left empty, ozgent answers **only you** and
-ignores everyone who messages your number. That is probably the setup you want.
-
-It is off by default for one reason: plenty of people use that chat as a
-notepad, and an assistant that starts replying to a shopping list has broken
-something that was working.
-
-Everything in that chat is "from you" as far as WhatsApp is concerned —
-including ozgent's own replies — so the bridge tracks the messages it sent and
-ignores its own edits, or it would answer itself in a loop. That filter is
-`bridge/whatsapp/filter.mjs` and is tested on its own.
-
-### Answering other people
-
-If you leave `self_chat` off and allowlist someone else, ozgent replies to them
-**as you**, from your number. That is a different thing from a personal
-assistant, and worth being deliberate about.
+Numbers can be typed any way — `+91 98765 43210`, `0091-98765-43210` — and are
+stored as digits with the country code.
 
 There are no buttons on WhatsApp, so a permission question arrives as numbered
-options and is answered by typing a number.
+options and is answered by typing a number. Group chats are ignored unless you
+turn them on: a bot answering everything in a group is a way for someone never
+allowed to steer it through a member who was.
 
-Group chats are ignored unless `groups = true`. A bot that answers everything it
-can see in a group is both a nuisance and a way for someone who was never
-allowlisted to steer it through a member who was.
+## Changing things later
 
-    ozgent channel logout whatsapp      unlink and forget the credentials
+Run the same command again and you get a menu:
 
-Remove the device from WhatsApp ▸ Linked devices as well, so the session on
-their side is gone too.
+```
+$ ozgent gateway telegram
+telegram · @my_ozgent_bot · on · 2 allowed
+  1  who may message it
+  2  allow someone
+  3  remove someone
+  4  tools                 (web_search, fetch_url)
+  5  approve tool calls    (yes)
+  6  change the bot token
+  7  turn it off
+  8  sign out
+  9  done
+```
+
+Or say it directly — handy in scripts:
+
+| | |
+|---|---|
+| `ozgent gateway telegram allow 4242 @ada_l` | let people in (ids, @usernames) |
+| `ozgent gateway whatsapp allow "+1 555 123 4567"` | a number, with its country code |
+| `ozgent gateway <channel> deny <who>` | take someone off the list |
+| `ozgent gateway <channel> allowed` | who is on it |
+| `ozgent gateway <channel> tools web_search,fetch_url` | only these; also `all`, `none` |
+| `ozgent gateway telegram token` | a new bot token (asked for, hidden) |
+| `ozgent gateway whatsapp link` | link a different account |
+| `ozgent gateway <channel> signout` | forget the token / unlink the device |
+| `ozgent gateway <channel> on` / `off` | stop answering, keep the settings |
+
+Signing WhatsApp out removes the device from your phone's Linked devices list
+too. Signing Telegram out forgets the token here; revoke it with @BotFather
+(`/revoke`) if it should stop working everywhere.
+
+### Letting someone in from their phone
+
+When the gateway runs it has a **pairing code** — shown on `/admin` and when
+`ozgent gateway` starts. Someone not on the list can send `/pair CODE` to the
+bot and be added. The code works once and changes after it is used. It is the
+only thing ozgent answers for someone not on the list; everyone else is
+ignored, deliberately, since replying to strangers confirms the bot is live.
+
+## Running it
+
+`ozgent web` answers the channels that are set up, sharing the model it has
+loaded. To answer them without the web interface:
+
+```
+ozgent gateway              answer messages from this terminal
+ozgent gateway --web        and serve the web interface, sharing one model
+```
+
+Only one ozgent can answer a channel at a time — Telegram allows one reader per
+bot token, and a second WhatsApp connection replaces the first. The second one
+to start says who has the channels, and takes over if that one stops.
 
 ## What you can type
 
@@ -162,8 +194,10 @@ Anything that is not one of these is a question.
 | `/model` | which model is answering; `/model <name>` to change it |
 | `/tools` | what it is allowed to use here, and what each one will ask about |
 | `/stop` | stop what it is writing |
-| `/whoami` | the ids an allowlist needs |
+| `/whoami` | the ids a list needs |
 | `/pair <code>` | the only thing it answers for someone not yet allowed |
+
+`@agent` works here too, and the model can hand a question to an agent itself.
 
 ## How a reply arrives
 
@@ -178,65 +212,52 @@ once a second, with tool activity shown above the text:
 The three closest stations are …
 ```
 
-A tool is shown from the moment the model commits to calling it, not when the
-call finishes. Otherwise a model writing a file generates the entire file before
-anything can be displayed, and a minute of silence on a phone reads as a dropped
-connection.
-
 When a reply outgrows one message, the current one is closed off at a sentence
-or paragraph boundary and a new one continues from there — so a long answer
-arrives as a sequence of complete messages, and a code block that spans the
-break is closed and reopened with its language intact.
+or paragraph boundary and a new one continues from there, and a code block
+that spans the break is closed and reopened with its language intact.
 
 ## Settings
 
+Everything above is stored in `~/ozgent/configs/config.toml`; you never need
+to touch it, but this is what it looks like:
+
 ```toml
 [channels]
-enabled = false
-# Model for messages from a channel. Falls back to the general default_model.
-# Separate because a phone is a poor place to wait on a 70B.
-model = "coder"
+enabled = true
+model = "coder"      # optional: the model chats get. Falls back to default_model.
 
 [channels.telegram]
-enabled = false
-token   = ""        # or $OZGENT_TELEGRAM_TOKEN
-allow   = []        # user ids or @handles; empty admits nobody, "*" admits everyone
-tools   = []        # omit the key entirely to offer every tool
-stream  = true      # edit one message as the reply is written
+enabled = true
+token   = "…"        # or $OZGENT_TELEGRAM_TOKEN
+allow   = ["4242", "@ada_l"]
+tools   = ["web_search", "fetch_url"]   # leave out for every tool; [] for none
+approve = true       # may a tool that asks be approved from the chat
+stream  = true       # edit one message as the reply is written
 
 [channels.whatsapp]
-enabled   = false
-allow     = []      # phone numbers (digits) or full JIDs
-tools     = []
-stream    = true
-self_chat = false   # answer in your own "Message yourself" chat
-groups    = false   # answer in group chats
-node      = "node"  # interpreter for the bridge
-# bridge = "/path/to/bridge/whatsapp"   # found beside the executable otherwise
+enabled   = true
+allow     = ["15551234567"]
+self_chat = true     # answer your own "Message yourself" chat
+groups    = false
+approve   = false
+node      = "node"
 ```
-
-`ozgent channel status` shows all of it, plus which chats are bound to a
-conversation. It never prints the token.
 
 ## When something is wrong
 
-**WhatsApp ignores what I type to myself.** `self_chat` is off by default;
-turn it on. `ozgent channel status` says which it is.
-
-**Nothing is answered.** Almost always the allowlist. `ozgent channel status`
-says who is on it. A message from someone not on it is logged and otherwise
-ignored — deliberately, since replying to strangers confirms the bot is live.
+**Nothing is answered.** Almost always the list. `ozgent gateway status` says
+who is on it. A message from someone not on it is logged and otherwise ignored.
 
 **`another program is already polling this bot token`.** Telegram allows one
-reader per token. Either another `ozgent gateway` is running, or a webhook is
-set for that bot. Stop the other one, or clear the webhook.
+reader per token. Either another ozgent is running, or a webhook is set for
+that bot. Stop the other one, or clear the webhook.
 
-**Telegram replies arrive without formatting.** Telegram rejects a message whose
-markup it dislikes, whole, rather than stripping it — so ozgent retries as plain
-text. Losing the formatting beats losing the reply. The log says which message.
+**WhatsApp says it is not linked any more.** Someone removed the device in
+WhatsApp ▸ Linked devices. Run `ozgent gateway whatsapp link`, or press Link
+on `/admin`.
 
-**WhatsApp stops after a while.** The bridge reconnects on its own and says so.
-If it says the device was unlinked, someone removed it in WhatsApp ▸ Linked
-devices; run `ozgent channel login whatsapp` again.
+**Telegram replies arrive without formatting.** Telegram rejects a message
+whose markup it dislikes, whole, so ozgent retries as plain text. Losing the
+formatting beats losing the reply.
 
 See also [tools and permissions](tools.md) and [settings](settings.md).

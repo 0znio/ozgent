@@ -4,6 +4,7 @@
 //! store the terminal client uses, so a conversation started in one shows up
 //! in the other.
 
+pub mod admin;
 pub mod agents;
 pub mod anthropic;
 pub mod api;
@@ -41,7 +42,9 @@ pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::R
     // The OpenAI- and Anthropic-compatible API on the same port, over the
     // same loaded model. Run separately, `ozgent serve` would load a second
     // copy of the model into VRAM just so another program could talk to it.
+    state::watch_config(&state);
     let app = api::router(state.clone())
+        .merge(admin::router(state.clone()))
         .merge(openai::router(state, openai::ApiKey(None)))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
@@ -56,6 +59,7 @@ pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::R
     println!("ozgent web");
     println!("  this machine:  http://localhost:{port}");
     println!("  API:           http://localhost:{port}/v1  (OpenAI and Anthropic compatible)");
+    println!("  admin:         http://localhost:{port}/admin  (gateway and model downloads)");
     if host == "0.0.0.0" || host == "::" {
         match lan_address() {
             Some(ip) => {
@@ -71,7 +75,10 @@ pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::R
     }
     println!();
     println!("press ctrl-c to stop");
-    axum::serve(listener, app).await?;
+    // With the peer's address, so failed admin sign-ins are counted per
+    // address rather than for everyone at once.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await?;
     Ok(())
 }
 

@@ -37,11 +37,12 @@ import urllib.parse
 import urllib.request
 from typing import Annotated, Any, Literal
 
+from .. import indicators
 from ..base import ToolError, get_config, tool
 
 USER_AGENT = "Mozilla/5.0 (compatible; ozgent/0.1; +https://github.com/0znio/ozgent)"
 
-Action = Literal["quote", "history", "fundamentals", "news", "search"]
+Action = Literal["quote", "history", "technicals", "fundamentals", "news", "search"]
 Range = Literal["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
 
 #: The bar size that suits each range: enough points to see the shape, few
@@ -307,6 +308,42 @@ def _history(symbol: str, range_: str) -> dict[str, Any]:
     return shape_history(data, range_, interval)
 
 
+def daily_bars(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every daily bar in a chart response, oldest first, unthinned."""
+    result = ((data.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        raise ToolError("no price history returned for that symbol")
+    stamps = result.get("timestamp") or []
+    quote = (((result.get("indicators") or {}).get("quote")) or [{}])[0]
+    column = lambda k: quote.get(k) or [None] * len(stamps)  # noqa: E731
+    opens, highs, lows, closes, volumes = (column(k) for k in ("open", "high", "low", "close", "volume"))
+    return [
+        {"time": _iso(t), "open": opens[i], "high": highs[i], "low": lows[i], "close": closes[i], "volume": volumes[i]}
+        for i, t in enumerate(stamps)
+        if closes[i] is not None
+    ]
+
+
+def _technicals(symbol: str) -> dict[str, Any]:
+    # Two years of daily bars: the 200-day average needs 200 of them, and a
+    # year beyond that gives the 52-week range and the swing levels room.
+    data = _fetch(
+        f"/v8/finance/chart/{urllib.parse.quote(symbol)}",
+        {"range": "2y", "interval": "1d", "includePrePost": "false"},
+    )
+    meta = (((data.get("chart") or {}).get("result") or [{}])[0] or {}).get("meta") or {}
+    try:
+        reading = indicators.analyse(daily_bars(data))
+    except ValueError as e:
+        raise ToolError(f"{symbol}: {e}") from None
+    return {
+        "symbol": meta.get("symbol") or symbol,
+        "currency": meta.get("currency"),
+        "exchange": meta.get("fullExchangeName") or meta.get("exchangeName"),
+        **reading,
+    }
+
+
 def shape_fundamentals(data: dict[str, Any]) -> dict[str, Any]:
     result = ((data.get("quoteSummary") or {}).get("result") or [None])[0]
     if not result:
@@ -440,6 +477,8 @@ async def yahoo_finance(
     action: Annotated[
         Action,
         "quote: current price and key stats. history: price series over `range`. "
+        "technicals: RSI, MACD, moving averages, Bollinger bands, ATR, support and "
+        "resistance, 52-week range, returns and volume trend, from daily prices. "
         "fundamentals: financials, valuation, analyst targets, earnings dates. "
         "news: recent headlines. search: find the symbol for a company name.",
     ],
@@ -450,7 +489,7 @@ async def yahoo_finance(
     range: Annotated[Range, "Period for action 'history'."] = "1mo",
     count: Annotated[int, "How many headlines or search matches, 1-20."] = 8,
 ) -> dict[str, Any]:
-    """Live stock, ETF, index and crypto data: quotes, price history, fundamentals, news, symbol search."""
+    """Live stock, ETF, index and crypto data: quotes, price history, technical indicators, fundamentals, news, symbol search."""
     # One tool with an `action` rather than five tools: small models pick the
     # right action from one description far more reliably than they pick the
     # right tool out of five near-identical ones.
@@ -488,6 +527,8 @@ async def yahoo_finance(
         if range not in INTERVALS:
             raise ToolError(f"range must be one of {', '.join(INTERVALS)}")
         return {"action": action, **await asyncio.to_thread(_history, one, range)}
+    if action == "technicals":
+        return {"action": action, **await asyncio.to_thread(_technicals, one)}
     if action == "fundamentals":
         return {"action": action, **await asyncio.to_thread(_fundamentals, one)}
     if action == "news":

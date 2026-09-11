@@ -414,7 +414,10 @@ impl Options {
         Resolved {
             inference_mode: mode,
             gpu_layers: self.gpu_layers.unwrap_or_else(|| mode.gpu_layers()),
-            context_length: self.context_length.unwrap_or(4096),
+            // 32k: enough for a long conversation with tool results in it. The
+            // engine lowers it to what the model was trained on and to what
+            // fits in memory, and says so, so a generous default costs nothing.
+            context_length: self.context_length.unwrap_or(32_768),
             batch_size: self.batch_size.unwrap_or(512),
             ubatch: self.ubatch,
             // 0 lets llama.cpp pick based on the physical core count.
