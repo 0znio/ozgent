@@ -164,7 +164,11 @@ impl Writer {
                 Flavour::WhatsApp => self.raw(&format!("`{t}`")),
                 Flavour::Plain => self.text(&t),
             },
-            Event::SoftBreak => self.raw(" "),
+            // A chat shows lines as they were written. Markdown's rule that a
+            // single newline is a space is a rule for reflowed documents; in
+            // a chat it glued tool-activity lines and a model's line-by-line
+            // lists into one run-on paragraph.
+            Event::SoftBreak => self.raw("\n"),
             Event::HardBreak => self.raw("\n"),
             Event::Rule => {
                 self.block();
@@ -565,5 +569,11 @@ mod tests {
         // visible whitespace.
         assert_eq!(tg("text\n\n\n"), "text");
         assert_eq!(tg(""), "");
+    }
+
+    #[test]
+    fn a_single_newline_stays_a_line_break() {
+        assert_eq!(tg("one\ntwo"), "one\ntwo");
+        assert_eq!(wa("*@agent* — done\n  ↳ ✓ `web_search`"), "_@agent_ — done\n↳ ✓ `web_search`");
     }
 }

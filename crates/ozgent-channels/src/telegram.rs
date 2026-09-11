@@ -464,9 +464,13 @@ async fn send_loop(
             Command::Post { chat, token, markdown } => {
                 // Only the last chunk keeps the token: it is the one a later
                 // revision would rewrite, and the earlier ones are finished.
+                // Split as markdown, so a fence broken across messages is
+                // closed and reopened, then each chunk rendered on its own —
+                // HTML split mid-tag would be refused whole.
                 let chunks = split(&markdown, TELEGRAM_LIMIT);
                 let last = chunks.len().saturating_sub(1);
                 for (i, chunk) in chunks.into_iter().enumerate() {
+                    let chunk = render(&chunk, Flavour::TelegramHtml);
                     match post(&api, &chat, &chunk, None).await {
                         Ok(id) if i == last => {
                             sent.message.insert(token, id);
@@ -489,12 +493,15 @@ async fn send_loop(
                 if markdown.chars().count() > TELEGRAM_LIMIT {
                     continue;
                 }
-                if sent.text.get(&token).is_some_and(|t| *t == markdown) {
+                // Rendered like a post: this used to send the markdown itself
+                // as HTML, so every reply arrived with its ** and ## showing.
+                let html = render(&markdown, Flavour::TelegramHtml);
+                if sent.text.get(&token).is_some_and(|t| *t == html) {
                     continue;
                 }
-                match edit(&api, &chat, message_id, &markdown, None).await {
+                match edit(&api, &chat, message_id, &html, None).await {
                     Ok(()) => {
-                        sent.text.insert(token, markdown);
+                        sent.text.insert(token, html);
                     }
                     Err(e) if e.is_unchanged() => {}
                     Err(e) => tracing::debug!("telegram: revising: {e}"),
