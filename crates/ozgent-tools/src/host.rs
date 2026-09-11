@@ -461,6 +461,10 @@ pub enum ToolCallError {
     /// tool result either way.
     #[error("{name} was declined")]
     Declined { name: String },
+    /// Called by name, but not one of the tools this turn was offered — an
+    /// agent reaching past its list. Nobody refused it; it was never there.
+    #[error("{name} is not available here")]
+    NotOffered { name: String, offered: Vec<String> },
 }
 
 impl ToolCallError {
@@ -488,6 +492,14 @@ impl ToolCallError {
                 format!("The tool system is unavailable: {e}. Do not retry; tell the user.")
             }
             Self::Declined { name } => ozgent_core::permission::refusal(name),
+            Self::NotOffered { name, offered } if offered.is_empty() => format!(
+                "{name} is not available to you, and you have no tools here. \
+                 Answer from what you already have."
+            ),
+            Self::NotOffered { name, offered } => format!(
+                "{name} is not one of your tools. You can use: {}. Carry on with those.",
+                offered.join(", ")
+            ),
         }
     }
 }

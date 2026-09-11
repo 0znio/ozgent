@@ -36,7 +36,29 @@ its own user.
 | `fetch_url` | read a page, article, JSON API, or feed | read | `network` + host allowlist |
 | `write_file` | create or modify a file | write | `write = true`, confined to `root` |
 | `run_command` | run one allowed program | execute | `shell = true` + allowlist |
-| `get_temperature` | example tool | read | — |
+| `yahoo_finance` | quotes, price history, fundamentals, news, symbol search | read | — |
+| `reddit` | search posts, list a subreddit, read a thread | read | optional app credentials |
+
+**`yahoo_finance`** needs no key. One tool with an `action` — `quote`,
+`history`, `fundamentals`, `news`, `search` — because a small model picks the
+right action from one description far more reliably than the right tool out
+of five. Every number comes back raw, never as Yahoo's `"3.2T"`.
+
+**`reddit`** works without setup, but slowly: Reddit refuses anonymous API
+calls, so it reads the public feeds, which allow about one request a minute
+and carry no scores. For the real thing, create a free *script* app at
+<https://www.reddit.com/prefs/apps> and add it:
+
+```toml
+[tools.config.reddit]
+client_id = "..."          # or $REDDIT_CLIENT_ID
+client_secret = "..."      # or $REDDIT_CLIENT_SECRET
+username = "your_name"     # Reddit asks apps to name who runs them
+```
+
+Every result says which route it came from, and a spent rate limit is
+reported with how long until the next request rather than retried into a
+longer one.
 
 Tools can also come from [MCP servers](mcp.md). They go through everything
 below unchanged, with one difference stated there: a server's claim that a tool
@@ -91,18 +113,18 @@ nothing is asked about, which is what silence has to mean.
 
 ## Where they live
 
-One tool per file, and the file is named after the tool. The six built-ins are
-in `python/ozgent_tools/builtin/` — `read_file.py`, `list_dir.py`,
-`web_search.py`, `write_file.py`, `run_command.py`, `fetch_url.py`. The
-seventh, `get_temperature`, is the example in `~/ozgent/tools/`, which is where
-your own go.
+One tool per file, and the file is named after the tool. The eight built-ins
+are in `python/ozgent_tools/builtin/` — `read_file.py`, `list_dir.py`,
+`web_search.py`, `write_file.py`, `run_command.py`, `fetch_url.py`,
+`yahoo_finance.py`, `reddit.py`. Your own go in `~/ozgent/tools/`; the
+`get_temperature` below is the kind of thing that lives there.
 
 `ozgent tools list` prints the file each tool came from, so the two are never
 in doubt:
 
 ```
 $ ozgent tools list
-7 tools · python 3.14.6 · worker 0.1.0
+9 tools · python 3.14.6 · worker 0.1.0
 
 read_file
   ~/ozgent/lib/python/ozgent_tools/builtin/read_file.py
@@ -256,7 +278,8 @@ pass both.
 
 ## The agent loop
 
-A turn may call tools up to **eight** times before it must answer. Each round
+A turn may call tools up to **eight** times before it must answer ([agents](agents.md)
+set their own number). Each round
 is a full generation, so the number is a latency budget as much as a capability
 one. When the rounds run out the tools are taken away and the model is asked to
 answer from what it has — and to say what is missing rather than invent it.

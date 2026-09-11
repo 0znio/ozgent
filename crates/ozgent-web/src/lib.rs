@@ -4,6 +4,8 @@
 //! store the terminal client uses, so a conversation started in one shows up
 //! in the other.
 
+pub mod agents;
+pub mod anthropic;
 pub mod api;
 pub mod media;
 pub mod openai;
@@ -35,7 +37,12 @@ pub async fn serve(
 /// mean two copies of the model in VRAM and a permission answered in the
 /// browser having no effect on a question asked over Telegram.
 pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::Result<()> {
-    let app = api::router(state).layer(tower_http::trace::TraceLayer::new_for_http());
+    // The OpenAI- and Anthropic-compatible API on the same port, over the
+    // same loaded model. Run separately, `ozgent serve` would load a second
+    // copy of the model into VRAM just so another program could talk to it.
+    let app = api::router(state.clone())
+        .merge(openai::router(state, openai::ApiKey(None)))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
@@ -47,6 +54,7 @@ pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::R
     // else is never the one this machine uses.
     println!("ozgent web");
     println!("  this machine:  http://localhost:{port}");
+    println!("  API:           http://localhost:{port}/v1  (OpenAI and Anthropic compatible)");
     if host == "0.0.0.0" || host == "::" {
         match lan_address() {
             Some(ip) => {

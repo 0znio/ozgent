@@ -37,6 +37,8 @@ pub fn router(state: State, key: ApiKey) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/messages", post(crate::anthropic::messages))
+        .route("/v1/agents", get(agents))
         .route("/health", get(health))
         .layer(axum::Extension(key))
         .with_state(state)
@@ -97,12 +99,19 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
+pub(crate) fn authorise_key(headers: &HeaderMap, key: &ApiKey) -> bool {
+    authorise(headers, key).is_ok()
+}
+
 fn authorise(headers: &HeaderMap, key: &ApiKey) -> Result<(), ApiError> {
     let Some(expected) = key.0.as_deref() else { return Ok(()) };
+    // Either spelling: OpenAI clients send a bearer token, Anthropic ones an
+    // `x-api-key` header, and one server answers both.
     let given = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
     // Constant-time enough for a local key: compare lengths first, then bytes.
     if given.len() == expected.len() && given.bytes().zip(expected.bytes()).all(|(a, b)| a == b) {
@@ -112,14 +121,14 @@ fn authorise(headers: &HeaderMap, key: &ApiKey) -> Result<(), ApiError> {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-fn id(prefix: &str) -> String {
+pub(crate) fn id(prefix: &str) -> String {
     // Enough entropy to correlate a request in a log without a uuid dependency.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -130,11 +139,20 @@ fn id(prefix: &str) -> String {
 
 // ------------------------------------------------------------------ models
 
+/// One model, in a shape both protocols read.
+///
+/// OpenAI's fields and Anthropic's side by side: `object`/`created` for one,
+/// `type`/`display_name`/`created_at` for the other. Each client reads its own
+/// and ignores the rest, so one listing serves both.
 #[derive(Serialize)]
 struct ModelObject {
     id: String,
     object: &'static str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    display_name: String,
     created: i64,
+    created_at: &'static str,
     owned_by: &'static str,
     /// Not in OpenAI's schema, but the first thing anyone actually wants.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,10 +176,14 @@ fn describe(state: &State, m: &ozgent_core::registry::Installed) -> ModelObject 
     if m.manifest.supports_vision() {
         capabilities.push("vision");
     }
+    let id = m.manifest.alias.clone().unwrap_or_else(|| m.model.to_string());
     ModelObject {
-        id: m.manifest.alias.clone().unwrap_or_else(|| m.model.to_string()),
+        display_name: id.clone(),
+        id,
         object: "model",
+        kind: "model",
         created: 0,
+        created_at: "1970-01-01T00:00:00Z",
         owned_by: "ozgent",
         quantization: m.manifest.quantization.clone(),
         size_bytes: m.manifest.size_bytes,
@@ -176,11 +198,35 @@ async fn models(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorise(&headers, &key)?;
-    let data: Vec<ModelObject> = ozgent_core::installed(&state.paths)
+    let mut data: Vec<serde_json::Value> = ozgent_core::installed(&state.paths)
         .iter()
-        .map(|m| describe(&state, m))
+        .filter_map(|m| serde_json::to_value(describe(&state, m)).ok())
         .collect();
-    Ok(Json(serde_json::json!({ "object": "list", "data": data })))
+    // Agents after the models, so a client that picks the first entry by
+    // default still picks a model.
+    data.extend(crate::agents::as_models(&state));
+    let first = data.first().and_then(|m| m["id"].as_str()).map(str::to_string);
+    let last = data.last().and_then(|m| m["id"].as_str()).map(str::to_string);
+    Ok(Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        // Anthropic's pagination fields. There is only ever one page.
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
+    })))
+}
+
+/// `/v1/agents`: the agents, in full, for a client that wants to offer an
+/// `@` menu of its own.
+async fn agents(
+    AxumState(state): AxumState<State>,
+    axum::Extension(key): axum::Extension<ApiKey>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorise(&headers, &key)?;
+    let catalog = ozgent_core::AgentCatalog::load(&state.paths);
+    Ok(Json(serde_json::json!({ "object": "list", "data": catalog.all() })))
 }
 
 async fn model(
@@ -188,11 +234,18 @@ async fn model(
     axum::Extension(key): axum::Extension<ApiKey>,
     headers: HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
-) -> ApiResult<Json<ModelObject>> {
+) -> ApiResult<Json<serde_json::Value>> {
     authorise(&headers, &key)?;
+    if name.starts_with('@') {
+        return crate::agents::as_models(&state)
+            .into_iter()
+            .find(|m| m["id"] == name.as_str())
+            .map(Json)
+            .ok_or_else(|| ApiError::not_found(format!("no agent {name:?}")));
+    }
     let found = ozgent_core::resolve(&state.paths, &name)
         .map_err(|_| ApiError::not_found(format!("no model {name:?}")))?;
-    Ok(Json(describe(&state, &found)))
+    Ok(Json(serde_json::to_value(describe(&state, &found)).unwrap_or_default()))
 }
 
 async fn health(AxumState(state): AxumState<State>) -> Json<serde_json::Value> {
@@ -258,6 +311,13 @@ pub struct ChatRequest {
     /// An empty list offers none.
     #[serde(default)]
     pub native_tools: Option<Vec<String>>,
+    /// `{"include_usage": true}` asks for a final chunk carrying only usage.
+    #[serde(default)]
+    pub stream_options: Option<serde_json::Value>,
+    /// ozgent extension: `false` stops an `@name` in the message from calling
+    /// an agent, for a client whose users type `@` for other reasons.
+    #[serde(default)]
+    pub ozgent_agents: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -546,8 +606,21 @@ async fn chat_completions(
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    let found = ozgent_core::resolve(&state.paths, &request.model)
-        .map_err(|_| ApiError::not_found(format!("no model {:?}", request.model)))?;
+    let latest = request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(ChatMessage::text)
+        .unwrap_or_default();
+    // Structured output and an agent do not mix: the agent's report is prose
+    // by design, and a grammar would stop it calling its tools. So mentions
+    // are not looked for when a schema is asked for, and choosing an agent
+    // *as the model* with one is refused below.
+    let agents_on = request.ozgent_agents.unwrap_or(true) && request.response_format.is_none();
+    let resolved = crate::agents::resolve(&state, &request.model, &latest, agents_on)
+        .map_err(refusal)?;
+    let found = resolved.model;
 
     let mut images = Vec::new();
     for message in &request.messages {
@@ -556,6 +629,12 @@ async fn chat_completions(
 
     let response_grammar = response_grammar(request.response_format.as_ref())
         .map_err(ApiError::bad_request)?;
+    if response_grammar.is_some() && !resolved.agents.is_empty() {
+        return Err(ApiError::bad_request(
+            "an agent cannot answer with response_format: its report is prose. \
+             Name a model instead of an agent",
+        ));
+    }
 
     // A schema grammar masks out every token that would break it, so the model
     // physically cannot emit a tool-call marker. Honouring both would leave the
@@ -570,6 +649,11 @@ async fn chat_completions(
              unrepresentable, so the tools would never be used",
         ));
     }
+
+    // `tool_choice: "none"` is the caller saying not to call anything this
+    // time, while still sending the tool list for context. Offering the tools
+    // anyway would produce exactly the call it asked not to get.
+    let no_tools = request.tool_choice.as_ref().and_then(|c| c.as_str()) == Some("none");
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     state
@@ -591,21 +675,36 @@ async fn chat_completions(
             max_tokens: request.max_tokens.or(request.max_completion_tokens),
             // Naming the built-ins is itself a request to use them, so a
             // caller does not have to set two fields that mean one thing.
-            tools_enabled: request.ozgent_tools.unwrap_or(request.native_tools.is_some()),
+            tools_enabled: !no_tools
+                && request.ozgent_tools.unwrap_or(request.native_tools.is_some()),
             native_tools: request.native_tools.clone(),
-            client_tools: client_tools(request.tools.as_ref()),
+            client_tools: if no_tools { Vec::new() } else { client_tools(request.tools.as_ref()) },
             response_grammar,
             overrides: Some(options_from(&request)),
             images,
+            agents: resolved.agents,
             out: tx,
         })
         .map_err(ApiError::internal)?;
 
     let model_id = found.model.to_string();
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if request.stream {
-        Ok(Sse::new(stream_chunks(rx, model_id)).into_response())
+        Ok(Sse::new(stream_chunks(rx, model_id, include_usage)).into_response())
     } else {
         Ok(Json(collect(rx, model_id).await?).into_response())
+    }
+}
+
+fn refusal(r: crate::agents::Refusal) -> ApiError {
+    match r {
+        crate::agents::Refusal::NotFound(m) => ApiError::not_found(m),
+        crate::agents::Refusal::BadRequest(m) => ApiError::bad_request(m),
     }
 }
 
@@ -705,8 +804,16 @@ async fn collect(
     let mut calls: Vec<serde_json::Value> = Vec::new();
     let mut timings = Timings::default();
     let mut stop = "stop";
+    let mut trace = crate::agents::Trace::default();
+    let mut events: Vec<serde_json::Value> = Vec::new();
 
     while let Some(event) = rx.recv().await {
+        if let Some(line) = trace.line(&event) {
+            reasoning.push_str(&line);
+        }
+        if let Some(e) = crate::agents::structured(&event) {
+            events.push(e);
+        }
         match event {
             Event::Answer { text } => answer.push_str(&text),
             Event::Thinking { text } => reasoning.push_str(&text),
@@ -747,7 +854,9 @@ async fn collect(
             | Event::ToolCall { .. }
             | Event::ToolCallStarted { .. }
             | Event::ToolResult { .. }
-            | Event::Permission { .. } => {}
+            | Event::Permission { .. }
+            | Event::AgentStart { .. }
+            | Event::AgentEnd { .. } => {}
         }
     }
 
@@ -763,7 +872,7 @@ async fn collect(
         stop = "tool_calls";
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "id": id("chatcmpl"),
         "object": "chat.completion",
         "created": now(),
@@ -775,117 +884,166 @@ async fn collect(
             "total_tokens": timings.prompt_tokens + timings.completion_tokens,
             "timings": timings,
         },
-    }))
+    });
+    if !events.is_empty() {
+        response["ozgent"] = serde_json::json!({ "events": events });
+    }
+    Ok(response)
+}
+
+/// Where a stream has got to, carried between events.
+struct StreamState {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    model: String,
+    completion: String,
+    opened: bool,
+    finished: bool,
+    include_usage: bool,
+    /// Index of the next tool call. OpenAI clients accumulate calls by index,
+    /// so two calls both sent as index 0 are merged into one call with both
+    /// names and both argument strings run together.
+    next_call: usize,
+    trace: crate::agents::Trace,
+    /// Chunks produced by one event beyond the first, sent before the next
+    /// event is read.
+    queued: std::collections::VecDeque<String>,
 }
 
 /// Stream a turn as `chat.completion.chunk` events.
 fn stream_chunks(
     rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     model: String,
+    include_usage: bool,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
-    let completion = id("chatcmpl");
-    futures_util::stream::unfold(
-        (rx, model, completion, false, false),
-        |(mut rx, model, completion, opened, finished)| async move {
-            if finished {
-                return None;
+    let state = StreamState {
+        rx,
+        model,
+        completion: id("chatcmpl"),
+        opened: false,
+        finished: false,
+        include_usage,
+        next_call: 0,
+        trace: Default::default(),
+        queued: Default::default(),
+    };
+    futures_util::stream::unfold(state, |mut st| async move {
+        if let Some(text) = st.queued.pop_front() {
+            return Some((Ok(SseEvent::default().data(text)), st));
+        }
+        if st.finished {
+            return None;
+        }
+        let chunk = |st: &StreamState, delta: serde_json::Value, reason: Option<&str>| {
+            serde_json::json!({
+                "id": st.completion,
+                "object": "chat.completion.chunk",
+                "created": now(),
+                "model": st.model,
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": reason }],
+            })
+        };
+
+        let Some(event) = st.rx.recv().await else {
+            // The stream ended without a Done — close it properly anyway,
+            // or a client waits forever.
+            st.finished = true;
+            return Some((Ok(SseEvent::default().data("[DONE]")), st));
+        };
+
+        // OpenAI's first chunk announces the role and nothing else.
+        let mut delta = serde_json::Map::new();
+        if !st.opened {
+            delta.insert("role".into(), "assistant".into());
+        }
+
+        // What an agent did goes into the reasoning stream, which is where
+        // every client that shows a model's working already looks.
+        let mut reasoning = st.trace.line(&event).unwrap_or_default();
+        let structured = crate::agents::structured(&event);
+
+        match event {
+            Event::Answer { text } => {
+                delta.insert("content".into(), text.into());
             }
-            let chunk = |delta: serde_json::Value, reason: Option<&str>| {
-                serde_json::json!({
-                    "id": completion,
-                    "object": "chat.completion.chunk",
-                    "created": now(),
-                    "model": model,
-                    "choices": [{ "index": 0, "delta": delta, "finish_reason": reason }],
-                })
-            };
-
-            let Some(event) = rx.recv().await else {
-                // The stream ended without a Done — close it properly anyway,
-                // or a client waits forever.
-                return Some((
-                    Ok(SseEvent::default().data("[DONE]")),
-                    (rx, model, completion, opened, true),
-                ));
-            };
-
-            // OpenAI's first chunk announces the role and nothing else.
-            let role = (!opened).then(|| serde_json::json!("assistant"));
-            let mut delta = serde_json::Map::new();
-            if let Some(role) = role {
-                delta.insert("role".into(), role);
+            Event::Thinking { text } => reasoning.push_str(&text),
+            Event::ClientToolCall { name, arguments } => {
+                let index = st.next_call;
+                st.next_call += 1;
+                delta.insert(
+                    "tool_calls".into(),
+                    serde_json::json!([{
+                        "index": index,
+                        "id": id("call"),
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments.to_string() },
+                    }]),
+                );
             }
-
-            match event {
-                Event::Answer { text } => {
-                    delta.insert("content".into(), text.into());
-                }
-                Event::Thinking { text } => {
-                    delta.insert("reasoning_content".into(), text.into());
-                }
-                Event::ClientToolCall { name, arguments } => {
-                    delta.insert(
-                        "tool_calls".into(),
-                        serde_json::json!([{
-                            "index": 0,
-                            "id": id("call"),
-                            "type": "function",
-                            "function": { "name": name, "arguments": arguments.to_string() },
-                        }]),
-                    );
-                }
-                // A server-side tool has already run; telling the client about
-                // it here would invite it to run the same call again.
-                Event::ToolCall { .. } => {}
-                Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms } => {
-                    let usage = serde_json::json!({
-                        "prompt_tokens": prompt,
+            Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms } => {
+                let usage = serde_json::json!({
+                    "prompt_tokens": prompt,
+                    "completion_tokens": generated,
+                    "total_tokens": prompt + generated,
+                    "timings": {
                         "completion_tokens": generated,
-                        "total_tokens": prompt + generated,
-                        "timings": {
-                            "completion_tokens": generated,
-                            "tokens_per_second": tokens_per_second,
-                            "cached_prompt_tokens": reused,
-                            "prompt_tokens": prompt,
-                            "prompt_ms": prompt_ms,
-                        },
-                    });
-                    let mut final_chunk = chunk(serde_json::json!({}), Some(finish_reason(&stop)));
-                    final_chunk["usage"] = usage;
-                    let text = serde_json::to_string(&final_chunk).unwrap_or_default();
-                    return Some((
-                        Ok(SseEvent::default().data(text)),
-                        (rx, model, completion, true, false),
-                    ));
+                        "tokens_per_second": tokens_per_second,
+                        "cached_prompt_tokens": reused,
+                        "prompt_tokens": prompt,
+                        "prompt_ms": prompt_ms,
+                    },
+                });
+                let mut final_chunk = chunk(&st, serde_json::json!({}), Some(finish_reason(&stop)));
+                // Kept on the finishing chunk for clients that read it there,
+                // as ozgent always has.
+                final_chunk["usage"] = usage.clone();
+                if st.include_usage {
+                    // And OpenAI's own form: one more chunk, no choices, just
+                    // the usage — which is what `include_usage` promises.
+                    let mut usage_chunk = chunk(&st, serde_json::json!({}), None);
+                    usage_chunk["choices"] = serde_json::json!([]);
+                    usage_chunk["usage"] = usage;
+                    st.queued.push_back(serde_json::to_string(&usage_chunk).unwrap_or_default());
                 }
-                Event::Error { message } => {
-                    let text = serde_json::to_string(&serde_json::json!({
-                        "error": { "message": message, "type": "api_error" }
-                    }))
-                    .unwrap_or_default();
-                    return Some((
-                        Ok(SseEvent::default().data(text)),
-                        (rx, model, completion, true, false),
-                    ));
-                }
-                Event::Ready { .. }
-                | Event::ToolResult { .. }
-                | Event::ToolCallStarted { .. }
-                | Event::Permission { .. } => {}
+                st.queued.push_back("[DONE]".to_string());
+                st.opened = true;
+                st.finished = true;
+                let text = serde_json::to_string(&final_chunk).unwrap_or_default();
+                return Some((Ok(SseEvent::default().data(text)), st));
             }
-
-            if delta.is_empty() {
-                // Nothing to say this time; keep the stream open.
-                return Some((
-                    Ok(SseEvent::default().comment("")),
-                    (rx, model, completion, opened, false),
-                ));
-            }
-            let text = serde_json::to_string(&chunk(serde_json::Value::Object(delta), None))
+            Event::Error { message } => {
+                let text = serde_json::to_string(&serde_json::json!({
+                    "error": { "message": message, "type": "api_error" }
+                }))
                 .unwrap_or_default();
-            Some((Ok(SseEvent::default().data(text)), (rx, model, completion, true, false)))
-        },
-    )
+                st.finished = true;
+                return Some((Ok(SseEvent::default().data(text)), st));
+            }
+            // A server-side tool has already run; telling the client about it
+            // as a tool call would invite it to run the same call again.
+            Event::ToolCall { .. }
+            | Event::Ready { .. }
+            | Event::ToolResult { .. }
+            | Event::ToolCallStarted { .. }
+            | Event::Permission { .. }
+            | Event::AgentStart { .. }
+            | Event::AgentEnd { .. } => {}
+        }
+
+        if !reasoning.is_empty() {
+            delta.insert("reasoning_content".into(), reasoning.into());
+        }
+        if delta.is_empty() && structured.is_none() {
+            // Nothing to say this time; keep the stream open.
+            return Some((Ok(SseEvent::default().comment("")), st));
+        }
+        let mut body = chunk(&st, serde_json::Value::Object(delta), None);
+        if let Some(e) = structured {
+            body["ozgent"] = e;
+        }
+        st.opened = true;
+        let text = serde_json::to_string(&body).unwrap_or_default();
+        Some((Ok(SseEvent::default().data(text)), st))
+    })
 }
 
 #[cfg(test)]

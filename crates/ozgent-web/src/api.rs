@@ -38,6 +38,8 @@ pub fn router(state: State) -> Router {
         .route("/api/conversations/{id}/facts", get(facts).post(add_fact))
         .route("/api/conversations/{id}/recall", post(preview_recall))
         .route("/api/facts/{id}", patch(pin_fact).delete(forget_fact))
+        .route("/api/agents", get(list_agents))
+        .route("/api/agents/{name}", axum::routing::put(save_agent).delete(delete_agent))
         .route("/api/chat", post(chat))
         .route("/api/unload", post(unload))
         .with_state(state)
@@ -101,6 +103,61 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+// ------------------------------------------------------------------- agents
+
+/// Every agent, and any file that could not be read.
+///
+/// The errors are part of the answer rather than a log line: an agent the user
+/// saved by hand that does not appear in the `@` panel is a mystery unless the
+/// page says why.
+async fn list_agents(AxumState(state): AxumState<State>) -> Json<serde_json::Value> {
+    let catalog = ozgent_core::AgentCatalog::load(&state.paths);
+    Json(serde_json::json!({
+        "agents": catalog.all(),
+        "errors": catalog.errors,
+        "limits": {
+            "max_rounds": ozgent_core::agents::MAX_ROUNDS,
+            "default_rounds": ozgent_core::agents::DEFAULT_ROUNDS,
+            "max_name": ozgent_core::agents::MAX_NAME,
+        },
+    }))
+}
+
+/// Create or replace an agent. Saving a built-in's name makes an override.
+async fn save_agent(
+    AxumState(state): AxumState<State>,
+    Path(name): Path<String>,
+    Json(definition): Json<ozgent_core::agents::Definition>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use ozgent_core::agents::AgentError;
+    match ozgent_core::agents::save(&state.paths, &name, &definition) {
+        Ok(path) => {
+            let catalog = ozgent_core::AgentCatalog::load(&state.paths);
+            Ok(Json(serde_json::json!({
+                "saved": path.display().to_string(),
+                "agent": catalog.get(&name),
+            })))
+        }
+        Err(e @ AgentError::Invalid(_)) => Err(ApiError::bad_request(e)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Delete an agent. Deleting an override brings the built-in back.
+async fn delete_agent(
+    AxumState(state): AxumState<State>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use ozgent_core::agents::{AgentError, Origin};
+    match ozgent_core::agents::remove(&state.paths, &name) {
+        Ok(origin) => Ok(Json(serde_json::json!({ "restored_builtin": origin == Origin::Override }))),
+        Err(e @ (AgentError::Builtin(_) | AgentError::NotFound(_) | AgentError::Invalid(_))) => {
+            Err(ApiError::bad_request(e))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
 
 // -------------------------------------------------------------- permissions
 

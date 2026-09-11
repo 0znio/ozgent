@@ -9,6 +9,7 @@ pub mod preamble;
 pub mod host;
 pub mod protocol;
 pub mod source;
+pub mod summary;
 
 pub use host::{HostConfig, HostError, ToolCallError, ToolHost, resolve_runtime};
 pub use protocol::{PROTOCOL_VERSION, RpcError, ToolManifest};

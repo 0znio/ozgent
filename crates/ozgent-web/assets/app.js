@@ -49,6 +49,8 @@ const CHOICES = [
 
 const state = {
   conversation: null, streaming: false, abort: null, files: [], tools: true,
+  /// Every agent, for the @ panel and for marking mentions in the thread.
+  agents: [],
   /// Row id to public id, so a route can be written without another request.
   uuids: new Map(),
 };
@@ -727,7 +729,7 @@ function addMessage(role, text = "") {
     `<div class="body"><div class="answer"></div></div>`;
   const body = wrap.querySelector(".body");
   const answer = wrap.querySelector(".answer");
-  if (role === "user") answer.textContent = text;
+  if (role === "user") answer.innerHTML = withMentions(text);
   else { answer.innerHTML = markdown(text); dressCode(answer); }
   el.thread.append(wrap);
   scrollToTail();
@@ -737,7 +739,9 @@ function addMessage(role, text = "") {
 /// Reasoning is rendered as markdown too — models format it, and showing the
 /// raw asterisks makes a long trace harder to skim than it needs to be.
 function reasoningPane(body) {
-  let pane = body.querySelector(".think");
+  // A direct child only: an agent block inside the body has a pane of its
+  // own, and the reply's reasoning must not land in it.
+  let pane = body.querySelector(":scope > .think");
   if (!pane) {
     pane = document.createElement("details");
     pane.className = "think";
@@ -745,6 +749,365 @@ function reasoningPane(body) {
     body.prepend(pane);
   }
   return pane.querySelector(".think-body");
+}
+
+// ---------------------------------------------------------------- agents
+
+/// A user's message with each `@agent` it calls drawn as a chip.
+///
+/// Only names that are agents: an email address, or an `@` that calls
+/// nothing, stays plain text, so the chip is a promise that something ran.
+function withMentions(text) {
+  const known = new Set(state.agents.map((a) => a.name));
+  return escapeHtml(text).replace(
+    /(^|[\s(\[{"'])@([a-z][a-z0-9-]*)/g,
+    (all, lead, name) => {
+      const clean = name.replace(/-+$/, "");
+      if (!known.has(clean)) return all;
+      return `${lead}<span class="ag-mention">@${clean}</span>${name.slice(clean.length)}`;
+    },
+  );
+}
+
+/// The block an agent's work is drawn in, where in the thread it ran.
+///
+/// Header, then the steps it took (reasoning and tool calls, open while it
+/// works and folded away once it has answered), then its report. It is the
+/// same shape live and on reload, because both are built by this.
+function agentBlock(event) {
+  const block = document.createElement("section");
+  block.className = "ag-block running";
+  block.innerHTML =
+    '<header class="ag-head">' +
+      '<span class="ag-kind">agent</span>' +
+      '<span class="ag-name"></span>' +
+      '<span class="ag-desc"></span>' +
+      '<span class="ag-state"><span class="ag-dot"></span><span class="ag-status">working</span></span>' +
+    '</header>' +
+    '<p class="ag-missing" hidden></p>' +
+    '<details class="ag-trace" open>' +
+      '<summary><span class="ag-steps">steps</span></summary>' +
+      '<div class="ag-trace-body"><span class="ag-end"></span></div>' +
+    '</details>' +
+    '<div class="ag-report answer"></div>';
+  block.querySelector(".ag-name").textContent = `@${event.name}`;
+  block.querySelector(".ag-desc").textContent = event.description ?? "";
+  if (event.missing?.length) {
+    const missing = block.querySelector(".ag-missing");
+    missing.hidden = false;
+    missing.textContent = `not available here: ${event.missing.join(", ")}`;
+  }
+  const started = Date.now();
+  const status = block.querySelector(".ag-status");
+  // Seconds, ticking, because an agent can work for a minute and a still
+  // "working" reads as stuck.
+  const timer = setInterval(() => {
+    status.textContent = `working · ${((Date.now() - started) / 1000).toFixed(0)}s`;
+  }, 1000);
+  return {
+    el: block,
+    trace: block.querySelector(".ag-trace-body"),
+    end: block.querySelector(".ag-end"),
+    report: block.querySelector(".ag-report"),
+    reportText: "",
+    thinkText: "",
+    calls: [],
+    stop() { clearInterval(timer); },
+  };
+}
+
+/// Mark an agent block finished, and say what it did.
+function finishAgent(agent, event) {
+  agent.stop();
+  const block = agent.el;
+  block.classList.remove("running");
+  block.classList.toggle("bad", !event.ok);
+  const seconds = ((event.ms ?? 0) / 1000).toFixed(1);
+  const calls = event.calls ?? agent.calls.length;
+  block.querySelector(".ag-status").textContent =
+    `${event.ok ? "done" : "no report"} · ${calls} tool call${calls === 1 ? "" : "s"} · ${seconds}s`;
+  // The steps fold away once there is a report to read; with none, they are
+  // the only account of what happened and stay open.
+  const names = [...new Set(agent.calls)];
+  block.querySelector(".ag-steps").textContent = calls
+    ? `${calls} step${calls === 1 ? "" : "s"} · ${names.join(", ")}`
+    : "no tools used";
+  if (event.ok) block.querySelector(".ag-trace").open = false;
+  block.querySelector(".ag-think")?.classList.remove("streaming");
+  agent.report.classList.remove("cursor");
+}
+
+/// Where each piece of a reply goes, in the order it happened.
+///
+/// Text, tool cards and agent blocks are laid down as they arrive, so a card
+/// sits between the paragraph before the call and the one after it. They used
+/// to be stacked above the whole answer, which made a reply that searched
+/// twice read as if both searches happened before a word was written.
+class ReplyView {
+  constructor(body, answer) {
+    this.body = body;
+    this.seg = answer;
+    this.segText = "";
+    this.agent = null;
+    this.think = null;
+    this.reasoning = "";
+  }
+
+  /// The element text is going into, for the typing cursor.
+  target() { return this.agent ? this.agent.report : this.seg; }
+
+  cursor(on) {
+    for (const el of this.body.querySelectorAll(".cursor")) el.classList.remove("cursor");
+    if (on) this.target().classList.add("cursor");
+  }
+
+  text(t) {
+    if (!t) return;
+    if (this.agent) {
+      this.agent.reportText += t;
+      this.agent.report.innerHTML = markdown(this.agent.reportText);
+      dressCode(this.agent.report);
+      this.agent.el.querySelector(".ag-think")?.classList.remove("streaming");
+      return;
+    }
+    // Whitespace between two agents' reports is a separator in the stored
+    // text, not something to draw.
+    if (!this.segText && !t.trim()) return;
+    this.segText += t;
+    this.seg.innerHTML = markdown(this.segText);
+    dressCode(this.seg);
+    this.body.querySelector(":scope > .think")?.classList.remove("streaming");
+  }
+
+  thinking(t) {
+    if (this.agent) {
+      this.agent.thinkText += t;
+      if (!this.agent.thinkText.trim()) return;
+      const pane = reasoningPane(this.agent.trace);
+      pane.closest(".think").classList.add("streaming", "ag-think");
+      pane.innerHTML = markdown(this.agent.thinkText);
+      pane.scrollTop = pane.scrollHeight;
+      return;
+    }
+    this.reasoning += t;
+    if (!this.reasoning.trim()) return;
+    this.think = this.think ?? reasoningPane(this.body);
+    this.think.closest(".think").classList.add("streaming");
+    this.think.innerHTML = markdown(this.reasoning);
+    this.think.scrollTop = this.think.scrollHeight;
+  }
+
+  /// The element a new card or note goes in front of.
+  ///
+  /// Inside an agent, the end of its steps. Otherwise after the text so far:
+  /// the segment that holds it is closed, and text after the card starts a
+  /// new one.
+  anchor() {
+    if (this.agent) return this.agent.end;
+    if (this.segText.trim()) this.newSegment();
+    return this.seg;
+  }
+
+  newSegment() {
+    const next = document.createElement("div");
+    next.className = "answer";
+    this.seg.after(next);
+    this.seg = next;
+    this.segText = "";
+  }
+
+  /// A card for a tool call, placed where the call happened.
+  card(event) {
+    if (this.agent) this.agent.calls.push(event.name);
+    return openToolCard(this.anchor(), event);
+  }
+
+  agentStart(event) {
+    const agent = agentBlock(event);
+    // Before the current segment if nothing has been written into it, so the
+    // block is not stranded below an empty paragraph.
+    if (this.segText.trim()) {
+      this.seg.after(agent.el);
+    } else {
+      this.seg.before(agent.el);
+    }
+    this.agent = agent;
+  }
+
+  agentEnd(event) {
+    if (!this.agent) return;
+    finishAgent(this.agent, event);
+    // Anything said after the agent is the conversation's, below its block.
+    const next = document.createElement("div");
+    next.className = "answer";
+    this.agent.el.after(next);
+    this.seg = next;
+    this.segText = "";
+    this.agent = null;
+  }
+
+  /// A line of status or failure, at the end of whatever is being written.
+  note(html) {
+    this.target().insertAdjacentHTML("beforeend", html);
+  }
+
+  /// Stop every animation that says something is still happening.
+  settle() {
+    this.agent?.stop();
+    for (const t of this.body.querySelectorAll(".think.streaming")) t.classList.remove("streaming");
+    this.cursor(false);
+  }
+}
+
+/// Rebuild a stored reply: text, cards and agent blocks at their offsets.
+///
+/// Offsets count UTF-16 units into the stored text, as the server records
+/// them. A reply saved before offsets existed has none, and its cards go
+/// above the text as they always did.
+function replayReply(view, text, activity) {
+  const events = [];
+  activity.forEach((item, i) => {
+    if (item.kind === "agent") {
+      events.push({ at: item.at ?? 0, seq: i * 2, item, what: "start" });
+      // The end sorts after the last call the agent made, even when that call
+      // shares its offset.
+      let last = i;
+      activity.forEach((other, j) => { if (other.agent === item.name && j > i) last = j; });
+      events.push({ at: item.end ?? text.length, seq: last * 2 + 1, item, what: "end" });
+    } else {
+      events.push({ at: item.at ?? 0, seq: i * 2, item, what: "tool" });
+    }
+  });
+  events.sort((a, b) => a.at - b.at || a.seq - b.seq);
+
+  let cursor = 0;
+  for (const e of events) {
+    view.text(text.slice(cursor, e.at));
+    cursor = Math.max(cursor, e.at);
+    if (e.what === "start") {
+      view.agentStart(e.item);
+      if (e.item.thinking) view.thinking(e.item.thinking);
+    } else if (e.what === "end") {
+      view.agentEnd(e.item);
+    } else {
+      const card = view.card(e.item);
+      if (e.item.ok !== undefined) closeToolCard(card, e.item);
+    }
+  }
+  view.text(text.slice(cursor));
+  view.settle();
+}
+
+/// The @ panel: agents matching what is being typed after an `@`.
+const suggest = {
+  open: false,
+  items: [],
+  active: 0,
+  /// Where the `@` being completed starts in the field.
+  start: -1,
+  /// Dismissed for this `@`, so Escape is not undone by the next keystroke.
+  dismissedAt: -1,
+
+  /// The mention being typed at the caret, if there is one.
+  typing() {
+    const before = el.input.value.slice(0, el.input.selectionStart ?? 0);
+    const m = before.match(/(^|[\s(\[{"'])@([a-z0-9-]*)$/);
+    if (!m) return null;
+    return { start: before.length - m[2].length - 1, typed: m[2] };
+  },
+
+  update() {
+    const t = this.typing();
+    if (!t || !state.agents.length || t.start === this.dismissedAt) return this.close();
+    const q = t.typed.toLowerCase();
+    // A prefix match first, then names that only contain it, so `@guru`
+    // still finds stock-guru.
+    const starts = state.agents.filter((a) => a.name.startsWith(q));
+    const contains = state.agents.filter((a) => !a.name.startsWith(q) && a.name.includes(q));
+    this.items = [...starts, ...contains];
+    if (!this.items.length) return this.close();
+    if (this.start !== t.start) this.active = 0;
+    this.start = t.start;
+    this.active = Math.min(this.active, this.items.length - 1);
+    this.render();
+  },
+
+  render() {
+    const box = $("ag-suggest");
+    box.replaceChildren();
+    const head = document.createElement("div");
+    head.className = "ag-sug-head";
+    head.innerHTML = "<span>Agents</span><span>↑↓ choose · Tab or Enter insert · Esc close</span>";
+    box.append(head);
+    this.items.forEach((a, i) => {
+      const row = document.createElement("div");
+      row.className = "ag-sug-row";
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", String(i === this.active));
+      row.innerHTML =
+        '<span class="ag-sug-name"></span><span class="ag-sug-desc"></span><span class="ag-sug-tools"></span>';
+      row.querySelector(".ag-sug-name").textContent = `@${a.name}`;
+      row.querySelector(".ag-sug-desc").textContent = a.description;
+      row.querySelector(".ag-sug-tools").textContent = (a.tools ?? []).join(" · ");
+      // mousedown, not click: a click would blur the field first and the
+      // caret position the insertion depends on would be gone.
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); this.pick(i); });
+      box.append(row);
+    });
+    box.hidden = false;
+    this.open = true;
+  },
+
+  close() {
+    $("ag-suggest").hidden = true;
+    this.open = false;
+    this.items = [];
+  },
+
+  /// Replace the partial mention with the chosen name and a space.
+  pick(i) {
+    const agent = this.items[i];
+    if (!agent) return;
+    const value = el.input.value;
+    const caret = el.input.selectionStart ?? value.length;
+    const insert = `@${agent.name} `;
+    el.input.value = value.slice(0, this.start) + insert + value.slice(caret);
+    const at = this.start + insert.length;
+    el.input.setSelectionRange(at, at);
+    this.close();
+    el.input.dispatchEvent(new Event("input"));
+    el.input.focus();
+  },
+
+  /// Keys the panel owns while it is open. Returns true when it used one.
+  key(e) {
+    if (!this.open) return false;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      this.active = (this.active + step + this.items.length) % this.items.length;
+      this.render();
+    } else if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      this.pick(this.active);
+    } else if (e.key === "Escape") {
+      this.dismissedAt = this.start;
+      this.close();
+    } else {
+      return false;
+    }
+    e.preventDefault();
+    return true;
+  },
+};
+
+async function loadAgents() {
+  try {
+    const data = await api("/api/agents");
+    state.agents = data.agents ?? [];
+    return data;
+  } catch {
+    state.agents = [];
+    return { agents: [], errors: [] };
+  }
 }
 
 // ------------------------------------------------------------- the gauge
@@ -1144,9 +1507,11 @@ async function openConversation(id, { route = true } = {}) {
       pane.innerHTML = markdown(m.thinking);
       dressCode(pane);
     }
-    for (const call of m.tool_calls ?? []) {
-      const card = openToolCard(answer, call);
-      if (call.ok !== undefined) closeToolCard(card, call);
+    if (m.role !== "user" && (m.tool_calls ?? []).length) {
+      // Rebuilt from the stored text so cards and agent blocks land where
+      // they happened, not stacked above the reply.
+      answer.replaceChildren();
+      replayReply(new ReplyView(body, answer), m.text ?? "", m.tool_calls);
     }
   }
   loadConversations();
@@ -1246,13 +1611,11 @@ async function send(text) {
     el.stat.textContent = `${ignored} non-image attachment(s) ignored`;
   }
   const { body, answer: answerEl } = addMessage("assistant", "");
-  answerEl.classList.add("cursor");
+  const view = new ReplyView(body, answerEl);
+  view.cursor(true);
   setStreaming(true);
   el.stat.textContent = "loading model...";
 
-  let answer = "";
-  let reasoning = "";
-  let thinkBox = null;
   // Keyed by call id, not a single "current card". A batch is announced in
   // full before any of it is awaited, so with one variable the first result
   // closed the last card and every other card stayed running for good. A
@@ -1307,33 +1670,28 @@ async function send(text) {
           gauge.window = event.context;
           showGauge();
         } else if (event.type === "thinking") {
-          reasoning += event.text;
-          // Only once there is something to show: a model that emits an empty
-          // <think></think> must not leave a blank box in the transcript.
-          if (reasoning.trim()) {
-            thinkBox = thinkBox ?? reasoningPane(body);
-            // The pane is collapsed by default, so the summary itself has to
-            // show that something is happening.
-            thinkBox.closest(".think").classList.add("streaming");
-            thinkBox.innerHTML = markdown(reasoning);
-            // Follow the reasoning as it arrives, but inside its own pane.
-            thinkBox.scrollTop = thinkBox.scrollHeight;
-            scrollToTail();
-          }
+          view.thinking(event.text);
+          scrollToTail();
         } else if (event.type === "answer") {
-          body.querySelector(".think")?.classList.remove("streaming");
-          answer += event.text;
-          answerEl.innerHTML = markdown(answer);
-          // Re-dressed on every token: the blocks are rebuilt by innerHTML,
-          // so the headers have to be put back with them.
-          dressCode(answerEl);
+          view.text(event.text);
+          view.cursor(true);
+          scrollToTail();
+        } else if (event.type === "agent_start") {
+          view.agentStart(event);
+          view.cursor(true);
+          el.stat.textContent = `@${event.name} is working`;
+          scrollToTail();
+        } else if (event.type === "agent_end") {
+          view.agentEnd(event);
+          view.cursor(true);
+          el.stat.textContent = "generating";
           scrollToTail();
         } else if (event.type === "tool_call_started") {
           // The model has committed to a call and is still writing it. For a
           // file that means generating the whole file first, and the stream
           // withholds every token of it — so without a card here the page
           // simply stops for a minute and looks disconnected.
-          pending = openToolCard(answerEl, { name: event.name, arguments: {} });
+          pending = view.card({ name: event.name, arguments: {} });
           scrollToTail();
         } else if (event.type === "permission") {
           // The arguments are known by now, so the card stops saying it is
@@ -1364,23 +1722,29 @@ async function send(text) {
           if (choice !== "deny" && choice !== "once") {
             // Worth recording in the transcript: these two change what
             // happens next time, and the card only describes this call.
-            noteConsent(answerEl, event, choice);
+            noteConsent(view.anchor(), event, choice);
           }
           scrollToTail();
         } else if (event.type === "tool_call") {
           // Reuse the card opened when the call was named, rather than
           // stacking a second one under it.
-          const card = pending ?? openToolCard(answerEl, event);
+          const card = pending ?? view.card(event);
           pending = null;
           fillToolCard(card, event);
           toolCards.set(event.id, card);
           scrollToTail();
         } else if (event.type === "tool_result") {
-          closeToolCard(toolCards.get(event.id), event);
-          toolCards.delete(event.id);
+          const card = toolCards.get(event.id);
+          if (card) {
+            closeToolCard(card, event);
+            toolCards.delete(event.id);
+          } else if (!event.ok) {
+            // A result with no card: a call refused without asking, or one
+            // an agent was not given. It still happened, so it gets a card.
+            closeToolCard(view.card({ name: event.name, arguments: {} }), event);
+          }
           scrollToTail();
         } else if (event.type === "done") {
-          body.querySelector(".think")?.classList.remove("streaming");
           const reused = event.reused ? ` · ${event.reused} reused` : "";
           el.stat.textContent =
             `${event.generated} tok · ${event.tokens_per_second.toFixed(1)}/s${reused}`;
@@ -1393,17 +1757,15 @@ async function send(text) {
             TokenLimit: "hit the maximum token limit for this reply",
             Cancelled: "stopped",
           }[event.stop];
-          if (why) {
-            answerEl.insertAdjacentHTML("beforeend", `<p class="note">${escapeHtml(why)}</p>`);
-          }
+          if (why) view.note(`<p class="note">${escapeHtml(why)}</p>`);
         } else if (event.type === "error") {
-          answerEl.insertAdjacentHTML("beforeend", `<p class="error">${escapeHtml(event.message)}</p>`);
+          view.note(`<p class="error">${escapeHtml(event.message)}</p>`);
         }
       }
     }
   } catch (e) {
     if (e.name !== "AbortError") {
-      answerEl.insertAdjacentHTML("beforeend", `<p class="error">${escapeHtml(e.message)}</p>`);
+      view.note(`<p class="error">${escapeHtml(e.message)}</p>`);
     }
   } finally {
     // Anything still marked running never got its result: the stream ended
@@ -1416,10 +1778,13 @@ async function send(text) {
     }
     toolCards.clear();
     pending = null;
+    // An agent cut off mid-run is marked as such rather than left pulsing.
+    if (view.agent) {
+      view.agentEnd({ ok: false, ms: 0, calls: view.agent.calls.length });
+    }
     // A question nobody will now answer must not keep the panel on screen.
     $("consent").hidden = true;
-    body.querySelector(".think")?.classList.remove("streaming");
-    answerEl.classList.remove("cursor");
+    view.settle();
     setStreaming(false);
     state.abort = null;
     loadConversations();
@@ -1620,6 +1985,150 @@ function showTab(name) {
   }
   for (const p of document.querySelectorAll(".panel")) {
     p.hidden = p.dataset.panel !== name;
+  }
+  // An agent is saved by its own button, so the footer's Save would be a
+  // second button that saves something else.
+  $("save-settings").hidden = name === "agents";
+  if (name === "agents") renderAgents();
+}
+
+// ---- agents ----
+
+const AGENT_ORIGIN = { builtin: "built in", user: "yours", override: "edited" };
+
+/// The list of agents, each opening the editor.
+async function renderAgents() {
+  const data = await loadAgents();
+  const list = $("ag-list");
+  list.replaceChildren();
+  for (const a of state.agents) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "ag-row";
+    row.innerHTML =
+      '<span class="ag-row-name"></span><span class="ag-row-origin"></span>' +
+      '<span class="ag-row-desc"></span><span class="ag-row-tools"></span>';
+    row.querySelector(".ag-row-name").textContent = `@${a.name}`;
+    row.querySelector(".ag-row-origin").textContent = AGENT_ORIGIN[a.origin] ?? a.origin;
+    row.querySelector(".ag-row-desc").textContent = a.description;
+    row.querySelector(".ag-row-tools").textContent = (a.tools ?? []).join(" · ") || "no tools";
+    row.addEventListener("click", () => editAgent(a));
+    list.append(row);
+  }
+  const errors = $("ag-load-errors");
+  errors.hidden = !data.errors?.length;
+  errors.textContent = (data.errors ?? []).join("\n");
+}
+
+/// Open the editor, empty for a new agent or filled from an existing one.
+async function editAgent(agent) {
+  const form = $("ag-form");
+  const tools = settingsCache.tools ?? (settingsCache.tools = await api("/api/tools"));
+  const isNew = !agent;
+  agent = agent ?? { name: "", description: "", instructions: "", tools: [], permissions: {} };
+  $("ag-form-title").textContent = isNew ? "New agent" : `@${agent.name}`;
+  $("ag-name").value = agent.name;
+  // The name is the file; renaming would be saving a second agent.
+  $("ag-name").readOnly = !isNew;
+  $("ag-description").value = agent.description ?? "";
+  $("ag-instructions").value = agent.instructions ?? "";
+  $("ag-rounds").value = agent.max_rounds ?? "";
+  $("ag-thinking").value = agent.thinking ?? "";
+  $("ag-temperature").value = agent.temperature ?? "";
+  $("ag-form-error").hidden = true;
+
+  // Every tool this server has, plus any the agent lists that it does not —
+  // an MCP server that is not running, say — so saving never drops one.
+  const names = tools.available.map((t) => t.name);
+  for (const t of agent.tools ?? []) if (!names.includes(t)) names.push(t);
+  const box = $("ag-tools");
+  box.replaceChildren();
+  for (const name of names) {
+    const info = tools.available.find((t) => t.name === name);
+    const row = document.createElement("div");
+    row.className = "ag-tool";
+    row.innerHTML =
+      '<label class="ag-tool-pick"><input type="checkbox"><span class="ag-tool-name"></span></label>' +
+      '<span class="ag-tool-desc"></span>' +
+      '<select class="select ag-tool-rule">' +
+        '<option value="">global rule</option><option value="allow">allow</option>' +
+        '<option value="ask">ask</option><option value="deny">deny</option>' +
+      '</select>';
+    row.dataset.tool = name;
+    row.querySelector("input").checked = (agent.tools ?? []).includes(name);
+    row.querySelector(".ag-tool-name").textContent = name;
+    row.querySelector(".ag-tool-desc").textContent =
+      info ? info.description.split("\n")[0] : "not available on this server right now";
+    const rule = row.querySelector(".ag-tool-rule");
+    rule.value = agent.permissions?.[name] ?? "";
+    const sync = () => { rule.disabled = !row.querySelector("input").checked; };
+    row.querySelector("input").addEventListener("change", sync);
+    sync();
+    box.append(row);
+  }
+
+  const del = $("ag-delete");
+  del.hidden = isNew || agent.origin === "builtin";
+  del.textContent = agent.origin === "override" ? "Restore built-in" : "Delete";
+  form.hidden = false;
+  $("ag-new").hidden = true;
+  form.scrollIntoView({ block: "nearest" });
+  (isNew ? $("ag-name") : $("ag-description")).focus();
+}
+
+function closeAgentForm() {
+  $("ag-form").hidden = true;
+  $("ag-new").hidden = false;
+}
+
+async function saveAgent(e) {
+  e.preventDefault();
+  const name = $("ag-name").value.trim();
+  const tools = [];
+  const permissions = {};
+  for (const row of $("ag-tools").querySelectorAll(".ag-tool")) {
+    if (!row.querySelector("input").checked) continue;
+    tools.push(row.dataset.tool);
+    const rule = row.querySelector(".ag-tool-rule").value;
+    if (rule) permissions[row.dataset.tool] = rule;
+  }
+  const body = {
+    description: $("ag-description").value.trim(),
+    instructions: $("ag-instructions").value,
+    tools,
+    permissions,
+  };
+  const rounds = $("ag-rounds").value;
+  if (rounds) body.max_rounds = Number(rounds);
+  if ($("ag-thinking").value) body.thinking = $("ag-thinking").value;
+  const temp = $("ag-temperature").value;
+  if (temp !== "") body.temperature = Number(temp);
+
+  const error = $("ag-form-error");
+  try {
+    await api(`/api/agents/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify(body) });
+    error.hidden = true;
+    closeAgentForm();
+    await renderAgents();
+    $("save-note").textContent = `saved @${name}`;
+  } catch (err) {
+    // The server says exactly what is wrong — a bad name, a missing
+    // description — and that is more use than a generic failure.
+    error.textContent = err.message;
+    error.hidden = false;
+  }
+}
+
+async function deleteAgent() {
+  const name = $("ag-name").value.trim();
+  try {
+    const out = await api(`/api/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+    closeAgentForm();
+    await renderAgents();
+    $("save-note").textContent = out.restored_builtin ? `@${name} restored` : `deleted @${name}`;
+  } catch (err) {
+    $("ag-form-error").textContent = err.message;
+    $("ag-form-error").hidden = false;
   }
 }
 
@@ -2047,6 +2556,8 @@ async function boot() {
   // script in the document head, before anything was painted.
   applyTheme(storedTheme());
   syncTools();
+  // Before the conversation is drawn, so its mentions are marked.
+  await loadAgents();
   await loadModels();
   await loadConversations();
   await openRoute();
@@ -2063,6 +2574,9 @@ $("composer").addEventListener("submit", (e) => {
 });
 
 el.input.addEventListener("keydown", (e) => {
+  // The @ panel has first claim on the arrows, Tab, Enter and Escape while
+  // it is open; otherwise Enter would send a half-typed name.
+  if (suggest.key(e)) return;
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     $("composer").requestSubmit();
@@ -2072,7 +2586,14 @@ el.input.addEventListener("keydown", (e) => {
 el.input.addEventListener("input", () => {
   el.input.style.height = "auto";
   el.input.style.height = `${el.input.scrollHeight}px`;
+  suggest.update();
 });
+// Moving the caret into or out of a mention opens or closes the panel.
+el.input.addEventListener("click", () => suggest.update());
+el.input.addEventListener("keyup", (e) => {
+  if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) suggest.update();
+});
+el.input.addEventListener("blur", () => suggest.close());
 
 // Aborting the fetch closes the connection; axum drops the SSE stream, the
 // relay task's send then fails, and dropping its end of the worker channel is
@@ -2208,6 +2729,10 @@ for (const tab of document.querySelectorAll(".tab")) {
 $("close-settings").addEventListener("click", () => $("settings").close());
 $("cancel-settings").addEventListener("click", () => $("settings").close());
 $("save-settings").addEventListener("click", saveSettings);
+$("ag-new").addEventListener("click", () => editAgent(null));
+$("ag-cancel").addEventListener("click", closeAgentForm);
+$("ag-delete").addEventListener("click", deleteAgent);
+$("ag-form").addEventListener("submit", saveAgent);
 $("search-provider").addEventListener("change", syncKeyRow);
 
 $("fact-add").addEventListener("submit", async (e) => {

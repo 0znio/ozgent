@@ -36,9 +36,26 @@ impl Editor {
         }
     }
 
-    #[allow(dead_code)] // how the editing tests read the field back
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Byte offset of the cursor.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replace `start..end` with `with` and put the cursor after it.
+    ///
+    /// How a suggestion is accepted: the partial `@sto` is swapped for the
+    /// whole name in one step, so a single undo-free edit cannot leave half
+    /// of each behind.
+    pub fn replace(&mut self, start: usize, end: usize, with: &str) {
+        let end = end.min(self.text.len());
+        let start = start.min(end);
+        self.text.replace_range(start..end, with);
+        self.cursor = start + with.len();
+        self.browsing = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -372,6 +389,19 @@ mod tests {
         let (lines, caret) = e.layout(40);
         assert_eq!(lines, [""]);
         assert_eq!((caret.row, caret.col), (0, 0));
+    }
+
+    #[test]
+    fn replacing_a_partial_word_leaves_the_cursor_after_the_replacement() {
+        let mut e = typed("ask @sto now");
+        // Cursor after "@sto".
+        for _ in 0..4 {
+            e.left();
+        }
+        let at = e.text().find('@').unwrap();
+        e.replace(at, e.cursor(), "@stock-guru ");
+        assert_eq!(e.text(), "ask @stock-guru  now");
+        assert_eq!(&e.text()[..e.cursor()], "ask @stock-guru ");
     }
 
     #[test]

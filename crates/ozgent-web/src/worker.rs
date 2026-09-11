@@ -64,6 +64,10 @@ pub struct Request {
     /// question. True for the web interface, false for the OpenAI API, where
     /// the caller is a program.
     pub can_ask: bool,
+    /// Agents the message called by name, in order. Empty for an ordinary
+    /// turn. When set, each runs in turn with its own instructions, tools and
+    /// rules, and their reports are the reply.
+    pub agents: Vec<ozgent_core::Agent>,
     pub out: UnboundedSender<Event>,
 }
 
@@ -131,6 +135,19 @@ pub enum Event {
         prompt_ms: u64,
     },
     Error { message: String },
+    /// An agent has taken over the turn. Everything until the matching
+    /// `AgentEnd` — reasoning, tool calls, the answer — is that agent's.
+    AgentStart {
+        name: String,
+        description: String,
+        /// The tools it was actually offered.
+        tools: Vec<String>,
+        /// Tools it lists that are not available here, so the transcript can
+        /// say why an agent answered without them.
+        missing: Vec<String>,
+    },
+    /// The agent finished. `ok` is false when it produced no report.
+    AgentEnd { name: String, ok: bool, ms: u64, calls: usize, rounds: usize },
 }
 
 /// Handle to the inference thread.
@@ -486,6 +503,7 @@ fn permit(
     spec: Option<&ozgent_core::ToolSpec>,
     call: &ozgent_core::ToolCall,
     request: &Request,
+    agent: Option<&ozgent_core::Agent>,
 ) -> Option<bool> {
     use ozgent_core::permission::Verdict;
     let config = &permissions.config;
@@ -497,7 +515,12 @@ fn permit(
     let verdict = {
         let policy = config.lock().unwrap_or_else(|e| e.into_inner());
         let grants = permissions.grants.lock().unwrap_or_else(|e| e.into_inner());
-        policy.permissions.verdict(&call.name, effect, &grants)
+        match agent {
+            // An agent's own rules sit on top of the policy; see
+            // `Agent::verdict` for the order they apply in.
+            Some(agent) => agent.verdict(&policy.permissions, &call.name, effect, &grants),
+            None => policy.permissions.verdict(&call.name, effect, &grants),
+        }
     };
     match verdict {
         Verdict::Allow { by_user } => return Some(by_user),
@@ -552,6 +575,11 @@ fn permit(
 /// Mirrors the terminal client's loop so a conversation behaves the same in
 /// both front ends. Bounded, because a model that keeps calling tools would
 /// otherwise never produce an answer.
+///
+/// A turn is either the model answering in its own voice, or one or more
+/// agents answering in theirs. Both run the same rounds; an agent differs in
+/// what it is told, which tools it is shown, what its rules are, and how many
+/// rounds it gets.
 fn turn(
     engine: &Engine,
     session: &mut ozgent_llama::engine::Session<'_>,
@@ -577,147 +605,13 @@ fn turn(
         _ => Vec::new(),
     };
 
-    let media_turn = !images.is_empty();
     // Read per turn, so switching the search provider or disabling a tool in
     // Settings reaches the very next message rather than the next restart.
     let tools = current_tools(tools);
-    let mut offered: Vec<ozgent_core::ToolSpec> = match &tools {
-        Some(t) if request.tools_enabled => match &request.native_tools {
-            None => t.host.tools().to_vec(),
-            Some(allowed) => {
-                // A name that matches nothing is a caller mistake worth
-                // reporting: silently dropping it would leave them believing a
-                // tool is available when the model was never told about it.
-                let available: Vec<&str> =
-                    t.host.tools().iter().map(|s| s.name.as_str()).collect();
-                if let Some(unknown) =
-                    allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str()))
-                {
-                    let _ = request.out.send(Event::Error {
-                        message: format!(
-                            "no built-in tool named {unknown:?}. Available: {}",
-                            available.join(", ")
-                        ),
-                    });
-                    return Ok(());
-                }
-                t.host
-                    .tools()
-                    .iter()
-                    .filter(|s| allowed.iter().any(|a| a == &s.name))
-                    .cloned()
-                    .collect()
-            }
-        },
-        _ => Vec::new(),
-    };
-    // Caller-supplied tools are additive: a request may use the server's
-    // Python tools, its own, or both. A name collision resolves in favour of
-    // the server's, because that is the one this process can actually run.
-    let server_names: std::collections::HashSet<String> =
-        offered.iter().map(|s| s.name.clone()).collect();
-    let client_owned: std::collections::HashSet<String> = request
-        .client_tools
-        .iter()
-        .map(|s| s.name.clone())
-        .filter(|n| !server_names.contains(n))
-        .collect();
-    for spec in &request.client_tools {
-        if client_owned.contains(&spec.name) {
-            offered.push(spec.clone());
-        }
-    }
-
-    // Constrain the body of a tool call the moment one starts, so a malformed
-    // call is unreachable rather than emitted and then rejected.
-    // Same reasoning as the terminal client: the gate's grammar is for the
-    // JSON body ozgent's preamble describes, so it is withheld from a model
-    // that was given its own format instead.
-    if engine.template_handles_tools() {
-        session.set_tools(&[]);
-    } else {
-        session.set_tools(&offered);
-    }
-
-    // The session outlives the request, so a grammar left installed by an
-    // earlier one would silently shape this reply. Cleared unconditionally
-    // before anything else decides to set it.
-    if let Err(e) = session.set_grammar(None) {
-        let _ = request.out.send(Event::Error { message: e.to_string() });
-        return Ok(());
-    }
-    if let Some(grammar) = &request.response_grammar {
-        if let Err(e) = session.set_grammar(Some(grammar)) {
-            let _ = request.out.send(Event::Error {
-                message: format!("response_format produced a grammar the model rejected: {e}"),
-            });
-            return Ok(());
-        }
-    }
-
-    let mut messages = request.messages.clone();
-    if !images.is_empty() {
-        // Joined to the system prompt rather than replacing it, so a user's
-        // persona survives.
-        match messages.first_mut() {
-            Some(m) if m.role == ozgent_core::Role::System => {
-                let existing = m.text_content();
-                *m = Message::system(format!("{existing}\n\n{}", ozgent_tools::MEDIA_RULE));
-            }
-            _ => messages.insert(0, Message::system(ozgent_tools::MEDIA_RULE)),
-        }
-    }
-    if let (Some(p), false) = (projector, images.is_empty()) {
-        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == ozgent_core::Role::User) {
-            let text = ozgent_llama::mtmd::with_markers(p.marker(), &last.text_content(), images.len());
-            *last = Message::user(text);
-        }
-    }
     // A template with its own tools block tells the model the call format it
     // was trained on; ozgent's generic description would be a second one, in
     // a different syntax, and the model splits the difference.
     let native_tools = engine.template_handles_tools();
-
-    if !offered.is_empty() && !native_tools {
-        // The tool description joins the system prompt rather than replacing
-        // it, so a user-set persona survives.
-        let preamble = ozgent_tools::tool_preamble(&offered);
-        match messages.first_mut() {
-            Some(m) if m.role == ozgent_core::Role::System => {
-                let existing = m.text_content();
-                *m = Message::system(format!("{existing}\n\n{preamble}"));
-            }
-            _ => messages.insert(0, Message::system(preamble)),
-        }
-    }
-
-    if media_turn {
-        if let Some(observation) = ground(engine, session, &messages, media_for(projector, &images), request) {
-            // The observation alone was not enough: the model read the image
-            // correctly, then searched anyway. Naming the *only* reason a tool
-            // is still warranted turns "should I search?" from an open question
-            // into a test it can apply.
-            let note = format!(
-                "You have already looked at the attached media. This is what is \
-                 actually in it:\n{observation}\n\nAnswer the user from that \
-                 observation. It is a complete and accurate record of the media, \
-                 so questions about what the media contains, shows, or looks like \
-                 are already answered — do not use a tool for them, and do not ask \
-                 the user to describe it.\n\nUse a tool only if the user asked for \
-                 something the media cannot contain: a current price, recent news, \
-                 today's weather, or another fact from the outside world."
-            );
-            match messages.first_mut() {
-                Some(m) if m.role == ozgent_core::Role::System => {
-                    let existing = m.text_content();
-                    *m = Message::system(format!("{existing}\n\n{note}"));
-                }
-                _ => messages.insert(0, Message::system(note)),
-            }
-            let _ = &observation;
-        }
-    }
-
 
     // Ground the model in the picture before it is allowed to act on it.
     //
@@ -737,22 +631,344 @@ fn turn(
     // from an accurate reading of the image rather than a guess at it. This is
     // the grounding-before-response pattern the vision-language literature
     // settles on for the same failure.
-    let max_rounds = MAX_TOOL_ROUNDS;
-    let mut generated = 0u32;
-    let mut prompt_tokens = 0u32;
-    let mut elapsed_ms = 0u128;
-    let mut prompt_ms = 0u128;
-    let mut reused = 0usize;
-    let mut stop = StopReason::EndOfText;
-    // The turn ended because the caller has a tool to run, which is a
-    // different thing from the model choosing to stop.
-    let mut handed_back = false;
+    let observation = if images.is_empty() {
+        None
+    } else {
+        ground(engine, session, &request.messages, media_for(projector, &images), request)
+    };
+
+    let mut totals = Outcome::default();
+    if request.agents.is_empty() {
+        let Some(offered) = offer(tools.as_ref(), request) else { return Ok(()) };
+        // Caller-supplied tools are additive: a request may use the server's
+        // Python tools, its own, or both. A name collision resolves in favour
+        // of the server's, because that is the one this process can actually
+        // run.
+        let server_names: std::collections::HashSet<String> =
+            offered.iter().map(|s| s.name.clone()).collect();
+        let client_owned: std::collections::HashSet<String> = request
+            .client_tools
+            .iter()
+            .map(|s| s.name.clone())
+            .filter(|n| !server_names.contains(n))
+            .collect();
+        let mut offered = offered;
+        for spec in &request.client_tools {
+            if client_owned.contains(&spec.name) {
+                offered.push(spec.clone());
+            }
+        }
+
+        let mut messages = request.messages.clone();
+        prepare(&mut messages, &offered, native_tools, projector, &images, observation.as_deref());
+        if !install(engine, session, &offered, request.response_grammar.as_deref(), request) {
+            return Ok(());
+        }
+        totals = rounds(
+            engine, session, resolved, thinking, tools.as_ref(), permissions, projector, &images,
+            request, messages, &offered, &client_owned, MAX_TOOL_ROUNDS, None,
+        )?;
+    } else {
+        // What each agent may be shown. A channel's allowlist narrows agents
+        // too: consent arriving over a chat is consent from whoever holds that
+        // account, and an agent is not a way round the list.
+        let available: Vec<ozgent_core::ToolSpec> = tools
+            .as_ref()
+            .map(|t| t.host.tools().to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| request.native_tools.as_ref().is_none_or(|list| list.contains(&s.name)))
+            .collect();
+        let date = snapshot(&permissions.config)
+            .ui
+            .date_awareness
+            .then(|| ozgent_core::DateTime::now().prompt_line());
+
+        // Each agent sees the conversation as it stood, plus the reports of
+        // any agent that ran before it in this message.
+        let mut conversation = request.messages.clone();
+        for (index, agent) in request.agents.iter().enumerate() {
+            let (offered, missing) = agent.offer(&available);
+            let _ = request.out.send(Event::AgentStart {
+                name: agent.name.clone(),
+                description: agent.definition.description.clone(),
+                tools: offered.iter().map(|s| s.name.clone()).collect(),
+                missing: missing.clone(),
+            });
+
+            // Sampling is the agent's where it says, the turn's otherwise.
+            let mut tuned = resolved.clone();
+            if let Some(t) = agent.definition.temperature {
+                tuned.temperature = t;
+            }
+            if let Some(m) = agent.definition.max_tokens {
+                tuned.max_tokens = m;
+            }
+            session.set_options(&tuned);
+            if !install(engine, session, &offered, None, request) {
+                break;
+            }
+
+            let mut messages = conversation.clone();
+            let system = agent.system_prompt(date.as_deref(), &missing);
+            // The agent's instructions replace the chat's system prompt rather
+            // than joining it: a persona written for the chat, or a client's
+            // description of tools the agent does not have, would contradict
+            // the job it was called to do.
+            messages.retain(|m| m.role != ozgent_core::Role::System);
+            messages.insert(0, Message::system(system));
+            // Images belong to the first agent: they are evaluated into the
+            // cache once, with that agent's prompt around them.
+            let (media_images, media_note) = if index == 0 {
+                (&images[..], observation.as_deref())
+            } else {
+                (&[][..], None)
+            };
+            prepare(&mut messages, &offered, native_tools, projector, media_images, media_note);
+
+            let started = std::time::Instant::now();
+            let outcome = rounds(
+                engine,
+                session,
+                &tuned,
+                agent.definition.thinking.unwrap_or(thinking),
+                tools.as_ref(),
+                permissions,
+                projector,
+                media_images,
+                request,
+                messages,
+                &offered,
+                &Default::default(),
+                agent.definition.rounds(),
+                Some(agent),
+            )?;
+            let _ = request.out.send(Event::AgentEnd {
+                name: agent.name.clone(),
+                ok: !outcome.text.trim().is_empty(),
+                ms: started.elapsed().as_millis() as u64,
+                calls: outcome.calls,
+                rounds: outcome.rounds,
+            });
+            conversation.push(Message::assistant(outcome.text.clone()));
+            totals.absorb(outcome);
+            if request.out.is_closed() {
+                break;
+            }
+        }
+        // The next request on this session must not inherit the last agent's
+        // temperature.
+        session.set_options(resolved);
+    }
+
+    if request.response_grammar.is_some() {
+        let _ = session.set_grammar(None);
+    }
+
+    let seconds = totals.elapsed_ms as f64 / 1000.0;
+    let _ = request.out.send(Event::Done {
+        generated: totals.generated,
+        tokens_per_second: if seconds > 0.0 { totals.generated as f64 / seconds } else { 0.0 },
+        reused: totals.reused,
+        stop: if totals.handed_back { "ToolCalls".to_string() } else { format!("{:?}", totals.stop) },
+        prompt: totals.prompt_tokens,
+        prompt_ms: totals.prompt_ms as u64,
+    });
+    Ok(())
+}
+
+/// The built-in tools a plain turn offers, or `None` after reporting that the
+/// request named one that does not exist.
+fn offer(tools: Option<&Tools>, request: &Request) -> Option<Vec<ozgent_core::ToolSpec>> {
+    let Some(t) = tools.filter(|_| request.tools_enabled) else { return Some(Vec::new()) };
+    let Some(allowed) = &request.native_tools else { return Some(t.host.tools().to_vec()) };
+    // A name that matches nothing is a caller mistake worth reporting:
+    // silently dropping it would leave them believing a tool is available
+    // when the model was never told about it.
+    let available: Vec<&str> = t.host.tools().iter().map(|s| s.name.as_str()).collect();
+    if let Some(unknown) = allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str())) {
+        let _ = request.out.send(Event::Error {
+            message: format!(
+                "no built-in tool named {unknown:?}. Available: {}",
+                available.join(", ")
+            ),
+        });
+        return None;
+    }
+    Some(t.host.tools().iter().filter(|s| allowed.iter().any(|a| a == &s.name)).cloned().collect())
+}
+
+/// Put the tools and the grammar for this run on the session.
+///
+/// Returns false after reporting a grammar the model rejected.
+fn install(
+    engine: &Engine,
+    session: &mut ozgent_llama::engine::Session<'_>,
+    offered: &[ozgent_core::ToolSpec],
+    grammar: Option<&str>,
+    request: &Request,
+) -> bool {
+    // Constrain the body of a tool call the moment one starts, so a malformed
+    // call is unreachable rather than emitted and then rejected.
+    // Same reasoning as the terminal client: the gate's grammar is for the
+    // JSON body ozgent's preamble describes, so it is withheld from a model
+    // that was given its own format instead.
+    if engine.template_handles_tools() {
+        session.set_tools(&[]);
+    } else {
+        session.set_tools(offered);
+    }
+    // The session outlives the request, so a grammar left installed by an
+    // earlier one would silently shape this reply. Cleared unconditionally
+    // before anything else decides to set it.
+    if let Err(e) = session.set_grammar(None) {
+        let _ = request.out.send(Event::Error { message: e.to_string() });
+        return false;
+    }
+    if let Some(grammar) = grammar {
+        if let Err(e) = session.set_grammar(Some(grammar)) {
+            let _ = request.out.send(Event::Error {
+                message: format!("response_format produced a grammar the model rejected: {e}"),
+            });
+            return false;
+        }
+    }
+    true
+}
+
+/// Join what this run needs to the system prompt, and mark the images.
+///
+/// Everything is appended to the existing system message rather than
+/// replacing it, so a user's persona — or an agent's instructions — survive.
+fn prepare(
+    messages: &mut Vec<Message>,
+    offered: &[ozgent_core::ToolSpec],
+    native_tools: bool,
+    projector: Option<&LoadedProjector<'_>>,
+    images: &[ozgent_llama::mtmd::Media],
+    observation: Option<&str>,
+) {
+    let append = |messages: &mut Vec<Message>, text: &str| match messages.first_mut() {
+        Some(m) if m.role == ozgent_core::Role::System => {
+            let existing = m.text_content();
+            *m = Message::system(format!("{existing}\n\n{text}"));
+        }
+        _ => messages.insert(0, Message::system(text)),
+    };
+    if !images.is_empty() {
+        append(messages, ozgent_tools::MEDIA_RULE);
+    }
+    if let (Some(p), false) = (projector, images.is_empty()) {
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == ozgent_core::Role::User) {
+            let text = ozgent_llama::mtmd::with_markers(p.marker(), &last.text_content(), images.len());
+            *last = Message::user(text);
+        }
+    }
+    if !offered.is_empty() && !native_tools {
+        append(messages, &ozgent_tools::tool_preamble(offered));
+    }
+    if let Some(observation) = observation {
+        // The observation alone was not enough: the model read the image
+        // correctly, then searched anyway. Naming the *only* reason a tool is
+        // still warranted turns "should I search?" from an open question into
+        // a test it can apply. Appended after the tool preamble, which would
+        // otherwise be the last thing read.
+        let note = format!(
+            "You have already looked at the attached media. This is what is \
+             actually in it:\n{observation}\n\nAnswer the user from that \
+             observation. It is a complete and accurate record of the media, \
+             so questions about what the media contains, shows, or looks like \
+             are already answered — do not use a tool for them, and do not ask \
+             the user to describe it.\n\nUse a tool only if the user asked for \
+             something the media cannot contain: a current price, recent news, \
+             today's weather, or another fact from the outside world."
+        );
+        append(messages, &note);
+    }
+}
+
+/// What one run of rounds produced, and what it cost.
+struct Outcome {
+    /// The visible reply of the last round.
+    text: String,
+    generated: u32,
+    prompt_tokens: u32,
+    elapsed_ms: u128,
+    prompt_ms: u128,
+    reused: usize,
+    stop: StopReason,
+    /// The turn ended because the caller has a tool to run, which is a
+    /// different thing from the model choosing to stop.
+    handed_back: bool,
+    /// Tool calls that actually ran.
+    calls: usize,
+    rounds: usize,
+}
+
+impl Default for Outcome {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            generated: 0,
+            prompt_tokens: 0,
+            elapsed_ms: 0,
+            prompt_ms: 0,
+            reused: 0,
+            stop: StopReason::EndOfText,
+            handed_back: false,
+            calls: 0,
+            rounds: 0,
+        }
+    }
+}
+
+impl Outcome {
+    fn absorb(&mut self, other: Outcome) {
+        self.generated += other.generated;
+        self.prompt_tokens += other.prompt_tokens;
+        self.elapsed_ms += other.elapsed_ms;
+        self.prompt_ms += other.prompt_ms;
+        self.reused += other.reused;
+        self.stop = other.stop;
+        self.handed_back |= other.handed_back;
+        self.calls += other.calls;
+        self.rounds += other.rounds;
+        self.text = other.text;
+    }
+}
+
+/// Generate, run the tools asked for, and generate again, until the model
+/// answers or its rounds run out.
+#[allow(clippy::too_many_arguments)]
+fn rounds(
+    engine: &Engine,
+    session: &mut ozgent_llama::engine::Session<'_>,
+    resolved: &ozgent_core::options::Resolved,
+    thinking: ThinkingMode,
+    tools: Option<&Tools>,
+    permissions: &Permissions,
+    projector: Option<&LoadedProjector<'_>>,
+    images: &[ozgent_llama::mtmd::Media],
+    request: &Request,
+    mut messages: Vec<Message>,
+    offered: &[ozgent_core::ToolSpec],
+    client_owned: &std::collections::HashSet<String>,
+    max_rounds: usize,
+    agent: Option<&ozgent_core::Agent>,
+) -> anyhow::Result<Outcome> {
+    let native_tools = engine.template_handles_tools();
+    let mut out = Outcome::default();
     // One retry only, so a model that answers with silence twice cannot spin.
     let mut nudged = false;
-    // Counts every call made in this turn, so no two share an id.
+    // Counts every call made in this run, so no two share an id.
     let mut next_call_id = 0usize;
+    // Ids are prefixed per agent: two agents in one message each number from
+    // zero, and the transcript pairs results with cards by id.
+    let id_prefix = agent.map(|a| format!("{}_", a.name)).unwrap_or_default();
+    let offered_names: Vec<String> = offered.iter().map(|s| s.name.clone()).collect();
 
     for round in 0..=max_rounds {
+        out.rounds = round + 1;
         let last = round == max_rounds || offered.is_empty();
         // Out of rounds, with tools still on the table. Left there, the model
         // spends this turn on one more call, and the visible text before that
@@ -763,20 +979,23 @@ fn turn(
             messages.push(Message::system(OUT_OF_ROUNDS));
         }
         let media = (round == 0 && !images.is_empty())
-            .then(|| projector.map(|p| (p, &images[..], &request.images[..])))
+            .then(|| projector.map(|p| (p, images, &request.images[..])))
             .flatten();
+        // The tools stay in the rendered prompt even on the last round: taking
+        // them out changes the system block, and the whole conversation would
+        // be read again from the top. The instruction to answer does the job.
         let (reply, stats, reason, early) = generate(
-            engine, session, resolved, thinking, &messages, media, request, &offered, permissions,
+            engine, session, resolved, thinking, &messages, media, request, offered, permissions, agent,
         )?;
         // A turn can span several generations; the client is told once, at the
         // end, with the totals. Sending `Done` per round ended the SSE stream
         // before the first tool had even run.
-        generated += stats.generated_tokens as u32;
-        prompt_tokens += stats.prompt_tokens as u32;
-        elapsed_ms += stats.generation_ms;
-        prompt_ms += stats.prompt_ms;
-        reused += stats.reused_tokens;
-        stop = reason;
+        out.generated += stats.generated_tokens as u32;
+        out.prompt_tokens += stats.prompt_tokens as u32;
+        out.elapsed_ms += stats.generation_ms;
+        out.prompt_ms += stats.prompt_ms;
+        out.reused += stats.reused_tokens;
+        out.stop = reason;
 
         let mut parsed = ozgent_llama::extract_tool_calls(&reply);
         // The parser numbers calls from zero each time it runs, so round two
@@ -784,9 +1003,10 @@ fn turn(
         // client pairs a result with the card that asked for it, and how the
         // conversation pairs a result with its call.
         for call in parsed.calls.iter_mut() {
-            call.id = format!("call_{next_call_id}");
+            call.id = format!("{id_prefix}call_{next_call_id}");
             next_call_id += 1;
         }
+        out.text = parsed.text.clone();
         tracing::debug!(calls = parsed.calls.len(), "tool round {round}");
 
         // Reasoning, then nothing. A model can close its thought and stop
@@ -848,31 +1068,50 @@ fn turn(
                     arguments: call.arguments.clone(),
                 });
             }
-            handed_back = true;
+            out.handed_back = true;
             break;
         }
 
-        let Some(t) = tools.as_ref() else { break };
+        // A call to a tool this run was not offered is answered without
+        // running anything. The host has the tool — it simply was not on the
+        // table — and running it anyway would make an agent's list, or a
+        // channel's allowlist, a suggestion rather than a limit.
+        let reachable: Vec<bool> =
+            parsed.calls.iter().map(|c| offered_names.contains(&c.name)).collect();
+
+        // Nothing can run without a host. The calls still get results, so the
+        // conversation stays well formed and the model learns why.
+        let Some(t) = tools else {
+            for call in &parsed.calls {
+                let err = ozgent_tools::ToolCallError::NotOffered {
+                    name: call.name.clone(),
+                    offered: Vec::new(),
+                };
+                record(request, session, &mut messages, call, Err(err), 0);
+            }
+            continue;
+        };
 
         // Independent calls run together. In series, a turn asking for three
         // searches paid three network round trips end to end, and the tool
         // timeout applied to each in turn rather than to the set.
         //
-        // Every call is announced before any is awaited, so the transcript
-        // shows the whole batch as pending rather than appearing to work
-        // through them one at a time.
         // Permission first, one question at a time. Asking about a batch all
         // at once would put four modal cards on the page and make the user
         // answer them in whatever order they happened to be announced; asking
         // in the model's own order means the first refusal is about the first
         // call, which is the one the user is reading.
         let mut approved: Vec<Option<bool>> = Vec::with_capacity(parsed.calls.len());
-        for call in &parsed.calls {
+        for (call, reachable) in parsed.calls.iter().zip(&reachable) {
+            if !reachable {
+                approved.push(None);
+                continue;
+            }
             // Already answered while the call was still being written. Asking
             // again would make the early prompt look like it did nothing.
             match early.as_ref().filter(|(name, _)| *name == call.name) {
                 Some((_, allowed)) => approved.push(allowed.then_some(true)),
-                None => approved.push(permit(permissions, t.host.get(&call.name), call, request)),
+                None => approved.push(permit(permissions, t.host.get(&call.name), call, request, agent)),
             }
         }
 
@@ -887,15 +1126,28 @@ fn turn(
                 });
             }
         }
+        out.calls += approved.iter().filter(|a| a.is_some()).count();
         let outcomes = t.runtime.block_on(futures_util::future::join_all(
-            parsed.calls.iter().zip(&approved).map(|(call, allowed)| async {
-                let Some(by_user) = *allowed else {
-                    return (Err(ozgent_tools::ToolCallError::Declined { name: call.name.clone() }), 0);
-                };
-                let started = std::time::Instant::now();
-                let outcome =
-                    t.host.call_approved(&call.name, call.arguments.clone(), by_user).await;
-                (outcome, started.elapsed().as_millis() as u64)
+            parsed.calls.iter().zip(&approved).zip(&reachable).map(|((call, allowed), reachable)| {
+                let offered_names = offered_names.clone();
+                async move {
+                    if !reachable {
+                        return (
+                            Err(ozgent_tools::ToolCallError::NotOffered {
+                                name: call.name.clone(),
+                                offered: offered_names,
+                            }),
+                            0,
+                        );
+                    }
+                    let Some(by_user) = *allowed else {
+                        return (Err(ozgent_tools::ToolCallError::Declined { name: call.name.clone() }), 0);
+                    };
+                    let started = std::time::Instant::now();
+                    let outcome =
+                        t.host.call_approved(&call.name, call.arguments.clone(), by_user).await;
+                    (outcome, started.elapsed().as_millis() as u64)
+                }
             }),
         ));
 
@@ -903,55 +1155,53 @@ fn turn(
         // results become the next prompt, so letting a race decide their order
         // would make the same turn produce different continuations.
         for (call, (outcome, ms)) in parsed.calls.iter().zip(outcomes) {
-            let (ok, summary, detail, payload) = match outcome {
-                Ok(value) => {
-                    let text = serde_json::to_string(&value).unwrap_or_default();
-                    (true, summarise(&value), value, text)
-                }
-                // A tool failure is information the model can act on, not an
-                // error for the user: it is fed back so the model can retry or
-                // explain, exactly as the terminal client does.
-                Err(e) => {
-                    let text = e.for_model();
-                    let summary = ozgent_tools::first_line(&text).to_string();
-                    (false, summary, serde_json::json!({ "error": text.clone() }), text)
-                }
-            };
-            let _ = request.out.send(Event::ToolResult {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                ok,
-                summary,
-                ms,
-                detail,
-            });
-            // A search asked for 20 results can return more text than the whole
-            // context window holds. Unbounded, it crowds out the room the model
-            // needs to answer and the reply stops mid-sentence — which reads
-            // like a crash but is simply no space left.
-            // The window the session actually opened, not the one that was
-            // asked for: a request for more context than memory holds is
-            // granted at a smaller size, and budgeting against the request
-            // would size tool results to a window that does not exist.
-            let budget = fit_budget(session.n_ctx());
-            messages.push(Message::tool_result(call.id.clone(), fit(&payload, budget)));
+            record(request, session, &mut messages, call, outcome, ms);
         }
     }
+    Ok(out)
+}
 
-    if request.response_grammar.is_some() {
-        let _ = session.set_grammar(None);
-    }
-
-    let seconds = elapsed_ms as f64 / 1000.0;
-    let _ = request.out.send(Event::Done {
-        generated,
-        tokens_per_second: if seconds > 0.0 { generated as f64 / seconds } else { 0.0 },
-        reused,
-        stop: if handed_back { "ToolCalls".to_string() } else { format!("{stop:?}") },
-        prompt: prompt_tokens,
-        prompt_ms: prompt_ms as u64,
+/// Report one call's result to the client and hand it back to the model.
+fn record(
+    request: &Request,
+    session: &ozgent_llama::engine::Session<'_>,
+    messages: &mut Vec<Message>,
+    call: &ozgent_core::ToolCall,
+    outcome: Result<serde_json::Value, ozgent_tools::ToolCallError>,
+    ms: u64,
+) {
+    let (ok, summary, detail, payload) = match outcome {
+        Ok(value) => {
+            let text = serde_json::to_string(&value).unwrap_or_default();
+            (true, summarise(&value), value, text)
+        }
+        // A tool failure is information the model can act on, not an error
+        // for the user: it is fed back so the model can retry or explain,
+        // exactly as the terminal client does.
+        Err(e) => {
+            let text = e.for_model();
+            let summary = ozgent_tools::first_line(&text).to_string();
+            (false, summary, serde_json::json!({ "error": text.clone() }), text)
+        }
+    };
+    let _ = request.out.send(Event::ToolResult {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        ok,
+        summary,
+        ms,
+        detail,
     });
-    Ok(())
+    // A search asked for 20 results can return more text than the whole
+    // context window holds. Unbounded, it crowds out the room the model needs
+    // to answer and the reply stops mid-sentence — which reads like a crash
+    // but is simply no space left.
+    // The window the session actually opened, not the one that was asked for:
+    // a request for more context than memory holds is granted at a smaller
+    // size, and budgeting against the request would size tool results to a
+    // window that does not exist.
+    let budget = fit_budget(session.n_ctx());
+    messages.push(Message::tool_result(call.id.clone(), fit(&payload, budget)));
 }
 
 /// Tokens a call is given to finish its arguments before it is asked about.
@@ -984,7 +1234,7 @@ say so plainly and say what is missing.";
 /// The instruction to admit a shortfall is deliberate. A model told only to
 /// answer will invent the part it never managed to look up, which is worse
 /// than the loop running out.
-const OUT_OF_ROUNDS: &str = "\
+pub const OUT_OF_ROUNDS: &str = "\
 You have no tool calls left. Answer now, using only what the tool results \
 above actually contain. If they did not give you enough, say what you found \
 and what is still missing — do not fill the gap with a guess.";
@@ -1067,6 +1317,9 @@ fn ground(
 /// whether the call did what they wanted. Falls back to a trimmed first line
 /// for tools whose output has no shape worth naming.
 fn summarise(value: &serde_json::Value) -> String {
+    if let Some(known) = ozgent_tools::summary::describe(value) {
+        return known;
+    }
     if let Some(results) = value.get("results").and_then(|r| r.as_array()) {
         let mut out = format!(
             "{} result{}",
@@ -1158,6 +1411,7 @@ fn generate(
     request: &Request,
     tools: &[ozgent_core::ToolSpec],
     permissions: &Permissions,
+    agent: Option<&ozgent_core::Agent>,
 ) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason, Option<(String, bool)>)> {
     let prompt =
         engine.render_prompt_full(messages, thinking, resolved.reasoning_effort, tools)?;
@@ -1252,7 +1506,14 @@ fn generate(
                     arguments: serde_json::Value::Object(arguments),
                 };
                 let spec = tools.iter().find(|t| t.name == name);
-                match permit(permissions, spec, &call, request) {
+                // A call to something this run was not offered is not asked
+                // about: there is nothing to allow. Generation stops, and the
+                // round reports it as unavailable.
+                let verdict = match spec {
+                    Some(_) => permit(permissions, spec, &call, request, agent),
+                    None => None,
+                };
+                match verdict {
                     Some(_) => early = Some((name, true)),
                     None => {
                         early = Some((name, false));
@@ -1472,6 +1733,7 @@ mod tests {
             response_grammar: None,
             overrides: None,
             images: Vec::new(),
+            agents: Vec::new(),
             out,
         });
         assert!(result.is_err());

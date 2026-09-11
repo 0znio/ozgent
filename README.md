@@ -11,7 +11,7 @@ prompt before anything touches your disk.
 ```bash
 ozgent                    # chat in the terminal
 ozgent web                # chat in a browser
-ozgent serve              # OpenAI-compatible API on :7337
+ozgent serve              # OpenAI- and Anthropic-compatible API on :7337
 ozgent gateway            # answer messages on Telegram and WhatsApp
 ```
 
@@ -23,12 +23,13 @@ They run models. ozgent runs models **and does the work around them**.
 
 |  | ozgent | Ollama | LM Studio |
 |---|---|---|---|
-| Runs tools for you | built in — search, fetch, files, shell | you write the client | you wire it up |
+| Runs tools for you | built in — search, fetch, files, shell, markets, Reddit | you write the client | you wire it up |
+| Agents you call with `@name` | yes, with their own tools | — | — |
 | **Asks before writing or running** | yes, before the content is even generated | — | — |
 | MCP servers | yes | — | yes |
 | Full-screen terminal UI | yes | plain prompt | — |
 | Web interface | built in | desktop app | desktop app |
-| OpenAI-compatible API | yes | yes | yes |
+| OpenAI-compatible API | yes, and Anthropic-compatible | yes | yes |
 | Chat from your phone | Telegram, WhatsApp | — | — |
 | Remembers across chats | facts + retrieval | — | — |
 | Context sized to your VRAM | worked out for you, and reported | set by hand | set by hand |
@@ -110,9 +111,9 @@ bar showing the model, context used, and tokens/sec.
 
 ### Tools that run, with a prompt first
 
-Seven built in: fetch a page, read and write files, list directories, run a
-command, search the web (needs a provider key), and an example to copy. The
-model decides; you approve.
+Eight built in: fetch a page, read and write files, list directories, run a
+command, search the web, live market data, and read Reddit. The model
+decides; you approve.
 
 ```
 ✎ write_file  haiku.txt   1 yes · 2 session · 3 always · 4 no
@@ -139,6 +140,21 @@ The signature becomes the schema the model is shown — there is no manifest to
 keep in sync.
 
 → [docs/tools.md](docs/tools.md)
+
+### Agents
+
+Write `@name` and the message goes to an agent: its own instructions, **only
+its own tools**, and its work shown right where it ran.
+
+```
+@stock-guru how is NVDA doing after earnings?
+@deep-researcher what changed in the EU AI Act this year?
+@sentiment-analyser what does Reddit think of the new Pixel?
+```
+
+Type `@` for the list. Make your own in Settings → Agents, or
+`ozgent agent new <name>`.
+→ [docs/agents.md](docs/agents.md)
 
 ### MCP servers
 
@@ -176,15 +192,20 @@ Conversations live in SQLite and are shared by every surface — start in the
 terminal, continue in the browser, pick it up on your phone. Facts worth
 keeping are retrieved into later chats.
 
-### An OpenAI-compatible API
+### An OpenAI- and Anthropic-compatible API
 
 ```bash
 ozgent serve
 curl http://127.0.0.1:7337/v1/chat/completions \
   -d '{"model":"Qwen3-4B:Q4_K_M","messages":[{"role":"user","content":"hi"}]}'
+curl http://127.0.0.1:7337/v1/messages \
+  -d '{"model":"Qwen3-4B:Q4_K_M","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Streaming, tool calls, reasoning and embeddings all work.
+Point any OpenAI or Anthropic client at `http://127.0.0.1:7337/v1`. Streaming,
+tool calls, reasoning and embeddings all work, and so do agents — `@name` in a
+message, or picked as the model. `ozgent web` serves the same API on its own
+port, over the model it already has loaded.
 → [docs/api.md](docs/api.md)
 
 ### Context sized to your hardware
@@ -209,6 +230,7 @@ ozgent web --inference-mode gpu_ram
 |---|---|
 | [settings.md](docs/settings.md) | every option, and where to set it |
 | [tools.md](docs/tools.md) | the built-in tools and the permission rules |
+| [agents.md](docs/agents.md) | `@agents`: the built-in ones and making your own |
 | [mcp.md](docs/mcp.md) | connecting MCP servers |
 | [channels.md](docs/channels.md) | Telegram and WhatsApp |
 | [api.md](docs/api.md) | the HTTP API, endpoint by endpoint |

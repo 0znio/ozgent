@@ -156,10 +156,21 @@ pub enum Command {
         command: ChannelCommand,
     },
 
-    /// Serve an OpenAI-compatible HTTP API.
+    /// List, show, create and edit agents.
     ///
-    /// Point any OpenAI client at it: set the base URL and use any model name
-    /// `ozgent list` shows. Tools, streaming and reasoning all work.
+    /// An agent is a named job with its own instructions and its own tools.
+    /// Write `@name` in a message — terminal, browser, API or chat app — to
+    /// hand that message to it.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+
+    /// Serve an OpenAI- and Anthropic-compatible HTTP API.
+    ///
+    /// Point any OpenAI or Anthropic client at it: set the base URL to
+    /// http://host:port/v1 and use any model name `ozgent list` shows, or an
+    /// agent as `@name`. Tools, streaming and reasoning all work.
     Serve {
         #[arg(long, default_value_t = 7337)]
         port: u16,
@@ -322,6 +333,31 @@ pub enum Command {
         #[arg(long)]
         path: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Every agent, built in and yours.
+    #[command(alias = "ls")]
+    List,
+    /// One agent in full: its tools, rules and instructions.
+    Show { name: String },
+    /// Create an agent from a template and open it in $EDITOR.
+    ///
+    ///   ozgent agent new news-digest
+    ///   ozgent agent new my-guru --from stock-guru
+    New {
+        name: String,
+        /// Start from a copy of this agent instead of the template.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Open an agent in $EDITOR. A built-in one is copied to your agents
+    /// folder first, and the copy is what you edit.
+    Edit { name: String },
+    /// Delete one of your agents. Deleting an edited built-in restores it.
+    #[command(alias = "remove", alias = "delete")]
+    Rm { name: String },
 }
 
 #[derive(Debug, Subcommand)]

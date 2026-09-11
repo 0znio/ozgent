@@ -68,7 +68,22 @@ pub struct Ui {
     /// Whether `prompt` is also doing the line editing, which it is only when
     /// there is no screen.
     piped: bool,
+    /// Drawn down the left of everything written while it is set: an agent's
+    /// work, framed so it reads as one place in the conversation.
+    gutter: Option<String>,
+    /// Every agent, for the `@` panel.
+    agents: ozgent_core::AgentCatalog,
+    /// The highlighted row of the `@` panel, and where the mention it is
+    /// completing starts.
+    pick: usize,
+    pick_start: Option<usize>,
+    /// A mention the panel was dismissed for with Escape, by where it starts,
+    /// so it stays closed while that mention is being typed.
+    dismissed: Option<usize>,
 }
+
+/// Most agents the `@` panel lists at once.
+const PANEL_ROWS: usize = 6;
 
 /// A permission question, as the bar shows it.
 struct Question {
@@ -101,6 +116,110 @@ impl Ui {
             piped: screen.is_none(),
             prompt,
             screen,
+            gutter: None,
+            agents: Default::default(),
+            pick: 0,
+            pick_start: None,
+            dismissed: None,
+        }
+    }
+
+    /// Frame what is written from now on, or stop framing it.
+    pub fn set_gutter(&mut self, gutter: Option<String>) {
+        self.gutter = gutter;
+    }
+
+    /// The agents the `@` panel offers.
+    pub fn set_agents(&mut self, agents: ozgent_core::AgentCatalog) {
+        self.agents = agents;
+    }
+
+    /// A block, framed if a gutter is set.
+    fn framed(&self, block: Block) -> Block {
+        block.with_gutter(self.gutter.clone())
+    }
+
+    /// The agents matching the mention at the caret, and where it starts.
+    fn suggestions(&self) -> Option<(usize, Vec<&ozgent_core::Agent>)> {
+        if self.agents.all().is_empty() {
+            return None;
+        }
+        let text = self.editor.text();
+        let (start, typed) = ozgent_core::agents::typing_mention(&text[..self.editor.cursor()])?;
+        if self.dismissed == Some(start) {
+            return None;
+        }
+        let found = self.agents.suggest(typed);
+        (!found.is_empty()).then_some((start, found))
+    }
+
+    /// The rows the `@` panel adds above the prompt, empty when it is closed.
+    fn panel(&self, width: usize) -> Vec<String> {
+        let Some((_, found)) = self.suggestions() else { return Vec::new() };
+        let dim = |s: &str| self.theme.style(Style::dim(), s);
+        let mut rows = vec![frame::truncate(
+            &dim("  agents · ↑↓ choose · Tab or Enter insert · Esc close"),
+            width,
+        )];
+        let active = self.pick.min(found.len() - 1);
+        // A window of the list that keeps the highlighted row in view.
+        let first = active.saturating_sub(PANEL_ROWS - 1);
+        for (i, agent) in found.iter().enumerate().skip(first).take(PANEL_ROWS) {
+            let chosen = i == active;
+            let marker = if chosen { "› " } else { "  " };
+            let name = self.theme.style(
+                Style { bold: true, color: chosen.then_some(Color::Cyan), ..Default::default() },
+                &format!("@{}", agent.name),
+            );
+            let tools = if agent.definition.tools.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", agent.definition.tools.join(", "))
+            };
+            let line = format!(
+                "{marker}{name}  {}{}",
+                agent.definition.description,
+                dim(&tools)
+            );
+            rows.push(frame::truncate(&line, width));
+        }
+        rows
+    }
+
+    /// Keys the `@` panel owns while it is open. Returns true if it used one.
+    fn panel_key(&mut self, key: &Key) -> bool {
+        let Some((start, found)) = self.suggestions() else { return false };
+        let count = found.len();
+        let chosen = found[self.pick.min(count - 1)].name.clone();
+        match key {
+            Key::Up => self.pick = (self.pick + count - 1) % count,
+            Key::Down => self.pick = (self.pick + 1) % count,
+            Key::Tab | Key::Enter => {
+                let cursor = self.editor.cursor();
+                self.editor.replace(start, cursor, &format!("@{chosen} "));
+                self.pick = 0;
+            }
+            Key::Escape => self.dismissed = Some(start),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keep the highlighted row with the mention it belongs to.
+    fn sync_panel(&mut self) {
+        let start = self.suggestions().map(|(s, _)| s);
+        if start != self.pick_start {
+            self.pick = 0;
+            self.pick_start = start;
+        }
+        // A dismissal lasts only as long as that mention does.
+        if let Some(d) = self.dismissed {
+            let text = self.editor.text();
+            let still = ozgent_core::agents::typing_mention(&text[..self.editor.cursor()])
+                .is_some_and(|(s, _)| s == d);
+            if !still {
+                self.dismissed = None;
+            }
         }
     }
 
@@ -135,14 +254,14 @@ impl Ui {
         let line = self.activity_line(replacing);
         if self.screen.is_some() {
             if replacing {
-                self.transcript.set_last(Block::plain(line));
+                self.transcript.set_last(self.framed(Block::plain(line)));
             } else {
                 self.spin = 0;
-                self.transcript.push(Block::plain(line));
+                self.transcript.push(self.framed(Block::plain(line)));
             }
             self.render();
         } else if !replacing {
-            eprintln!("{line}");
+            eprintln!("{}{line}", self.gutter.as_deref().unwrap_or(""));
         }
     }
 
@@ -159,7 +278,7 @@ impl Ui {
         }
         self.spin = self.spin.wrapping_add(1);
         let line = self.activity_line(true);
-        self.transcript.set_last(Block::plain(line));
+        self.transcript.set_last(self.framed(Block::plain(line)));
         self.render();
     }
 
@@ -170,7 +289,7 @@ impl Ui {
         }
         let line = self.activity_line(false);
         if self.screen.is_some() {
-            self.transcript.set_last(Block::plain(line));
+            self.transcript.set_last(self.framed(Block::plain(line)));
             self.render();
         }
         self.activity = None;
@@ -207,19 +326,23 @@ impl Ui {
     pub fn say(&mut self, text: impl Into<String>) {
         let text = text.into();
         if self.screen.is_some() {
-            self.transcript.note(text);
+            self.transcript.push(self.framed(Block::plain(text)));
             self.render();
         } else {
-            eprintln!("{text}");
+            eprintln!("{}{text}", self.gutter.as_deref().unwrap_or(""));
         }
     }
 
     pub fn blank(&mut self) {
         if self.screen.is_some() {
-            self.transcript.blank();
+            match &self.gutter {
+                // A blank line inside a frame keeps the rule unbroken.
+                Some(g) => self.transcript.push(Block::fixed(vec![g.trim_end().to_string()])),
+                None => self.transcript.blank(),
+            }
             self.render();
         } else {
-            eprintln!();
+            eprintln!("{}", self.gutter.as_deref().unwrap_or("").trim_end());
         }
     }
 
@@ -227,7 +350,7 @@ impl Ui {
     pub fn markdown(&mut self, text: impl Into<String>) {
         let text = text.into();
         if self.screen.is_some() {
-            self.transcript.push(Block::markdown(text));
+            self.transcript.push(self.framed(Block::markdown(text)));
             self.render();
         } else {
             let width = ozgent_render::terminal_width();
@@ -241,12 +364,26 @@ impl Ui {
     /// otherwise sit unpainted until something else happened.
     pub fn stream(&mut self, thinking: Option<&str>, answer: &str, force: bool) {
         if self.screen.is_none() {
+            // With no screen to repaint, the forced call is the finished text
+            // — the reply, or what came before a tool call — and it is
+            // printed once. It used to be dropped, and a piped chat printed
+            // every tool line and never an answer.
+            if force && !answer.trim().is_empty() {
+                let width = ozgent_render::terminal_width();
+                let rendered =
+                    ozgent_render::MarkdownRenderer::new(self.theme.clone(), width).render(answer);
+                let gutter = self.gutter.as_deref().unwrap_or("");
+                for line in rendered.lines() {
+                    println!("{gutter}{line}");
+                }
+            }
             return;
         }
         if !force && self.last_frame.elapsed() < FRAME {
             return;
         }
-        self.transcript.set_live(Block::reply(thinking.map(str::to_string), answer.to_string()));
+        let block = Block::reply(thinking.map(str::to_string), answer.to_string());
+        self.transcript.set_live(self.framed(block));
         self.render();
     }
 
@@ -296,6 +433,14 @@ impl Ui {
                 // Nothing arrived, so nothing on screen can have changed.
                 None => continue,
             };
+            // The @ panel has first claim on the arrows, Tab, Enter and
+            // Escape while it is open; otherwise Enter would send a name
+            // half typed.
+            if self.panel_key(&key) {
+                self.sync_panel();
+                self.render();
+                continue;
+            }
             match key {
                 Key::Enter => {
                     if self.editor.is_empty() {
@@ -312,6 +457,7 @@ impl Ui {
                 Key::Eof if self.editor.is_empty() => return Submission::Eof,
                 other => {
                     self.edit(other);
+                    self.sync_panel();
                     self.render();
                 }
             }
@@ -499,10 +645,17 @@ impl Ui {
 
         // The transcript, bottom-aligned: a new conversation starts next to
         // the prompt rather than floating at the top of an empty screen.
-        let visible = self.transcript.visible(layout.transcript.1);
-        let blanks = layout.transcript.1.saturating_sub(visible.len());
+        // The @ panel takes its rows from the transcript, never from the
+        // prompt: the field being typed in must not move under the caret.
+        let panel = if self.question.is_none() { self.panel(layout.width) } else { Vec::new() };
+        let panel: Vec<String> =
+            panel.into_iter().take(layout.transcript.1.saturating_sub(1)).collect();
+        let height = layout.transcript.1 - panel.len();
+        let visible = self.transcript.visible(height);
+        let blanks = height.saturating_sub(visible.len());
         rows.extend(std::iter::repeat_n(String::new(), blanks));
         rows.extend(visible.iter().map(|l| frame::truncate(l, layout.width)));
+        rows.extend(panel);
 
         // The prompt box.
         let (lines, caret) = self.editor.layout(layout.prompt_width());

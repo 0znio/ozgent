@@ -178,9 +178,13 @@
         </div>
       </section>
 
+      <!-- Agents matching the @ being typed. In the flow above the box, like
+           the consent panel, so it never covers the text it completes. -->
+      <div class="ag-suggest" id="ag-suggest" role="listbox" aria-label="Agents" hidden></div>
+
       <div class="composer-box" id="composer-box">
         <div class="attachments" id="attachments" hidden></div>
-        <textarea id="input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
+        <textarea id="input" rows="1" placeholder="Send a message… or @ an agent" autocomplete="off"></textarea>
         <div class="composer-actions">
           <button type="button" id="attach" class="icon-btn small" data-tip="Attach an image" aria-label="Attach an image">
             <svg class="ic"><use href="#i-clip"></use></svg>
@@ -227,6 +231,7 @@
     <button class="tab" role="tab" data-tab="general" aria-selected="true">General</button>
     <button class="tab" role="tab" data-tab="params" aria-selected="false">Model</button>
     <button class="tab" role="tab" data-tab="tools" aria-selected="false">Tools</button>
+    <button class="tab" role="tab" data-tab="agents" aria-selected="false">Agents</button>
     <button class="tab" role="tab" data-tab="permissions" aria-selected="false">Permissions</button>
     <button class="tab" role="tab" data-tab="memory" aria-selected="false">Memory</button>
   </div>
@@ -265,6 +270,73 @@
     <p class="hint" id="key-hint"></p>
     <h3 class="sub">Available tools</h3>
     <div id="tool-list" class="tool-list"></div>
+  </section>
+
+  <section class="panel" data-panel="agents" hidden>
+    <p class="hint">
+      Write <code>@name</code> in a message to hand it to an agent. It works with
+      its own instructions and only the tools listed here, and its steps are
+      shown where it ran.
+    </p>
+    <div id="ag-list" class="ag-list"></div>
+    <p class="error" id="ag-load-errors" hidden></p>
+    <button type="button" class="ghost-btn auto" id="ag-new">
+      <svg class="ic"><use href="#i-plus"></use></svg><span>New agent</span>
+    </button>
+
+    <form class="ag-form" id="ag-form" hidden>
+      <h3 class="sub" id="ag-form-title">New agent</h3>
+      <label class="ag-field">
+        <span>Name</span>
+        <input type="text" id="ag-name" class="text-input" placeholder="my-agent" autocomplete="off"
+               pattern="[a-z][a-z0-9]*(-[a-z0-9]+)*" maxlength="32" required>
+        <small class="hint">What you type after <code>@</code>. Lowercase letters, digits and hyphens.</small>
+      </label>
+      <label class="ag-field">
+        <span>Description</span>
+        <input type="text" id="ag-description" class="text-input" placeholder="One line: what it is for" autocomplete="off" required>
+      </label>
+      <label class="ag-field">
+        <span>Instructions</span>
+        <textarea id="ag-instructions" class="text-input ag-instructions" rows="9"
+                  placeholder="What the agent does, how it should work, and what its report should look like." required></textarea>
+      </label>
+
+      <div class="ag-field">
+        <span>Tools</span>
+        <small class="hint">Only the tools ticked here are offered to it. Each can
+          follow your global rules, or have its own.</small>
+        <div id="ag-tools" class="ag-tools"></div>
+      </div>
+
+      <div class="ag-grid">
+        <label class="ag-field">
+          <span>Tool rounds</span>
+          <input type="number" id="ag-rounds" class="text-input" min="1" max="32" step="1" placeholder="8">
+        </label>
+        <label class="ag-field">
+          <span>Reasoning</span>
+          <select id="ag-thinking" class="select">
+            <option value="">as the chat</option>
+            <option value="auto">auto</option>
+            <option value="on">on</option>
+            <option value="off">off</option>
+          </select>
+        </label>
+        <label class="ag-field">
+          <span>Temperature</span>
+          <input type="number" id="ag-temperature" class="text-input" min="0" max="2" step="0.05" placeholder="model's">
+        </label>
+      </div>
+
+      <p class="error" id="ag-form-error" hidden></p>
+      <div class="ag-form-acts">
+        <button type="button" class="ghost-btn auto ag-danger" id="ag-delete" hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" class="ghost-btn auto" id="ag-cancel">Cancel</button>
+        <button type="submit" class="primary-btn" id="ag-save">Save agent</button>
+      </div>
+    </form>
   </section>
 
   <section class="panel" data-panel="permissions" hidden>

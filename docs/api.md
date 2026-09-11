@@ -1,32 +1,37 @@
 # ozgent HTTP API
 
-Two servers, deliberately separate.
+One API, spoken two ways. The same port answers **OpenAI** clients
+(`/v1/chat/completions`) and **Anthropic** clients (`/v1/messages`), so
+software written for either works unchanged: set its base URL to
+`http://127.0.0.1:7337/v1` and pick a model from `/v1/models`.
 
 | | command | default | what it is |
 |---|---|---|---|
-| **API** | `ozgent serve` | `http://127.0.0.1:7337` | OpenAI-compatible, for clients and scripts |
-| **Web UI** | `ozgent web` | `http://127.0.0.1:7333` | the browser interface and the endpoints behind it |
+| **API** | `ozgent serve` | `http://127.0.0.1:7337/v1` | OpenAI- and Anthropic-compatible |
+| **Web UI** | `ozgent web` | `http://127.0.0.1:7333` | the browser interface — and the same `/v1` API |
 
-`ozgent serve` is the one to point other software at. Set the base URL to
-`http://127.0.0.1:7337/v1` and use any model name `ozgent list` shows.
+`ozgent web` serves `/v1` too, over the model it already has loaded. Running
+`ozgent serve` alongside it would load a second copy into VRAM, so if the web
+interface is up, point other programs at its port instead.
 
-Both bind to loopback only. `--host 0.0.0.0` exposes them to the network,
-which you should pair with `--api-key`.
+`ozgent serve` binds loopback only. `--host 0.0.0.0` exposes it to the
+network, which you should pair with `--api-key`.
 
 ## Authentication
 
 None by default. With `ozgent serve --api-key SECRET` (or `$OZGENT_API_KEY`),
-every `/v1` request must carry it:
+every `/v1` request must carry it, in either client's spelling:
 
 ```
 Authorization: Bearer SECRET
+x-api-key: SECRET
 ```
 
-A missing or wrong token is `401` with an `invalid_request_error`.
+A missing or wrong token is `401`.
 
 ## Errors
 
-Errors are OpenAI-shaped:
+Each route answers in its own protocol's shape. On the OpenAI routes:
 
 ```json
 { "error": { "message": "…", "type": "invalid_request_error", "code": null } }
@@ -170,7 +175,15 @@ cannot read files even if it wants to.
 ### Streaming
 
 `"stream": true` returns `text/event-stream` in OpenAI's chunk format,
-terminated by `data: [DONE]`. The final chunk carries `usage`.
+terminated by `data: [DONE]`. The final chunk carries `usage`; with
+`"stream_options": {"include_usage": true}` a further chunk with empty
+`choices` carries it too, as OpenAI sends it.
+
+Several tool calls in one turn arrive with `index` 0, 1, 2…, which is what
+OpenAI clients accumulate them by.
+
+`"tool_choice": "none"` withholds every tool for that request, yours and
+ozgent's.
 
 ### Usage and timings
 
@@ -212,7 +225,122 @@ OpenAI's shape. An empty input is a `400`.
 
 ## `GET /v1/models`, `GET /v1/models/{model}`
 
-Installed models in OpenAI's listing shape.
+Installed models, then agents as `@name`. Each entry carries both protocols'
+fields — `object`/`created` for OpenAI, `type`/`display_name`/`created_at`
+for Anthropic — and the list has Anthropic's `has_more`, `first_id` and
+`last_id`, so either client reads it as its own.
+
+## `GET /v1/agents`
+
+Every agent in full — name, description, tools, rules — for a client that
+wants to offer its own `@` menu.
+
+---
+
+# `/v1/messages` — Anthropic-compatible
+
+## `POST /v1/messages`
+
+Anthropic's Messages API. The official SDKs and anything written against
+`api.anthropic.com` work with the base URL changed.
+
+```bash
+curl http://127.0.0.1:7337/v1/messages \
+  -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model": "Qwen3.5-4B:Q4_K_M", "max_tokens": 1024,
+       "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+| field | notes |
+|---|---|
+| `model` | any name `ozgent list` shows, or `@agent` |
+| `messages` | `user`/`assistant`; content a string or blocks |
+| `system` | a string or text blocks |
+| `max_tokens` | honoured; optional here (absent means the model's limit) |
+| `temperature`, `top_p`, `top_k` | as usual |
+| `stream` | Anthropic's event stream |
+| `tools`, `tool_choice` | your tools, as on the OpenAI route |
+| `thinking` | `{"type":"enabled","budget_tokens":N}`, `{"type":"disabled"}`, `{"type":"adaptive"}` |
+
+Content blocks understood: `text`, `image` (base64; a URL source is refused
+rather than ignored), `document` with a text source, `tool_use`,
+`tool_result` (with `is_error`). Earlier `thinking` blocks are accepted and
+not replayed. Anthropic's hosted tools (`web_search_20250305` and the like)
+cannot run here and are not offered to the model.
+
+**Thinking follows Anthropic's rule: absent means off.** A client that never
+asks for thinking gets a model that answers directly. Asked for, reasoning
+arrives as `thinking` blocks with an empty `signature`.
+
+**Your tools.** When the model calls one, the reply ends with a `tool_use`
+block and `stop_reason: "tool_use"`. Run it, send a `tool_result` block back
+in the next `user` message, and continue.
+
+**ozgent's tools.** `"ozgent_tools": true` and `native_tools` work exactly as
+on the OpenAI route.
+
+### Streaming
+
+The standard sequence: `message_start`, then each block opened, filled and
+closed by index (`content_block_start`, `content_block_delta` with
+`text_delta` / `thinking_delta` / `input_json_delta`, `content_block_stop`),
+then `message_delta` with `stop_reason` and `usage`, then `message_stop`.
+`ping` keeps the connection alive while a model loads or a tool runs. Input
+tokens are not known until the prompt has been read, so `message_start`
+reports 0 and `message_delta` carries both counts.
+
+### Errors
+
+```json
+{ "type": "error", "error": { "type": "invalid_request_error", "message": "…" } }
+```
+
+`invalid_request_error` (400), `authentication_error` (401),
+`not_found_error` (404), `api_error` (500).
+
+---
+
+# Agents over the API
+
+Agents work through both protocols without the client knowing they exist.
+
+**By mention.** `@stock-guru` anywhere in the **latest** user message hands
+that message to the agent. Only the latest: a mention further back in the
+history your client resends has already been answered.
+
+**By model.** Agents are listed in `/v1/models` as `@name`. Choose one as the
+model and every message goes to it, running on the server's default model
+(`ozgent default <model>`). Mentions in the message can add more agents after
+it.
+
+The agent runs server-side with **its own tools**, not yours, and under its
+own rules: the built-in agents allow their tools, so they work over the API
+where nobody can be asked. A tool whose rule is `ask` is refused — there is no
+person on the other end of an API call — and the agent is told so.
+
+What the agent did travels in the reasoning stream, which is where both
+clients already show a model working:
+
+- **OpenAI:** `reasoning_content`, as lines like
+  `@stock-guru is working on this · tools: yahoo_finance, web_search`,
+  `→ yahoo_finance action=quote symbol=NVDA`, `  ✓ 1 quote · 320 ms`,
+  `@stock-guru finished · 3 tool calls · 12.4s`.
+- **Anthropic:** the same lines in a `thinking` block, sent even when thinking
+  was not asked for, because it is the account of what ran.
+
+The agent's report is the answer: `content` on OpenAI, a `text` block on
+Anthropic. A client that ignores reasoning still gets it.
+
+For clients that want to draw their own agent view, OpenAI stream chunks for
+agent and tool events carry an extra `ozgent` field with the structured event
+(`agent_start`, `tool_call`, `tool_result`, `agent_end`), and a non-streamed
+response lists them under `ozgent.events`. Clients that do not know the field
+ignore it.
+
+| to… | send |
+|---|---|
+| stop mentions calling agents | `"ozgent_agents": false` |
+| structured output | `response_format` — mentions are not looked for, and choosing an agent as the model with it is a `400` |
 
 ## `GET /health`
 
@@ -329,6 +457,8 @@ Each SSE `data:` line is one event, tagged by `type`:
 | `permission` | `id`, `name`, `arguments`, `effect` | waiting for you — answer with `/api/permissions/decide` |
 | `tool_call` | `id`, `name`, `arguments` | the call is about to run |
 | `tool_result` | `id`, `name`, `ok`, `summary`, `ms`, `detail` | how it went |
+| `agent_start` | `name`, `description`, `tools`, `missing` | an agent has taken over; events until `agent_end` are its |
+| `agent_end` | `name`, `ok`, `ms`, `calls`, `rounds` | the agent finished; `ok` is false when it produced no report |
 | `done` | `generated`, `tokens_per_second`, `prompt`, `prompt_ms`, `reused`, `stop` | |
 | `error` | `message` | |
 
@@ -339,6 +469,31 @@ reads as a dropped connection.
 The reply is persisted by the server, not by the client: closing the connection
 mid-generation loses the delivery, not the answer. Dropping it is also what
 tells the engine to stop, so a closed tab frees the GPU.
+
+A stored reply's `tool_calls` records each call and agent with `at`: where
+in the reply text it happened, in UTF-16 units. The interface uses it to put
+cards and agent blocks back between the right paragraphs on reload.
+
+## Agents
+
+### `GET /api/agents`
+
+`{ "agents": [...], "errors": [...], "limits": {...} }`. Each agent has
+`name`, `origin` (`builtin`, `user`, `override`), `description`,
+`instructions`, `tools`, `permissions`, and optionally `max_rounds`,
+`thinking`, `temperature`, `max_tokens`. `errors` lists agent files that could
+not be read, and why.
+
+### `PUT /api/agents/{name}`
+
+Body: the agent without its name. Saving a built-in's name creates an
+override. A definition that could not run — no instructions, a rule for a tool
+it does not list, `max_rounds` out of range — is a `400` saying which.
+
+### `DELETE /api/agents/{name}`
+
+Deletes your agent, or your override of a built-in, which brings the original
+back (`{"restored_builtin": true}`). A built-in itself cannot be deleted.
 
 ## Permissions
 

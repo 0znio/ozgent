@@ -10,7 +10,7 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{ChannelCommand, Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
+use cli::{AgentCommand, ChannelCommand, Cli, Command, ConfigCommand, OptionFlags, ToolsCommand};
 use ozgent_core::{Config, ModelRef, Paths};
 use ozgent_tools::{HostConfig, ToolHost, Toolbox};
 use std::path::PathBuf;
@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
             gateway(paths, config, web, &host, port, options.to_options()?).await
         }
         Some(Command::Channel { command }) => channel(&paths, config, command).await,
+        Some(Command::Agent { command }) => agent(&paths, command),
         Some(Command::Mcp) => mcp(&config).await,
         Some(Command::Serve { port, host, api_key, options }) => {
             // The environment is the right place for a secret; a flag lands in
@@ -1429,6 +1430,126 @@ fn channel_status(paths: &Paths, config: &Config) {
 /// Connects for real rather than reading the file back: "it is in config.toml"
 /// and "the model can call it" are different claims, and the gap between them
 /// is exactly what this command exists to show.
+/// The file a new agent starts from, with every field present and explained.
+const AGENT_TEMPLATE: &str = r#"# An ozgent agent. Call it by writing @NAME in a message.
+# Everything here is read again on the next message, so edit and try.
+
+# One line, shown in the @ panel.
+description = "What this agent is for"
+
+# The only tools it may call. `ozgent tools` lists what this machine has.
+tools = ["web_search", "fetch_url"]
+
+# Tool rounds before it must answer (1-32).
+max_rounds = 8
+
+# auto, on or off. Leave out to follow the chat.
+# thinking = "auto"
+
+# Leave out to use the model's own.
+# temperature = 0.4
+
+instructions = """
+Say what the agent does, how it should go about it, and what its report
+should look like. Be specific: this is the whole of its job description.
+"""
+
+# Per-tool rules on top of your global ones: allow, ask or deny.
+# A global deny always wins.
+[permissions]
+web_search = "allow"
+fetch_url = "allow"
+"#;
+
+/// `ozgent agent …`
+fn agent(paths: &Paths, command: AgentCommand) -> Result<()> {
+    use ozgent_core::agents::{self, Origin};
+    let catalog = ozgent_core::AgentCatalog::load(paths);
+    let origin = |o: Origin| match o {
+        Origin::Builtin => "built in",
+        Origin::User => "yours",
+        Origin::Override => "edited built-in",
+    };
+    match command {
+        AgentCommand::List => {
+            for a in catalog.all() {
+                println!("@{:<22} {}  ({})", a.name, a.definition.description, origin(a.origin));
+                println!("  {:<22} tools: {}", "", a.definition.tools.join(", "));
+            }
+            for e in &catalog.errors {
+                eprintln!("warning: {e}");
+            }
+            println!("\nfiles: {}", paths.agents_dir().display());
+        }
+        AgentCommand::Show { name } => {
+            let name = name.trim_start_matches('@');
+            let a = catalog.get(name).with_context(|| format!("no agent named {name}"))?;
+            println!("@{}  ({})", a.name, origin(a.origin));
+            print!("{}", toml::to_string_pretty(&a.definition)?);
+        }
+        AgentCommand::New { name, from } => {
+            let name = name.trim_start_matches('@').to_string();
+            agents::validate_name(&name)?;
+            let path = ozgent_core::Agent::path(paths, &name);
+            if path.exists() || catalog.get(&name).is_some() {
+                anyhow::bail!("@{name} already exists; `ozgent agent edit {name}` changes it");
+            }
+            std::fs::create_dir_all(paths.agents_dir())?;
+            match from {
+                Some(source) => {
+                    let source = source.trim_start_matches('@');
+                    let base = catalog.get(source).with_context(|| format!("no agent named {source}"))?;
+                    agents::save(paths, &name, &base.definition)?;
+                }
+                None => std::fs::write(&path, AGENT_TEMPLATE.replace("NAME", &name))?,
+            }
+            println!("created {}", path.display());
+            open_in_editor(&path, &name)?;
+        }
+        AgentCommand::Edit { name } => {
+            let name = name.trim_start_matches('@').to_string();
+            let a = catalog.get(&name).with_context(|| format!("no agent named {name}"))?;
+            let path = ozgent_core::Agent::path(paths, &name);
+            if a.origin == Origin::Builtin {
+                // The copy is what gets edited; deleting it restores the original.
+                agents::save(paths, &name, &a.definition)?;
+                println!("copied the built-in @{name} to {}", path.display());
+            }
+            open_in_editor(&path, &name)?;
+        }
+        AgentCommand::Rm { name } => {
+            let name = name.trim_start_matches('@');
+            match agents::remove(paths, name)? {
+                Origin::Override => println!("removed your version; the built-in @{name} is back"),
+                _ => println!("deleted @{name}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open an agent file in `$VISUAL` or `$EDITOR`, then check what was saved.
+///
+/// Checked on the way out because a typo in the file would otherwise surface
+/// as the agent silently missing from the @ panel next time.
+fn open_in_editor(path: &std::path::Path, name: &str) -> Result<()> {
+    let Some(editor) = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) else {
+        println!("set $EDITOR to open it here, or edit {} yourself", path.display());
+        return Ok(());
+    };
+    let status = std::process::Command::new(&editor).arg(path).status()
+        .with_context(|| format!("running {}", editor.to_string_lossy()))?;
+    if !status.success() {
+        anyhow::bail!("the editor exited with {status}");
+    }
+    let text = std::fs::read_to_string(path)?;
+    match ozgent_core::Agent::parse(name, &text, ozgent_core::agents::Origin::User) {
+        Ok(_) => println!("@{name} is ready. Write @{name} in a message to call it."),
+        Err(e) => println!("warning: @{name} will not load until this is fixed: {e}"),
+    }
+    Ok(())
+}
+
 async fn mcp(config: &Config) -> Result<()> {
     if !config.mcp.enabled {
         println!("MCP is switched off. Add to {}:", "config.toml");

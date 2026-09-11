@@ -28,6 +28,8 @@ pub enum Stage {
     Done { ok: bool, summary: String, ms: u64 },
     /// Refused, or never asked because the policy says no.
     Refused,
+    /// Not a tool: an agent that took over the turn. `None` while it works.
+    Agent { finished: Option<(bool, usize, u64)> },
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,8 @@ struct Activity {
     name: String,
     effect: Effect,
     stage: Stage,
+    /// Set for a call an agent made, so it is drawn under that agent.
+    nested: bool,
 }
 
 /// Accumulates a turn and renders it as markdown.
@@ -51,6 +55,8 @@ pub struct Composer {
     /// What each tool does, so the "still being written" line can say what is
     /// being written. Supplied by the caller from the tool host.
     effects: HashMap<String, Effect>,
+    /// Whether an agent is running, so the calls it makes are nested under it.
+    in_agent: bool,
 }
 
 impl Composer {
@@ -61,6 +67,7 @@ impl Composer {
             error: None,
             thinking: false,
             effects,
+            in_agent: false,
         }
     }
 
@@ -92,6 +99,7 @@ impl Composer {
                     name: name.clone(),
                     effect,
                     stage: Stage::Writing,
+                    nested: self.in_agent,
                 });
             }
             Event::Permission { name, effect, .. } => {
@@ -107,6 +115,7 @@ impl Composer {
                         name: name.clone(),
                         effect: *effect,
                         stage: Stage::Waiting,
+                        nested: self.in_agent,
                     }),
                 }
             }
@@ -122,6 +131,7 @@ impl Composer {
                         name: name.clone(),
                         effect,
                         stage: Stage::Running,
+                        nested: self.in_agent,
                     }),
                 }
             }
@@ -166,10 +176,35 @@ impl Composer {
                         name: name.clone(),
                         effect: Effect::default(),
                         stage,
+                        nested: self.in_agent,
                     }),
                 }
             }
             Event::Error { message } => self.error = Some(message.clone()),
+            Event::AgentStart { name, .. } => {
+                self.activities.push(Activity {
+                    id: None,
+                    name: name.clone(),
+                    effect: Effect::default(),
+                    stage: Stage::Agent { finished: None },
+                    nested: false,
+                });
+                self.in_agent = true;
+                // Each report is headed with whose it is: two agents in one
+                // message would otherwise read as one answer run together.
+                if !self.answer.trim().is_empty() {
+                    self.answer.push_str("\n\n");
+                }
+                self.answer.push_str(&format!("*@{name}*\n\n"));
+            }
+            Event::AgentEnd { name, ok, calls, ms, .. } => {
+                if let Some(a) = self.activities.iter_mut().rev().find(|a| {
+                    a.name == *name && matches!(a.stage, Stage::Agent { finished: None })
+                }) {
+                    a.stage = Stage::Agent { finished: Some((*ok, *calls, *ms)) };
+                }
+                self.in_agent = false;
+            }
             _ => {}
         }
     }
@@ -195,7 +230,10 @@ impl Composer {
         self.activities
             .iter_mut()
             .rev()
-            .find(|a| a.name == name && !matches!(a.stage, Stage::Done { .. } | Stage::Refused))
+            .find(|a| {
+                a.name == name
+                    && !matches!(a.stage, Stage::Done { .. } | Stage::Refused | Stage::Agent { .. })
+            })
     }
 
     /// The whole message, as markdown.
@@ -229,8 +267,19 @@ impl Composer {
 }
 
 fn line(a: &Activity) -> String {
+    let body = describe(a);
+    if a.nested { format!("  ↳ {body}") } else { body }
+}
+
+fn describe(a: &Activity) -> String {
     let name = format!("`{}`", a.name);
     match &a.stage {
+        Stage::Agent { finished: None } => format!("🤖 *@{}* — working…", a.name),
+        Stage::Agent { finished: Some((ok, calls, ms)) } => {
+            let plural = if *calls == 1 { "" } else { "s" };
+            let how = if *ok { "done" } else { "no report" };
+            format!("🤖 *@{}* — {how} · {calls} tool{plural} · {}", a.name, duration(*ms))
+        }
         // The wording is the point: the person is waiting on generation they
         // cannot see, and "preparing" alone does not say that.
         Stage::Writing => match a.effect {
@@ -281,6 +330,36 @@ fn first_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_heads_its_calls_and_its_report() {
+        let mut c = Composer::new(effects());
+        c.absorb(&Event::AgentStart {
+            name: "stock-guru".into(),
+            description: "d".into(),
+            tools: vec!["web_search".into()],
+            missing: vec![],
+        });
+        c.absorb(&Event::ToolCall {
+            id: "stock-guru_call_0".into(),
+            name: "web_search".into(),
+            arguments: serde_json::json!({}),
+        });
+        c.absorb(&Event::ToolResult {
+            id: "stock-guru_call_0".into(),
+            name: "web_search".into(),
+            ok: true,
+            summary: "3 results".into(),
+            ms: 400,
+            detail: serde_json::json!({}),
+        });
+        assert!(c.render().starts_with("🤖 *@stock-guru* — working…\n  ↳ ✓ `web_search`"));
+        c.absorb(&Event::AgentEnd { name: "stock-guru".into(), ok: true, ms: 2500, calls: 1, rounds: 2 });
+        c.absorb(&Event::Answer { text: "Up 3%.".into() });
+        let text = c.render();
+        assert!(text.starts_with("🤖 *@stock-guru* — done · 1 tool · 2.5s"), "{text}");
+        assert!(text.ends_with("*@stock-guru*\n\nUp 3%."), "{text}");
+    }
 
     fn effects() -> HashMap<String, Effect> {
         HashMap::from([

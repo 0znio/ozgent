@@ -66,6 +66,11 @@ impl Paths {
         self.root.join("tools")
     }
 
+    /// Agent definitions, one TOML file each.
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
     pub fn cache_dir(&self) -> PathBuf {
         self.root.join("cache")
     }

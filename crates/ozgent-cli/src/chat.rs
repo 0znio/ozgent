@@ -115,6 +115,26 @@ pub struct Chat<'a> {
     /// borrowing from the caller across an await.
     paths: Paths,
     config: Config,
+    /// The agent running now, if the turn was handed to one.
+    scope: Option<Scope>,
+}
+
+/// An agent at work: what it is, and what it was given.
+struct Scope {
+    agent: ozgent_core::Agent,
+    /// The only tools this agent's generations are shown.
+    offered: Vec<ozgent_core::ToolSpec>,
+    /// Tools it lists that this session does not have.
+    missing: Vec<String>,
+}
+
+/// What a run of tool rounds produced.
+struct Rounds {
+    reply: Reply,
+    /// Every call made, in the shape the web interface stores.
+    activity: Vec<serde_json::Value>,
+    /// Calls that actually ran.
+    calls: usize,
 }
 
 /// Start a chat.
@@ -252,7 +272,10 @@ async fn run_one(
         turn,
         paths: paths.clone(),
         config: config.clone(),
+        scope: None,
     };
+    // The @ panel needs the agents before the first keystroke.
+    chat.ui.set_agents(ozgent_core::AgentCatalog::load(paths));
 
     // Constrain the body of a tool call once one starts. This is the cheap
     // half of the pair below: the retry path in `turn` fixes a malformed call
@@ -508,8 +531,58 @@ impl<'a> Chat<'a> {
         if self.media_turn {
             self.media_observation = self.ground(&extracted.text);
         }
-        let mut messages = self.build_context(Some(conversation), &extracted.text)?;
+        // Agents called by name take the turn; with none it is the model's.
+        // Read per turn, so an agent saved a moment ago can be called now.
+        let catalog = ozgent_core::AgentCatalog::load(&self.paths);
+        let agents: Vec<ozgent_core::Agent> =
+            catalog.mentioned(&extracted.text).into_iter().cloned().collect();
+        self.ui.set_agents(catalog);
+
+        let (text, thinking, activity) = if agents.is_empty() {
+            let messages = self.build_context(Some(conversation), &extracted.text)?;
+            let rounds = self.rounds(messages, ozgent_web::worker::MAX_TOOL_ROUNDS).await?;
+            (rounds.reply.text, rounds.reply.thinking, rounds.activity)
+        } else {
+            self.run_agents(conversation, &extracted.text, &agents).await?
+        };
+
+        // What happened on the way, in the shape the web interface replays,
+        // so a turn taken here reads the same when the conversation is opened
+        // in the browser.
+        let calls = (!activity.is_empty()).then(|| serde_json::to_string(&activity).unwrap_or_default());
+        let assistant_id = self.store.append_message_full(
+            conversation,
+            "assistant",
+            text.trim_end(),
+            thinking.as_deref(),
+            calls.as_deref(),
+            None,
+            0,
+        )?;
+        self.store.put_embedding(
+            OwnerKind::Message,
+            assistant_id,
+            &self.embedder.embed(&text),
+        )?;
+        Ok(())
+    }
+
+    /// The tools this generation may be offered: an agent's own, or all of them.
+    fn offered(&self) -> Vec<ozgent_core::ToolSpec> {
+        match &self.scope {
+            Some(scope) => scope.offered.clone(),
+            None => self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default(),
+        }
+    }
+
+    /// Generate, run any tools the model asks for, and generate again, until
+    /// it answers or `max_calls` rounds are spent.
+    async fn rounds(&mut self, mut messages: Vec<Message>, max_calls: usize) -> Result<Rounds> {
         let mut reply = self.generate(&messages)?;
+        let offered = self.offered();
+        let names: Vec<String> = offered.iter().map(|s| s.name.clone()).collect();
+        let mut activity = Vec::new();
+        let mut calls = 0usize;
 
         // A tool call is a request, not an answer: run it, hand the result
         // back, and let the model continue. Bounded so a model that keeps
@@ -518,7 +591,6 @@ impl<'a> Chat<'a> {
         // lookup and not for a question worth asking an agent: two searches
         // and two pages, which a research prompt spends before it has read
         // anything, and the turn then answers from what it half-saw.
-        let max_calls = ozgent_web::worker::MAX_TOOL_ROUNDS;
         for round in 0..max_calls {
             let mut parsed = toolcall::extract(&reply.text);
 
@@ -526,13 +598,11 @@ impl<'a> Chat<'a> {
             // unparseable. Constrained decoding cannot produce malformed JSON,
             // an unknown tool name, or a misspelled parameter, so retrying
             // under the grammar turns a failed attempt into a valid one.
-            if !parsed.has_calls() && reply.attempted_call {
-                if let Some(host) = &self.tools {
-                    if let Some(grammar) = ozgent_llama::grammar::tool_call_grammar(host.tools()) {
-                        self.ui.say(self.theme.style(Style::dim(), "· malformed tool call; retrying under grammar"));
-                        reply = self.generate_with(&messages, Some(&grammar))?;
-                        parsed = toolcall::extract(&reply.text);
-                    }
+            if !parsed.has_calls() && reply.attempted_call && self.tools.is_some() {
+                if let Some(grammar) = ozgent_llama::grammar::tool_call_grammar(&offered) {
+                    self.ui.say(self.theme.style(Style::dim(), "· malformed tool call; retrying under grammar"));
+                    reply = self.generate_with(&messages, Some(&grammar))?;
+                    parsed = toolcall::extract(&reply.text);
                 }
             }
 
@@ -548,29 +618,68 @@ impl<'a> Chat<'a> {
 
             for call in &parsed.calls {
                 self.show_call(call);
+                let started = std::time::Instant::now();
 
-                // Asked before the call runs, so the transcript never shows
-                // a tool working that the user is about to refuse. A refusal
-                // still goes into the history as a result: the assistant
-                // message below records the call, and a call with no answer
-                // leaves the conversation malformed for every later turn.
-                let result = match self.permit(call, reply.early_permission.as_ref()).await? {
-                    Some(approved) => {
-                        let started = std::time::Instant::now();
-                        let outcome = self.run_tool(call, approved).await;
-                        self.ui.settle();
-                        self.show_result(&outcome, started.elapsed());
-                        match outcome {
-                            Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
-                            Err(e) => e.for_model(),
+                // A tool this generation was not offered is answered without
+                // running it. The host has it — it simply was not on the
+                // table — and running it anyway would make an agent's list a
+                // suggestion rather than a limit.
+                let (result, ok, summary) = if !names.contains(&call.name) {
+                    self.ui.settle();
+                    let outcome: Result<serde_json::Value, ozgent_tools::ToolCallError> =
+                        Err(ozgent_tools::ToolCallError::NotOffered {
+                            name: call.name.clone(),
+                            offered: names.clone(),
+                        });
+                    self.show_result(&outcome, started.elapsed());
+                    let text = outcome.unwrap_err().for_model();
+                    let summary = ozgent_tools::first_line(&text).to_string();
+                    (text, false, summary)
+                } else {
+                    // Asked before the call runs, so the transcript never
+                    // shows a tool working that the user is about to refuse.
+                    // A refusal still goes into the history as a result: the
+                    // assistant message below records the call, and a call
+                    // with no answer leaves the conversation malformed for
+                    // every later turn.
+                    match self.permit(call, reply.early_permission.as_ref()).await? {
+                        Some(approved) => {
+                            calls += 1;
+                            let outcome = self.run_tool(call, approved).await;
+                            self.ui.settle();
+                            self.show_result(&outcome, started.elapsed());
+                            match outcome {
+                                Ok(value) => {
+                                    let summary = summarise_result(&value);
+                                    (serde_json::to_string(&value).unwrap_or_default(), true, summary)
+                                }
+                                Err(e) => {
+                                    let text = e.for_model();
+                                    let summary = ozgent_tools::first_line(&text).to_string();
+                                    (text, false, summary)
+                                }
+                            }
+                        }
+                        None => {
+                            self.ui.settle();
+                            self.show_refusal(&call.name);
+                            (ozgent_core::permission::refusal(&call.name), false, "declined".to_string())
                         }
                     }
-                    None => {
-                        self.ui.settle();
-                        self.show_refusal(&call.name);
-                        ozgent_core::permission::refusal(&call.name)
-                    }
                 };
+                let mut entry = serde_json::json!({
+                    "kind": "tool",
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "at": 0,
+                    "ok": ok,
+                    "ms": started.elapsed().as_millis() as u64,
+                    "summary": summary,
+                });
+                if let Some(scope) = &self.scope {
+                    entry["agent"] = scope.agent.name.clone().into();
+                }
+                activity.push(entry);
 
                 // Structured when the template can render a call itself, so
                 // it writes the syntax this model was trained on. Spelt out
@@ -607,25 +716,152 @@ impl<'a> Chat<'a> {
 
             if round + 1 == max_calls {
                 self.ui.say(self.theme.style(Style::dim(), "· tool call limit reached"));
+                // Asked for an answer, rather than left to spend the last
+                // generation on one more call whose text — nothing — would
+                // then be the reply.
+                messages.push(Message::system(ozgent_web::worker::OUT_OF_ROUNDS));
+            }
+            if crate::input::interrupted() {
+                break;
             }
             reply = self.generate(&messages)?;
         }
+        Ok(Rounds { reply, activity, calls })
+    }
 
-        let assistant_id = self.store.append_message_full(
-            conversation,
-            "assistant",
-            &reply.text,
-            reply.thinking.as_deref(),
-            None,
-            None,
-            0,
-        )?;
-        self.store.put_embedding(
-            OwnerKind::Message,
-            assistant_id,
-            &self.embedder.embed(&reply.text),
-        )?;
-        Ok(())
+    /// Hand the turn to each agent the message named, in order.
+    ///
+    /// Each works inside a frame: a header naming it and the tools it has, a
+    /// rule down the left of everything it does, and a footer saying how it
+    /// went. Its report is streamed inside the frame, since it is the answer.
+    async fn run_agents(
+        &mut self,
+        conversation: i64,
+        query: &str,
+        agents: &[ozgent_core::Agent],
+    ) -> Result<(String, Option<String>, Vec<serde_json::Value>)> {
+        let available = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
+        let saved = self.opts.clone();
+        let mut combined = String::new();
+        let mut activity: Vec<serde_json::Value> = Vec::new();
+        // Each agent sees the reports of the ones before it.
+        let mut earlier: Vec<Message> = Vec::new();
+
+        for agent in agents {
+            let (offered, missing) = agent.offer(&available);
+            self.agent_header(agent, &offered, &missing);
+
+            // The agent's sampling where it says, the session's otherwise.
+            if let Some(t) = agent.definition.thinking {
+                self.opts.thinking = t;
+            }
+            if let Some(t) = agent.definition.temperature {
+                self.opts.temperature = t;
+            }
+            if let Some(m) = agent.definition.max_tokens {
+                self.opts.max_tokens = m;
+            }
+            self.session.set_options(&self.opts);
+            if !self.engine.template_handles_tools() {
+                self.session.set_tools(&offered);
+            }
+            self.scope = Some(Scope { agent: agent.clone(), offered, missing });
+            let rule = self.theme.style(Style::color(ozgent_render::Color::Cyan), "│ ");
+            self.ui.set_gutter(Some(rule));
+
+            let started = std::time::Instant::now();
+            let outcome = match self.build_context(Some(conversation), query) {
+                Ok(mut messages) => {
+                    messages.extend(earlier.iter().cloned());
+                    self.rounds(messages, agent.definition.rounds()).await
+                }
+                Err(e) => Err(e),
+            };
+
+            // Put everything back whatever happened, or the next message would
+            // run with this agent's tools and temperature.
+            self.ui.set_gutter(None);
+            self.scope = None;
+            self.opts = saved.clone();
+            self.session.set_options(&self.opts);
+            if !self.engine.template_handles_tools() {
+                let all = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
+                self.session.set_tools(&all);
+            }
+            let rounds = outcome?;
+
+            let report = rounds.reply.text.trim().to_string();
+            let ms = started.elapsed().as_millis() as u64;
+            self.agent_footer(!report.is_empty(), rounds.calls, ms);
+
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            let at = combined.encode_utf16().count();
+            activity.push(serde_json::json!({
+                "kind": "agent",
+                "name": agent.name,
+                "description": agent.definition.description,
+                "tools": agent.offer(&available).0.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                "missing": agent.offer(&available).1,
+                "at": at,
+                "ok": !report.is_empty(),
+                "ms": ms,
+                "calls": rounds.calls,
+                "thinking": rounds.reply.thinking.clone().unwrap_or_default(),
+            }));
+            for mut entry in rounds.activity {
+                entry["at"] = at.into();
+                activity.push(entry);
+            }
+            combined.push_str(&report);
+            let end = combined.encode_utf16().count();
+            if let Some(block) = activity.iter_mut().rev().find(|a| a["kind"] == "agent") {
+                block["end"] = end.into();
+            }
+            earlier.push(Message::assistant(report));
+            if crate::input::interrupted() {
+                break;
+            }
+        }
+        Ok((combined, None, activity))
+    }
+
+    /// The top of an agent's frame.
+    fn agent_header(
+        &mut self,
+        agent: &ozgent_core::Agent,
+        offered: &[ozgent_core::ToolSpec],
+        missing: &[String],
+    ) {
+        let theme = self.theme.clone();
+        let cyan = |s: &str| theme.style(Style::color(ozgent_render::Color::Cyan), s);
+        let name = theme.style(
+            Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
+            &format!("@{}", agent.name),
+        );
+        let desc = theme.style(Style::dim(), &agent.definition.description);
+        self.ui.say(format!("{}{name}  {desc}", cyan("╭─ ")));
+        let mut tools = if offered.is_empty() {
+            "no tools".to_string()
+        } else {
+            offered.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+        };
+        if !missing.is_empty() {
+            tools.push_str(&format!("  ·  not available here: {}", missing.join(", ")));
+        }
+        self.ui.say(format!("{}{}", cyan("│ "), theme.style(Style::dim(), &tools)));
+    }
+
+    /// The bottom of an agent's frame: how it went, in one line.
+    fn agent_footer(&mut self, ok: bool, calls: usize, ms: u64) {
+        let theme = self.theme.clone();
+        let cyan = |s: &str| theme.style(Style::color(ozgent_render::Color::Cyan), s);
+        let plural = if calls == 1 { "" } else { "s" };
+        let how = if ok { "done" } else { "no report" };
+        let line = format!("{how} · {calls} tool call{plural} · {:.1}s", ms as f64 / 1000.0);
+        self.ui.say(format!("{}{}", cyan("╰─ "), theme.style(Style::dim(), &line)));
+        self.ui.blank();
     }
 
     /// Assemble the prompt from pinned facts, recent turns, and recall.
@@ -655,15 +891,22 @@ impl<'a> Chat<'a> {
         }
         // The date goes first: it is context about the world, not instruction,
         // and a model reads the opening of a system prompt most reliably.
-        let dated = if self.config.ui.date_awareness {
-            let line = ozgent_core::DateTime::now().prompt_line();
-            Some(match &self.opts.system_prompt {
-                Some(base) if !base.trim().is_empty() => format!("{line}\n\n{base}"),
-                _ => line,
-            })
-        } else {
-            self.opts.system_prompt.clone()
+        let date = self
+            .config
+            .ui
+            .date_awareness
+            .then(|| ozgent_core::DateTime::now().prompt_line());
+        let dated = match &self.scope {
+            // An agent's instructions replace the chat's system prompt: a
+            // persona written for the chat would contradict the job.
+            Some(scope) => Some(scope.agent.system_prompt(date.as_deref(), &scope.missing)),
+            None => match (date, &self.opts.system_prompt) {
+                (Some(line), Some(base)) if !base.trim().is_empty() => Some(format!("{line}\n\n{base}")),
+                (Some(line), _) => Some(line),
+                (None, base) => base.clone(),
+            },
         };
+        let offered = self.offered();
 
         // The tool description joins the system prompt rather than replacing
         // it, so a user-set persona survives.
@@ -679,12 +922,12 @@ impl<'a> Chat<'a> {
         let native_tools = self.engine.template_handles_tools();
 
         let system = match (&dated, &self.tools) {
-            (base, Some(host)) if !host.tools().is_empty() && !native_tools => {
+            (base, Some(_)) if !offered.is_empty() && !native_tools => {
                 let mut text = base.clone().unwrap_or_default();
                 if !text.is_empty() {
                     text.push_str("\n\n");
                 }
-                text.push_str(&ozgent_tools::tool_preamble(host.tools()));
+                text.push_str(&ozgent_tools::tool_preamble(&offered));
                 if let Some(note) = &media_note {
                     text.push_str("\n\n");
                     text.push_str(note);
@@ -788,13 +1031,12 @@ impl<'a> Chat<'a> {
     }
 
     fn generate_inner(&mut self, messages: &[Message]) -> Result<Reply> {
-        let offered: &[ozgent_core::ToolSpec] =
-            self.tools.as_ref().map(|h| h.tools()).unwrap_or(&[]);
+        let offered = self.offered();
         let prompt = self.engine.render_prompt_full(
             messages,
             self.opts.thinking,
             self.opts.reasoning_effort,
-            offered,
+            &offered,
         )?;
         // Images belong to this turn only: once evaluated they are resident in
         // the cache, and re-sending them would duplicate them in the context.
@@ -847,11 +1089,11 @@ impl<'a> Chat<'a> {
         // Read out of `self` before the borrow below, so the callback can
         // consult the policy without holding the whole struct.
         let policy = self.config.permissions.clone();
-        let effects: std::collections::BTreeMap<String, ozgent_core::Effect> = self
-            .tools
-            .as_ref()
-            .map(|h| h.tools().iter().map(|t| (t.name.clone(), t.effect)).collect())
-            .unwrap_or_default();
+        let effects: std::collections::BTreeMap<String, ozgent_core::Effect> =
+            offered.iter().map(|t| (t.name.clone(), t.effect)).collect();
+        // An agent's own rules sit on top of the policy, and a tool it was
+        // not given is refused before anyone is asked about it.
+        let agent = self.scope.as_ref().map(|s| s.agent.clone());
         let grants = &mut self.grants;
 
         let media = self
@@ -928,7 +1170,11 @@ impl<'a> Chat<'a> {
                             serde_json::Value::String("still being written".into()),
                         );
                     }
-                    let choice = match policy.verdict(&name, effect, grants) {
+                    let verdict = match &agent {
+                        Some(a) => a.verdict(&policy, &name, effect, grants),
+                        None => policy.verdict(&name, effect, grants),
+                    };
+                    let choice = match verdict {
                         ozgent_core::Verdict::Allow { .. } => None,
                         ozgent_core::Verdict::Deny => Some(ozgent_core::Choice::Deny),
                         ozgent_core::Verdict::Ask => Some(ui.ask_permission(
@@ -1094,7 +1340,11 @@ impl<'a> Chat<'a> {
             // later with a much better message than anything here could give.
             .unwrap_or_default();
 
-        match self.config.permissions.verdict(&call.name, effect, &self.grants) {
+        let verdict = match &self.scope {
+            Some(scope) => scope.agent.verdict(&self.config.permissions, &call.name, effect, &self.grants),
+            None => self.config.permissions.verdict(&call.name, effect, &self.grants),
+        };
+        match verdict {
             Verdict::Allow { by_user } => return Ok(Some(by_user)),
             Verdict::Deny => return Ok(None),
             Verdict::Ask => {}
@@ -1116,7 +1366,23 @@ impl<'a> Chat<'a> {
     /// where each exchange started when scrolling back through a long thread.
     fn echo(&mut self, text: &str) {
         let marker = self.theme.style(Style::color(ozgent_render::Color::Cyan), "› ");
-        let body = self.theme.style(Style { bold: true, ..Default::default() }, text);
+        // Agents called by name are picked out, so it is clear before the
+        // frame appears that this message went to one.
+        let catalog = ozgent_core::AgentCatalog::load(&self.paths);
+        let mut body = String::new();
+        let mut from = 0;
+        for m in ozgent_core::agents::mentions(text) {
+            if catalog.get(&m.name).is_none() {
+                continue;
+            }
+            body.push_str(&self.theme.style(Style { bold: true, ..Default::default() }, &text[from..m.start]));
+            body.push_str(&self.theme.style(
+                Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
+                &text[m.start..m.end],
+            ));
+            from = m.end;
+        }
+        body.push_str(&self.theme.style(Style { bold: true, ..Default::default() }, &text[from..]));
         self.ui.blank();
         self.ui.say(format!("{marker}{body}"));
         self.ui.blank();
@@ -1197,6 +1463,54 @@ impl<'a> Chat<'a> {
         let arrow = self.theme.style(Style::color(colour), "  ⎿");
         let timing = self.theme.style(Style::dim(), &format!(" · {}ms", elapsed.as_millis()));
         self.ui.say(format!("{arrow} {}{timing}", self.theme.style(Style::dim(), &text)));
+    }
+
+    /// `/agents`: list them, or show one in full.
+    fn agents(&mut self, arg: &str) {
+        let theme = self.theme.clone();
+        let dim = |s: &str| theme.style(Style::dim(), s);
+        let catalog = ozgent_core::AgentCatalog::load(&self.paths);
+        self.ui.set_agents(catalog.clone());
+        if arg.is_empty() {
+            for a in catalog.all() {
+                let name = theme.style(
+                    Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
+                    &format!("@{}", a.name),
+                );
+                let origin = match a.origin {
+                    ozgent_core::agents::Origin::Builtin => "built in",
+                    ozgent_core::agents::Origin::User => "yours",
+                    ozgent_core::agents::Origin::Override => "edited",
+                };
+                self.ui.say(format!("{name}  {}  {}", a.definition.description, dim(origin)));
+                self.ui.say(dim(&format!("    tools: {}", a.definition.tools.join(", "))));
+            }
+            for e in &catalog.errors {
+                self.ui.say(theme.style(Style::color(ozgent_render::Color::Red), e));
+            }
+            self.ui.say(dim(
+                "write @name in a message to call one · /agents <name> for its instructions · \
+                 `ozgent agent new <name>` to make your own",
+            ));
+            return;
+        }
+        let name = arg.trim_start_matches('@');
+        match catalog.get(name) {
+            Some(a) => {
+                let d = &a.definition;
+                self.ui.say(format!("@{}  {}", a.name, d.description));
+                let rules: Vec<String> = d.permissions.iter().map(|(t, r)| format!("{t}={r}")).collect();
+                self.ui.say(dim(&format!(
+                    "tools: {}  ·  rules: {}  ·  rounds: {}  ·  thinking: {}",
+                    d.tools.join(", "),
+                    if rules.is_empty() { "global".into() } else { rules.join(", ") },
+                    d.rounds(),
+                    d.thinking.map(|t| format!("{t:?}").to_lowercase()).unwrap_or_else(|| "as the chat".into()),
+                )));
+                self.ui.markdown(d.instructions.clone());
+            }
+            None => self.ui.say(dim(&format!("no agent named {name}; /agents lists them"))),
+        }
     }
 
     /// The conversation being written to, creating it if this is the first
@@ -1916,6 +2230,8 @@ impl<'a> Chat<'a> {
                 }
             }
 
+            "/agents" | "/agent" => self.agents(arg),
+
             "/tools" if !arg.is_empty() => self.configure_tool(arg)?,
 
             "/tools" => match &self.tools {
@@ -2053,6 +2369,9 @@ fn pretty_args(args: &serde_json::Value) -> String {
 /// A search response is thousands of characters; the user wants to know it
 /// worked and roughly what came back, not to read it.
 fn summarise_result(value: &serde_json::Value) -> String {
+    if let Some(known) = ozgent_tools::summary::describe(value) {
+        return known;
+    }
     if let Some(obj) = value.as_object() {
         // The shape every web_search provider normalises to.
         if let Some(results) = obj.get("results").and_then(|r| r.as_array()) {
@@ -2198,6 +2517,7 @@ const HELP: &str = "\
                    gpu_ram keeps the weights on the card and the KV cache in
                    RAM: the full window, several times slower per token
 /tools             list available tools
+/agents [name]     list agents, or show one · write @name in a message to call it
 /default           use this model when none is named · /default clear to unset
 /permissions       what tools may do without asking
 /permissions <tool> allow|ask|deny|clear   ·  or read|write|execute <rule>
@@ -2211,7 +2531,8 @@ Scrolling    wheel, PageUp/PageDown, or Shift-Up/Shift-Down
 Editing      Alt-Enter for a new line · Ctrl-A/E/K/U/W as in any shell
              Up/Down walk what you typed before
 
-Paste an image path or URL in a message and it is picked up automatically.";
+Paste an image path or URL in a message and it is picked up automatically.
+Type @ for the agents; Tab or Enter picks one.";
 
 #[cfg(test)]
 mod tests {

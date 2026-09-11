@@ -36,26 +36,53 @@ pub enum Source {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub source: Source,
+    /// Drawn at the start of every line, and taken out of the width the
+    /// content wraps to. How an agent's work is framed: everything it does
+    /// carries the rule down its left edge, however the terminal is resized.
+    gutter: Option<String>,
     /// Rendered lines at the current width.
     lines: Vec<String>,
 }
 
 impl Block {
     pub fn markdown(text: impl Into<String>) -> Self {
-        Self { source: Source::Markdown(text.into()), lines: Vec::new() }
+        Self { source: Source::Markdown(text.into()), gutter: None, lines: Vec::new() }
     }
     pub fn plain(text: impl Into<String>) -> Self {
-        Self { source: Source::Plain(text.into()), lines: Vec::new() }
+        Self { source: Source::Plain(text.into()), gutter: None, lines: Vec::new() }
     }
     pub fn fixed(lines: Vec<String>) -> Self {
-        Self { source: Source::Fixed(lines), lines: Vec::new() }
+        Self { source: Source::Fixed(lines), gutter: None, lines: Vec::new() }
     }
     pub fn reply(thinking: Option<String>, answer: impl Into<String>) -> Self {
-        Self { source: Source::Reply { thinking, answer: answer.into() }, lines: Vec::new() }
+        Self {
+            source: Source::Reply { thinking, answer: answer.into() },
+            gutter: None,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Frame this block with a gutter, or leave it bare.
+    pub fn with_gutter(mut self, gutter: Option<String>) -> Self {
+        self.gutter = gutter;
+        self
     }
 
     fn render(&mut self, theme: &Theme, width: usize) {
-        self.lines = match &self.source {
+        let Some(gutter) = self.gutter.clone() else {
+            self.lines = self.render_source(theme, width);
+            return;
+        };
+        let inner = width.saturating_sub(display_width(&gutter)).max(8);
+        self.lines = self
+            .render_source(theme, inner)
+            .into_iter()
+            .map(|line| format!("{gutter}{line}"))
+            .collect();
+    }
+
+    fn render_source(&self, theme: &Theme, width: usize) -> Vec<String> {
+        match &self.source {
             Source::Fixed(lines) => lines.clone(),
             Source::Plain(text) => wrap_styled(text, width),
             Source::Markdown(text) => render_markdown(theme, width, text),
@@ -77,7 +104,7 @@ impl Block {
                 }
                 lines
             }
-        };
+        }
     }
 }
 
@@ -137,6 +164,7 @@ impl Transcript {
     }
 
     /// Convenience for the many one-line notes ozgent prints.
+    #[cfg_attr(not(test), allow(dead_code))] // the screen frames its own notes now
     pub fn note(&mut self, text: impl Into<String>) {
         self.push(Block::plain(text));
     }
@@ -306,6 +334,20 @@ mod tests {
 
     fn transcript() -> Transcript {
         Transcript::new(Theme::plain(), 40)
+    }
+
+    #[test]
+    fn a_gutter_frames_every_line_and_reflows_inside_it() {
+        let mut t = Transcript::new(Theme::plain(), 20);
+        t.push(Block::plain("one two three four five six").with_gutter(Some("│ ".into())));
+        let lines: Vec<String> = t.visible(10).iter().map(|l| l.to_string()).collect();
+        assert!(lines.len() >= 2, "{lines:?}");
+        for l in &lines {
+            assert!(l.starts_with("│ "), "{l:?}");
+            assert!(display_width(l) <= 20, "{l:?}");
+        }
+        t.resize(60);
+        assert_eq!(t.visible(10), ["│ one two three four five six"]);
     }
 
     #[test]

@@ -110,6 +110,14 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
         assembled.to_messages(system.as_deref())
     };
 
+    // Read per turn, so an agent saved in Settings a moment ago can be
+    // called in the very next message. A handful of small files.
+    let agents: Vec<ozgent_core::Agent> = ozgent_core::AgentCatalog::load(&state.paths)
+        .mentioned(&turn.message)
+        .into_iter()
+        .cloned()
+        .collect();
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     state
         .worker
@@ -125,6 +133,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             response_grammar: None,
             overrides: None,
             images: turn.images,
+            agents,
             out: tx,
         })
         // The inference thread is gone, which is ozgent's problem, not the
@@ -132,6 +141,15 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
         .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(relay(state.clone(), turn.conversation, rx))
+}
+
+/// Where the reply has got to, in the units the browser slices text by.
+///
+/// UTF-16, because that is what a JavaScript string index counts. A byte or
+/// character offset would put a card in the middle of a word the first time a
+/// reply contained an emoji.
+fn offset(answer: &str) -> usize {
+    answer.encode_utf16().count()
 }
 
 /// Forward events to the caller while accumulating the reply, and write it
@@ -147,27 +165,92 @@ fn relay(
         let mut answer = String::new();
         let mut thinking = String::new();
         let mut activity: Vec<serde_json::Value> = Vec::new();
+        // The agent running now, so its calls and reasoning are filed under it.
+        let mut agent: Option<usize> = None;
 
         while let Some(event) = rx.recv().await {
             match &event {
                 Event::Answer { text } => answer.push_str(text),
-                Event::Thinking { text } => thinking.push_str(text),
-                Event::ToolCall { name, arguments, .. } => activity.push(serde_json::json!({
-                    "name": name,
-                    "arguments": arguments,
-                })),
+                Event::Thinking { text } => match agent {
+                    // An agent's reasoning belongs in its own block, not in the
+                    // message's: a reload has to put it back where it was.
+                    Some(i) => {
+                        let slot = &mut activity[i]["thinking"];
+                        let mut so_far = slot.as_str().unwrap_or_default().to_string();
+                        so_far.push_str(text);
+                        *slot = so_far.into();
+                    }
+                    None => thinking.push_str(text),
+                },
+                Event::ToolCall { name, arguments, .. } => {
+                    let mut call = serde_json::json!({
+                        "kind": "tool",
+                        "name": name,
+                        "arguments": arguments,
+                        // Where in the reply the call happened, so a reload
+                        // puts the card between the right paragraphs instead
+                        // of stacking every card above the whole answer.
+                        "at": offset(&answer),
+                    });
+                    if let Some(i) = agent {
+                        call["agent"] = activity[i]["name"].clone();
+                    }
+                    activity.push(call);
+                }
                 Event::ToolResult { name, ok, summary, ms, detail, .. } => {
                     // Attach to the call this answers, so a reload replays the
                     // pair rather than two loose halves.
-                    let slot = activity
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c["name"] == name.as_str() && c.get("ok").is_none());
-                    if let Some(call) = slot {
-                        call["ok"] = (*ok).into();
-                        call["ms"] = (*ms).into();
-                        call["summary"] = summary.clone().into();
-                        call["detail"] = crate::api::bounded(detail);
+                    let slot = activity.iter_mut().rev().find(|c| {
+                        c["kind"] == "tool" && c["name"] == name.as_str() && c.get("ok").is_none()
+                    });
+                    match slot {
+                        Some(call) => {
+                            call["ok"] = (*ok).into();
+                            call["ms"] = (*ms).into();
+                            call["summary"] = summary.clone().into();
+                            call["detail"] = crate::api::bounded(detail);
+                        }
+                        // A call that was never announced — one refused, or
+                        // one the agent was not offered — still happened, and
+                        // the transcript should say so.
+                        None => {
+                            let mut call = serde_json::json!({
+                                "kind": "tool", "name": name, "arguments": {},
+                                "at": offset(&answer), "ok": ok, "ms": ms,
+                                "summary": summary, "detail": crate::api::bounded(detail),
+                            });
+                            if let Some(i) = agent {
+                                call["agent"] = activity[i]["name"].clone();
+                            }
+                            activity.push(call);
+                        }
+                    }
+                }
+                Event::AgentStart { name, description, tools, missing } => {
+                    // Reports are separated in the stored text so the model,
+                    // reading this turn back later, sees two answers rather
+                    // than one run together.
+                    if !answer.trim().is_empty() {
+                        answer.push_str("\n\n");
+                    }
+                    activity.push(serde_json::json!({
+                        "kind": "agent",
+                        "name": name,
+                        "description": description,
+                        "tools": tools,
+                        "missing": missing,
+                        "at": offset(&answer),
+                    }));
+                    agent = Some(activity.len() - 1);
+                }
+                Event::AgentEnd { ok, ms, calls, rounds, .. } => {
+                    if let Some(i) = agent.take() {
+                        let block = &mut activity[i];
+                        block["end"] = offset(&answer).into();
+                        block["ok"] = (*ok).into();
+                        block["ms"] = (*ms).into();
+                        block["calls"] = (*calls).into();
+                        block["rounds"] = (*rounds).into();
                     }
                 }
                 _ => {}
@@ -191,10 +274,12 @@ fn relay(
         let trace = (!thinking.trim().is_empty()).then(|| thinking.trim().to_string());
         let calls =
             (!activity.is_empty()).then(|| serde_json::to_string(&activity).unwrap_or_default());
+        // Only the end is trimmed: the offsets recorded above count from the
+        // start of the reply, and trimming it there would shift every card.
         match store.append_message_full(
             conversation,
             "assistant",
-            answer.trim(),
+            answer.trim_end(),
             trace.as_deref(),
             calls.as_deref(),
             None,
