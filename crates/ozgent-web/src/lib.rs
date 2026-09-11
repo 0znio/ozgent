@@ -7,6 +7,7 @@
 pub mod agents;
 pub mod anthropic;
 pub mod api;
+pub mod hub;
 pub mod media;
 pub mod openai;
 pub mod permission;

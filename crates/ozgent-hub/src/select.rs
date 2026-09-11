@@ -264,6 +264,54 @@ fn pick_mmproj<'a>(projectors: &[&'a RepoFile]) -> Option<&'a RepoFile> {
     projectors.first().copied()
 }
 
+/// One quantisation a repository offers: its name, total size, and shards.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Quant {
+    pub quant: String,
+    pub bytes: u64,
+    pub shards: usize,
+}
+
+/// Every quantisation in a file listing, smallest first.
+///
+/// Shared by `ozgent pull --list` and the web interface, so both offer the
+/// same choices with the same sizes.
+pub fn quantisations(files: &[RepoFile]) -> Vec<Quant> {
+    let mut by_quant: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
+    for f in files.iter().filter(|f| f.is_gguf() && !f.is_mmproj()) {
+        if let Some(q) = quant_of(&f.path) {
+            let e = by_quant.entry(q).or_insert((0, 0));
+            e.0 += f.size;
+            e.1 += 1;
+        }
+    }
+    let mut rows: Vec<Quant> = by_quant
+        .into_iter()
+        .map(|(quant, (bytes, shards))| Quant { quant, bytes, shards })
+        .collect();
+    rows.sort_by_key(|q| q.bytes);
+    rows
+}
+
+/// The quantisation to suggest, given how much memory the GPU has.
+///
+/// Q4_K_M when it fits: quality per byte flattens out above it, so the
+/// largest that merely fits trades a lot of VRAM — and the context it would
+/// otherwise buy — for very little. Otherwise the largest that fits, and with
+/// nothing fitting (or no GPU at all) Q4_K_M or the smallest, which is the
+/// one that will run at all on the CPU.
+pub fn recommend(rows: &[Quant], projector: u64, vram: Option<u64>) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let fits = |bytes: u64| vram.is_some_and(|v| bytes + projector < v * 85 / 100);
+    let q4 = rows.iter().position(|q| q.quant.eq_ignore_ascii_case("Q4_K_M"));
+    q4.filter(|&i| fits(rows[i].bytes))
+        .or_else(|| rows.iter().rposition(|q| fits(q.bytes)))
+        .or(q4)
+        .or(Some(0))
+}
+
 /// Derive an ozgent `name:tag` from a repository id and quantisation.
 ///
 /// `unsloth/gemma-3-12b-it-GGUF` + `Q4_K_M` becomes `gemma-3-12b-it:Q4_K_M`:
@@ -278,6 +326,47 @@ pub fn derive_ref(repo_id: &str, quant: &str) -> String {
         }
     }
     format!("{}:{}", name, quant)
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+
+    fn file(path: &str, size: u64) -> RepoFile {
+        RepoFile { path: path.into(), size, sha256: None }
+    }
+
+    #[test]
+    fn quantisations_group_shards_and_skip_projectors() {
+        let files = [
+            file("m-Q8_0-00001-of-00002.gguf", 5),
+            file("m-Q8_0-00002-of-00002.gguf", 5),
+            file("m-Q4_K_M.gguf", 4),
+            file("mmproj-F16.gguf", 1),
+            file("README.md", 1),
+        ];
+        let rows = quantisations(&files);
+        assert_eq!(
+            rows,
+            [
+                Quant { quant: "Q4_K_M".into(), bytes: 4, shards: 1 },
+                Quant { quant: "Q8_0".into(), bytes: 10, shards: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn q4_k_m_is_suggested_when_it_fits_and_the_largest_fit_otherwise() {
+        let rows = vec![
+            Quant { quant: "Q2_K".into(), bytes: 2_000, shards: 1 },
+            Quant { quant: "Q4_K_M".into(), bytes: 4_000, shards: 1 },
+            Quant { quant: "Q8_0".into(), bytes: 8_000, shards: 1 },
+        ];
+        assert_eq!(recommend(&rows, 0, Some(10_000)), Some(1));
+        assert_eq!(recommend(&rows, 0, Some(4_000)), Some(0), "Q4 does not fit in 85% of 4000");
+        assert_eq!(recommend(&rows, 0, None), Some(1), "no GPU: Q4_K_M anyway");
+        assert_eq!(recommend(&[], 0, None), None);
+    }
 }
 
 #[cfg(test)]

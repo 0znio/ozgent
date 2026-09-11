@@ -70,6 +70,30 @@ struct Lfs {
     oid: Option<String>,
 }
 
+/// One repository in a search result.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct Found {
+    pub id: String,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub likes: u64,
+    #[serde(default)]
+    pub pipeline_tag: Option<String>,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing)]
+    tags: Vec<String>,
+}
+
+impl Found {
+    /// Whether the model reads images, by the tags Hugging Face assigns.
+    pub fn vision(&self) -> bool {
+        self.pipeline_tag.as_deref() == Some("image-text-to-text")
+            || self.tags.iter().any(|t| t == "image-text-to-text")
+    }
+}
+
 pub struct Client {
     http: reqwest::Client,
     endpoint: String,
@@ -138,6 +162,27 @@ impl Client {
             tags: info.tags,
             gated,
         })
+    }
+
+    /// Repositories with GGUF files matching `query`, most downloaded first.
+    ///
+    /// Filtered to GGUF on Hugging Face's side: a search for "qwen" otherwise
+    /// returns safetensors checkpoints first, none of which llama.cpp can run.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Found>, HubError> {
+        let url = format!("{}/api/models", self.endpoint);
+        let limit = limit.clamp(1, 50).to_string();
+        let resp = self
+            .authed(self.http.get(&url).query(&[
+                ("search", query),
+                ("filter", "gguf"),
+                ("sort", "downloads"),
+                ("direction", "-1"),
+                ("limit", limit.as_str()),
+            ]))
+            .send()
+            .await?;
+        let resp = self.check(resp, query).await?;
+        Ok(resp.json().await?)
     }
 
     /// URL that serves a file's bytes.

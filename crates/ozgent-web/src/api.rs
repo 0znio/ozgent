@@ -38,6 +38,12 @@ pub fn router(state: State) -> Router {
         .route("/api/conversations/{id}/facts", get(facts).post(add_fact))
         .route("/api/conversations/{id}/recall", post(preview_recall))
         .route("/api/facts/{id}", patch(pin_fact).delete(forget_fact))
+        .route("/api/hub/search", get(crate::hub::search))
+        .route("/api/hub/repo", get(crate::hub::repo))
+        .route("/api/hub/pull", post(crate::hub::pull))
+        .route("/api/hub/pulls", get(crate::hub::pulls))
+        .route("/api/hub/pulls/{id}", delete(crate::hub::cancel))
+        .route("/api/models/{model}", delete(crate::hub::remove))
         .route("/api/agents", get(list_agents))
         .route("/api/agents/{name}", axum::routing::put(save_agent).delete(delete_agent))
         .route("/api/chat", post(chat))
@@ -329,6 +335,12 @@ struct ModelInfo {
     /// Whether `default_model` names this one. The page opens on it, so the
     /// model someone uses most is not one they re-pick on every visit.
     is_default: bool,
+    /// An embedding model: it turns text into vectors and cannot chat. Kept
+    /// out of the chat picker, where it used to be the first entry and so the
+    /// one the page opened on.
+    embedding: bool,
+    /// The context it was trained for, from its own header.
+    context_train: Option<u32>,
 }
 
 async fn models(AxumState(state): AxumState<State>) -> Json<Vec<ModelInfo>> {
@@ -344,6 +356,7 @@ async fn models(AxumState(state): AxumState<State>) -> Json<Vec<ModelInfo>> {
             let is_default = default
                 .as_deref()
                 .is_some_and(|d| d == reference || Some(d) == m.manifest.alias.as_deref());
+            let weights = m.manifest.primary_weights(&m.dir);
             ModelInfo {
                 reference,
                 alias: m.manifest.alias.clone(),
@@ -351,6 +364,10 @@ async fn models(AxumState(state): AxumState<State>) -> Json<Vec<ModelInfo>> {
                 size_bytes: m.manifest.size_bytes,
                 vision: m.manifest.supports_vision(),
                 is_default,
+                embedding: ozgent_llama::layout::is_embedding(&weights),
+                context_train: ozgent_llama::layout::read(&weights)
+                    .map(|l| l.context_train)
+                    .filter(|c| *c > 0),
             }
         })
         .collect();

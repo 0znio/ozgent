@@ -88,6 +88,10 @@ an installer — nothing is compiled on the target. See
 
 ### First run
 
+In the browser: `ozgent web`, then the **download button** next to the model
+picker. Search Hugging Face, pick a size (it says which fit your GPU), watch
+it download. Or from the terminal:
+
 ```bash
 ozgent pull unsloth/Qwen3.5-4B-GGUF:Q4_K_M   # any GGUF repo, fetched in parallel
 ozgent list                                  # what you have

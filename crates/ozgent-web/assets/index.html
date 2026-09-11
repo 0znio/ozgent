@@ -96,6 +96,14 @@
     <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6L12 3Z"/>
     <path d="M9.5 12.2 11.3 14l3.4-3.6"/>
   </symbol>
+  <!-- A tray with an arrow into it: models come from somewhere else and land
+       here. -->
+  <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 4v11M7.5 10.5 12 15l4.5-4.5"/><path d="M4.5 15.5v2A2.5 2.5 0 0 0 7 20h10a2.5 2.5 0 0 0 2.5-2.5v-2"/>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+    <circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/>
+  </symbol>
   <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 3l1.9 5.3L19 10l-5.1 1.7L12 17l-1.9-5.3L5 10l5.1-1.7z"/>
     <path d="M18.5 15.5l.7 1.9 1.8.6-1.8.6-.7 1.9-.7-1.9-1.8-.6 1.8-.6z"/>
@@ -130,6 +138,10 @@
         <svg class="ic"><use href="#i-menu"></use></svg>
       </button>
       <select id="model" class="select" aria-label="Model"></select>
+      <button class="icon-btn" id="open-models" data-tip="Get and manage models" aria-label="Models">
+        <svg class="ic"><use href="#i-download"></use></svg>
+        <span class="md-badge" id="md-badge" hidden></span>
+      </button>
       <select id="thinking" class="select" aria-label="Reasoning">
         <option value="auto">Reasoning: auto</option>
         <option value="on">Reasoning: on</option>
@@ -219,6 +231,59 @@
   </button>
   <img id="lightbox-img" alt="">
 </div>
+
+<!-- Models: find one on Hugging Face, download it, remove what is installed.
+     Downloads belong to the server, so this can be closed while they run. -->
+<dialog id="models" class="settings md-dialog">
+  <div class="settings-head">
+    <h2>Models</h2>
+    <button class="icon-btn" id="close-models" aria-label="Close">
+      <svg class="ic"><use href="#i-close"></use></svg>
+    </button>
+  </div>
+
+  <div class="md-body">
+    <section class="md-section">
+      <h3 class="sub">Get a model</h3>
+      <form class="md-search" id="md-search-form" autocomplete="off">
+        <svg class="ic"><use href="#i-search"></use></svg>
+        <input type="text" id="md-query" class="text-input"
+               placeholder="Search Hugging Face, or paste owner/repo" spellcheck="false">
+      </form>
+      <p class="hint" id="md-search-note">GGUF repositories only — those are what llama.cpp runs.</p>
+      <div class="md-results" id="md-results"></div>
+
+      <div class="md-repo" id="md-repo" hidden>
+        <div class="md-repo-head">
+          <span class="md-repo-id" id="md-repo-id"></span>
+          <span class="md-chip" id="md-repo-vision" hidden>vision</span>
+          <span class="md-chip md-warn" id="md-repo-gated" hidden>gated</span>
+          <button type="button" class="linky" id="md-repo-back">back to results</button>
+        </div>
+        <p class="hint" id="md-gpu"></p>
+        <div class="md-quants" id="md-quants" role="radiogroup" aria-label="Quantisation"></div>
+        <div class="md-pull-row">
+          <label class="md-alias">
+            <span>Short name</span>
+            <input type="text" id="md-alias" class="text-input" placeholder="optional, e.g. qwen" maxlength="40">
+          </label>
+          <button type="button" class="primary-btn" id="md-pull">Download</button>
+        </div>
+        <p class="error" id="md-repo-error" hidden></p>
+      </div>
+    </section>
+
+    <section class="md-section" id="md-jobs-section" hidden>
+      <h3 class="sub">Downloads</h3>
+      <div class="md-jobs" id="md-jobs"></div>
+    </section>
+
+    <section class="md-section">
+      <h3 class="sub">Installed</h3>
+      <div class="md-installed" id="md-installed"></div>
+    </section>
+  </div>
+</dialog>
 
 <dialog id="settings" class="settings">
   <div class="settings-head">

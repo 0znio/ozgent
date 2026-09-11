@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ozgent-core.workspace = true
+ozgent-hub.workspace = true
 ozgent-llama.workspace = true
 ozgent-memory.workspace = true
 ozgent-tools.workspace = true

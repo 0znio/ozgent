@@ -62,6 +62,26 @@ pub fn read(path: &Path) -> Option<Layout> {
     layout
 }
 
+/// Whether `path` is an embedding model rather than one to chat with.
+///
+/// Read from the file, not guessed from the name: an embedding model's GGUF
+/// declares how its token vectors are pooled into one (`<arch>.pooling_type`)
+/// and a generative model's does not. Only the header is read.
+pub fn is_embedding(path: &Path) -> bool {
+    let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) else { return false };
+    let params = sys::gguf_init_params { no_alloc: true, ctx: std::ptr::null_mut() };
+    // SAFETY: `c_path` outlives the call; the handle is freed below.
+    let gguf = unsafe { sys::gguf_init_from_file(c_path.as_ptr(), params) };
+    if gguf.is_null() {
+        return false;
+    }
+    let pooled = string_key(gguf, "general.architecture")
+        .and_then(|arch| find(gguf, &format!("{arch}.pooling_type")))
+        .is_some();
+    unsafe { sys::gguf_free(gguf) };
+    pooled
+}
+
 fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
     let count = unsafe { sys::gguf_get_n_tensors(gguf) };
     if count <= 0 {

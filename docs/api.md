@@ -474,6 +474,53 @@ A stored reply's `tool_calls` records each call and agent with `at`: where
 in the reply text it happened, in UTF-16 units. The interface uses it to put
 cards and agent blocks back between the right paragraphs on reload.
 
+## Getting models
+
+Behind the Models dialog. The same machinery as `ozgent pull`: the listing,
+the quantisation choice, the parallel resumable downloader.
+
+### `GET /api/hub/search?q=`
+
+GGUF repositories on Hugging Face matching `q`, most downloaded first:
+`{"results": [{"id", "downloads", "likes", "vision", "created_at"}]}`.
+
+### `GET /api/hub/repo?repo=owner/name`
+
+What a repository offers: `quants` (each with `quant`, `bytes`, `shards`,
+`fits`, `recommended`, and the `name` it would install as), `vision` and
+`projector_bytes`, `gated`, `runnable` (false when it has no GGUF at all),
+and the `gpu` sizes are judged against. `fits` compares with the GPU's
+*total* memory at 85%, since the loaded model is unloaded to make room.
+`recommended` is Q4_K_M when it fits, otherwise the largest that does.
+
+### `POST /api/hub/pull`
+
+`{"repo": "owner/name", "quant": "Q4_K_M", "alias": "qwen"}` — `quant` and
+`alias` optional. Returns the new job immediately; the download runs on the
+server and outlives the page. `409` if the same model is already downloading;
+`400` if the alias is taken.
+
+### `GET /api/hub/pulls`
+
+Every job, newest first: `status` (`resolving`, `downloading`, `done`,
+`failed`, `cancelled`), `model`, `done`/`total` bytes across all files,
+`bytes_per_second` over the last few seconds, `file_index`/`file_count`,
+`error`. Poll it; a reload or a second tab sees the same jobs.
+
+### `DELETE /api/hub/pulls/{id}`
+
+Cancels a running job — what arrived is kept, and pulling again resumes from
+it — or clears a finished one from the list.
+
+### `DELETE /api/models/{model}`
+
+Deletes an installed model from disk, unloading it first if it is loaded.
+Refused (`409`) while it is downloading. If it was the default model, the
+default is cleared and the response says so (`"cleared_default": true`).
+
+`GET /api/models` marks `embedding` models (read from the file's own header),
+which the chat picker leaves out, and gives each model's `context_train`.
+
 ## Agents
 
 ### `GET /api/agents`

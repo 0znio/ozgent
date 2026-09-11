@@ -67,6 +67,9 @@ pub struct App {
     pub store: Mutex<Store>,
     pub embedder: HashingEmbedder,
     pub worker: Worker,
+    /// Model downloads started from the browser. They belong to the server,
+    /// so closing the tab that started one does not stop it.
+    pub pulls: crate::hub::SharedPulls,
 }
 
 pub type State = Arc<App>;
@@ -126,6 +129,7 @@ impl App {
             store: Mutex::new(store),
             embedder: HashingEmbedder::default(),
             worker,
+            pulls: Default::default(),
         }))
     }
 }

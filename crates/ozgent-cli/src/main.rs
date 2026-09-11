@@ -388,18 +388,10 @@ fn default_model(paths: &Paths, model: Option<String>, clear: bool) -> Result<()
 /// A quantisation can be split across several shard files, so summing matters:
 /// reporting one shard's size would understate a large model badly.
 fn quant_rows(info: &ozgent_hub::RepoInfo) -> Vec<(String, u64, usize)> {
-    let mut by_quant: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
-    for f in info.files.iter().filter(|f| f.is_gguf() && !f.is_mmproj()) {
-        if let Some(q) = ozgent_hub::quant_of(&f.path) {
-            let e = by_quant.entry(q).or_insert((0, 0));
-            e.0 += f.size;
-            e.1 += 1;
-        }
-    }
-    let mut rows: Vec<(String, u64, usize)> =
-        by_quant.into_iter().map(|(q, (b, n))| (q, b, n)).collect();
-    rows.sort_by_key(|(_, size, _)| *size);
-    rows
+    ozgent_hub::quantisations(&info.files)
+        .into_iter()
+        .map(|q| (q.quant, q.bytes, q.shards))
+        .collect()
 }
 
 /// Ask which quantisation to download.
