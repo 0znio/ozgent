@@ -3,7 +3,7 @@
 // Run by `the_bridge_never_answers_itself` in ozgent-channels, which skips when
 // node is not installed.
 
-import { decide, isBookkeeping, numberOf, textOf } from "./filter.mjs";
+import { decide, isBookkeeping, numberOf, textOf, userOf } from "./filter.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -16,7 +16,9 @@ const msg = (over = {}) => ({
   message: over.message === undefined ? { conversation: "hello" } : over.message,
 });
 
-const on = { selfChat: true, selfJid: ME, ourIds: new Set() };
+const MY_LID = "207741234567890@lid";
+const self = new Set([userOf(ME), userOf(MY_LID)]);
+const on = { selfChat: true, self, ourIds: new Set() };
 
 test("a message from someone else is answered", () => {
   const out = decide(msg(), on);
@@ -40,7 +42,7 @@ test("your own message to yourself is answered when the setting is on", () => {
 
 test("the self-chat is ignored entirely when the setting is off", () => {
   // Whoever uses that chat as a notepad keeps their notepad.
-  const off = { selfChat: false, selfJid: ME, ourIds: new Set() };
+  const off = { selfChat: false, self, ourIds: new Set() };
   assert.equal(decide(msg({ key: { remoteJid: ME, fromMe: true } }), off), null);
 });
 
@@ -123,4 +125,51 @@ test("text is found wherever WhatsApp put it", () => {
   assert.equal(textOf({ imageMessage: { caption: "c" } }), "c");
   assert.equal(textOf({ stickerMessage: {} }), "");
   assert.equal(textOf(null), "");
+});
+
+// ------------------------------------------------------------------- LIDs
+//
+// WhatsApp now addresses people by an opaque `…@lid` id. A bridge that only
+// knew phone-number JIDs failed both ways at once: your own chat, arriving
+// under your LID, was taken for "you, talking to someone else" and dropped;
+// and a friend's number in the allowlist never matched their LID.
+
+test("your own chat under your LID is your own chat", () => {
+  const out = decide(msg({ key: { remoteJid: MY_LID, fromMe: true } }), on);
+  assert.equal(out.own, true);
+  assert.equal(out.chat, MY_LID, "replies go back to the chat as addressed");
+});
+
+test("a device suffix on your id does not hide it", () => {
+  const out = decide(msg({ key: { remoteJid: "207741234567890:12@lid", fromMe: true } }), on);
+  assert.equal(out.own, true);
+});
+
+test("the self-chat addressed by LID with the number alongside is still yours", () => {
+  const out = decide(msg({ key: { remoteJid: "999@lid", remoteJidAlt: ME, fromMe: true } }), on);
+  assert.equal(out.own, true);
+});
+
+test("someone writing by LID is known by their number when WhatsApp gives it", () => {
+  const out = decide(msg({ key: { remoteJid: "31337@lid", remoteJidAlt: FRIEND } }), on);
+  assert.equal(out.own, false);
+  assert.equal(out.senderJid, "31337@lid");
+  assert.equal(out.phoneJid, FRIEND);
+});
+
+test("in a group the participant's number comes from participantAlt", () => {
+  const out = decide(msg({ key: { remoteJid: GROUP, participant: "31337@lid", participantAlt: FRIEND } }), on);
+  assert.equal(out.group, true);
+  assert.equal(out.phoneJid, FRIEND);
+});
+
+test("your own LID in someone else's chat is not the self-chat", () => {
+  // fromMe into a friend's chat, even though WhatsApp knows you by LID.
+  assert.equal(decide(msg({ key: { remoteJid: "31337@lid", fromMe: true } }), on), null);
+});
+
+test("Channels and broadcast lists are not conversations", () => {
+  for (const remoteJid of ["120363267230866345@newsletter", "1234@broadcast", "status@broadcast"]) {
+    assert.equal(decide(msg({ key: { remoteJid } }), on), null, remoteJid);
+  }
 });

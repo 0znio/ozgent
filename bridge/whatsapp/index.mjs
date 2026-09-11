@@ -7,7 +7,7 @@
 import { createRequire } from 'node:module'
 import { mkdirSync } from 'node:fs'
 import { createInterface } from 'node:readline'
-import { decide, numberOf, textOf } from './filter.mjs'
+import { decide, numberOf, textOf, userOf } from './filter.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -62,7 +62,7 @@ try {
 const api = baileys.default && baileys.default.makeWASocket ? baileys.default : baileys
 const makeWASocket =
   typeof api === 'function' ? api : (api.makeWASocket || api.default)
-const { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, Browsers } = api
+const { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = api
 
 if (typeof makeWASocket !== 'function') {
   send({ type: 'fatal', reason: 'the installed baileys does not export a socket constructor' })
@@ -106,8 +106,11 @@ function remember (key) {
   if (ourIds.size > OUR_IDS_KEPT) ourIds.delete(ourIds.values().next().value)
 }
 
-/** This account's own JID, which is also the id of the self-chat. */
-let selfJid = null
+/**
+ * Every id this account goes by — its phone number and its LID, user parts
+ * only — since the self-chat can arrive under either.
+ */
+const self = new Set()
 let sock = null
 let stopping = false
 
@@ -144,7 +147,10 @@ async function connect () {
     // stdout — which is the protocol.
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: Browsers ? Browsers.appropriate('ozgent') : undefined,
+    // What WhatsApp ▸ Linked devices shows is the first entry. Baileys'
+    // `appropriate()` puts the operating system there ("Ubuntu" on any
+    // Linux), so the device read as an Ubuntu machine rather than as ozgent.
+    browser: ['ozgent', 'Chrome', '0.1.0'],
     // Nothing here reads anyone's history, and syncing it on every link is
     // slow and stores messages this machine was never sent.
     syncFullHistory: false,
@@ -168,7 +174,10 @@ async function connect () {
       const me = sock.user && sock.user.id
       // The JID carries a device suffix (`:12`) that chat ids never have, so
       // it is rebuilt from the number to be comparable with `remoteJid`.
-      selfJid = numberOf(me) ? `${numberOf(me)}@s.whatsapp.net` : null
+      self.clear()
+      for (const id of [me, sock.user && sock.user.lid]) {
+        if (id) self.add(userOf(id))
+      }
       send({ type: 'ready', who: numberOf(me) ? '+' + numberOf(me) : 'this account' })
       if (once) {
         // Give the credentials a moment to finish being written before the
@@ -202,9 +211,17 @@ async function connect () {
     // `append` is history being filled in behind us, not something just said.
     if (type !== 'notify') return
     for (const m of messages) {
-      const verdict = decide(m, { selfChat, selfJid, ourIds })
+      const verdict = decide(m, { selfChat, self, ourIds })
       if (!verdict) continue
       const { chat, senderJid, group, own } = verdict
+      // The sender's phone number: given alongside the LID when WhatsApp
+      // chose to, otherwise looked up in the mapping Baileys keeps.
+      let phoneJid = verdict.phoneJid
+      if (!phoneJid && senderJid.endsWith('@lid')) {
+        try {
+          phoneJid = (await sock.signalRepository.lidMapping.getPNForLID(senderJid)) || ''
+        } catch (e) { log('lid lookup:', e.message) }
+      }
 
       const text = textOf(m.message)
       const image = await imageOf(m)
@@ -213,9 +230,11 @@ async function connect () {
       send({
         type: 'message',
         chat,
-        sender: numberOf(senderJid),
+        // The number when it is known — what an allowlist is written in —
+        // and the JID either way, so an entry in either form matches.
+        sender: numberOf(phoneJid) || numberOf(senderJid),
         jid: senderJid || '',
-        name: m.pushName || numberOf(senderJid) || 'someone',
+        name: m.pushName || (phoneJid ? '+' + numberOf(phoneJid) : 'someone'),
         text,
         group,
         // True only for your own chat with yourself: the account that scanned
