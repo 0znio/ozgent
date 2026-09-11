@@ -769,72 +769,41 @@ function withMentions(text) {
   );
 }
 
-/// The block an agent's work is drawn in, where in the thread it ran.
+/// The line that says an agent is answering, placed where it took over.
 ///
-/// Header, then the steps it took (reasoning and tool calls, open while it
-/// works and folded away once it has answered), then its report. It is the
-/// same shape live and on reload, because both are built by this.
-function agentBlock(event) {
-  const block = document.createElement("section");
-  block.className = "ag-block running";
-  block.innerHTML =
-    '<header class="ag-head">' +
-      '<span class="ag-kind">agent</span>' +
-      '<span class="ag-name"></span>' +
-      '<span class="ag-desc"></span>' +
-      '<span class="ag-state"><span class="ag-dot"></span><span class="ag-status">working</span></span>' +
-    '</header>' +
-    '<p class="ag-missing" hidden></p>' +
-    '<details class="ag-trace" open>' +
-      '<summary><span class="ag-steps">steps</span></summary>' +
-      '<div class="ag-trace-body"><span class="ag-end"></span></div>' +
-    '</details>' +
-    '<div class="ag-report answer"></div>';
-  block.querySelector(".ag-name").textContent = `@${event.name}`;
-  block.querySelector(".ag-desc").textContent = event.description ?? "";
-  if (event.missing?.length) {
-    const missing = block.querySelector(".ag-missing");
-    missing.hidden = false;
-    missing.textContent = `not available here: ${event.missing.join(", ")}`;
-  }
+/// Not a frame around its work: its tool calls and its reply look like any
+/// other, and this line is what says whose they are — with a pulse while it
+/// works and a one-line account once it has finished.
+function agentTag(event) {
+  const tag = document.createElement("div");
+  tag.className = "ag-tag running";
+  tag.innerHTML =
+    '<span class="ag-mention"></span>' +
+    '<span class="ag-desc"></span>' +
+    '<span class="ag-state"><span class="ag-dot"></span><span class="ag-status">working</span></span>';
+  tag.querySelector(".ag-mention").textContent = `@${event.name}`;
+  let desc = event.description ?? "";
+  if (event.missing?.length) desc += ` · not available here: ${event.missing.join(", ")}`;
+  tag.querySelector(".ag-desc").textContent = desc;
   const started = Date.now();
-  const status = block.querySelector(".ag-status");
+  const status = tag.querySelector(".ag-status");
   // Seconds, ticking, because an agent can work for a minute and a still
   // "working" reads as stuck.
   const timer = setInterval(() => {
     status.textContent = `working · ${((Date.now() - started) / 1000).toFixed(0)}s`;
   }, 1000);
-  return {
-    el: block,
-    trace: block.querySelector(".ag-trace-body"),
-    end: block.querySelector(".ag-end"),
-    report: block.querySelector(".ag-report"),
-    reportText: "",
-    thinkText: "",
-    calls: [],
-    stop() { clearInterval(timer); },
-  };
+  return { el: tag, calls: [], stop() { clearInterval(timer); } };
 }
 
-/// Mark an agent block finished, and say what it did.
+/// Mark an agent finished, and say what it did.
 function finishAgent(agent, event) {
   agent.stop();
-  const block = agent.el;
-  block.classList.remove("running");
-  block.classList.toggle("bad", !event.ok);
+  agent.el.classList.remove("running");
+  agent.el.classList.toggle("bad", !event.ok);
   const seconds = ((event.ms ?? 0) / 1000).toFixed(1);
   const calls = event.calls ?? agent.calls.length;
-  block.querySelector(".ag-status").textContent =
+  agent.el.querySelector(".ag-status").textContent =
     `${event.ok ? "done" : "no report"} · ${calls} tool call${calls === 1 ? "" : "s"} · ${seconds}s`;
-  // The steps fold away once there is a report to read; with none, they are
-  // the only account of what happened and stay open.
-  const names = [...new Set(agent.calls)];
-  block.querySelector(".ag-steps").textContent = calls
-    ? `${calls} step${calls === 1 ? "" : "s"} · ${names.join(", ")}`
-    : "no tools used";
-  if (event.ok) block.querySelector(".ag-trace").open = false;
-  block.querySelector(".ag-think")?.classList.remove("streaming");
-  agent.report.classList.remove("cursor");
 }
 
 /// Where each piece of a reply goes, in the order it happened.
@@ -853,23 +822,13 @@ class ReplyView {
     this.reasoning = "";
   }
 
-  /// The element text is going into, for the typing cursor.
-  target() { return this.agent ? this.agent.report : this.seg; }
-
   cursor(on) {
     for (const el of this.body.querySelectorAll(".cursor")) el.classList.remove("cursor");
-    if (on) this.target().classList.add("cursor");
+    if (on) this.seg.classList.add("cursor");
   }
 
   text(t) {
     if (!t) return;
-    if (this.agent) {
-      this.agent.reportText += t;
-      this.agent.report.innerHTML = markdown(this.agent.reportText);
-      dressCode(this.agent.report);
-      this.agent.el.querySelector(".ag-think")?.classList.remove("streaming");
-      return;
-    }
     // Whitespace between two agents' reports is a separator in the stored
     // text, not something to draw.
     if (!this.segText && !t.trim()) return;
@@ -880,15 +839,6 @@ class ReplyView {
   }
 
   thinking(t) {
-    if (this.agent) {
-      this.agent.thinkText += t;
-      if (!this.agent.thinkText.trim()) return;
-      const pane = reasoningPane(this.agent.trace);
-      pane.closest(".think").classList.add("streaming", "ag-think");
-      pane.innerHTML = markdown(this.agent.thinkText);
-      pane.scrollTop = pane.scrollHeight;
-      return;
-    }
     this.reasoning += t;
     if (!this.reasoning.trim()) return;
     this.think = this.think ?? reasoningPane(this.body);
@@ -897,13 +847,10 @@ class ReplyView {
     this.think.scrollTop = this.think.scrollHeight;
   }
 
-  /// The element a new card or note goes in front of.
-  ///
-  /// Inside an agent, the end of its steps. Otherwise after the text so far:
-  /// the segment that holds it is closed, and text after the card starts a
-  /// new one.
+  /// The element a new card or note goes in front of: after the text so
+  /// far, which closes that paragraph, so text after the card starts a new
+  /// one.
   anchor() {
-    if (this.agent) return this.agent.end;
     if (this.segText.trim()) this.newSegment();
     return this.seg;
   }
@@ -923,32 +870,22 @@ class ReplyView {
   }
 
   agentStart(event) {
-    const agent = agentBlock(event);
-    // Before the current segment if nothing has been written into it, so the
-    // block is not stranded below an empty paragraph.
-    if (this.segText.trim()) {
-      this.seg.after(agent.el);
-    } else {
-      this.seg.before(agent.el);
-    }
+    const agent = agentTag(event);
+    this.anchor().before(agent.el);
     this.agent = agent;
   }
 
   agentEnd(event) {
     if (!this.agent) return;
     finishAgent(this.agent, event);
-    // Anything said after the agent is the conversation's, below its block.
-    const next = document.createElement("div");
-    next.className = "answer";
-    this.agent.el.after(next);
-    this.seg = next;
-    this.segText = "";
+    // A second agent's line must come after this one's reply.
+    if (this.segText.trim()) this.newSegment();
     this.agent = null;
   }
 
   /// A line of status or failure, at the end of whatever is being written.
   note(html) {
-    this.target().insertAdjacentHTML("beforeend", html);
+    this.seg.insertAdjacentHTML("beforeend", html);
   }
 
   /// Stop every animation that says something is still happening.
@@ -959,7 +896,7 @@ class ReplyView {
   }
 }
 
-/// Rebuild a stored reply: text, cards and agent blocks at their offsets.
+/// Rebuild a stored reply: text, cards and agent lines at their offsets.
 ///
 /// Offsets count UTF-16 units into the stored text, as the server records
 /// them. A reply saved before offsets existed has none, and its cards go
@@ -2663,8 +2600,10 @@ async function openRepo(id) {
     $("md-repo-id").textContent = repo.id;
     $("md-repo-vision").hidden = !repo.vision;
     $("md-repo-gated").hidden = !repo.gated;
+    const allFit = repo.quants.length && repo.quants.every((q) => q.fits === true);
     $("md-gpu").textContent = repo.gpu
-      ? `Sizes judged against ${repo.gpu.name} (${bytesText(repo.gpu.memory)}).` +
+      ? `Judged against ${repo.gpu.name} (${bytesText(repo.gpu.memory)}): ` +
+        (allFit ? "every size here fits." : "sizes marked \u201cpartly on CPU\u201d run, but slower.") +
         (repo.vision ? ` The vision projector adds ${bytesText(repo.projector_bytes)}.` : "")
       : "No GPU found: every size runs on the CPU, and smaller is faster.";
     renderQuants();
@@ -2698,7 +2637,8 @@ function renderQuants() {
       bytesText(q.bytes) + (q.shards > 1 ? ` · ${q.shards} files` : "");
     const chips = [];
     if (q.recommended) chips.push('<span class="md-chip md-good">recommended</span>');
-    if (q.fits === true) chips.push('<span class="md-chip">fits your GPU</span>');
+    // Only the exception is marked: a chip saying "fits" on twenty rows
+    // says nothing twenty times.
     if (q.fits === false) chips.push('<span class="md-chip md-faint">partly on CPU</span>');
     if (installed) chips.push('<span class="md-chip">installed</span>');
     row.querySelector(".md-chips").innerHTML = chips.join("");
@@ -2707,6 +2647,8 @@ function renderQuants() {
     box.append(row);
   }
   syncQuants();
+  // The list scrolls on its own; start it at the suggestion.
+  box.querySelector('[aria-checked="true"]')?.scrollIntoView({ block: "center" });
 }
 
 function syncQuants() {

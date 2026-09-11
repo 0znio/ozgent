@@ -1521,38 +1521,19 @@ body {
 }
 .msg.user .ag-mention { color: var(--ink); }
 
-.ag-block {
-  margin: 0 0 var(--s3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--raised);
-  overflow: hidden;
-  transition: border-color var(--mid) var(--ease);
-}
-.ag-block.running { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
-.ag-block.bad { border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); }
-
-.ag-head {
+/* The line that says an agent is answering. Its calls and reply below are
+   drawn like any other; this is what says whose they are. */
+.ag-tag {
   display: flex;
   align-items: baseline;
   gap: var(--s2);
-  padding: var(--s2) var(--s3);
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
+  margin: 0 0 var(--s2);
   min-width: 0;
 }
-.ag-kind {
-  flex: none;
-  font-family: var(--mono);
-  font-size: var(--t-micro);
-  letter-spacing: .08em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-}
-.ag-name { flex: none; font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--ink); }
+.ag-tag .ag-mention { font-weight: 700; color: var(--ink); }
 .ag-desc {
   min-width: 0;
-  color: var(--ink-soft);
+  color: var(--ink-faint);
   font-size: var(--t-small);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -1564,45 +1545,10 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .ag-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
-.ag-block.running .ag-dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
-.ag-block.running .ag-status { color: var(--accent); }
-.ag-block.bad .ag-dot { background: var(--danger); }
-@media (prefers-reduced-motion: reduce) { .ag-block.running .ag-dot { animation: none; } }
-
-.ag-missing {
-  margin: 0;
-  padding: 6px var(--s3);
-  border-bottom: 1px solid var(--line-soft);
-  font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint);
-}
-
-.ag-trace > summary {
-  cursor: pointer;
-  list-style: none;
-  padding: 6px var(--s3);
-  font-family: var(--mono);
-  font-size: var(--t-micro);
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-  user-select: none;
-}
-.ag-trace > summary::-webkit-details-marker { display: none; }
-.ag-trace > summary::marker { content: ""; }
-/* Two glyphs rather than one rotated: a rotated character turns about its
-   own box, not its ink, and lands visibly off the line. */
-.ag-trace > summary::before { content: "▸"; display: inline-block; width: 1.2em; }
-.ag-trace[open] > summary::before { content: "▾"; }
-.ag-trace > summary:hover { color: var(--ink-soft); }
-.ag-trace-body { padding: 0 var(--s3) var(--s2); }
-.ag-trace-body:has(> .ag-end:only-child) { display: none; }
-.ag-trace-body .think { margin-bottom: var(--s2); }
-.ag-trace-body .tool-card { margin-bottom: 6px; }
-.ag-end { display: block; }
-
-.ag-report { padding: var(--s3); border-top: 1px solid var(--line-soft); }
-.ag-report:empty { display: none; }
-.ag-report > :last-child { margin-bottom: 0; }
+.ag-tag.running .ag-dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+.ag-tag.running .ag-status { color: var(--accent); }
+.ag-tag.bad .ag-dot { background: var(--danger); }
+@media (prefers-reduced-motion: reduce) { .ag-tag.running .ag-dot { animation: none; } }
 
 /* --- the @ panel --------------------------------------------------------- */
 
@@ -1688,7 +1634,7 @@ body {
 @media (max-width: 620px) {
   .ag-tool { grid-template-columns: 1fr auto; }
   .ag-tool-desc { grid-column: 1 / -1; }
-  .ag-desc { display: none; }
+  .ag-tag .ag-desc { display: none; }
 }
 
 /* ---------------------------------------------------------------- models
@@ -1774,7 +1720,11 @@ body {
   display: flex; flex-direction: column;
   margin-top: var(--s3);
   border: 1px solid var(--line); border-radius: var(--radius);
-  overflow: hidden;
+  /* A repo can offer twenty sizes; the list scrolls so Download stays in
+     view under it. */
+  max-height: 290px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .md-quant {
   display: grid;

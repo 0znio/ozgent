@@ -35,10 +35,15 @@ use ozgent_render::crossterm::{
     cursor,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     terminal,
 };
+
+/// Whether the enhanced key reporting was switched on, so exactly the
+/// terminals that got it are asked to switch it off again.
+static ENHANCED_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub use editor::Editor;
 pub use transcript::{Block, Transcript};
@@ -73,15 +78,29 @@ impl Screen {
         // input history" — so spinning the wheel to re-read a long answer
         // riffled through past commands in the prompt box instead.
         //
-        // The cost is that click-drag selection now goes to ozgent rather
-        // than the terminal. Every mainstream terminal keeps Shift-drag for
-        // its own selection, which is what `/help` says.
+        // The cost is that click-drag now goes to ozgent rather than the
+        // terminal, so ozgent does the selecting itself: a drag highlights
+        // what is on screen and copies it on release. Shift-drag still gives
+        // the terminal's own selection where the terminal supports it.
         ozgent_render::crossterm::execute!(
             out,
             terminal::EnterAlternateScreen,
             EnableMouseCapture,
             cursor::Hide,
         )?;
+        // Without this a terminal sends Shift-Enter as a plain Enter — there
+        // is no byte sequence for it in the legacy encoding — so the binding
+        // for "new line" could never be seen. Terminals that speak the kitty
+        // keyboard protocol (kitty, WezTerm, foot, Ghostty, recent Alacritty)
+        // report the modifier once asked; the rest are left alone and keep
+        // Alt-Enter and Ctrl-J.
+        if matches!(terminal::supports_keyboard_enhancement(), Ok(true)) {
+            ozgent_render::crossterm::execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            ENHANCED_KEYS.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         out.flush()?;
         Ok(Self { open: true })
     }
@@ -148,6 +167,9 @@ impl Drop for Screen {
 /// Put the terminal back the way it was found.
 fn restore() {
     let mut out = std::io::stdout();
+    if ENHANCED_KEYS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = ozgent_render::crossterm::execute!(out, PopKeyboardEnhancementFlags);
+    }
     let _ = ozgent_render::crossterm::execute!(
         out,
         cursor::Show,
@@ -203,6 +225,11 @@ pub enum Key {
     KillToStart,
     KillWord,
     Resize,
+    /// The left button went down, was dragged, or came up, at (row, column)
+    /// of the screen. How text is selected for copying.
+    Press(usize, usize),
+    Drag(usize, usize),
+    Release(usize, usize),
     /// A key this application has no use for.
     Ignored,
 }
@@ -226,13 +253,18 @@ pub fn translate(event: Event) -> Option<Key> {
     Some(from_key(key))
 }
 
-/// Only the wheel. Clicks and drags are reported now that capture is on, and
-/// acting on them would mean inventing a click target the interface does not
-/// have — a stray click must not move the caret or select a message.
+/// The wheel, and the left button for selecting text.
+///
+/// A click selects nothing on its own — it starts a selection that a drag
+/// extends — so a stray click never moves the caret or changes anything.
 fn from_mouse(event: MouseEvent) -> Option<Key> {
+    let at = (event.row as usize, event.column as usize);
     match event.kind {
         MouseEventKind::ScrollUp => Some(Key::ScrollUp),
         MouseEventKind::ScrollDown => Some(Key::ScrollDown),
+        MouseEventKind::Down(MouseButton::Left) => Some(Key::Press(at.0, at.1)),
+        MouseEventKind::Drag(MouseButton::Left) => Some(Key::Drag(at.0, at.1)),
+        MouseEventKind::Up(MouseButton::Left) => Some(Key::Release(at.0, at.1)),
         _ => None,
     }
 }
@@ -340,7 +372,6 @@ mod tests {
         // alternate screen turns the wheel into Up and Down, which this
         // application reads as "walk the input history" — so spinning the
         // wheel to re-read an answer riffled through past commands instead.
-        use ozgent_render::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let at = |kind| {
             translate(Event::Mouse(MouseEvent {
                 kind,
@@ -351,11 +382,12 @@ mod tests {
         };
         assert_eq!(at(MouseEventKind::ScrollUp), Some(Key::ScrollUp));
         assert_eq!(at(MouseEventKind::ScrollDown), Some(Key::ScrollDown));
-        assert_eq!(
-            at(MouseEventKind::Down(MouseButton::Left)),
-            None,
-            "a click has no target in this interface and must not move the caret",
-        );
+        // The left button is how text is selected for copying: press, drag,
+        // release, at the cell the pointer is on.
+        assert_eq!(at(MouseEventKind::Down(MouseButton::Left)), Some(Key::Press(4, 4)));
+        assert_eq!(at(MouseEventKind::Drag(MouseButton::Left)), Some(Key::Drag(4, 4)));
+        assert_eq!(at(MouseEventKind::Up(MouseButton::Left)), Some(Key::Release(4, 4)));
+        assert_eq!(at(MouseEventKind::Down(MouseButton::Right)), None);
     }
 
     #[test]

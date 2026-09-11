@@ -15,9 +15,10 @@ to choose, **Tab** or **Enter** to insert.
 
 ## What you get
 
-The agent's work shows **where it ran** in the conversation: a framed block
-with its name, every step it took, and its report. The steps fold away once it
-answers.
+The reply comes back like any other — its tool calls, then its answer —
+headed with the agent's name, so it is clear who did the work. In the browser
+that line shows it working and then how it went (`done · 4 tool calls ·
+30.3s`); in the terminal the same summary follows the reply.
 
 | agent | for | tools |
 |---|---|---|

@@ -68,9 +68,14 @@ pub struct Ui {
     /// Whether `prompt` is also doing the line editing, which it is only when
     /// there is no screen.
     piped: bool,
-    /// Drawn down the left of everything written while it is set: an agent's
-    /// work, framed so it reads as one place in the conversation.
-    gutter: Option<String>,
+    /// Text being selected with the mouse: where the drag started and where
+    /// it is now, as (row, column) of the screen.
+    selection: Option<((usize, usize), (usize, usize))>,
+    /// The last frame, without its colours, which is what a selection copies.
+    plain_rows: Vec<String>,
+    /// A short message on the permission bar — "copied 312 characters" —
+    /// and when it goes away.
+    notice: Option<(String, Instant)>,
     /// Every agent, for the `@` panel.
     agents: ozgent_core::AgentCatalog,
     /// The highlighted row of the `@` panel, and where the mention it is
@@ -116,7 +121,9 @@ impl Ui {
             piped: screen.is_none(),
             prompt,
             screen,
-            gutter: None,
+            selection: None,
+            plain_rows: Vec::new(),
+            notice: None,
             agents: Default::default(),
             pick: 0,
             pick_start: None,
@@ -124,19 +131,9 @@ impl Ui {
         }
     }
 
-    /// Frame what is written from now on, or stop framing it.
-    pub fn set_gutter(&mut self, gutter: Option<String>) {
-        self.gutter = gutter;
-    }
-
     /// The agents the `@` panel offers.
     pub fn set_agents(&mut self, agents: ozgent_core::AgentCatalog) {
         self.agents = agents;
-    }
-
-    /// A block, framed if a gutter is set.
-    fn framed(&self, block: Block) -> Block {
-        block.with_gutter(self.gutter.clone())
     }
 
     /// The agents matching the mention at the caret, and where it starts.
@@ -254,14 +251,14 @@ impl Ui {
         let line = self.activity_line(replacing);
         if self.screen.is_some() {
             if replacing {
-                self.transcript.set_last(self.framed(Block::plain(line)));
+                self.transcript.set_last(Block::plain(line));
             } else {
                 self.spin = 0;
-                self.transcript.push(self.framed(Block::plain(line)));
+                self.transcript.push(Block::plain(line));
             }
             self.render();
         } else if !replacing {
-            eprintln!("{}{line}", self.gutter.as_deref().unwrap_or(""));
+            eprintln!("{line}");
         }
     }
 
@@ -278,7 +275,7 @@ impl Ui {
         }
         self.spin = self.spin.wrapping_add(1);
         let line = self.activity_line(true);
-        self.transcript.set_last(self.framed(Block::plain(line)));
+        self.transcript.set_last(Block::plain(line));
         self.render();
     }
 
@@ -289,7 +286,7 @@ impl Ui {
         }
         let line = self.activity_line(false);
         if self.screen.is_some() {
-            self.transcript.set_last(self.framed(Block::plain(line)));
+            self.transcript.set_last(Block::plain(line));
             self.render();
         }
         self.activity = None;
@@ -326,23 +323,19 @@ impl Ui {
     pub fn say(&mut self, text: impl Into<String>) {
         let text = text.into();
         if self.screen.is_some() {
-            self.transcript.push(self.framed(Block::plain(text)));
+            self.transcript.push(Block::plain(text));
             self.render();
         } else {
-            eprintln!("{}{text}", self.gutter.as_deref().unwrap_or(""));
+            eprintln!("{text}");
         }
     }
 
     pub fn blank(&mut self) {
         if self.screen.is_some() {
-            match &self.gutter {
-                // A blank line inside a frame keeps the rule unbroken.
-                Some(g) => self.transcript.push(Block::fixed(vec![g.trim_end().to_string()])),
-                None => self.transcript.blank(),
-            }
+            self.transcript.blank();
             self.render();
         } else {
-            eprintln!("{}", self.gutter.as_deref().unwrap_or("").trim_end());
+            eprintln!();
         }
     }
 
@@ -350,7 +343,7 @@ impl Ui {
     pub fn markdown(&mut self, text: impl Into<String>) {
         let text = text.into();
         if self.screen.is_some() {
-            self.transcript.push(self.framed(Block::markdown(text)));
+            self.transcript.push(Block::markdown(text));
             self.render();
         } else {
             let width = ozgent_render::terminal_width();
@@ -372,18 +365,14 @@ impl Ui {
                 let width = ozgent_render::terminal_width();
                 let rendered =
                     ozgent_render::MarkdownRenderer::new(self.theme.clone(), width).render(answer);
-                let gutter = self.gutter.as_deref().unwrap_or("");
-                for line in rendered.lines() {
-                    println!("{gutter}{line}");
-                }
+                println!("{}", rendered.trim_end());
             }
             return;
         }
         if !force && self.last_frame.elapsed() < FRAME {
             return;
         }
-        let block = Block::reply(thinking.map(str::to_string), answer.to_string());
-        self.transcript.set_live(self.framed(block));
+        self.transcript.set_live(Block::reply(thinking.map(str::to_string), answer.to_string()));
         self.render();
     }
 
@@ -436,6 +425,11 @@ impl Ui {
             // The @ panel has first claim on the arrows, Tab, Enter and
             // Escape while it is open; otherwise Enter would send a name
             // half typed.
+            // A finished selection stays lit until something else happens,
+            // so it is clear what was copied.
+            if !matches!(key, Key::Press(..) | Key::Drag(..) | Key::Release(..)) {
+                self.selection = None;
+            }
             if self.panel_key(&key) {
                 self.sync_panel();
                 self.render();
@@ -528,8 +522,70 @@ impl Ui {
             Key::ScrollDown => self.transcript.scroll_down(WHEEL),
             Key::Escape => self.transcript.scroll_to_tail(),
             Key::Resize => self.resize(),
+            Key::Press(row, col) => self.selection = Some(((row, col), (row, col))),
+            Key::Drag(row, col) => {
+                if let Some((anchor, _)) = self.selection {
+                    self.selection = Some((anchor, (row, col)));
+                }
+            }
+            Key::Release(row, col) => {
+                if let Some((anchor, _)) = self.selection {
+                    self.selection = Some((anchor, (row, col)));
+                    let text = self.selected_text();
+                    if text.trim().is_empty() {
+                        // A click, not a drag: nothing was selected.
+                        self.selection = None;
+                    } else {
+                        self.copy(&text);
+                    }
+                }
+            }
             Key::Enter | Key::Interrupt | Key::Eof | Key::Tab | Key::Ignored => {}
         }
+    }
+
+    /// Put `text` on the clipboard, and say so on the bar.
+    ///
+    /// Two routes, because neither reaches every setup. OSC 52 asks the
+    /// terminal itself to set the clipboard, which works over ssh and in
+    /// kitty, WezTerm, foot, Alacritty and iTerm2 — but not in GNOME's VTE
+    /// terminals. A clipboard program, where one is installed, covers those.
+    pub fn copy(&mut self, text: &str) {
+        let encoded = ozgent_core::chat::b64::encode(text.as_bytes());
+        let mut out = std::io::stdout();
+        let _ = std::io::Write::write_all(&mut out, format!("\x1b]52;c;{encoded}\x07").as_bytes());
+        let _ = std::io::Write::flush(&mut out);
+        let helper = clipboard_program();
+        if let Some((program, args)) = &helper {
+            if let Ok(mut child) = std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = std::io::Write::write_all(&mut stdin, text.as_bytes());
+                }
+                // Not waited on: wl-copy stays alive to serve the clipboard.
+            }
+        }
+        let n = text.chars().count();
+        self.notice = Some((format!("copied {n} character{}", if n == 1 { "" } else { "s" }), Instant::now()));
+    }
+
+    /// The characters under the selection, from the last frame drawn.
+    fn selected_text(&self) -> String {
+        let Some((a, b)) = self.selection else { return String::new() };
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = Vec::new();
+        for row in start.0..=end.0.min(self.plain_rows.len().saturating_sub(1)) {
+            let line = &self.plain_rows[row];
+            let from = if row == start.0 { start.1 } else { 0 };
+            let to = if row == end.0 { end.1 + 1 } else { usize::MAX };
+            out.push(columns(line, from, to).trim_end().to_string());
+        }
+        out.join("\n")
     }
 
     /// Poll for a key while something else is happening.
@@ -561,7 +617,13 @@ impl Ui {
                 | Key::ScrollUp
                 | Key::ScrollDown
                 | Key::Escape
-                | Key::Resize => self.edit(key),
+                | Key::Resize
+                | Key::Press(..)
+                | Key::Drag(..)
+                | Key::Release(..) => {
+                    self.edit(key);
+                    self.render();
+                }
                 _ => {}
             }
         }
@@ -626,7 +688,7 @@ impl Ui {
 
     fn layout(&self) -> Layout {
         let (width, height) = self.size;
-        let rows = self.editor.layout(width.saturating_sub(4).max(1)).0.len();
+        let rows = self.editor.layout(width.saturating_sub(5).max(1)).0.len();
         Layout::compute(width, height, rows.min(MAX_PROMPT_ROWS))
     }
 
@@ -687,6 +749,24 @@ impl Ui {
         }
         rows.truncate(layout.height);
 
+        // What the frame says without colour, for copying; and the selection
+        // drawn over it in reverse video.
+        self.plain_rows = rows.iter().map(|r| strip(r)).collect();
+        if let Some((a, b)) = self.selection {
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            for row in start.0..=end.0.min(rows.len().saturating_sub(1)) {
+                let plain = &self.plain_rows[row];
+                let from = if row == start.0 { start.1 } else { 0 };
+                let to = if row == end.0 { end.1 + 1 } else { usize::MAX };
+                rows[row] = format!(
+                    "{}\x1b[7m{}\x1b[27m{}",
+                    columns(plain, 0, from),
+                    columns(plain, from, to),
+                    columns(plain, to, usize::MAX),
+                );
+            }
+        }
+
         // The caret sits inside the box: one row down for the top border, two
         // columns in for the border and the space.
         let caret_row = layout.prompt.0 + 1 + caret.row.saturating_sub(first);
@@ -705,7 +785,15 @@ impl Ui {
     /// been reading "run programs: ask" for a week knows exactly where the
     /// question will appear when it does.
     fn permission_bar(&self, width: usize) -> String {
+        let notice = self
+            .notice
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(2500))
+            .map(|(text, _)| text.clone());
         let Some(q) = &self.question else {
+            if let Some(text) = notice {
+                return pad(&self.theme.style(Style::color(Color::Green), &format!("✓ {text}")), width);
+            }
             let text = if self.posture.is_empty() {
                 "tools · no policy loaded".to_string()
             } else {
@@ -746,6 +834,79 @@ impl Ui {
         }
     }
 
+}
+
+/// A row without its escape sequences.
+fn strip(row: &str) -> String {
+    let mut out = String::with_capacity(row.len());
+    let mut chars = row.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ ... final byte in @..~. OSC: ESC ] ... BEL or ST.
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(d) = chars.next() {
+                        if d == '\x07' || (d == '\x1b' && chars.peek() == Some(&'\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The part of a plain row between two screen columns, by display width.
+fn columns(row: &str, from: usize, to: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    for c in row.chars() {
+        let w = display_width(&c.to_string());
+        if col >= to {
+            break;
+        }
+        if col >= from {
+            out.push(c);
+        }
+        col += w;
+    }
+    out
+}
+
+/// A clipboard program for terminals that ignore OSC 52, if one is here.
+fn clipboard_program() -> Option<(&'static str, Vec<&'static str>)> {
+    let on_path = |name: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+    };
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && on_path("wl-copy") {
+        return Some(("wl-copy", vec![]));
+    }
+    if std::env::var_os("DISPLAY").is_some() {
+        if on_path("xclip") {
+            return Some(("xclip", vec!["-selection", "clipboard"]));
+        }
+        if on_path("xsel") {
+            return Some(("xsel", vec!["--clipboard", "--input"]));
+        }
+    }
+    if on_path("pbcopy") {
+        return Some(("pbcopy", vec![]));
+    }
+    None
 }
 
 fn glyph(effect: Effect) -> &'static str {
@@ -799,6 +960,19 @@ fn clip(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stripping_leaves_the_text_and_nothing_else() {
+        assert_eq!(strip("\x1b[1;36m› \x1b[0mhello\x1b[K"), "› hello");
+        assert_eq!(strip("\x1b]52;c;aGk=\x07after"), "after");
+    }
+
+    #[test]
+    fn columns_are_counted_by_display_width() {
+        assert_eq!(columns("hello world", 6, usize::MAX), "world");
+        assert_eq!(columns("hello world", 0, 5), "hello");
+        assert_eq!(columns("a界b", 1, 3), "界");
+    }
 
     #[test]
     fn a_command_is_its_own_summary() {

@@ -3,8 +3,9 @@
 Run language models on your own machine — and let them actually *do* things.
 
 ozgent is one Rust binary over llama.cpp. It gives you a terminal app, a web
-interface, an OpenAI-compatible API, tools that really run, and a permission
-prompt before anything touches your disk.
+interface, an OpenAI- and Anthropic-compatible API, tools that really run,
+`@agents` that use them, and a permission prompt before anything touches your
+disk.
 
 ![ozgent web interface](docs/images/web.png)
 
@@ -89,8 +90,12 @@ an installer — nothing is compiled on the target. See
 ### First run
 
 In the browser: `ozgent web`, then the **download button** next to the model
-picker. Search Hugging Face, pick a size (it says which fit your GPU), watch
-it download. Or from the terminal:
+picker. Search Hugging Face, pick a size — it says which fit your GPU — and
+watch it arrive. Downloads keep going if you close the tab.
+
+<img src="docs/images/web-models.png" alt="the Models dialog" width="480">
+
+Or from the terminal:
 
 ```bash
 ozgent pull unsloth/Qwen3.5-4B-GGUF:Q4_K_M   # any GGUF repo, fetched in parallel
@@ -113,11 +118,24 @@ bar showing the model, context used, and tokens/sec.
 
 ![terminal interface](docs/images/tui.png)
 
+- **Shift+Enter** for a new line (Alt+Enter where the terminal can't report Shift).
+- **Drag over text** to select it — it's copied when you let go. `/copy` copies
+  the whole last reply.
+- **Type `@`** for the agents; Tab or Enter picks one.
+
 ### Tools that run, with a prompt first
 
-Eight built in: fetch a page, read and write files, list directories, run a
-command, search the web, live market data, and read Reddit. The model
-decides; you approve.
+The model decides; you approve.
+
+| tool | does | needs |
+|---|---|---|
+| `web_search` | searches the web or the news | a Brave or Tavily key, or none for DuckDuckGo |
+| `fetch_url` | reads a page — the article, not the menus | — |
+| `yahoo_finance` | quotes, price history, fundamentals, news | — |
+| `reddit` | searches posts, reads threads | optional app key for full speed |
+| `read_file` · `list_dir` | read your files | — |
+| `write_file` | writes a file | asks first |
+| `run_command` | runs one program | asks first |
 
 ```
 ✎ write_file  haiku.txt   1 yes · 2 session · 3 always · 4 no
@@ -147,18 +165,24 @@ keep in sync.
 
 ### Agents
 
-Write `@name` and the message goes to an agent: its own instructions, **only
-its own tools**, and its work shown right where it ran.
+Write `@name` and the message goes to an agent: its own instructions and
+**only its own tools**. Its reply comes back like any other, headed with its
+name, so you can see who did the work.
+
+| agent | for | uses |
+|---|---|---|
+| `@deep-researcher` | a question answered from many sources, cited | `web_search`, `fetch_url` |
+| `@stock-guru` | a stock: price, trend, fundamentals, news | `yahoo_finance`, `web_search`, `fetch_url` |
+| `@sentiment-analyser` | what people think, from Reddit and the news | `reddit`, `web_search`, `yahoo_finance`, `fetch_url` |
 
 ```
 @stock-guru how is NVDA doing after earnings?
-@deep-researcher what changed in the EU AI Act this year?
-@sentiment-analyser what does Reddit think of the new Pixel?
+@stock-guru @sentiment-analyser AMD — the numbers, then the mood
 ```
 
-Type `@` for the list. Make your own in Settings → Agents, or
-`ozgent agent new <name>`.
-→ [docs/agents.md](docs/agents.md)
+Type `@` for the list. Make your own in **Settings → Agents** or with
+`ozgent agent new <name>`; they work over the API and on Telegram and WhatsApp
+too. → [docs/agents.md](docs/agents.md)
 
 ### MCP servers
 

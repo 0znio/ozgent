@@ -68,9 +68,14 @@ impl Layout {
         }
     }
 
-    /// Columns available inside the prompt box's borders.
+    /// Columns the typed text may use inside the prompt box.
+    ///
+    /// Five narrower than the screen: the two borders, the space after the
+    /// left one, and the two columns of the `› ` marker (which every row is
+    /// indented by). It was four, and a full row came out one column wider
+    /// than the box — the terminal wrapped it itself and the box broke.
     pub fn prompt_width(&self) -> usize {
-        self.width.saturating_sub(4).max(1)
+        self.width.saturating_sub(5).max(1)
     }
 }
 
@@ -155,6 +160,10 @@ pub fn prompt_box(
 
     for (i, line) in lines.iter().enumerate() {
         let lead = if i == 0 { marker } else { &" ".repeat(display_width(marker)) };
+        // Cut rather than trusted: a row wider than the box makes the
+        // terminal wrap it, and every row below moves down with it.
+        let room = inner.saturating_sub(1 + display_width(marker));
+        let line = if display_width(line) > room { truncate(line, room) } else { line.clone() };
         let body = format!("{lead}{line}");
         let pad = inner.saturating_sub(display_width(&body) + 1);
         out.push(format!(
@@ -269,6 +278,22 @@ mod tests {
         let widths: Vec<usize> = lines.iter().map(|l| display_width(l)).collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}\n{lines:#?}");
         assert_eq!(widths[0], 40);
+    }
+
+    #[test]
+    fn a_full_width_row_of_typed_text_fits_the_box_exactly() {
+        // The bug: text wrapped at width-4 and the row came out one column
+        // wider than the screen, which the terminal wrapped, breaking the box.
+        let layout = Layout::compute(40, 20, 2);
+        let full = "x".repeat(layout.prompt_width());
+        for row in prompt_box(&Theme::plain(), &[full.clone(), full], 40, "› ", Style::dim(), None) {
+            assert_eq!(display_width(&row), 40, "{row:?}");
+        }
+        // And a row that is somehow too long is cut, not allowed to wrap.
+        let long = "y".repeat(100);
+        for row in prompt_box(&Theme::plain(), &[long], 40, "› ", Style::dim(), None) {
+            assert_eq!(display_width(&row), 40, "{row:?}");
+        }
     }
 
     #[test]

@@ -117,6 +117,8 @@ pub struct Chat<'a> {
     config: Config,
     /// The agent running now, if the turn was handed to one.
     scope: Option<Scope>,
+    /// The last reply's text, for `/copy`.
+    last_reply: String,
 }
 
 /// An agent at work: what it is, and what it was given.
@@ -273,6 +275,7 @@ async fn run_one(
         paths: paths.clone(),
         config: config.clone(),
         scope: None,
+        last_reply: String::new(),
     };
     // The @ panel needs the agents before the first keystroke.
     chat.ui.set_agents(ozgent_core::AgentCatalog::load(paths));
@@ -549,6 +552,7 @@ impl<'a> Chat<'a> {
         // What happened on the way, in the shape the web interface replays,
         // so a turn taken here reads the same when the conversation is opened
         // in the browser.
+        self.last_reply = text.trim().to_string();
         let calls = (!activity.is_empty()).then(|| serde_json::to_string(&activity).unwrap_or_default());
         let assistant_id = self.store.append_message_full(
             conversation,
@@ -766,8 +770,6 @@ impl<'a> Chat<'a> {
                 self.session.set_tools(&offered);
             }
             self.scope = Some(Scope { agent: agent.clone(), offered, missing });
-            let rule = self.theme.style(Style::color(ozgent_render::Color::Cyan), "│ ");
-            self.ui.set_gutter(Some(rule));
 
             let started = std::time::Instant::now();
             let outcome = match self.build_context(Some(conversation), query) {
@@ -780,7 +782,6 @@ impl<'a> Chat<'a> {
 
             // Put everything back whatever happened, or the next message would
             // run with this agent's tools and temperature.
-            self.ui.set_gutter(None);
             self.scope = None;
             self.opts = saved.clone();
             self.session.set_options(&self.opts);
@@ -792,7 +793,7 @@ impl<'a> Chat<'a> {
 
             let report = rounds.reply.text.trim().to_string();
             let ms = started.elapsed().as_millis() as u64;
-            self.agent_footer(!report.is_empty(), rounds.calls, ms);
+            self.agent_footer(&agent.name, !report.is_empty(), rounds.calls, ms);
 
             if !combined.is_empty() {
                 combined.push_str("\n\n");
@@ -827,7 +828,10 @@ impl<'a> Chat<'a> {
         Ok((combined, None, activity))
     }
 
-    /// The top of an agent's frame.
+    /// Say which agent is answering, before it starts.
+    ///
+    /// One line, not a frame: the agent's calls and reply look like any
+    /// other, and this is what says whose they are.
     fn agent_header(
         &mut self,
         agent: &ozgent_core::Agent,
@@ -835,32 +839,29 @@ impl<'a> Chat<'a> {
         missing: &[String],
     ) {
         let theme = self.theme.clone();
-        let cyan = |s: &str| theme.style(Style::color(ozgent_render::Color::Cyan), s);
         let name = theme.style(
             Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
             &format!("@{}", agent.name),
         );
-        let desc = theme.style(Style::dim(), &agent.definition.description);
-        self.ui.say(format!("{}{name}  {desc}", cyan("╭─ ")));
-        let mut tools = if offered.is_empty() {
-            "no tools".to_string()
-        } else {
-            offered.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
-        };
-        if !missing.is_empty() {
-            tools.push_str(&format!("  ·  not available here: {}", missing.join(", ")));
+        let mut detail = agent.definition.description.clone();
+        if offered.is_empty() {
+            detail.push_str(" · no tools");
         }
-        self.ui.say(format!("{}{}", cyan("│ "), theme.style(Style::dim(), &tools)));
+        if !missing.is_empty() {
+            detail.push_str(&format!(" · not available here: {}", missing.join(", ")));
+        }
+        self.ui.say(format!("{name}  {}", theme.style(Style::dim(), &detail)));
     }
 
-    /// The bottom of an agent's frame: how it went, in one line.
-    fn agent_footer(&mut self, ok: bool, calls: usize, ms: u64) {
-        let theme = self.theme.clone();
-        let cyan = |s: &str| theme.style(Style::color(ozgent_render::Color::Cyan), s);
+    /// How the agent's turn went, in one dim line under its reply.
+    fn agent_footer(&mut self, name: &str, ok: bool, calls: usize, ms: u64) {
         let plural = if calls == 1 { "" } else { "s" };
-        let how = if ok { "done" } else { "no report" };
-        let line = format!("{how} · {calls} tool call{plural} · {:.1}s", ms as f64 / 1000.0);
-        self.ui.say(format!("{}{}", cyan("╰─ "), theme.style(Style::dim(), &line)));
+        let how = if ok { "" } else { " · no report" };
+        let line = format!(
+            "· @{name}{how} · {calls} tool call{plural} · {:.1}s",
+            ms as f64 / 1000.0
+        );
+        self.ui.say(self.theme.style(Style::dim(), &line));
         self.ui.blank();
     }
 
@@ -2232,6 +2233,18 @@ impl<'a> Chat<'a> {
 
             "/agents" | "/agent" => self.agents(arg),
 
+            // The whole reply, as the model wrote it — markdown and all, and
+            // including the parts scrolled off screen that a drag cannot reach.
+            "/copy" => {
+                if self.last_reply.is_empty() {
+                    self.ui.say(dim("nothing to copy yet"));
+                } else {
+                    let text = self.last_reply.clone();
+                    self.ui.copy(&text);
+                    self.ui.render();
+                }
+            }
+
             "/tools" if !arg.is_empty() => self.configure_tool(arg)?,
 
             "/tools" => match &self.tools {
@@ -2518,6 +2531,7 @@ const HELP: &str = "\
                    RAM: the full window, several times slower per token
 /tools             list available tools
 /agents [name]     list agents, or show one · write @name in a message to call it
+/copy              copy the last reply to the clipboard
 /default           use this model when none is named · /default clear to unset
 /permissions       what tools may do without asking
 /permissions <tool> allow|ask|deny|clear   ·  or read|write|execute <rule>
@@ -2527,8 +2541,10 @@ const HELP: &str = "\
 
 Scrolling    wheel, PageUp/PageDown, or Shift-Up/Shift-Down
              Esc returns to the newest message
-             Shift-drag to select text, since the wheel belongs to ozgent
-Editing      Alt-Enter for a new line · Ctrl-A/E/K/U/W as in any shell
+Copying      drag over text to select it; it is copied when you let go
+             /copy copies the whole last reply, markdown included
+Editing      Shift-Enter for a new line (Alt-Enter or Ctrl-J in terminals
+             that cannot report Shift) · Ctrl-A/E/K/U/W as in any shell
              Up/Down walk what you typed before
 
 Paste an image path or URL in a message and it is picked up automatically.
