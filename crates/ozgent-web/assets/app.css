@@ -2174,6 +2174,36 @@ a.ghost-btn { text-decoration: none; }
 .sch-preview-times li { display: flex; gap: var(--s3); }
 .sch-preview-at { font-variant-numeric: tabular-nums; min-width: 13ch; }
 
+/* --- the history, opened in place ------------------------------------- */
+
+.sch-history { border-top: 1px solid var(--line-soft); margin-top: var(--s1); }
+.sch-history > summary {
+  display: flex; align-items: center; gap: var(--s2);
+  padding: var(--s2) 0; cursor: pointer;
+  font-size: var(--t-small); color: var(--ink-faint);
+  list-style: none;
+}
+.sch-history > summary::-webkit-details-marker { display: none; }
+/* A caret of our own, so it points the same way in every browser. */
+.sch-history > summary::before {
+  content: "›"; display: inline-block; font-size: 15px; line-height: 1;
+  transition: transform .12s ease; color: var(--ink-faint);
+}
+.sch-history[open] > summary::before { transform: rotate(90deg); }
+.sch-history > summary:hover { color: var(--ink); }
+.sch-history-body {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s2) 0 var(--s3);
+}
+
+/* What it is set to do, above what it actually did. */
+.sch-facts {
+  display: grid; grid-template-columns: auto 1fr; gap: 2px var(--s3);
+  margin: 0 0 var(--s2); font-size: var(--t-small);
+}
+.sch-facts dt { color: var(--ink-faint); }
+.sch-facts dd { margin: 0; color: var(--ink-soft); overflow-wrap: anywhere; }
+
 /* --- what happened last time ----------------------------------------- */
 
 .sch-run {

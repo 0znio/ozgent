@@ -1053,7 +1053,7 @@ async fn chat_task(
 
 /// The model channels answer with.
 fn model_for(config: &Config) -> Option<String> {
-    config.channels.model.clone().or_else(|| config.default_model.clone())
+    config.answering_model()
 }
 
 async fn set_model(shared: &Arc<Shared>, kind: Kind, chat: &str, name: &str) {

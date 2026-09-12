@@ -27,7 +27,7 @@ function el(tag, cls, text) {
 
 /// A unix time as a short local string. The server sends instants; only the
 /// browser knows what the reader's clock says.
-function when(unix) {
+function when_(unix) {
   if (!unix) return "";
   const d = new Date(unix * 1000);
   const today = new Date();
@@ -130,17 +130,107 @@ function card(job) {
   const foot = el("div", "sch-job-foot");
   const next = el("span", "sch-next");
   if (!job.enabled) next.textContent = "paused";
-  else if (job.next_run_at) next.textContent = `next ${job.next_in} · ${when(job.next_run_at)}`;
+  else if (job.next_run_at) next.textContent = `next ${job.next_in} · ${when_(job.next_run_at)}`;
   else next.textContent = "no next run";
   foot.append(next);
   foot.append(el("span", "spacer"));
 
-  foot.append(button("Runs", "i-clock", () => showRuns(job.name), job.runs === 0));
   foot.append(button("Run now", "i-play", () => runNow(job.name)));
   foot.append(button("Edit", "i-edit", () => openForm(job)));
   foot.append(button("Delete", "i-trash", () => remove(job)));
   c.append(foot);
+
+  // The history opens in place rather than over the page. "Did it run, and
+  // did it work" is the question people come here with, and answering it
+  // should not cover up the job being asked about.
+  const details = el("details", "sch-history");
+  details.open = open.has(job.name);
+  const summary = el("summary");
+  summary.append(el("span", "sch-history-label", historyLabel(job)));
+  details.append(summary);
+  const body = el("div", "sch-history-body");
+  details.append(body);
+  details.addEventListener("toggle", () => {
+    // Remembered so a reload every twenty seconds does not close a panel
+    // somebody is reading.
+    if (details.open) { open.add(job.name); fillHistory(body, job.name); }
+    else open.delete(job.name);
+  });
+  if (details.open) fillHistory(body, job.name);
+  c.append(details);
   return c;
+}
+
+/// Which job histories are open, so redrawing does not shut them.
+const open = new Set();
+
+/// What the closed row says, so it is worth opening — or worth not opening.
+function historyLabel(job) {
+  if (!job.runs) return "Never run";
+  const when = job.last_run_at ? when_(job.last_run_at) : "";
+  const outcome = {
+    ok: job.deliver === "none" ? "answered" : "sent",
+    quiet: "nothing to say",
+    error: "failed",
+    missed: "missed — ozgent was not running",
+    running: "running now",
+  }[job.last_status] ?? "ran";
+  const times = job.runs === 1 ? "once" : `${job.runs} times`;
+  return `Ran ${times} · last ${when} · ${outcome}`;
+}
+
+async function fillHistory(body, name) {
+  body.replaceChildren(el("p", "hint", "loading…"));
+  let out;
+  try {
+    out = await api(`/api/scheduler/${encodeURIComponent(name)}`);
+  } catch (e) {
+    body.replaceChildren(el("p", "error", e.message));
+    return;
+  }
+  body.replaceChildren();
+
+  // Where it goes, said here rather than only as a chip, because this is the
+  // panel somebody opens when it did not arrive.
+  const facts = el("dl", "sch-facts");
+  const fact = (k, v) => { facts.append(el("dt", null, k), el("dd", null, v)); };
+  fact("Delivery", out.job.deliver === "none"
+    ? "kept on this page"
+    : `${out.job.deliver} · ${out.job.deliver_to || "everyone allowed"}`);
+  fact("Asked of", out.job.agent ? `@${out.job.agent}` : "the default model");
+  fact("Next run", out.job.enabled
+    ? (out.job.next_run_at ? `${out.job.next_in} · ${when_(out.job.next_run_at)}` : "none")
+    : "paused");
+  if (out.job.only_if) fact("Only when", out.job.only_if);
+  body.append(facts);
+
+  if (!out.runs.length) {
+    body.append(el("p", "hint", "It has not run yet."));
+    return;
+  }
+  if (out.job.conversation) {
+    const link = el("a", "linky", "open the conversation these were written to");
+    link.href = `/chat?c=${encodeURIComponent(out.job.conversation)}`;
+    body.append(link);
+  }
+  for (const run of out.runs) {
+    const r = el("div", `sch-run ${run.status}`);
+    const head = el("div", "sch-run-head");
+    head.append(el("span", "sch-run-when", when_(run.started_at)));
+    head.append(el("span", `adm-pill ${runKind(run)}`, runLabel(run)));
+    if (run.finished_at) {
+      head.append(el("span", "hint", `${run.finished_at - run.started_at}s`));
+    }
+    r.append(head);
+    if (run.error) r.append(el("p", "error", run.error));
+    if (run.output) r.append(el("pre", "sch-run-out", run.output));
+    body.append(r);
+  }
+}
+
+/// The pill colour for a run, so a failure is visible while scrolling.
+function runKind(run) {
+  return { ok: "good", error: "bad", missed: "warn", running: "live" }[run.status] ?? "";
 }
 
 function button(label, icon, onclick, disabled) {
@@ -284,7 +374,7 @@ async function previewWhen() {
     const times = el("ul", "sch-preview-times");
     for (const f of out.fires) {
       const li = el("li");
-      li.append(el("span", "sch-preview-at", when(f.at)));
+      li.append(el("span", "sch-preview-at", when_(f.at)));
       li.append(el("span", "hint", f.in));
       times.append(li);
     }
@@ -331,44 +421,6 @@ async function submit(event) {
   }
 }
 
-// ------------------------------------------------------------------- runs
-
-async function showRuns(name) {
-  $("runs-title").textContent = name;
-  const body = $("runs-body");
-  body.replaceChildren(el("p", "hint", "loading…"));
-  $("runs-sheet").hidden = false;
-  let out;
-  try {
-    out = await api(`/api/scheduler/${encodeURIComponent(name)}`);
-  } catch (e) {
-    body.replaceChildren(el("p", "error", e.message));
-    return;
-  }
-  body.replaceChildren();
-  if (!out.runs.length) {
-    body.append(el("p", "hint", "It has not run yet."));
-    return;
-  }
-  if (out.job.conversation) {
-    const link = el("a", "linky", "open the conversation these were written to");
-    link.href = `/chat?c=${encodeURIComponent(out.job.conversation)}`;
-    body.append(link);
-  }
-  for (const run of out.runs) {
-    const r = el("div", `sch-run ${run.status}`);
-    const head = el("div", "sch-run-head");
-    head.append(el("span", "sch-run-when", when(run.started_at)));
-    head.append(el("span", "adm-pill", runLabel(run)));
-    r.append(head);
-    if (run.error) r.append(el("p", "error", run.error));
-    if (run.output) {
-      const pre = el("pre", "sch-run-out", run.output);
-      r.append(pre);
-    }
-    body.append(r);
-  }
-}
 
 function runLabel(run) {
   if (run.status === "ok") return run.delivered ? "sent" : "answered";
@@ -387,17 +439,13 @@ $("f-when").oninput = schedulePreview;
 $("f-zone").oninput = schedulePreview;
 $("f-deliver").onchange = deliverChanged;
 for (const node of document.querySelectorAll("[data-close]")) node.onclick = closeForm;
-for (const node of document.querySelectorAll("[data-close-runs]")) {
-  node.onclick = () => { $("runs-sheet").hidden = true; };
-}
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (!$("runs-sheet").hidden) $("runs-sheet").hidden = true;
-  else if (!$("sheet").hidden) closeForm();
+  if (!$("sheet").hidden) closeForm();
 });
 
 load();
 // Jobs fire while the page is open, and a next-run time goes stale on its own.
 setInterval(() => {
-  if ($("sheet").hidden && $("runs-sheet").hidden) load();
+  if ($("sheet").hidden) load();
 }, 20000);

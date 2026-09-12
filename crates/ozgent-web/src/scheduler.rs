@@ -415,6 +415,24 @@ async fn perform(state: &State, job: &Job) -> Outcome {
     }
 }
 
+/// The model a job is answered with.
+///
+/// The job's own, then whatever ozgent answers with generally — which is
+/// `[channels] model` before `default_model`, because a model chosen for a
+/// phone was chosen for answering unattended. Said in one place so the
+/// scheduler and the channels cannot disagree: they did, and a setup with
+/// `[channels] model` and no `default_model` had working Telegram replies and
+/// every scheduled job failing.
+fn model_for(state: &State, job: &Job) -> Result<String, String> {
+    if let Some(named) = &job.model {
+        return Ok(named.clone());
+    }
+    state.config.lock().unwrap().answering_model().ok_or_else(|| {
+        "no model is set to answer with. Pick one with `ozgent default <model>`,          or give this job its own on the scheduler page."
+            .to_string()
+    })
+}
+
 /// The conversation this job's runs are written to, making one if needed.
 fn thread_for(state: &State, job: &Job) -> Result<i64, String> {
     if let Some(id) = job.conversation_id {
@@ -436,16 +454,7 @@ fn thread_for(state: &State, job: &Job) -> Result<i64, String> {
 
 /// Put the question to the model and collect the answer.
 async fn ask(state: &State, conversation: i64, job: &Job, question: &str) -> Result<String, String> {
-    let model = match &job.model {
-        Some(m) => m.clone(),
-        None => state
-            .config
-            .lock()
-            .unwrap()
-            .default_model
-            .clone()
-            .ok_or("no model is configured to answer with")?,
-    };
+    let model = model_for(state, job)?;
     let tools: Option<Vec<String>> = job.tools.as_deref().and_then(|t| serde_json::from_str(t).ok());
     // An empty list is a job that may not call anything, which is different
     // from a job that was never narrowed.
@@ -533,16 +542,7 @@ async fn worth_sending(
     condition: &str,
     answer: &str,
 ) -> Result<bool, String> {
-    let model = match &job.model {
-        Some(m) => m.clone(),
-        None => state
-            .config
-            .lock()
-            .unwrap()
-            .default_model
-            .clone()
-            .ok_or("no model is configured")?,
-    };
+    let model = model_for(state, job)?;
     let prompt = format!(
         "A scheduled check produced this report:\n\n---\n{}\n---\n\nThe user only wants to be \
          told when this is true: {condition}\n\nIs it true? Answer with one word, YES or NO.",

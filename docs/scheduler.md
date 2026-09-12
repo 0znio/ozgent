@@ -58,6 +58,7 @@ like:
 | `every weekday at 9:20` | Monday to Friday |
 | `every day at 6pm` | `daily at 18:00` works too |
 | `every monday, friday at 18:00` | named days |
+| `every day from monday to friday` | a range, however you write it — `mon-fri` too |
 | `every weekend at 10:00` | Saturday and Sunday |
 | `every 30 minutes` | lands on :00 and :30, not 30 minutes after you typed it |
 | `every 2 hours` | on the hour |
@@ -213,6 +214,12 @@ a job rescheduled from 9:20 to 8:00 that still says 9:20 until tomorrow has not
 really been rescheduled.
 
 ## When something is wrong
+
+**Every run fails with "no model is set to answer with".** Nothing has told
+ozgent which model to use. `ozgent default <model>` sets one for everything;
+`[channels] model` counts too, and a job can carry its own on the page.
+
+**Nothing is answered.** Almost always the list.
 
 **Nothing has run.** Almost always nothing is awake to run it. `ozgent daemon
 status` says whether the daemon is up, and whether it is the process holding the

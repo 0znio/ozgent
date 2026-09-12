@@ -663,6 +663,41 @@ fn dedup(mut v: Vec<String>) -> Vec<String> {
 
 /// The day part of a phrase, as cron's three day fields.
 fn day_fields(head: &str) -> Result<(String, String, String), String> {
+    // "every day from monday to friday", "every day mon-fri". The leading
+    // "day" is filler once a range follows it, and dropping it here is what
+    // lets the rest of this read one phrasing instead of four.
+    let head = head
+        .strip_prefix("day from ")
+        .or_else(|| head.strip_prefix("days from "))
+        .or_else(|| head.strip_prefix("day "))
+        .or_else(|| head.strip_prefix("days "))
+        .filter(|rest| rest.contains(" to ") || rest.contains('-') || rest.contains(','))
+        .unwrap_or(head);
+    let head = head.strip_prefix("from ").unwrap_or(head).trim();
+
+    // "monday to friday" and "mon-fri" are one thing said two ways.
+    if let Some((first, last)) = head
+        .split_once(" to ")
+        .or_else(|| head.split_once(" through "))
+        .or_else(|| head.split_once('-').filter(|_| !head.contains(' ')))
+    {
+        let day = |name: &str| -> Option<u32> {
+            let short: String =
+                name.trim().trim_end_matches('s').chars().take(3).collect();
+            DAY_NAMES.iter().position(|d| *d == short).map(|i| i as u32)
+        };
+        if let (Some(from), Some(to)) = (day(first), day(last)) {
+            // Cron reads a backwards range as an error, but "friday to monday"
+            // plainly means the weekend wrap, so it is written as two pieces.
+            let days = if from <= to {
+                format!("{from}-{to}")
+            } else {
+                format!("{from}-6,0-{to}")
+            };
+            return Ok(("*".into(), "*".into(), days));
+        }
+    }
+
     if matches!(head, "day" | "hour" | "minute" | "" | "week") {
         // "every week" with no day named is every Monday, which is the only
         // reading that does not silently depend on when the job was made.
@@ -1289,5 +1324,91 @@ mod zones_in_phrases {
         let ist = Zone::fixed("IST", 5 * 3600 + 1800);
         let there = ist.local_at(fires);
         assert_eq!((there.hour, there.minute), (21, 30), "which is 21:30 in India");
+    }
+}
+
+#[cfg(test)]
+mod day_ranges {
+    use super::*;
+
+    /// The phrasing a model produced, which was refused with "day from monday
+    /// to friday is not a day" — a sentence nobody typed and nobody could act
+    /// on.
+    #[test]
+    fn a_range_written_out_in_words_is_understood() {
+        for text in [
+            "every day from monday to friday at 10:00",
+            "every monday to friday at 10:00",
+            "every day monday to friday at 10:00",
+            "every mon to fri at 10:00",
+            "every monday through friday at 10:00",
+        ] {
+            let r = Recur::parse(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(r.to_string(), "cron 0 10 * * 1,2,3,4,5", "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_hyphenated_range_works_too() {
+        assert_eq!(
+            Recur::parse("every mon-fri at 10:00").unwrap().to_string(),
+            "cron 0 10 * * 1,2,3,4,5"
+        );
+    }
+
+    #[test]
+    fn a_range_that_wraps_the_week_is_not_an_error() {
+        // "friday to monday" is the weekend plus its edges, which cron cannot
+        // say as one range.
+        let r = Recur::parse("every friday to monday at 18:00").unwrap();
+        assert_eq!(r.to_string(), "cron 0 18 * * 0,1,5,6");
+    }
+
+    #[test]
+    fn a_range_reads_back_as_the_same_rule() {
+        for text in ["every day from monday to friday at 9:20", "every sat to sun at 10:00"] {
+            let once = Recur::parse(text).unwrap();
+            assert_eq!(Recur::parse(&once.to_string()).unwrap(), once, "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_range_fires_only_on_those_days() {
+        let zone = Zone::utc();
+        let r = Recur::parse("every day from monday to friday at 10:00").unwrap();
+        // 2026-09-11 is a Friday; the next is Monday the 14th.
+        let friday = zone.instant_of(&DateTime::civil(2026, 9, 11, 12, 0, 0));
+        let next = r.next_after(friday, 0, &zone).unwrap();
+        let t = zone.local_at(next);
+        assert_eq!((t.year, t.month, t.day), (2026, 9, 14));
+        assert_eq!(t.weekday_name(), "Monday");
+    }
+
+    #[test]
+    fn a_range_of_things_that_are_not_days_still_says_so() {
+        let err = Recur::parse("every blursday to thorsday at 10:00").unwrap_err();
+        assert!(err.contains("cron") || err.contains("weekday"), "{err}");
+    }
+
+    #[test]
+    fn the_word_day_on_its_own_still_means_every_day() {
+        // The prefix strip must not turn "every day at 10:00" into something
+        // else; it only fires when a range follows.
+        assert_eq!(
+            Recur::parse("every day at 10:00").unwrap().to_string(),
+            "cron 0 10 * * *"
+        );
+        assert_eq!(
+            Recur::parse("every day at 6pm").unwrap().to_string(),
+            "cron 0 18 * * *"
+        );
+    }
+
+    #[test]
+    fn named_days_separated_by_commas_still_work() {
+        assert_eq!(
+            Recur::parse("every monday, friday at 18:00").unwrap().to_string(),
+            "cron 0 18 * * 1,5"
+        );
     }
 }

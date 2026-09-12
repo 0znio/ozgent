@@ -192,6 +192,20 @@ impl Default for UiConfig {
 }
 
 impl Config {
+    /// The model to answer with when nothing names one.
+    ///
+    /// `[channels] model` first, then `default_model`. The order is not
+    /// arbitrary: somebody who set a model for their phone chose it for
+    /// answering *unattended*, which is exactly what a scheduled job is.
+    ///
+    /// Shared because it was not. The channels had this rule and the
+    /// scheduler had its own, so a person with `[channels] model` set and no
+    /// `default_model` — a perfectly ordinary setup — got working Telegram
+    /// replies and every scheduled job failing with "no model is configured".
+    pub fn answering_model(&self) -> Option<String> {
+        self.channels.model.clone().or_else(|| self.default_model.clone())
+    }
+
     /// Load `config.toml`, treating a missing file as an empty config so a
     /// fresh install works with no setup.
     pub fn load(paths: &Paths) -> Result<Self, ConfigError> {
@@ -347,5 +361,43 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.defaults.gpu_layers, Some(GpuLayers::OFF));
+    }
+}
+
+#[cfg(test)]
+mod answering_model_tests {
+    use super::*;
+
+    #[test]
+    fn a_channel_model_answers_when_nothing_else_is_set() {
+        // The reported failure: `[channels] model` set, no `default_model`.
+        // Telegram replied perfectly well and every scheduled job died with
+        // "no model is configured to answer with", because the two surfaces
+        // each had their own idea of what to fall back to.
+        let mut c = Config::default();
+        c.channels.model = Some("Qwen3.5-4B:Q4_K_M".into());
+        assert_eq!(c.answering_model().as_deref(), Some("Qwen3.5-4B:Q4_K_M"));
+    }
+
+    #[test]
+    fn a_channel_model_wins_over_the_default() {
+        // Somebody who chose a model for their phone chose it for answering
+        // unattended, which is what a scheduled job is.
+        let mut c = Config::default();
+        c.default_model = Some("big:Q8".into());
+        c.channels.model = Some("small:Q4".into());
+        assert_eq!(c.answering_model().as_deref(), Some("small:Q4"));
+    }
+
+    #[test]
+    fn the_default_answers_when_no_channel_model_is_set() {
+        let mut c = Config::default();
+        c.default_model = Some("big:Q8".into());
+        assert_eq!(c.answering_model().as_deref(), Some("big:Q8"));
+    }
+
+    #[test]
+    fn neither_set_is_none_rather_than_a_guess() {
+        assert_eq!(Config::default().answering_model(), None);
     }
 }
