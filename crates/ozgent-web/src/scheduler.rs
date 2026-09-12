@@ -367,6 +367,16 @@ async fn perform(state: &State, job: &Job) -> Outcome {
         None => job.prompt.clone(),
     };
 
+    // A run that died mid-turn — ozgent killed, the machine rebooted, the GPU
+    // gone — leaves its question in the job's thread with no answer under it.
+    // The next run then asks a model whose history ends with two questions in
+    // a row, and a small model handed that often returns nothing at all: the
+    // job goes quiet for ever after one crash, which is precisely the silent
+    // failure a scheduler cannot have.
+    if let Err(e) = drop_unanswered(&state.store.lock().unwrap(), conversation) {
+        tracing::warn!("scheduler: {} could not tidy its thread: {e}", job.name);
+    }
+
     let answer = match ask(state, conversation, job, &question).await {
         Ok(a) => a,
         Err(e) => {
@@ -457,6 +467,20 @@ fn thread_for(state: &State, job: &Job) -> Result<i64, String> {
     Ok(id)
 }
 
+/// Remove a trailing question that never got an answer.
+///
+/// Only ever the last message, and only when it is the user's: anything else
+/// is a real exchange, and a job's thread is its own record.
+fn drop_unanswered(store: &ozgent_memory::Store, conversation: i64) -> Result<(), String> {
+    let messages = store.messages(conversation).map_err(|e| e.to_string())?;
+    let Some(last) = messages.last() else { return Ok(()) };
+    if last.role != "user" {
+        return Ok(());
+    }
+    store.truncate_conversation(conversation, last.seq).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Put the question to the model and collect the answer.
 async fn ask(state: &State, conversation: i64, job: &Job, question: &str) -> Result<String, String> {
     let model = model_for(state, job)?;
@@ -474,12 +498,20 @@ async fn ask(state: &State, conversation: i64, job: &Job, question: &str) -> Res
             thinking: None,
             tools: tools_enabled,
             native_tools: tools,
-            tools_off: Vec::new(),
+            // A job is not offered the tool that makes jobs. It is already
+            // the schedule, so calling it is either a loop or a rewrite of
+            // the thing currently running; and it needs approval, which a
+            // scheduled run can never get. Offering a tool that will always
+            // be refused is worse than not offering it: a model that reaches
+            // for it spends the whole answer explaining the refusal, and the
+            // brief that was actually asked for never gets written.
+            tools_off: vec!["schedule".into()],
             images: Vec::new(),
             // Nobody is awake. Anything that would ask is refused.
             can_ask: false,
-            // A job may reschedule itself, and gets its own tool list when
-            // it does — not a wider one.
+            // Still passed, because the tools a job *does* get are narrowed by
+            // it, and a job created from a chat may only answer back into that
+            // chat.
             caller: Some(ozgent_schedule::Caller {
                 origin: format!("job:{}", job.name),
                 deliver: Some(Deliver::read(&job.deliver, job.deliver_to.as_deref())),
@@ -720,6 +752,56 @@ fn headed(job: &Job, answer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::drop_unanswered;
+
+    #[test]
+    fn a_question_a_crash_left_unanswered_is_dropped_before_the_next_run() {
+        // The shape a killed run leaves behind. Asked again on top of it, the
+        // model sees two questions in a row and can return nothing at all —
+        // one crash and the job is quiet for ever.
+        let store = ozgent_memory::Store::open_in_memory().unwrap();
+        let c = store.create_conversation("job", None).unwrap();
+        store.append_message(c, "user", "the brief please", 0).unwrap();
+
+        drop_unanswered(&store, c).unwrap();
+
+        assert!(store.messages(c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_finished_exchange_is_left_exactly_alone() {
+        let store = ozgent_memory::Store::open_in_memory().unwrap();
+        let c = store.create_conversation("job", None).unwrap();
+        store.append_message(c, "user", "the brief please", 0).unwrap();
+        store.append_message(c, "assistant", "here it is", 0).unwrap();
+
+        drop_unanswered(&store, c).unwrap();
+
+        assert_eq!(store.messages(c).unwrap().len(), 2, "a job's thread is its own record");
+    }
+
+    #[test]
+    fn only_the_last_question_goes_not_the_history_above_it() {
+        let store = ozgent_memory::Store::open_in_memory().unwrap();
+        let c = store.create_conversation("job", None).unwrap();
+        store.append_message(c, "user", "monday", 0).unwrap();
+        store.append_message(c, "assistant", "monday's brief", 0).unwrap();
+        store.append_message(c, "user", "tuesday", 0).unwrap();
+
+        drop_unanswered(&store, c).unwrap();
+
+        let left = store.messages(c).unwrap();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[1].content, "monday's brief");
+    }
+
+    #[test]
+    fn an_empty_thread_is_not_an_error() {
+        let store = ozgent_memory::Store::open_in_memory().unwrap();
+        let c = store.create_conversation("job", None).unwrap();
+        drop_unanswered(&store, c).unwrap();
+    }
+
     use super::describe;
 
     fn chat(display: &str, id: &str, identities: &[&str]) -> ozgent_memory::ChannelChat {

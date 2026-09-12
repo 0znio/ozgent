@@ -59,6 +59,31 @@ pub struct Turn {
     pub caller: Option<ozgent_schedule::Caller>,
 }
 
+/// The standing lines put in front of the conversation.
+///
+/// A scheduled job's prompt is a standing instruction written for a timer —
+/// "a market brief at 10am on weekdays". Handed over with no framing, a model
+/// reads the timing as a request to *arrange* that, reaches for the schedule
+/// tool, and spends the answer explaining why it could not. Saying plainly
+/// that the timer has already fired is what turns the prompt back into the
+/// question it is.
+fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::Caller>) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if date_aware {
+        lines.push(ozgent_core::DateTime::now().prompt_line());
+    }
+    if let Some(name) = caller.and_then(|c| c.origin.strip_prefix("job:")) {
+        lines.push(format!(
+            "You are the scheduled job \"{name}\", running now because its time came \
+             round. What follows is the job's own standing instruction, not a request \
+             to set anything up: the schedule already exists and is what woke you. \
+             Answer it for today, as the answer itself. Nobody is at a keyboard, so \
+             there is no one to ask and no reply coming."
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Start a turn. The receiver yields every event until `Done` or `Error`.
 ///
 /// Persistence does not depend on the caller draining the receiver to the end:
@@ -113,10 +138,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             .build(turn.conversation, &turn.message)?;
 
         let config = state.config.lock().unwrap();
-        let system = config
-            .ui
-            .date_awareness
-            .then(|| ozgent_core::DateTime::now().prompt_line());
+        let system = system_prompt(config.ui.date_awareness, turn.caller.as_ref());
         assembled.to_messages(system.as_deref())
     };
 
@@ -328,4 +350,43 @@ fn relay(
     });
 
     out_rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_prompt;
+    use ozgent_schedule::Caller;
+
+    fn job(name: &str) -> Caller {
+        Caller { origin: format!("job:{name}"), ..Default::default() }
+    }
+
+    #[test]
+    fn a_scheduled_run_is_told_that_its_timer_has_already_fired() {
+        // Without this the model reads "at 10am on weekdays" as something to
+        // arrange, reaches for the schedule tool, and the brief never gets
+        // written.
+        let text = system_prompt(false, Some(&job("daily-india-market-analysis"))).unwrap();
+        assert!(text.contains("daily-india-market-analysis"), "{text}");
+        assert!(text.contains("not a request"), "{text}");
+    }
+
+    #[test]
+    fn a_person_at_a_keyboard_is_not_told_any_of_that() {
+        assert_eq!(system_prompt(false, None), None);
+        let chat = Caller { origin: "chat:telegram:42".into(), ..Default::default() };
+        assert_eq!(system_prompt(false, Some(&chat)), None);
+    }
+
+    #[test]
+    fn the_date_line_and_the_job_line_are_both_given_when_both_apply() {
+        let text = system_prompt(true, Some(&job("brief"))).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+    }
+
+    #[test]
+    fn date_awareness_alone_is_unchanged_by_any_of_this() {
+        let text = system_prompt(true, None).unwrap();
+        assert_eq!(text, ozgent_core::DateTime::now().prompt_line());
+    }
 }

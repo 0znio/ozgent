@@ -192,6 +192,19 @@ it is thin instead of looking like a quiet news day.
 If a job needs a tool that currently asks, the fix is to decide that in the
 permission rules once, deliberately, in Settings — not to let a timer decide it.
 
+One tool is not offered at all: **`schedule`**. A job *is* a schedule, so
+calling it is either a loop or a rewrite of the thing currently running, and it
+would be refused anyway. Offering a tool that can only ever be refused turned
+out to be worse than withholding it — a model that reaches for one spends the
+whole answer explaining the refusal, and the brief that was asked for never
+gets written.
+
+A run is also told what it is. Job prompts are written for a timer — "a market
+brief at 10am on weekdays" — and handed over with no framing a model reads that
+timing as a request to *arrange* something rather than to answer. Every
+scheduled run is told plainly that its schedule already exists, that the timer
+is what woke it, and that nobody is at a keyboard.
+
 ## From a chat, and from the page
 
 Both work, and the page can do more, on purpose. A chat is for the sentence you
