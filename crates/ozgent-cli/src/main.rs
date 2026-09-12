@@ -1,5 +1,6 @@
 //! The `ozgent` binary.
 
+mod backend;
 mod daemon;
 mod chat;
 mod input;

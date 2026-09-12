@@ -28,6 +28,10 @@ tokio.workspace = true
 tracing.workspace = true
 rustyline.workspace = true
 ctrlc.workspace = true
+# The terminal is a client of the daemon, so it needs an HTTP client. rustls
+# rather than native-tls, as everywhere else: no OpenSSL headers to build
+# against, so `cargo install ozgent` works on a bare machine.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "charset", "http2"] }
 tracing-subscriber.workspace = true
 
 [features]

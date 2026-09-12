@@ -1420,6 +1420,7 @@ dependencies = [
  "ozgent-schedule",
  "ozgent-tools",
  "ozgent-web",
+ "reqwest",
  "rustyline",
  "serde_json",
  "tokio",
