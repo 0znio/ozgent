@@ -9,6 +9,7 @@ mod logging;
 mod permission;
 mod scheduler;
 mod setup;
+mod stream;
 mod status;
 mod tui;
 
@@ -914,10 +915,6 @@ async fn chat(
     chat::run(paths, config, model, options).await
 }
 
-/// A dim one-line note to stderr, so it never lands in piped output.
-fn theme_hint(text: &str) -> String {
-    format!("\x1b[2m{text}\x1b[0m")
-}
 
 /// Context window given to a draft model.
 ///
@@ -925,6 +922,13 @@ fn theme_hint(text: &str) -> String {
 /// target's full window; a large KV here would only take VRAM the target needs.
 const DRAFT_CONTEXT: u32 = 4096;
 
+/// Answer one prompt and exit.
+///
+/// A client of the daemon like everything else, over the stateless
+/// OpenAI-compatible route: `ozgent run` is a question with no thread behind
+/// it, and the stateful route would leave a conversation row behind for every
+/// one-liner. If no daemon is listening one is started, and it stays up — so
+/// the second `ozgent run` of the day does not pay for a model load.
 async fn run_once(
     paths: &Paths,
     config: &Config,
@@ -932,22 +936,7 @@ async fn run_once(
     prompt: &str,
     options: &OptionFlags,
 ) -> Result<()> {
-    use ozgent_core::{Message, ThinkingMode};
-    use ozgent_llama::engine::{Engine, StopReason};
-    use ozgent_llama::thinking::{Chunk, ThinkingFilter};
-    use ozgent_render::{MarkdownRenderer, StreamRenderer, Theme};
     use std::io::Write;
-
-    // Accepts an alias or a full `name:tag`.
-    let found = ozgent_core::resolve(paths, model)?;
-    let (r, dir, manifest) = (found.model, found.dir, found.manifest);
-
-    // The full precedence chain: defaults < config.toml < manifest < flags.
-    let resolved = config
-        .options_for(&r.to_string())
-        .merge(&manifest.defaults)
-        .merge(&options.to_options()?)
-        .resolve();
 
     let prompt_text = if prompt.trim().is_empty() {
         let mut buf = String::new();
@@ -957,217 +946,42 @@ async fn run_once(
         prompt.to_string()
     };
     anyhow::ensure!(!prompt_text.trim().is_empty(), "no prompt given");
+    let _ = (paths, config, options);
 
-    let weights = manifest.primary_weights(&dir);
-    let loading = std::time::Instant::now();
-    let engine = Engine::load(&weights, &resolved).context("loading the model")?;
-    tracing::info!(
-        "loaded {} layers ({} on gpu) in {:?}",
-        engine.n_layer(),
-        engine.gpu_layers_used(),
-        loading.elapsed()
-    );
+    let backend = backend::Backend::connect_or_start(|note| eprintln!("{note}")).await?;
+    let mut events = backend
+        .complete(serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt_text }],
+            "stream": true,
+        }))
+        .await?;
 
-    let mut messages = Vec::new();
-    // Tell the model what day it is, or "latest" and "tomorrow" resolve
-    // against its training data rather than reality.
-    let system = match (config.ui.date_awareness, &resolved.system_prompt) {
-        (true, Some(base)) => Some(format!(
-            "{}\n\n{base}",
-            ozgent_core::DateTime::now().prompt_line()
-        )),
-        (true, None) => Some(ozgent_core::DateTime::now().prompt_line()),
-        (false, base) => base.clone(),
-    };
-    if let Some(system) = system {
-        messages.push(Message::system(system));
-    }
-    // Images the user referenced by path or URL are detected automatically.
-    let extracted = ozgent_llama::vision::extract(&prompt_text);
-    let mut projector = None;
-    let mut images = Vec::new();
-    if extracted.has_images() {
-        if let Some(mmproj) = manifest.projector_path(&dir) {
-            let loaded = engine.projector(&mmproj, &resolved).context("loading the projector")?;
-            images = ozgent_llama::mtmd::load_media(&extracted.images)
-                .context("reading the image(s)")?;
-            projector = Some(loaded);
-        } else {
-            eprintln!("note: {r} has no vision projector; the image(s) will be ignored");
-        }
-    }
-
-    // The marker stands where the image belongs in the conversation.
-    let user_text = match &projector {
-        Some(p) => ozgent_llama::mtmd::with_markers(p.marker(), &extracted.text, images.len()),
-        None => extracted.text.clone(),
-    };
-    messages.push(Message::user(user_text));
-
-    let rendered_prompt = engine.render_prompt_with(&messages, resolved.thinking, resolved.reasoning_effort)?;
-    if !engine.has_chat_template() {
-        eprintln!("note: this GGUF carries no chat template; using a generic format");
-    }
-
-    // A draft model, when one is configured. Loaded here so it lives exactly as
-    // long as the session that verifies its proposals.
-    //
-    // Its own context is small and its KV cheap: it only ever holds the same
-    // transcript as the target, and rolls itself back after every proposal.
-    let draft_ref = match &resolved.speculative {
-        ozgent_core::accel::Speculative::Draft { model, gpu_layers } => {
-            Some((model.clone(), *gpu_layers))
-        }
-        _ => None,
-    };
-    let draft_loaded = match &draft_ref {
-        Some((name, gpu_layers)) => {
-            let found = ozgent_core::resolve(paths, name)
-                .with_context(|| format!("draft model {name:?} is not installed"))?;
-            let weights = found.manifest.primary_weights(&found.dir);
-            let mut opts = resolved.clone();
-            // The drafter never needs the target's context window: it is
-            // re-synced to the confirmed transcript every round, and a large
-            // KV here would take VRAM the target needs.
-            opts.context_length = resolved.context_length.min(DRAFT_CONTEXT);
-            opts.speculative = ozgent_core::accel::Speculative::Off;
-            if let Some(n) = gpu_layers {
-                opts.gpu_layers = ozgent_core::GpuLayers::Count(*n);
-            }
-            let engine = Engine::load(&weights, &opts).with_context(|| {
-                format!("loading draft model {name:?}")
-            })?;
-            Some((engine, opts))
-        }
-        None => None,
-    };
-    let mut draft_session = match &draft_loaded {
-        Some((engine, opts)) => Some(engine.session(opts)?),
-        None => None,
-    };
-
-    let mut session = engine.session(&resolved)?;
-
-    // A drafter proposes token *ids*. If the two models do not share a
-    // vocabulary those ids mean different words to each, and verification
-    // silently compares unrelated things — so the mismatch is refused rather
-    // than discovered as nonsense output.
-    if let Some(draft) = draft_session.as_ref() {
-        anyhow::ensure!(
-            draft.n_vocab() == session.n_vocab(),
-            "the draft model's vocabulary ({}) does not match {}'s ({}); \
-             speculation needs both models to share a tokenizer",
-            draft.n_vocab(),
-            r,
-            session.n_vocab(),
-        );
-        eprintln!(
-            "{}",
-            theme_hint(&format!(
-                "drafting with {}",
-                draft_ref.as_ref().map(|(m, _)| m.as_str()).unwrap_or("?")
-            ))
-        );
-    }
-
-    // Reasoning is separated from the answer, then the answer is rendered as
-    // streaming markdown.
-    let plain = options.plain || !config.ui.markdown;
-    let theme = if plain { Theme::plain() } else { Theme::default() };
-    let width = terminal_width();
-    let mut markdown = StreamRenderer::new(MarkdownRenderer::new(theme.clone(), width));
-    let mut filter = ThinkingFilter::new(resolved.thinking);
-    if let Some(close) = Engine::stream_starts_inside(&rendered_prompt) {
-        filter = filter.starting_inside(close);
-    }
-
+    // Written straight through rather than rendered as markdown: `ozgent run`
+    // is the form that gets piped into something else, and escape codes in a
+    // pipe are somebody else's problem to strip.
     let mut out = std::io::stdout();
-    let mut showed_thinking = false;
-    let mut produced_answer = false;
-
-    let media = projector.as_ref().map(|p| (p, &images[..], &extracted.images[..]));
-    let (stats, reason) = session.generate_drafted(&rendered_prompt, media, resolved.max_tokens, draft_session.as_mut(), |piece| {
-        for chunk in filter.push(piece) {
-            match chunk {
-                Chunk::Thinking(text) => {
-                    if resolved.thinking != ThinkingMode::Off && config.ui.show_thinking {
-                        if !showed_thinking {
-                            showed_thinking = true;
-                            eprint!("{}", theme.style(theme.thinking, "thinking: "));
-                        }
-                        eprint!("{}", theme.style(theme.thinking, &text));
-                        let _ = std::io::stderr().flush();
-                    }
-                }
-                Chunk::Answer(text) => {
-                    produced_answer = true;
-                    if showed_thinking {
-                        showed_thinking = false;
-                        eprintln!();
-                    }
-                    let _ = markdown.push(&text, &mut out);
-                }
+    let mut wrote_anything = false;
+    while let Some(event) = events.next().await? {
+        if let Some(text) = event["choices"][0]["delta"]["content"].as_str() {
+            if !text.is_empty() {
+                out.write_all(text.as_bytes())?;
+                out.flush()?;
+                wrote_anything = true;
             }
         }
-        true
-    })?;
-
-    for chunk in filter.finish() {
-        if let Chunk::Answer(text) = chunk {
-            let _ = markdown.push(&text, &mut out);
+        if let Some(message) = event["error"]["message"].as_str() {
+            anyhow::bail!("{message}");
         }
     }
-    markdown.finish(&mut out)?;
-    println!();
-
-    if stats.generated_tokens > 0 && !produced_answer {
-        eprintln!(
-            "note: the model produced no answer{}. Raise --max-tokens, or use --think on to see what it did.",
-            if filter.saw_thinking() { " — it spent the whole budget reasoning" } else { "" }
-        );
-    }
-
-    if options.stats || config.ui.show_stats {
-        eprintln!(
-            "\n{} prompt tokens ({:.1}/s) · {} generated ({:.1}/s) · stopped: {reason:?}",
-            stats.prompt_tokens,
-            stats.prompt_tokens_per_second(),
-            stats.generated_tokens,
-            stats.tokens_per_second(),
-        );
-        eprintln!(
-            "host {} ms of {} ms ({:.1}%) · drafted {} accepted {}",
-            stats.callback_ms,
-            stats.generation_ms,
-            stats.callback_ms as f64 * 100.0 / stats.generation_ms.max(1) as f64,
-            stats.drafted_tokens,
-            stats.accepted_drafts,
-        );
-        eprintln!(
-            "drafts proposed {} accepted {} ({:.0}%) · bookkeeping {} us",
-            stats.proposed_drafts,
-            stats.accepted_drafts,
-            stats.accepted_drafts as f64 * 100.0 / stats.proposed_drafts.max(1) as f64,
-            stats.spec_ms,
-        );
-    }
-    if reason == StopReason::ContextFull {
-        eprintln!("note: the context filled up; raise --ctx for a longer answer");
+    if wrote_anything {
+        out.write_all(b"\n")?;
+        out.flush()?;
     }
     Ok(())
 }
 
-/// Terminal width, falling back to a readable default when not a tty.
-fn terminal_width() -> usize {
-    ozgent_render::terminal_width()
-}
 
-/// Report a command that exists but has no engine behind it yet.
-///
-/// Better an explicit, accurate message than a confusing failure deeper down.
-fn not_yet(what: &str) -> Result<()> {
-    anyhow::bail!("{what} needs the inference engine, which is still being built")
-}
 
 /// The byte total a finished bar should report.
 fn b_total(bar: &ozgent_hub::Bar) -> u64 {

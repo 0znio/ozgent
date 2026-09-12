@@ -454,7 +454,6 @@ fn enable(init: Init, path: &Path) -> Result<()> {
             systemctl(&["enable", "--now", &format!("{SERVICE}.service")])
         }
         Init::Launchd => {
-            let label = "com.ozgent.daemon";
             let uid = users_id();
             // `bootstrap` is the modern spelling; `load` is what older macOS
             // has. Trying the new one first means no deprecation warning on a

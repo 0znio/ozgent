@@ -149,6 +149,9 @@ impl Backend {
         read(res).await
     }
 
+    /// Kept beside `post` and `delete` so the client covers the API's verbs;
+    /// the settings pages a terminal does not have are what use them.
+    #[allow(dead_code)]
     pub async fn put(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let res = self
             .http
@@ -160,6 +163,7 @@ impl Backend {
         read(res).await
     }
 
+    #[allow(dead_code)]
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {
         let res = self
             .http
@@ -179,6 +183,28 @@ impl Backend {
         let res = self
             .http
             .post(format!("{}/api/chat", self.base))
+            .json(&request)
+            .send()
+            .await
+            .context("asking the daemon")?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("{status}: {}", message_in(&body));
+        }
+        Ok(Stream { res: Some(res), buffer: String::new(), done: false })
+    }
+
+    /// A one-shot completion, with no conversation and no memory.
+    ///
+    /// The OpenAI-compatible route rather than `/api/chat` because that is
+    /// exactly what `ozgent run` is: a question with no thread behind it and
+    /// nothing kept afterwards. Using the stateful route would leave a
+    /// conversation row behind for every one-liner.
+    pub async fn complete(&self, request: serde_json::Value) -> Result<Stream> {
+        let res = self
+            .http
+            .post(format!("{}/v1/chat/completions", self.base))
             .json(&request)
             .send()
             .await

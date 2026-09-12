@@ -125,15 +125,30 @@ pub fn watch_config(state: &State) {
             seen = now;
             let changed = {
                 let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-                let changed = config.channels != fresh.channels || config.web != fresh.web;
-                if changed {
-                    config.channels = fresh.channels;
-                    config.web = fresh.web;
-                }
-                changed
+                // Everything that is read per turn, which is everything except
+                // `[tools]`. The tool worker reads its configuration once when
+                // the interpreter starts, so swapping that section here would
+                // report a change that never reached a tool — the settings
+                // page restarts the host for exactly that reason.
+                //
+                // This grew beyond `[channels]` and `[web]` when the terminal
+                // became a client: `/config temperature` writes the file, and
+                // without this it wrote a file nothing read.
+                // Swapped rather than compared: most of these types have no
+                // equality, the file only changes when something wrote it,
+                // and assigning a section that happens to be identical costs
+                // nothing.
+                config.channels = fresh.channels;
+                config.web = fresh.web;
+                config.defaults = fresh.defaults;
+                config.models = fresh.models;
+                config.permissions = fresh.permissions;
+                config.ui = fresh.ui;
+                config.default_model = fresh.default_model;
+                true
             };
             if changed {
-                tracing::info!("config.toml changed: channel and admin settings reloaded");
+                tracing::info!("config.toml changed; reloaded");
             }
             if let Some(gateway) = state.gateway.get() {
                 gateway.apply();

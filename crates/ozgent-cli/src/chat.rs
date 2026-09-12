@@ -6,144 +6,60 @@
 //! isolation; this module is the wiring.
 
 use anyhow::{Context, Result};
-use ozgent_core::{Config, Manifest, Message, ModelRef, Paths, Resolved, Role, ThinkingMode};
-use ozgent_llama::engine::{Engine, Session, StopReason};
-use ozgent_llama::thinking::{Chunk, ThinkingFilter};
-use ozgent_llama::toolcall;
-use ozgent_memory::{Budget, ContextBuilder, HashingEmbedder, OwnerKind, Store};
+use ozgent_core::{Config, Paths, ThinkingMode};
+use crate::backend::Backend;
+use ozgent_memory::Store;
 use ozgent_render::{Style, Theme};
-use ozgent_tools::Toolbox;
 use crate::tui::{Submission, Ui};
 use std::io::Write;
 
 /// Everything one chat session needs.
-/// The engine's embedder, adapted to the memory layer's trait.
 ///
-/// A newtype because both the trait and the type are foreign here; the
-/// alternative is a dependency from ozgent-llama on ozgent-memory, which would
-/// pull SQLite into the inference crate for one interface.
-struct ModelEmbedder(ozgent_llama::embed::Embedder);
-
-impl ozgent_memory::Embedder for ModelEmbedder {
-    fn dimensions(&self) -> usize {
-        self.0.dimensions()
-    }
-
-    fn embed(&self, text: &str) -> Vec<f32> {
-        // A failure here must not take the turn down with it: retrieval
-        // degrades to the keyword half rather than the conversation ending.
-        self.0.embed(text).unwrap_or_else(|e| {
-            tracing::warn!("embedding failed, falling back to no vector: {e}");
-            vec![0.0; self.0.dimensions()]
-        })
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
-        self.0.embed_batch(texts).unwrap_or_else(|e| {
-            tracing::warn!("batch embedding failed: {e}");
-            texts.iter().map(|_| vec![0.0; self.0.dimensions()]).collect()
-        })
-    }
-}
-
-/// The configured embedding model, or the lexical fallback.
-///
-/// Falling back is deliberate and logged: memory still works without an
-/// embedding model, it just loses the half of retrieval that finds a note
-/// whose words differ from the query's.
-fn build_embedder(paths: &Paths, config: &Config) -> Box<dyn ozgent_memory::Embedder> {
-    let Some(name) = config.embedding.model.as_deref() else {
-        return Box::new(HashingEmbedder::default());
-    };
-    let loaded = ozgent_core::resolve(paths, name)
-        .map_err(|e| e.to_string())
-        .and_then(|found| {
-            let weights = found.manifest.primary_weights(&found.dir);
-            ozgent_llama::embed::Embedder::load(&weights, 99).map_err(|e| e.to_string())
-        });
-    match loaded {
-        Ok(e) => Box::new(ModelEmbedder(e)),
-        Err(e) => {
-            tracing::warn!("embedding model {name:?} unavailable; memory falls back to lexical matching: {e}");
-            Box::new(HashingEmbedder::default())
-        }
-    }
-}
-
+/// No engine, no session, no tool host: the daemon holds all of it. What is
+/// left is a screen, a conversation to write into, and the name of the model
+/// to ask for.
 pub struct Chat<'a> {
-    engine: &'a Engine,
-    session: Session<'a>,
+    /// The daemon. The terminal loads no model of its own: it asks whichever
+    /// ozgent is already running, which is usually holding the model already.
+    backend: Backend,
+    /// Read directly for the conversation picker and `/memory`. One SQLite
+    /// file, shared with the daemon that writes to it.
     store: Store,
-    embedder: Box<dyn ozgent_memory::Embedder>,
-    tools: Option<Toolbox>,
     /// The conversation being written to, once there is one.
     ///
     /// `None` until the first message. Opening a chat and closing it again
-    /// used to leave a titleless empty row behind every time, which filled
-    /// the picker with nothing.
+    /// used to leave a titleless empty row behind every time.
     conversation: Option<i64>,
-    opts: Resolved,
     theme: Theme,
-    /// The screen. Borrowed rather than owned because switching models tears
-    /// this struct down and rebuilds it, and the conversation on screen must
-    /// survive that.
+    /// The screen.
     ui: &'a mut Ui,
-    /// Tools the user has approved for the rest of this run. Never written
-    /// to disk: "yes, for now" is a different promise from "yes, always".
-    grants: ozgent_core::Grants,
-    /// Generation rate of the last reply, for the status line. `None`
-    /// until this session has produced one — a rate carried over from a
-    /// previous model would be a lie about this one.
+    /// Generation rate of the last reply, for the status line.
     last_rate: Option<f64>,
-    model: ModelRef,
-    manifest: Manifest,
-    /// Where this model's files live, for finding its projector.
-    model_dir: std::path::PathBuf,
-    /// Loaded on the first turn that carries an image, then kept.
-    projector: Option<ozgent_llama::mtmd::Projector<'a>>,
-    /// Images for the turn being built; cleared once evaluated.
-    pending_images: Vec<ozgent_llama::mtmd::Media>,
-    /// The sources those bytes came from, for capability reporting.
-    pending_sources: Vec<ozgent_core::ImageSource>,
-    /// Set when this turn carries media, so the model is told it can see.
-    media_turn: bool,
-    /// What the grounding pass saw, consumed when the turn's prompt is built.
-    media_observation: Option<String>,
+    /// The model to ask for. A name, not a loaded thing — the daemon resolves
+    /// it, and answers from the copy it already has if it has one.
+    model: String,
+    /// Context used and the window it came out of, as the daemon reported
+    /// them. Its numbers rather than a second guess at them.
+    used: Option<u32>,
+    window: Option<u32>,
     /// Turns are numbered for the `/memory` display.
     turn: usize,
     /// Owned copies so `/config` and `/tools` can persist changes without
     /// borrowing from the caller across an await.
     paths: Paths,
     config: Config,
-    /// The agent running now, if the turn was handed to one.
-    scope: Option<Scope>,
     /// The last reply's text, for `/copy`.
     last_reply: String,
-    /// Agents the model may hand this turn to itself, through `ask_agent`.
-    handoff: Vec<ozgent_core::Agent>,
-}
-
-/// An agent at work: what it is, and what it was given.
-struct Scope {
-    agent: ozgent_core::Agent,
-    /// The only tools this agent's generations are shown.
-    offered: Vec<ozgent_core::ToolSpec>,
-    /// Tools it lists that this session does not have.
-    missing: Vec<String>,
-}
-
-/// What a run of tool rounds produced.
-struct Rounds {
-    reply: Reply,
-    /// Every call made, in the shape the web interface stores.
-    activity: Vec<serde_json::Value>,
-    /// Calls that actually ran.
-    calls: usize,
-    /// The model handed the turn to this agent, with this task.
-    handoff: Option<(ozgent_core::Agent, String)>,
+    /// Reasoning mode for the next turn. Sent with each request rather than
+    /// held on a session, because there is no session here to hold it.
+    thinking: Option<ThinkingMode>,
 }
 
 /// Start a chat.
+///
+/// No model is loaded here. The terminal is a client of the daemon — see
+/// [`crate::backend`] — so this connects, starting one if nothing answers,
+/// and everything after that is a request.
 pub async fn run(
     paths: &Paths,
     config: &Config,
@@ -158,33 +74,43 @@ pub async fn run(
         )?;
 
     paths.ensure()?;
-    // The conversation survives a model switch: it is the user's thread, not
-    // the model's.
-    let mut conversation: Option<i64> = None;
 
-    // Built once, outside the loop. Switching models tears down the engine and
-    // the tool worker; taking over the terminal again as well would blank the
-    // screen and lose everything said so far.
     let plain = options.plain || !config.ui.markdown;
     let theme = if plain { Theme::plain() } else { Theme::default() };
-    let mut ui = Ui::new(theme, Some(paths.root().join("history")));
+    let mut ui = Ui::new(theme.clone(), Some(paths.root().join("history")));
 
-    // Each pass loads one model. `/models` unwinds here to load another;
-    // rebuilding the store and tool worker costs far less than the model load
-    // that is happening anyway.
-    let outcome = loop {
-        let next = match run_one(paths, config, &name, options, &mut ui, &mut conversation).await {
-            Ok(next) => next,
-            Err(e) => break Err(e),
-        };
-        match next {
-            Some(other) => {
-                ui.blank();
-                name = other;
-            }
-            None => break Ok(()),
+    // Connect before taking over the screen, so "starting a backend" is an
+    // ordinary line on the terminal rather than a message on a blank
+    // alternate screen that vanishes when it is handed back.
+    let backend = match crate::backend::Backend::connect().await {
+        Some(backend) => backend,
+        None => {
+            println!("no backend at {} — starting one", crate::backend::Backend::address());
+            crate::backend::Backend::connect_or_start(|_| {}).await?
         }
     };
+
+    let store = Store::open(paths.root().join("ozgent.db"))?;
+    let conversation: Option<i64> = None;
+
+    let mut chat = Chat {
+        backend,
+        store,
+        conversation,
+        theme,
+        ui: &mut ui,
+        last_rate: None,
+        model: name,
+        used: None,
+        window: None,
+        turn: 0,
+        paths: paths.clone(),
+        config: config.clone(),
+        last_reply: String::new(),
+        thinking: None,
+    };
+    chat.banner();
+    let outcome = chat.repl().await.map(|_| ());
 
     ui.save_history();
     // Before the error is printed, or it lands on the alternate screen and
@@ -193,230 +119,44 @@ pub async fn run(
     outcome
 }
 
-/// Run a chat against one model. Returns the model to switch to, if any.
-async fn run_one(
-    paths: &Paths,
-    config: &Config,
-    name: &str,
-    options: &crate::cli::OptionFlags,
-    ui: &mut Ui,
-    conversation: &mut Option<i64>,
-) -> Result<Option<String>> {
-    let found = ozgent_core::resolve(paths, name)?;
-    let (model_ref, dir, manifest) = (found.model, found.dir, found.manifest);
-
-    let opts = config
-        .options_for(&model_ref.to_string())
-        .merge(&manifest.defaults)
-        .merge(&options.to_options()?)
-        .resolve();
-
-    // Painted before the load rather than after, because the load is the long
-    // part and a blank screen for twenty seconds looks like a hang.
-    let started = std::time::Instant::now();
-    let engine = load_with_bar(ui, &model_ref.to_string(), manifest.primary_weights(&dir), &opts)?;
-    ui.say(format!(
-        "{} layers ({} on gpu) in {:.1}s",
-        engine.n_layer(),
-        engine.gpu_layers_used(),
-        started.elapsed().as_secs_f32()
-    ));
-
-    let session = engine.session(&opts)?;
-
-    // One database for every front end, so the web UI sees the same history.
-    let store = Store::open(paths.root().join("ozgent.db"))?;
-    // Deliberately not created here. A conversation begins when the user says
-    // something, not when a model finishes loading.
-    let conversation_id = *conversation;
-
-    let tools = if opts.tools && config.tools.enabled {
-        match crate::start_tools(paths, config).await {
-            Ok(host) => {
-                ui.say(format!("{} tools loaded", host.tools().len()));
-                Some(host)
-            }
-            Err(e) => {
-                ui.say(format!("tools unavailable: {e}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // The same decision `run` made when it built the screen, so the two
-    // cannot disagree about whether this session is in colour.
-    let plain = options.plain || !config.ui.markdown;
-    let theme = if plain { Theme::plain() } else { Theme::default() };
-    let turn = conversation_id
-        .and_then(|id| store.message_count(id).ok())
-        .unwrap_or(0) as usize;
-
-    let mut chat = Chat {
-        engine: &engine,
-        session,
-        store,
-        embedder: build_embedder(paths, config),
-        tools,
-        conversation: conversation_id,
-        ui,
-        theme,
-        grants: ozgent_core::Grants::default(),
-        last_rate: None,
-        model: model_ref,
-        manifest,
-        model_dir: dir.clone(),
-        projector: None,
-        pending_images: Vec::new(),
-        pending_sources: Vec::new(),
-        media_turn: false,
-        media_observation: None,
-        opts,
-        turn,
-        paths: paths.clone(),
-        config: config.clone(),
-        scope: None,
-        last_reply: String::new(),
-        handoff: Vec::new(),
-    };
-    // The @ panel needs the agents before the first keystroke.
-    chat.ui.set_agents(ozgent_core::AgentCatalog::load(paths));
-
-    // Constrain the body of a tool call once one starts. This is the cheap
-    // half of the pair below: the retry path in `turn` fixes a malformed call
-    // after paying for it, while gating stops it being generated at all.
-    if let Some(host) = &chat.tools {
-        let specs = host.tools().to_vec();
-        // Withheld from a model whose template writes calls in its own
-        // syntax: the grammar describes the JSON body ozgent's preamble asks
-        // for, and that preamble was not sent.
-        if !engine.template_handles_tools() {
-            chat.session.set_tools(&specs);
-        }
-    }
-
-    chat.banner();
-    let outcome = chat.repl().await;
-
-    if let Some(host) = &chat.tools {
-        host.shutdown().await;
-    }
-    *conversation = chat.conversation;
-
-    match outcome? {
-        Flow::Switch(other) => Ok(Some(other)),
-        _ => Ok(None),
-    }
-}
-
 impl<'a> Chat<'a> {
     fn banner(&mut self) {
-        // A clone, not a borrow of `self.theme`: writing to the screen
-        // takes `&mut self`, and a closure holding the theme would block it.
+        // A clone, not a borrow of `self.theme`: writing to the screen takes
+        // `&mut self`, and a closure holding the theme would block it.
         let theme = self.theme.clone();
         let dim = |s: &str| theme.style(Style::dim(), s);
         self.ui.blank();
-        let window = self.session.n_ctx();
-        self.ui.say(format!(
-            "{} {}",
-            self.model,
-            dim(&format!("· {} ctx", ozgent_core::format_count(window)))
-        ));
-        // A window smaller than the one asked for is not a detail to leave in
-        // the log. The model was loaded, answers will be correct, and the only
-        // visible symptom is that a long conversation runs out sooner than the
-        // user planned for — which is impossible to work out after the fact.
-        if window < self.opts.context_length {
-            let asked = ozgent_core::format_count(self.opts.context_length);
-            let trained = self.engine.n_ctx_train();
-            // Two different reasons land here and the fix for each is
-            // different: one is answered by freeing memory or quantising the
-            // cache, the other by picking a model that was trained longer.
-            let why = if trained > 0 && window >= trained {
-                format!("this model was trained for {}", ozgent_core::format_count(trained))
-            } else if self.opts.kv_offload {
-                "that much KV cache does not fit in VRAM. `/config mode gpu_ram` puts it \
-                 in system RAM instead: the whole window, slower per token"
-                    .to_string()
-            } else {
-                "that much KV cache does not fit in this machine's memory".to_string()
-            };
-            self.ui.say(dim(&format!("· asked for {asked}; {why}")));
-        }
+        self.ui.say(format!("{} {}", self.model, dim("· asking the ozgent daemon")));
+        // The window is the daemon's to report, and it does on the first
+        // reply. Claiming a number before then would be a guess at settings
+        // this process no longer resolves.
         self.ui.say(dim("/help for commands, /exit to quit"));
         self.ui.blank();
     }
 
     /// What the bottom row says: the facts that change as the session runs.
-    ///
-    /// Priorities decide what survives a narrow terminal. The model name goes
-    /// first because a status line that has dropped it no longer says which
-    /// machine's answer you are reading; the sampler settings go last because
-    /// they are the ones `/config` will tell you on demand.
     fn status_segments(&self) -> Vec<crate::status::Segment> {
         use crate::status::Segment;
         use ozgent_core::format_count;
 
-        let used = self.session.used();
-        let window = self.session.n_ctx();
-        let percent = if window > 0 { used * 100 / window } else { 0 };
-
-        let mut segments = vec![
-            Segment::new(0, self.model.to_string()),
-            Segment::new(
-                1,
-                format!("ctx {}/{} {percent}%", format_count(used), format_count(window)),
-            ),
-        ];
-        // Absent rather than zero before the first reply: "0.0 tok/s" reads as
-        // a measurement, and there has not been one yet.
-        if let Some(rate) = self.last_rate {
-            segments.push(Segment::new(2, format!("{rate:.1} tok/s")));
+        // The model first: a status line that has dropped it no longer says
+        // which machine's answer you are reading.
+        let mut out = vec![Segment::new(100, self.model.clone())];
+        if let (Some(used), Some(window)) = (self.used, self.window) {
+            out.push(Segment::new(
+                80,
+                format!("{}/{}", format_count(used), format_count(window)),
+            ));
         }
-        segments.push(Segment::new(
-            3,
-            match self.opts.thinking {
-                ThinkingMode::Off => "think off".to_string(),
-                _ => format!("think {}", self.opts.reasoning_effort),
-            },
-        ));
-        // Tools, and how many of them can act without being asked. A count
-        // alone says nothing about the thing worth knowing.
-        segments.push(Segment::new(
-            4,
-            match &self.tools {
-                Some(host) => {
-                    let asking = host
-                        .tools()
-                        .iter()
-                        .filter(|spec| {
-                            matches!(
-                                self.config.permissions.verdict(
-                                    &spec.name,
-                                    spec.effect,
-                                    &self.grants,
-                                ),
-                                ozgent_core::Verdict::Ask,
-                            )
-                        })
-                        .count();
-                    match asking {
-                        0 => format!("{} tools", host.tools().len()),
-                        n => format!("{} tools · {n} ask", host.tools().len()),
-                    }
-                }
-                None => "no tools".to_string(),
-            },
-        ));
-        segments.push(Segment::new(
-            5,
-            format!("temp {:.2} top-p {:.2}", self.opts.temperature, self.opts.top_p),
-        ));
-        segments
+        if let Some(rate) = self.last_rate {
+            out.push(Segment::new(60, format!("{rate:.0} tok/s")));
+        }
+        if self.config.tools.enabled {
+            out.push(Segment::new(40, "tools"));
+        }
+        out
     }
 
-    /// Refresh the two bottom bars from the session's current state.
     fn update_status(&mut self) {
         let segments = self.status_segments();
         self.ui.set_status(segments);
@@ -424,23 +164,47 @@ impl<'a> Chat<'a> {
         self.ui.set_posture(posture);
     }
 
-    /// What the permission bar says when nothing is being asked.
-    ///
-    /// The standing policy, in the same words the prompt will use when a tool
-    /// does ask. Someone who has been reading "runs programs: ask" all week
-    /// knows what the question means the moment it appears.
+    /// One line about what tool calls will do, so the rules are visible
+    /// without asking for them.
     fn permission_posture(&self) -> String {
         let p = &self.config.permissions;
-        let session: Vec<&str> = self.grants.allowed().collect();
-        let mut text = format!(
-            "tools · read {} · write {} · run {}",
-            p.read, p.write, p.execute
-        );
-        if !session.is_empty() {
-            text.push_str(&format!("  ·  allowed this session: {}", session.join(", ")));
-        }
-        text
+        // Session grants live in the daemon now, so only the standing rules
+        // are shown. Claiming to know what was allowed "this session" from
+        // here would be a guess at somebody else's state.
+        format!("tools · read {} · write {} · run {}", p.read, p.write, p.execute)
     }
+
+    /// Echo the question into the transcript.
+    ///
+    /// In a scrolling REPL the terminal did this for free; a full-screen
+    /// application draws its own rows, so without it a conversation is a
+    /// column of answers to questions nobody can see.
+    fn echo(&mut self, text: &str) {
+        let marker = self.theme.style(Style::color(ozgent_render::Color::Cyan), "› ");
+        // Agents called by name are picked out, so it is clear before any
+        // frame appears that this message went to one.
+        let catalog = ozgent_core::AgentCatalog::load(&self.paths);
+        let mut body = String::new();
+        let mut from = 0;
+        for m in ozgent_core::agents::mentions(text) {
+            if catalog.get(&m.name).is_none() {
+                continue;
+            }
+            body.push_str(
+                &self.theme.style(Style { bold: true, ..Default::default() }, &text[from..m.start]),
+            );
+            body.push_str(&self.theme.style(
+                Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
+                &text[m.start..m.end],
+            ));
+            from = m.end;
+        }
+        body.push_str(&self.theme.style(Style { bold: true, ..Default::default() }, &text[from..]));
+        self.ui.blank();
+        self.ui.say(format!("{marker}{body}"));
+        self.ui.blank();
+    }
+
 
     async fn repl(&mut self) -> Result<Flow> {
         crate::input::install_interrupt_handler();
@@ -492,908 +256,94 @@ impl<'a> Chat<'a> {
     }
 
     /// One user turn: remember it, build context, generate, run any tools.
+    /// One user turn: hand it to the daemon and draw what comes back.
+    ///
+    /// Everything that used to be here — assembling context, the tool loop,
+    /// agents, persisting the reply — is the daemon's now, and was always
+    /// also implemented there. What is left is the part that is genuinely
+    /// about a terminal.
     async fn turn(&mut self, input: &str) -> Result<()> {
         self.turn += 1;
-
-        // Images referenced by path or URL are picked up automatically.
-        let mut extracted = ozgent_llama::vision::extract(input);
-        if extracted.has_images() {
-            match self.load_media(&extracted.images) {
-                Ok(count) if count > 0 => {
-                    let marker = self.projector.as_ref().expect("loaded above").marker();
-                    extracted.text =
-                        ozgent_llama::mtmd::with_markers(marker, &extracted.text, count);
-                    self.media_turn = true;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    self.ui.say(self.theme.style(Style::dim(), &format!("note: {e}")));
-                    self.pending_images.clear();
-                }
-            }
-        }
-
-        // The first message is what brings a conversation into existence.
         let conversation = self.ensure_conversation()?;
-        let user_id = self.store.append_message(
-            conversation,
-            "user",
-            &extracted.text,
-            0,
-        )?;
-        self.store.put_embedding(
-            OwnerKind::Message,
-            user_id,
-            &self.embedder.embed(&extracted.text),
-        )?;
 
-        // Name the conversation after its first line, so `ozgent web` has
-        // something readable in its sidebar.
-        if self.turn == 1 {
-            let title: String = extracted.text.chars().take(60).collect();
-            self.store.rename_conversation(conversation, &title)?;
+        // Images named by path or URL are read here, because the daemon
+        // cannot open files on this machine — it may not even be on it.
+        let extracted = ozgent_llama::vision::extract(input);
+        let images = self.read_images(&extracted.images);
+
+        let request = serde_json::json!({
+            "conversation": conversation,
+            "model": self.model,
+            "message": extracted.text,
+            "thinking": self.thinking.map(|m| match m {
+                ThinkingMode::On => "on",
+                ThinkingMode::Off => "off",
+                ThinkingMode::Auto => "auto",
+            }),
+            "tools": self.config.tools.enabled,
+            "images": images,
+        });
+
+        let events = self.backend.chat(request).await?;
+        let show_thinking = self.config.ui.show_thinking;
+        let theme = self.theme.clone();
+        let backend = self.backend.clone();
+        let ui = &mut *self.ui;
+
+        // Asking is the one part that genuinely needs the whole terminal — the
+        // prompt, one-key answers, the redraw underneath — so it stays here
+        // and the renderer calls back into it.
+        let finished = crate::stream::render(
+            &backend,
+            events,
+            ui,
+            &theme,
+            show_thinking,
+            answer_permission,
+        )
+        .await?;
+
+        self.last_reply = finished.answer.trim().to_string();
+        if let Some(rate) = finished.rate {
+            self.last_rate = Some(rate);
         }
-
-        if self.media_turn {
-            self.media_observation = self.ground(&extracted.text);
+        if finished.used.is_some() {
+            self.used = finished.used;
         }
-        // Agents called by name take the turn; with none it is the model's.
-        // Read per turn, so an agent saved a moment ago can be called now.
-        let catalog = ozgent_core::AgentCatalog::load(&self.paths);
-        let agents: Vec<ozgent_core::Agent> =
-            catalog.mentioned(&extracted.text).into_iter().cloned().collect();
-        self.ui.set_agents(catalog);
-
-        let (text, thinking, activity) = if agents.is_empty() {
-            // The model may hand the turn to an agent itself.
-            self.handoff = if self.config.tools.handoff && self.tools.is_some() {
-                catalog_agents(&self.paths)
-            } else {
-                Vec::new()
-            };
-            if !self.engine.template_handles_tools() && self.tools.is_some() {
-                let offered = self.offered();
-                self.session.set_tools(&offered);
-            }
-            let messages = self.build_context(Some(conversation), &extracted.text)?;
-            let rounds = self.rounds(messages, ozgent_web::worker::MAX_TOOL_ROUNDS).await;
-            self.handoff.clear();
-            let rounds = rounds?;
-            match rounds.handoff {
-                None => (rounds.reply.text, rounds.reply.thinking, rounds.activity),
-                Some((agent, task)) => {
-                    let note = ozgent_core::agents::handoff_note(&task);
-                    let before = rounds.reply.text.trim().to_string();
-                    let (report, _, mut activity) =
-                        self.run_agents(conversation, &extracted.text, &[agent], Some(&note)).await?;
-                    // What the model said before handing over stays, above
-                    // the agent's report; the report's offsets move past it.
-                    let (text, shift) = if before.is_empty() {
-                        (report, 0)
-                    } else {
-                        let shift = before.encode_utf16().count() + 2;
-                        (format!("{before}\n\n{report}"), shift)
-                    };
-                    for entry in activity.iter_mut() {
-                        for key in ["at", "end"] {
-                            if let Some(n) = entry.get(key).and_then(|v| v.as_u64()) {
-                                entry[key] = (n + shift as u64).into();
-                            }
-                        }
-                    }
-                    let mut all = rounds.activity;
-                    all.extend(activity);
-                    (text, rounds.reply.thinking, all)
-                }
-            }
-        } else {
-            self.run_agents(conversation, &extracted.text, &agents, None).await?
-        };
-
-        // What happened on the way, in the shape the web interface replays,
-        // so a turn taken here reads the same when the conversation is opened
-        // in the browser.
-        self.last_reply = text.trim().to_string();
-        let calls = (!activity.is_empty()).then(|| serde_json::to_string(&activity).unwrap_or_default());
-        let assistant_id = self.store.append_message_full(
-            conversation,
-            "assistant",
-            text.trim_end(),
-            thinking.as_deref(),
-            calls.as_deref(),
-            None,
-            0,
-        )?;
-        self.store.put_embedding(
-            OwnerKind::Message,
-            assistant_id,
-            &self.embedder.embed(&text),
-        )?;
+        if finished.window.is_some() {
+            self.window = finished.window;
+        }
         Ok(())
     }
 
-    /// The tools this generation may be offered: an agent's own, or all of them.
-    fn offered(&self) -> Vec<ozgent_core::ToolSpec> {
-        match &self.scope {
-            Some(scope) => scope.offered.clone(),
-            None => {
-                let mut all = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
-                if self.tools.is_some() {
-                    all.extend(ozgent_core::agents::handoff_spec(&self.handoff));
-                }
-                all
-            }
-        }
-    }
-
-    /// Generate, run any tools the model asks for, and generate again, until
-    /// it answers or `max_calls` rounds are spent.
-    async fn rounds(&mut self, mut messages: Vec<Message>, max_calls: usize) -> Result<Rounds> {
-        let mut reply = self.generate(&messages)?;
-        let offered = self.offered();
-        let names: Vec<String> = offered.iter().map(|s| s.name.clone()).collect();
-        let mut activity = Vec::new();
-        let mut calls = 0usize;
-
-        // A tool call is a request, not an answer: run it, hand the result
-        // back, and let the model continue. Bounded so a model that keeps
-        // calling cannot loop forever.
-        // The same budget the server gives a turn. Four was enough for a
-        // lookup and not for a question worth asking an agent: two searches
-        // and two pages, which a research prompt spends before it has read
-        // anything, and the turn then answers from what it half-saw.
-        for round in 0..max_calls {
-            let mut parsed = toolcall::extract(&reply.text);
-
-            // The model tried to call a tool and produced something
-            // unparseable. Constrained decoding cannot produce malformed JSON,
-            // an unknown tool name, or a misspelled parameter, so retrying
-            // under the grammar turns a failed attempt into a valid one.
-            if !parsed.has_calls() && reply.attempted_call && self.tools.is_some() {
-                if let Some(grammar) = ozgent_llama::grammar::tool_call_grammar(&offered) {
-                    self.ui.say(self.theme.style(Style::dim(), "· malformed tool call; retrying under grammar"));
-                    reply = self.generate_with(&messages, Some(&grammar))?;
-                    parsed = toolcall::extract(&reply.text);
-                }
-            }
-
-            if !parsed.has_calls() || self.tools.is_none() {
-                // A call that was announced but never parsed leaves its line
-                // frozen mid-spin. Settle it: the model started something and
-                // did not finish, which is worth leaving on screen, but not as
-                // something that still looks like it is working.
-                self.ui.settle();
-                break;
-            }
-            reply.text = parsed.text.clone();
-
-            // Handing the turn to an agent ends the model's part of it.
-            if self.scope.is_none() {
-                if let Some(call) = parsed.calls.iter().find(|c| c.name == ozgent_core::agents::HANDOFF_TOOL) {
-                    if let Ok((agent, task)) = ozgent_core::agents::read_handoff(&call.arguments, &self.handoff) {
-                        self.ui.settle();
-                        return Ok(Rounds { reply, activity, calls, handoff: Some((agent.clone(), task)) });
-                    }
-                }
-            }
-
-            for call in &parsed.calls {
-                self.show_call(call);
-                let started = std::time::Instant::now();
-
-                // A tool this generation was not offered is answered without
-                // running it. The host has it — it simply was not on the
-                // table — and running it anyway would make an agent's list a
-                // suggestion rather than a limit.
-                let (result, ok, summary) = if call.name == ozgent_core::agents::HANDOFF_TOOL
-                    && self.scope.is_none()
-                    && names.contains(&call.name)
-                {
-                    // Reached only when the agent it named does not exist.
-                    self.ui.settle();
-                    let reason = ozgent_core::agents::read_handoff(&call.arguments, &self.handoff)
-                        .err()
-                        .unwrap_or_default();
-                    let outcome: Result<serde_json::Value, ozgent_tools::ToolCallError> =
-                        Err(ozgent_tools::ToolCallError::Invalid { name: call.name.clone(), reason });
-                    self.show_result(&outcome, started.elapsed());
-                    let text = outcome.unwrap_err().for_model();
-                    let summary = ozgent_tools::first_line(&text).to_string();
-                    (text, false, summary)
-                } else if !names.contains(&call.name) {
-                    self.ui.settle();
-                    let outcome: Result<serde_json::Value, ozgent_tools::ToolCallError> =
-                        Err(ozgent_tools::ToolCallError::NotOffered {
-                            name: call.name.clone(),
-                            offered: names.clone(),
-                        });
-                    self.show_result(&outcome, started.elapsed());
-                    let text = outcome.unwrap_err().for_model();
-                    let summary = ozgent_tools::first_line(&text).to_string();
-                    (text, false, summary)
-                } else {
-                    // Asked before the call runs, so the transcript never
-                    // shows a tool working that the user is about to refuse.
-                    // A refusal still goes into the history as a result: the
-                    // assistant message below records the call, and a call
-                    // with no answer leaves the conversation malformed for
-                    // every later turn.
-                    match self.permit(call, reply.early_permission.as_ref()).await? {
-                        Some(approved) => {
-                            calls += 1;
-                            let outcome = self.run_tool(call, approved).await;
-                            self.ui.settle();
-                            self.show_result(&outcome, started.elapsed());
-                            match outcome {
-                                Ok(value) => {
-                                    let summary = summarise_result(&value);
-                                    (serde_json::to_string(&value).unwrap_or_default(), true, summary)
-                                }
-                                Err(e) => {
-                                    let text = e.for_model();
-                                    let summary = ozgent_tools::first_line(&text).to_string();
-                                    (text, false, summary)
-                                }
-                            }
-                        }
-                        None => {
-                            self.ui.settle();
-                            self.show_refusal(&call.name);
-                            (ozgent_core::permission::refusal(&call.name), false, "declined".to_string())
-                        }
-                    }
-                };
-                let mut entry = serde_json::json!({
-                    "kind": "tool",
-                    "name": call.name,
-                    "arguments": call.arguments,
-                    "at": 0,
-                    "ok": ok,
-                    "ms": started.elapsed().as_millis() as u64,
-                    "summary": summary,
-                });
-                if let Some(scope) = &self.scope {
-                    entry["agent"] = scope.agent.name.clone().into();
-                }
-                activity.push(entry);
-
-                // Structured when the template can render a call itself, so
-                // it writes the syntax this model was trained on. Spelt out
-                // as text when it cannot: the fallback renderers read only
-                // `content`, and a structured call would vanish from the
-                // history entirely — and the text form is the one ozgent's
-                // preamble described to the model in that case anyway.
-                let (content, tool_calls) = if self.engine.template_handles_tools() {
-                    (Vec::new(), vec![call.clone()])
-                } else {
-                    (
-                        vec![ozgent_core::Part::Text {
-                            text: format!(
-                                "<tool_call>{{\"name\": \"{}\", \"arguments\": {}}}</tool_call>",
-                                call.name, call.arguments
-                            ),
-                        }],
-                        Vec::new(),
-                    )
-                };
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content,
-                    // The reasoning that led to this call, so the next round
-                    // sees why it was made. Dropped, the template writes an
-                    // empty `<think></think>` for the turn and the model
-                    // continues from a history saying it never reasoned.
-                    thinking: reply.thinking.clone(),
-                    tool_calls,
-                    tool_call_id: None,
-                });
-                messages.push(Message::tool_result(call.id.clone(), truncate_result(&result)));
-            }
-
-            if round + 1 == max_calls {
-                self.ui.say(self.theme.style(Style::dim(), "· tool call limit reached"));
-                // Asked for an answer, rather than left to spend the last
-                // generation on one more call whose text — nothing — would
-                // then be the reply.
-                messages.push(Message::system(ozgent_web::worker::OUT_OF_ROUNDS));
-            }
-            if crate::input::interrupted() {
-                break;
-            }
-            reply = self.generate(&messages)?;
-        }
-        Ok(Rounds { reply, activity, calls, handoff: None })
-    }
-
-    /// Hand the turn to each agent the message named, in order.
+    /// Attachments as data URLs, which is how the API takes them.
     ///
-    /// Each works inside a frame: a header naming it and the tools it has, a
-    /// rule down the left of everything it does, and a footer saying how it
-    /// went. Its report is streamed inside the frame, since it is the answer.
-    async fn run_agents(
-        &mut self,
-        conversation: i64,
-        query: &str,
-        agents: &[ozgent_core::Agent],
-        note: Option<&str>,
-    ) -> Result<(String, Option<String>, Vec<serde_json::Value>)> {
-        let available = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
-        let saved = self.opts.clone();
-        let mut combined = String::new();
-        let mut activity: Vec<serde_json::Value> = Vec::new();
-        // Each agent sees the reports of the ones before it.
-        let mut earlier: Vec<Message> = Vec::new();
-
-        for agent in agents {
-            let (offered, missing) = agent.offer(&available);
-            self.agent_header(agent, &offered, &missing);
-
-            // The agent's sampling where it says, the session's otherwise.
-            if let Some(t) = agent.definition.thinking {
-                self.opts.thinking = t;
-            }
-            if let Some(t) = agent.definition.temperature {
-                self.opts.temperature = t;
-            }
-            if let Some(m) = agent.definition.max_tokens {
-                self.opts.max_tokens = m;
-            }
-            self.session.set_options(&self.opts);
-            if !self.engine.template_handles_tools() {
-                self.session.set_tools(&offered);
-            }
-            self.scope = Some(Scope { agent: agent.clone(), offered, missing });
-
-            let started = std::time::Instant::now();
-            let outcome = match self.build_context(Some(conversation), query) {
-                Ok(mut messages) => {
-                    if let Some(note) = note {
-                        messages.push(Message::system(note));
-                    }
-                    messages.extend(earlier.iter().cloned());
-                    self.rounds(messages, agent.definition.rounds()).await
-                }
-                Err(e) => Err(e),
+    /// Read here rather than passed as paths: the daemon may be on another
+    /// machine, and a path that means something here means nothing there.
+    fn read_images(&mut self, sources: &[ozgent_core::ImageSource]) -> Vec<String> {
+        let mut out = Vec::new();
+        for source in sources {
+            let bytes = match source {
+                ozgent_core::ImageSource::Path { path } => std::fs::read(path)
+                    .map_err(|e| format!("{}: {e}", path.display())),
+                ozgent_core::ImageSource::Bytes { bytes, .. } => Ok(bytes.clone()),
+                // A URL is left for the daemon to fetch; it has the network
+                // access and the caching for it.
+                ozgent_core::ImageSource::Url { .. } => continue,
             };
-
-            // Put everything back whatever happened, or the next message would
-            // run with this agent's tools and temperature.
-            self.scope = None;
-            self.opts = saved.clone();
-            self.session.set_options(&self.opts);
-            if !self.engine.template_handles_tools() {
-                let all = self.tools.as_ref().map(|h| h.tools().to_vec()).unwrap_or_default();
-                self.session.set_tools(&all);
-            }
-            let rounds = outcome?;
-
-            let report = rounds.reply.text.trim().to_string();
-            let ms = started.elapsed().as_millis() as u64;
-            self.agent_footer(&agent.name, !report.is_empty(), rounds.calls, ms);
-
-            if !combined.is_empty() {
-                combined.push_str("\n\n");
-            }
-            let at = combined.encode_utf16().count();
-            activity.push(serde_json::json!({
-                "kind": "agent",
-                "name": agent.name,
-                "description": agent.definition.description,
-                "tools": agent.offer(&available).0.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-                "missing": agent.offer(&available).1,
-                "at": at,
-                "ok": !report.is_empty(),
-                "ms": ms,
-                "calls": rounds.calls,
-                "thinking": rounds.reply.thinking.clone().unwrap_or_default(),
-            }));
-            for mut entry in rounds.activity {
-                entry["at"] = at.into();
-                activity.push(entry);
-            }
-            combined.push_str(&report);
-            let end = combined.encode_utf16().count();
-            if let Some(block) = activity.iter_mut().rev().find(|a| a["kind"] == "agent") {
-                block["end"] = end.into();
-            }
-            earlier.push(Message::assistant(report));
-            if crate::input::interrupted() {
-                break;
-            }
-        }
-        Ok((combined, None, activity))
-    }
-
-    /// Say which agent is answering, before it starts.
-    ///
-    /// One line, not a frame: the agent's calls and reply look like any
-    /// other, and this is what says whose they are.
-    fn agent_header(
-        &mut self,
-        agent: &ozgent_core::Agent,
-        offered: &[ozgent_core::ToolSpec],
-        missing: &[String],
-    ) {
-        let theme = self.theme.clone();
-        let name = theme.style(
-            Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
-            &format!("@{}", agent.name),
-        );
-        let mut detail = agent.definition.description.clone();
-        if offered.is_empty() {
-            detail.push_str(" · no tools");
-        }
-        if !missing.is_empty() {
-            detail.push_str(&format!(" · not available here: {}", missing.join(", ")));
-        }
-        self.ui.say(format!("{name}  {}", theme.style(Style::dim(), &detail)));
-    }
-
-    /// How the agent's turn went, in one dim line under its reply.
-    fn agent_footer(&mut self, name: &str, ok: bool, calls: usize, ms: u64) {
-        let plural = if calls == 1 { "" } else { "s" };
-        let how = if ok { "" } else { " · no report" };
-        let line = format!(
-            "· @{name}{how} · {calls} tool call{plural} · {:.1}s",
-            ms as f64 / 1000.0
-        );
-        self.ui.say(self.theme.style(Style::dim(), &line));
-        self.ui.blank();
-    }
-
-    /// Assemble the prompt from pinned facts, recent turns, and recall.
-    fn build_context(&mut self, conversation: Option<i64>, query: &str) -> Result<Vec<Message>> {
-        // Leave room for the answer, and keep the window inside the context.
-        let budget = Budget {
-            total: self.session.n_ctx() as usize,
-            reserve_for_reply: (self.session.n_ctx() as usize / 4).max(256),
-            recent_messages: 12,
-            max_retrieved: 6,
-        };
-
-        // Before the first message there is no conversation and so no history
-        // to assemble — the system prompt and the query are the whole context.
-        let ctx = match conversation {
-            Some(id) => ContextBuilder::new(&self.store, &self.embedder)
-                .with_budget(budget)
-                .build(id, query)?,
-            None => Default::default(),
-        };
-
-        if ctx.used_recall() {
-            self.ui.say(self.theme.style(
-                    Style::dim(),
-                    &format!("· recalled {} earlier item(s)", ctx.retrieved.len())
-                ));
-        }
-        // The date goes first: it is context about the world, not instruction,
-        // and a model reads the opening of a system prompt most reliably.
-        let date = self
-            .config
-            .ui
-            .date_awareness
-            .then(|| ozgent_core::DateTime::now().prompt_line());
-        let dated = match &self.scope {
-            // An agent's instructions replace the chat's system prompt: a
-            // persona written for the chat would contradict the job.
-            Some(scope) => Some(scope.agent.system_prompt(date.as_deref(), &scope.missing)),
-            None => match (date, &self.opts.system_prompt) {
-                (Some(line), Some(base)) if !base.trim().is_empty() => Some(format!("{line}\n\n{base}")),
-                (Some(line), _) => Some(line),
-                (None, base) => base.clone(),
-            },
-        };
-        let offered = self.offered();
-
-        // The tool description joins the system prompt rather than replacing
-        // it, so a user-set persona survives.
-        // What the model saw when it looked, so the turn starts from an
-        // accurate reading rather than a guess at one. Appended *after* the
-        // tool preamble below, not before: placed first, the tool instructions
-        // were the last thing read and the model reached for a search anyway.
-        let media_note = self.media_observation.as_deref().map(grounded_note);
-
-        // A template with its own tools block already tells the model the
-        // format it was trained on. Adding ozgent's generic description then
-        // gives it two, in different syntaxes, and it splits the difference.
-        let native_tools = self.engine.template_handles_tools();
-
-        let system = match (&dated, &self.tools) {
-            (base, Some(_)) if !offered.is_empty() && !native_tools => {
-                let mut text = base.clone().unwrap_or_default();
-                if !text.is_empty() {
-                    text.push_str("\n\n");
+            match bytes {
+                Ok(bytes) => {
+                    let mime = mime_of(&bytes);
+                    out.push(format!("data:{mime};base64,{}", base64(&bytes)));
                 }
-                text.push_str(&ozgent_tools::tool_preamble(&offered));
-                if let Some(note) = &media_note {
-                    text.push_str("\n\n");
-                    text.push_str(note);
-                }
-                Some(text)
-            }
-            (base, _) => match (&media_note, base) {
-                (Some(note), Some(b)) => Some(format!("{b}\n\n{note}")),
-                (Some(note), None) => Some(note.clone()),
-                (None, b) => b.clone(),
-            },
-        };
-        // The agents, named where the model reads its instructions, when it
-        // may hand a turn to one; see `handoff_prompt`.
-        let system = if self.scope.is_none() && !self.handoff.is_empty() && self.tools.is_some() {
-            let line = ozgent_core::agents::handoff_prompt(&self.handoff);
-            Some(match system {
-                Some(s) if !s.is_empty() => format!("{s}\n\n{line}"),
-                _ => line,
-            })
-        } else {
-            system
-        };
-        Ok(ctx.to_messages(system.as_deref()))
-    }
-
-    /// Load a projector if needed and read this turn's images.
-    ///
-    /// The projector is kept for the life of the session: loading it costs time
-    /// and VRAM, and a conversation with one image usually has more.
-    fn load_media(&mut self, sources: &[ozgent_core::ImageSource]) -> Result<usize> {
-        if self.projector.is_none() {
-            let Some(mmproj) = self.manifest.projector_path(&self.model_dir) else {
-                anyhow::bail!("this model has no vision projector; the image is ignored");
-            };
-            self.projector = Some(self.engine.projector(&mmproj, &self.opts)?);
-        }
-        self.pending_images = ozgent_llama::mtmd::load_media(sources)?;
-        self.pending_sources = sources.to_vec();
-        Ok(self.pending_images.len())
-    }
-
-    /// Look at the media before doing anything else with it.
-    ///
-    /// A short, tool-free pass that describes what is actually in the
-    /// attachment. The observation joins the system prompt, so by the time the
-    /// real turn runs, "what is in this image" is already answered and there is
-    /// nothing to search for — while a question the media genuinely cannot
-    /// answer still has every tool available. See the note in the web worker
-    /// for what this replaced and why a rule in the prompt was not enough.
-    fn ground(&mut self, question: &str) -> Option<String> {
-        let projector = self.projector.as_ref()?;
-        if self.pending_images.is_empty() {
-            return None;
-        }
-
-        let prompt = self
-            .engine
-            .render_prompt_with(
-                &[
-                    Message::system(
-                        "Describe exactly what is in the attached media: subjects, text, \
-                         colours, layout. State only what you can actually see. Do not \
-                         speculate about what it might be, and do not answer the user's \
-                         question yet.",
-                    ),
-                    Message::user(question),
-                ],
-                ozgent_core::ThinkingMode::Off,
-                Default::default(),
-            )
-            .ok()?;
-
-        self.ui.say(self.theme.style(Style::dim(), "· looking"));
-        self.ui.render();
-
-        let mut observed = String::new();
-        let result = self.session.generate_with_media(
-            &prompt,
-            Some((projector, &self.pending_images[..], &self.pending_sources[..])),
-            GROUNDING_LIMIT,
-            |piece| {
-                observed.push_str(piece);
-                true
-            },
-        );
-        self.ui.say(self.theme.style(Style::dim(), " ✓"));
-
-        match result {
-            Ok(_) if !observed.trim().is_empty() => Some(observed.trim().to_string()),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!("grounding pass failed, continuing without it: {e}");
-                None
-            }
-        }
-    }
-
-    /// Generate one reply, streaming it to the terminal.
-    fn generate(&mut self, messages: &[Message]) -> Result<Reply> {
-        self.generate_with(messages, None)
-    }
-
-    /// Generate, optionally constrained to a GBNF grammar.
-    fn generate_with(&mut self, messages: &[Message], grammar: Option<&str>) -> Result<Reply> {
-        self.session.set_grammar(grammar)?;
-        let result = self.generate_inner(messages);
-        // The constraint must not leak into the next turn, or every reply
-        // would be forced into the shape of a tool call.
-        self.session.set_grammar(None)?;
-        result
-    }
-
-    fn generate_inner(&mut self, messages: &[Message]) -> Result<Reply> {
-        let offered = self.offered();
-        let prompt = self.engine.render_prompt_full(
-            messages,
-            self.opts.thinking,
-            self.opts.reasoning_effort,
-            &offered,
-        )?;
-        // Images belong to this turn only: once evaluated they are resident in
-        // the cache, and re-sending them would duplicate them in the context.
-        let pending_images = std::mem::take(&mut self.pending_images);
-        let pending_sources = std::mem::take(&mut self.pending_sources);
-        self.media_turn = false;
-        self.media_observation = None;
-        tracing::debug!(
-            "prompt ({} messages, {} chars):\n{prompt}",
-            messages.len(),
-            prompt.len()
-        );
-
-        let mut filter = ThinkingFilter::new(self.opts.thinking);
-        if let Some(close) = Engine::stream_starts_inside(&prompt) {
-            filter = filter.starting_inside(close);
-        }
-
-        // Tool-call syntax is a request to the runtime, not output for the
-        // user, so it is withheld from the terminal while still being captured
-        // for parsing.
-        let mut gate = toolcall::StreamGate::new();
-        // Reasoning needs its own gate: a model that never closes `</think>`
-        // emits its tool call inside the reasoning stream, and an ungated
-        // thinking display would print raw JSON at the user.
-        let mut think_gate = toolcall::StreamGate::new();
-        crate::input::arm_interrupt();
-        let mut answer = String::new();
-        let mut thinking = String::new();
-        // What has actually been shown, as opposed to what the model has
-        // produced. The gates withhold a partial tool call until they know
-        // whether it is one, and the screen must not flicker a half-written
-        // call into view and then take it back.
-        let mut shown_thinking = String::new();
-        let mut shown_answer = String::new();
-        // Set once the call being written has been named, so it is announced
-        // once rather than on every token.
-        let mut announced = false;
-        // Tokens generated since the name appeared, so a compact call gets a
-        // moment to finish its arguments before it is asked about.
-        let mut since_named = 0usize;
-        // The answer given before the content was generated, applied in the
-        // tool loop instead of asking a second time.
-        let mut early: Option<(String, ozgent_core::Choice)> = None;
-        let generating = self.theme.style(Style::dim(), "  generating the arguments…");
-        let generating_content =
-            self.theme.style(Style::dim(), "  approved · generating the content…");
-        let show_thinking = self.opts.thinking != ThinkingMode::Off;
-
-        // Read out of `self` before the borrow below, so the callback can
-        // consult the policy without holding the whole struct.
-        let policy = self.config.permissions.clone();
-        let effects: std::collections::BTreeMap<String, ozgent_core::Effect> =
-            offered.iter().map(|t| (t.name.clone(), t.effect)).collect();
-        // An agent's own rules sit on top of the policy, and a tool it was
-        // not given is refused before anyone is asked about it.
-        let agent = self.scope.as_ref().map(|s| s.agent.clone());
-        let grants = &mut self.grants;
-
-        let media = self
-            .projector
-            .as_ref()
-            .filter(|_| !pending_images.is_empty())
-            .map(|p| (p, &pending_images[..], &pending_sources[..]));
-
-        // The screen is repainted from the whole reply on every token rather
-        // than appended to. Markdown cannot be appended: a closing fence
-        // changes how every line since the opening one is drawn, so a renderer
-        // that had already committed those lines would have to take them back.
-        // `Ui::stream` throttles the repaint, so this is cheap.
-        let ui = &mut *self.ui;
-        let session = &mut self.session;
-        let (stats, reason) = session.generate_with_media(&prompt, media, self.opts.max_tokens, |piece| {
-            for chunk in filter.push(piece) {
-                match chunk {
-                    Chunk::Thinking(text) => {
-                        thinking.push_str(&text);
-                        if show_thinking {
-                            shown_thinking.push_str(&think_gate.push(&text));
-                        }
-                    }
-                    Chunk::Answer(text) => {
-                        answer.push_str(&text);
-                        // Gated: tool-call syntax is a request to the runtime,
-                        // not prose, and must never reach the terminal.
-                        shown_answer.push_str(&gate.push(&text));
-                    }
+                Err(e) => {
+                    self.ui.say(self.theme.style(Style::dim(), &format!("note: {e}")));
                 }
             }
-
-            // The moment the model commits to a tool call, say which one.
-            //
-            // Everything from the opening marker is withheld, so without this
-            // the screen simply stops: a model writing a file generates the
-            // whole file before the call can be parsed, and thirty seconds of
-            // nothing looks like a hang or a lost connection. The name is
-            // readable from the first few tokens of the call, long before its
-            // arguments, and is enough to say what the wait is for.
-            if gate.suppressing() && !announced {
-                if let Some(name) = toolcall::pending_name(&answer) {
-                    announced = true;
-                    // The reply so far is finished; what follows is the call.
-                    ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
-                    ui.commit();
-                    ui.begin_activity(format!("{name}{}", generating));
-                }
-            }
-            if announced {
-                since_named += 1;
-
-                // Ask before the content is generated, not after.
-                //
-                // A model writing a file spends the whole call on `content`,
-                // so waiting for the finished call means asking a minute
-                // after the decision was made — and a refusal then has
-                // already paid for every token. Asked here, a refusal stops
-                // generation on the spot.
-                //
-                // The grace period is what keeps the question answerable: a
-                // compact call finishes inside it and is asked about in full,
-                // while a file's `content` has barely started, so what is
-                // shown is the `path` that identifies it.
-                if early.is_none() && since_named >= ARGUMENT_GRACE {
-                    let name = toolcall::pending_name(&answer).unwrap_or_default().to_string();
-                    let effect = effects.get(&name).copied().unwrap_or_default();
-                    let mut arguments = toolcall::pending_arguments(&answer);
-                    let complete = toolcall::call_is_closed(&answer);
-                    if !complete {
-                        arguments.insert(
-                            "…".into(),
-                            serde_json::Value::String("still being written".into()),
-                        );
-                    }
-                    let verdict = match &agent {
-                        Some(a) => a.verdict(&policy, &name, effect, grants),
-                        None => policy.verdict(&name, effect, grants),
-                    };
-                    let choice = match verdict {
-                        ozgent_core::Verdict::Allow { .. } => None,
-                        ozgent_core::Verdict::Deny => Some(ozgent_core::Choice::Deny),
-                        ozgent_core::Verdict::Ask => Some(ui.ask_permission(
-                            &name,
-                            effect,
-                            &serde_json::Value::Object(arguments),
-                        )),
-                    };
-                    if let Some(choice) = choice {
-                        grants.remember(&name, choice);
-                        early = Some((name, choice));
-                        if !choice.is_allow() {
-                            // Nothing after this point is wanted, and the rest
-                            // of the file would cost a minute to refuse.
-                            return false;
-                        }
-                        ui.begin_activity(format!(
-                            "{}{}",
-                            early.as_ref().unwrap().0,
-                            generating_content,
-                        ));
-                    }
-                }
-                ui.tick();
-            } else {
-                ui.stream(Some(shown_thinking.as_str()), &shown_answer, false);
-            }
-            // Polled between tokens, so Ctrl-C stops the answer not the
-            // process — and so a resize or a page-up is noticed mid-reply.
-            !ui.poll_interrupt()
-        })?;
-
-        for chunk in filter.finish() {
-            if let Chunk::Answer(text) = chunk {
-                answer.push_str(&text);
-                shown_answer.push_str(&gate.push(&text));
-            }
         }
-        shown_answer.push_str(&gate.finish());
-        if announced {
-            // The reply was committed when the call was announced, and the
-            // activity line is left standing for the tool loop to fill in with
-            // the arguments it is about to ask permission for.
-            self.ui.tick();
-        } else {
-            // Forced, because the last token would otherwise sit unpainted
-            // behind the throttle until something else happened to redraw.
-            self.ui.stream(Some(shown_thinking.as_str()), &shown_answer, true);
-            self.ui.commit();
-        }
-
-        if crate::input::interrupted() {
-            self.ui.say(self.theme.style(Style::dim(), "· interrupted"));
-        }
-        // Three different situations used to share one message, and it was
-        // wrong for two of them.
-        if stats.generated_tokens > 0 && !crate::input::interrupted() {
-            let note = if filter.is_thinking() && !thinking.trim().is_empty() {
-                // The text is above, styled as reasoning, because that is how
-                // it arrived. Say why rather than leave it looking unanswered.
-                Some("· the model never closed its reasoning tag; the text above is its reply")
-            } else if answer.trim().is_empty() && !thinking.trim().is_empty() {
-                Some("· reasoning finished with no reply. Try /think off, or a longer /effort")
-            } else if answer.trim().is_empty() {
-                Some("· the model produced nothing")
-            } else {
-                None
-            };
-            if let Some(note) = note {
-                self.ui.say(self.theme.style(Style::dim(), note));
-            }
-        }
-        // Kept for the status line. Only a real generation updates it: an
-        // interrupted or empty turn would otherwise report a rate measured
-        // over a handful of tokens.
-        if stats.generated_tokens > 0 {
-            self.last_rate = Some(stats.tokens_per_second());
-        }
-        if reason == StopReason::ContextFull {
-            self.ui.say(self.theme.style(Style::dim(), "· context full"));
-        }
-        if self.opts_show_stats() {
-            self.ui.say(self.theme.style(
-                    Style::dim(),
-                    &format!(
-                        "· {} in ({:.0}/s), {} reused · {} out ({:.1}/s)",
-                        stats.prompt_tokens,
-                        stats.prompt_tokens_per_second(),
-                        stats.reused_tokens,
-                        stats.generated_tokens,
-                        stats.tokens_per_second()
-                    )
-                ));
-        }
-
-        // A reasoning block the model never closed was not a reasoning block.
-        // It reached the end of its turn still inside `<think>`, so the words
-        // in there are its reply, mislabelled by a tag it did not emit.
-        // Treating them as reasoning and returning an empty answer loses a
-        // complete response and writes an empty assistant message into the
-        // conversation, which then poisons every later turn.
-        let unclosed = filter.is_thinking() && !thinking.trim().is_empty();
-
-        let (text, reasoning) = if toolcall::extract(&answer).has_calls() {
-            (answer, Some(thinking))
-        } else if unclosed {
-            (format!("{answer}{thinking}"), None)
-        } else if think_gate.suppressing() {
-            // Closed its reasoning, but the call was inside it. The parser has
-            // to see the call; the reasoning is still reasoning.
-            (format!("{answer}{thinking}"), Some(thinking))
-        } else {
-            (answer, Some(thinking))
-        };
-
-        // Persisted here rather than in the callback, which cannot reach the
-        // config or the paths while the session is borrowed.
-        if let Some((name, choice)) = &early {
-            if self.config.permissions.apply(name, *choice) {
-                self.config.save(&self.paths)?;
-            }
-        }
-
-        Ok(Reply {
-            text,
-            // An empty reasoning block is not a reasoning trace.
-            thinking: reasoning.filter(|t| !t.trim().is_empty()),
-            attempted_call: gate.suppressing() || think_gate.suppressing(),
-            early_permission: early,
-        })
+        out
     }
+
 
     fn opts_show_stats(&self) -> bool {
         std::env::var("OZGENT_STATS").is_ok()
@@ -1404,156 +354,6 @@ impl<'a> Chat<'a> {
     /// Returns `None` for a refusal, or `Some(by_user)` to run it — where
     /// `by_user` says a person authorised this call, which is what lets the
     /// Python side treat it as past its own standing boundaries.
-    async fn permit(
-        &mut self,
-        call: &ozgent_core::ToolCall,
-        early: Option<&(String, ozgent_core::Choice)>,
-    ) -> Result<Option<bool>> {
-        use ozgent_core::permission::Verdict;
-
-        // Already answered, while the call was still being written. Asking
-        // again about the same call would make the early prompt look like it
-        // did nothing.
-        if let Some((name, choice)) = early.filter(|(n, _)| *n == call.name) {
-            let _ = name;
-            return Ok(choice.is_allow().then_some(true));
-        }
-
-        let effect = self
-            .tools
-            .as_ref()
-            .and_then(|h| h.get(&call.name))
-            .map(|spec| spec.effect)
-            // A call to a tool that does not exist fails in the host a moment
-            // later with a much better message than anything here could give.
-            .unwrap_or_default();
-
-        let verdict = match &self.scope {
-            Some(scope) => scope.agent.verdict(&self.config.permissions, &call.name, effect, &self.grants),
-            None => self.config.permissions.verdict(&call.name, effect, &self.grants),
-        };
-        match verdict {
-            Verdict::Allow { by_user } => return Ok(Some(by_user)),
-            Verdict::Deny => return Ok(None),
-            Verdict::Ask => {}
-        }
-
-        let choice = self.ui.ask_permission(&call.name, effect, &call.arguments);
-        self.grants.remember(&call.name, choice);
-        // "Always" is the one answer that outlives the process, so it is the
-        // one that touches the file.
-        if self.config.permissions.apply(&call.name, choice) {
-            self.config.save(&self.paths)?;
-        }
-        Ok(choice.is_allow().then_some(true))
-    }
-
-    /// Put what the user typed into the transcript.
-    ///
-    /// Marked with the same `›` the prompt box wears, so the eye can find
-    /// where each exchange started when scrolling back through a long thread.
-    fn echo(&mut self, text: &str) {
-        let marker = self.theme.style(Style::color(ozgent_render::Color::Cyan), "› ");
-        // Agents called by name are picked out, so it is clear before the
-        // frame appears that this message went to one.
-        let catalog = ozgent_core::AgentCatalog::load(&self.paths);
-        let mut body = String::new();
-        let mut from = 0;
-        for m in ozgent_core::agents::mentions(text) {
-            if catalog.get(&m.name).is_none() {
-                continue;
-            }
-            body.push_str(&self.theme.style(Style { bold: true, ..Default::default() }, &text[from..m.start]));
-            body.push_str(&self.theme.style(
-                Style { bold: true, color: Some(ozgent_render::Color::Cyan), ..Default::default() },
-                &text[m.start..m.end],
-            ));
-            from = m.end;
-        }
-        body.push_str(&self.theme.style(Style { bold: true, ..Default::default() }, &text[from..]));
-        self.ui.blank();
-        self.ui.say(format!("{marker}{body}"));
-        self.ui.blank();
-    }
-
-    /// Run one tool, keeping the screen alive while it works.
-    ///
-    /// A web search takes seconds and a page fetch can take most of the tool
-    /// timeout. Awaiting it plainly leaves a still screen for that whole time,
-    /// which is indistinguishable from a hang — so the spinner on the call's
-    /// own line is advanced until the call returns.
-    ///
-    /// The two borrows are of different fields, which is what makes this
-    /// legal: the host is read while the screen is written.
-    async fn run_tool(
-        &mut self,
-        call: &ozgent_core::ToolCall,
-        approved: bool,
-    ) -> Result<serde_json::Value, ozgent_tools::ToolCallError> {
-        let host = self.tools.as_ref().expect("checked above");
-        let ui = &mut *self.ui;
-
-        let running = host.call_approved(&call.name, call.arguments.clone(), approved);
-        tokio::pin!(running);
-        // The first tick fires immediately, which would advance the spinner
-        // before any time had passed; starting a period late keeps the line
-        // still for calls that return at once.
-        let mut spin = tokio::time::interval_at(
-            tokio::time::Instant::now() + crate::tui::ui::SPIN,
-            crate::tui::ui::SPIN,
-        );
-        loop {
-            tokio::select! {
-                outcome = &mut running => return outcome,
-                _ = spin.tick() => ui.tick(),
-            }
-        }
-    }
-
-    /// Say that a call did not run, in the same shape as a result.
-    ///
-    /// Shaped like `show_result` on purpose: a refusal is an outcome of the
-    /// call, and putting it anywhere else makes the transcript look like the
-    /// tool is still running.
-    fn show_refusal(&mut self, name: &str) {
-        let arrow = self.theme.style(Style::color(ozgent_render::Color::Red), "  ⎿");
-        self.ui.say(format!(
-            "{arrow} {}",
-            self.theme.style(Style::dim(), &format!("declined · {name} did not run"))
-        ));
-    }
-
-    /// Announce a tool call: a green marker, the name, then its arguments.
-    ///
-    /// Arguments are shown as `key: value` rather than raw JSON, since the
-    /// braces and quotes carry no information the user needs.
-    fn show_call(&mut self, call: &ozgent_core::ToolCall) {
-        let name = self.theme.style(
-            ozgent_render::Style { bold: true, ..Default::default() },
-            &call.name,
-        );
-        let args = self.theme.style(Style::dim(), &pretty_args(&call.arguments));
-        // The marker column belongs to the screen, which turns it into a
-        // spinner while the call runs and back into a dot when it returns.
-        self.ui.begin_activity(format!("{name}{args}"));
-    }
-
-    /// Report what a tool returned, indented under its call.
-    fn show_result(
-        &mut self,
-        outcome: &Result<serde_json::Value, ozgent_tools::ToolCallError>,
-        elapsed: std::time::Duration,
-    ) {
-        let (colour, text) = match outcome {
-            Ok(value) => (ozgent_render::Color::Green, summarise_result(value)),
-            Err(e) => (ozgent_render::Color::Red, ozgent_tools::first_line(&e.for_model()).to_string()),
-        };
-        let arrow = self.theme.style(Style::color(colour), "  ⎿");
-        let timing = self.theme.style(Style::dim(), &format!(" · {}ms", elapsed.as_millis()));
-        self.ui.say(format!("{arrow} {}{timing}", self.theme.style(Style::dim(), &text)));
-    }
-
-    /// `/agents`: list them, or show one in full.
     fn agents(&mut self, arg: &str) {
         let theme = self.theme.clone();
         let dim = |s: &str| theme.style(Style::dim(), s);
@@ -1667,7 +467,6 @@ impl<'a> Chat<'a> {
                 // starts a fresh one.
                 if self.conversation == Some(id) {
                     self.conversation = None;
-                    self.session.reset();
                     self.turn = 0;
                     self.ui.say(dim(&format!("· deleted {label} (was the current one)")));
                 } else {
@@ -1682,7 +481,6 @@ impl<'a> Chat<'a> {
 
             "new" => {
                 self.conversation = None;
-                self.session.reset();
                 self.turn = 0;
                 self.ui.clear();
                 self.banner();
@@ -1701,9 +499,6 @@ impl<'a> Chat<'a> {
                 let (id, model) = (target.id, target.model.clone());
                 self.conversation = Some(id);
                 self.turn = self.store.message_count(id)? as usize;
-                // The KV cache holds the previous conversation's prompt, and
-                // none of it is a prefix of this one.
-                self.session.reset();
                 // Same reasoning as /new: the thread being left behind must
                 // not stay on screen above the one being opened.
                 clear_screen();
@@ -1732,7 +527,7 @@ impl<'a> Chat<'a> {
         for m in &recent {
             let who = match m.role.as_str() {
                 "user" => "you",
-                "assistant" => self.model.name.as_str(),
+                "assistant" => self.model.as_str(),
                 other => other,
             };
             self.ui.say(dim(&format!("  {who}: {}", one_line(&m.content, 72))));
@@ -1760,14 +555,14 @@ impl<'a> Chat<'a> {
                     self.ui.say(dim(&format!("no model {n}; there are {}", models.len())));
                     return Ok(None);
                 };
-                if chosen.model == self.model {
+                if chosen.model.to_string() == self.model {
                     self.ui.say(dim("already using that model"));
                     return Ok(None);
                 }
                 return Ok(Some(chosen.short_name()));
             }
             let found = ozgent_core::resolve(&self.paths, arg)?;
-            if found.model == self.model {
+            if found.model.to_string() == self.model {
                 self.ui.say(dim(&format!("already using {}", found.model)));
                 return Ok(None);
             }
@@ -1776,7 +571,7 @@ impl<'a> Chat<'a> {
 
         self.ui.say(dim("installed models:"));
         for (i, m) in models.iter().enumerate() {
-            let marker = if m.model == self.model { "*" } else { " " };
+            let marker = if m.model.to_string() == self.model { "*" } else { " " };
             let alias = m.manifest.alias.as_ref().map(|a| format!("  ({a})")).unwrap_or_default();
             self.ui.say(dim(&format!("{marker} {:>2}. {}{alias}", i + 1, m.model)));
         }
@@ -1797,38 +592,42 @@ impl<'a> Chat<'a> {
         let key = parts.next().unwrap_or("");
         let value = parts.collect::<Vec<_>>().join(" ");
 
+        // Resolved here from config.toml rather than read off a session:
+        // there is no session, and the file is what the daemon reads too.
+        let opts = self.config.options_for(&self.model).resolve();
+
         if key.is_empty() {
             self.ui.say(dim(&format!("settings for {}:", self.model)));
-            self.ui.say(dim(&format!("  thinking        {:?}", self.opts.thinking)));
-            self.ui.say(dim(&format!("  effort          {:?}", self.opts.reasoning_effort)));
-            self.ui.say(dim(&format!("  temperature     {}", self.opts.temperature)));
-            self.ui.say(dim(&format!("  top_p           {}", self.opts.top_p)));
-            self.ui.say(dim(&format!("  top_k           {}", self.opts.top_k)));
-            self.ui.say(dim(&format!("  min_p           {}", self.opts.min_p)));
-            self.ui.say(dim(&format!("  repeat_penalty  {}", self.opts.repeat_penalty)));
-            self.ui.say(dim(&format!("  max_tokens      {}", self.opts.max_tokens)));
-            let seed = self.opts.seed.map_or("random".to_string(), |s| s.to_string());
+            self.ui.say(dim(&format!("  thinking        {:?}", opts.thinking)));
+            self.ui.say(dim(&format!("  effort          {:?}", opts.reasoning_effort)));
+            self.ui.say(dim(&format!("  temperature     {}", opts.temperature)));
+            self.ui.say(dim(&format!("  top_p           {}", opts.top_p)));
+            self.ui.say(dim(&format!("  top_k           {}", opts.top_k)));
+            self.ui.say(dim(&format!("  min_p           {}", opts.min_p)));
+            self.ui.say(dim(&format!("  repeat_penalty  {}", opts.repeat_penalty)));
+            self.ui.say(dim(&format!("  max_tokens      {}", opts.max_tokens)));
+            let seed = opts.seed.map_or("random".to_string(), |s| s.to_string());
             self.ui.say(dim(&format!("  seed            {seed}")));
             // Both numbers, because they can differ: what was asked for is
             // what `/config ctx` set, and what the session runs on is what
             // the machine's memory allowed.
-            let asked = ozgent_core::format_count(self.opts.context_length);
-            let window = self.session.n_ctx();
-            let ctx = if window == self.opts.context_length {
-                asked
-            } else {
-                format!("{asked} (running at {})", ozgent_core::format_count(window))
+            let asked = ozgent_core::format_count(opts.context_length);
+            let ctx = match self.window {
+                Some(window) if window != opts.context_length => {
+                    format!("{asked} (the daemon is running at {})", ozgent_core::format_count(window))
+                }
+                _ => asked,
             };
             self.ui.say(dim(&format!("  ctx             {ctx}")));
-            self.ui.say(dim(&format!("  gpu layers      {}", self.opts.gpu_layers)));
-            let kv = if self.opts.kv_offload { "gpu" } else { "system ram" };
+            self.ui.say(dim(&format!("  gpu layers      {}", opts.gpu_layers)));
+            let kv = if opts.kv_offload { "gpu" } else { "system ram" };
             self.ui.say(dim(&format!("  kv cache        {kv}")));
             self.ui.say(dim(&format!(
                 "  mode            {} ({})",
-                self.opts.inference_mode,
-                self.opts.inference_mode.describes(),
+                opts.inference_mode,
+                opts.inference_mode.describes(),
             )));
-            self.ui.say(dim(&format!("  tools           {}", self.opts.tools)));
+            self.ui.say(dim(&format!("  tools           {}", opts.tools)));
             self.ui.say(dim(&format!("set with /config <key> <value>; keys: {SETTABLE}")));
             return Ok(());
         }
@@ -1842,48 +641,39 @@ impl<'a> Chat<'a> {
         match key {
             "thinking" | "think" => {
                 let mode: ThinkingMode = value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                self.opts.thinking = mode;
                 layer.thinking = Some(mode);
             }
             "effort" | "reasoning_effort" => {
                 let level: ozgent_core::ReasoningEffort =
                     value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                self.opts.reasoning_effort = level;
                 layer.reasoning_effort = Some(level);
             }
             "temperature" | "temp" => {
                 let t: f32 = value.parse().context("temperature must be a number")?;
-                self.opts.temperature = t;
                 layer.temperature = Some(t);
             }
             "top_p" | "top-p" => {
                 let p: f32 = value.parse().context("top_p must be a number")?;
-                self.opts.top_p = p;
                 layer.top_p = Some(p);
             }
             "top_k" | "top-k" => {
                 let k: u32 = value.parse().context("top_k must be a whole number")?;
-                self.opts.top_k = k;
                 layer.top_k = Some(k);
             }
             "min_p" | "min-p" => {
                 let p: f32 = value.parse().context("min_p must be a number")?;
-                self.opts.min_p = p;
                 layer.min_p = Some(p);
             }
             "repeat_penalty" | "repeat-penalty" => {
                 let p: f32 = value.parse().context("repeat_penalty must be a number")?;
-                self.opts.repeat_penalty = p;
                 layer.repeat_penalty = Some(p);
             }
             "max_tokens" | "max-tokens" => {
                 let n = ozgent_core::parse_count(&value).map_err(|e| anyhow::anyhow!(e))?;
-                self.opts.max_tokens = n;
                 layer.max_tokens = Some(n);
             }
             "seed" => {
                 let n: u32 = value.parse().context("seed must be a whole number")?;
-                self.opts.seed = Some(n);
                 layer.seed = Some(n);
             }
             // Context length is fixed when the weights are loaded, so this
@@ -1899,13 +689,14 @@ impl<'a> Chat<'a> {
                 self.ui.say(dim(&format!(
                         "· ctx = {n} (saved; applies when the model is next loaded, \
                          currently {})",
-                        ozgent_core::format_count(self.session.n_ctx())
+                        self.window
+                            .map(ozgent_core::format_count)
+                            .unwrap_or_else(|| "unknown".into())
                     )));
                 return Ok(());
             }
             "tools" => {
                 let on = matches!(value.as_str(), "on" | "true" | "yes" | "1");
-                self.opts.tools = on;
                 layer.tools = Some(on);
             }
             "mode" | "inference_mode" => {
@@ -1946,11 +737,9 @@ impl<'a> Chat<'a> {
             }
         }
 
-        // Sampling changes only reach generation through the sampler, which is
-        // rebuilt from these options; without this the value is printed as set
-        // and every following turn still uses the old one.
-        self.session.set_options(&self.opts);
-
+        // Saved to config.toml, which is what the daemon reads. It re-reads
+        // the file as it changes, so a sampling change here reaches the next
+        // turn without anything being restarted — see `state::watch_config`.
         let entry = self.config.models.entry(self.model.to_string()).or_default();
         *entry = entry.clone().merge(&layer);
         self.config.save(&self.paths)?;
@@ -1986,7 +775,7 @@ impl<'a> Chat<'a> {
                 self.ui.say(dim(&format!("  {label:<14}  {rule}")));
             }
 
-            match &self.tools {
+            match None::<&ozgent_tools::Toolbox> {
                 Some(host) if !host.tools().is_empty() => {
                     self.ui.say(dim("by tool:"));
                     for spec in host.tools() {
@@ -1999,7 +788,7 @@ impl<'a> Chat<'a> {
                         } else {
                             "from its kind"
                         };
-                        let session = if self.grants.allowed().any(|t| t == spec.name) {
+                        let session = if false {
                             "  · allowed for this session"
                         } else {
                             ""
@@ -2040,8 +829,9 @@ impl<'a> Chat<'a> {
             return Ok(());
         }
 
-        let known = self.tools.as_ref().is_some_and(|h| h.get(target).is_some());
-        if !known {
+        // A rule can be set for a tool that is not loaded right now, and the
+        // list lives in the daemon anyway, so nothing is checked here.
+        if false {
             // Not an error: a rule can be set for a tool that is not loaded
             // right now, and refusing would make the manager useless whenever
             // tools are switched off.
@@ -2115,64 +905,6 @@ impl<'a> Chat<'a> {
     }
 
     /// Force the next reply to be a tool call, for `/call`.
-    async fn forced_call(&mut self, query: &str) -> Result<()> {
-        let Some(host) = &self.tools else {
-            self.ui.say(self.theme.style(Style::dim(), "tools are disabled"));
-            return Ok(());
-        };
-        let Some(grammar) = ozgent_llama::grammar::tool_call_grammar(host.tools()) else {
-            self.ui.say(self.theme.style(Style::dim(), "no tools available"));
-            return Ok(());
-        };
-
-        // `/call` is a probe: it uses the conversation for context when there
-        // is one, but must not bring one into being.
-        let mut messages = self.build_context(self.conversation, query)?;
-        messages.push(Message::user(format!(
-            "Call the most appropriate tool to answer: {query}"
-        )));
-        let reply = self.generate_with(&messages, Some(&grammar))?;
-
-        let parsed = toolcall::extract(&reply.text);
-        if parsed.calls.is_empty() {
-            self.ui.say(self.theme.style(Style::dim(), "· the model produced no call"));
-            return Ok(());
-        }
-        for call in &parsed.calls {
-            self.ui.say(self.theme.style(Style::dim(), &format!("· {}({})", call.name, compact(&call.arguments))));
-            // `/call` is the user asking directly, which is consent for this
-            // one call — but the standing policy still decides, so a tool set
-            // to `deny` stays denied rather than being reachable by typing a
-            // different command.
-            let approved = match self.permit(call, None).await? {
-                Some(by_user) => by_user,
-                None => {
-                    self.show_refusal(&call.name);
-                    return Ok(());
-                }
-            };
-            // The same spinner as the model's own calls: `/call` runs the
-            // identical tool and can take just as long.
-            self.ui.begin_activity(self.theme.style(Style::dim(), &call.name.clone()));
-            let outcome = self.run_tool(call, approved).await;
-            self.ui.settle();
-            match outcome {
-                Ok(v) => {
-                    // Into the transcript, not stdout: in full-screen mode
-                    // stdout is the screen, and writing to it directly would
-                    // scroll the layout apart.
-                    let text = serde_json::to_string_pretty(&v).unwrap_or_default();
-                    self.ui.markdown(format!("```json\n{text}\n```"));
-                }
-                Err(e) => self.ui.say(self.theme.style(Style::dim(), &e.for_model())),
-            }
-        }
-        Ok(())
-    }
-
-    /// `/clear` must drop the cache, since the next prompt shares no history.
-
-    /// Handle a slash command.
     async fn command(&mut self, input: &str) -> Result<Flow> {
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or("");
@@ -2193,7 +925,6 @@ impl<'a> Chat<'a> {
                 // Nothing is created here either: the next message does it.
                 // Otherwise `/clear` typed twice leaves an orphan behind.
                 self.conversation = None;
-                self.session.reset();
                 self.turn = 0;
                 // Wipe the screen too. The old thread staying on screen under
                 // a one-line notice reads as "still in that conversation",
@@ -2205,38 +936,29 @@ impl<'a> Chat<'a> {
 
             "/conv" | "/convs" | "/conversations" => return self.conversations(arg),
 
+            // Sent with each turn rather than held on a session: there is no
+            // session here to hold it, and the daemon takes it per request.
             "/think" => match arg {
-                "" => self.ui.say(dim(&format!("thinking: {:?}", self.opts.thinking))),
+                "" => {
+                    let now = self.thinking.map(|m| format!("{m:?}")).unwrap_or("auto".into());
+                    self.ui.say(dim(&format!("thinking: {now}")));
+                }
                 other => match other.parse::<ThinkingMode>() {
                     Ok(mode) => {
-                        self.opts.thinking = mode;
+                        self.thinking = Some(mode);
                         self.ui.say(dim(&format!("· thinking {other}")));
                     }
                     Err(e) => self.ui.say(dim(&e)),
                 },
             },
 
-            "/effort" => match arg {
-                "" => self.ui.say(dim(&format!("effort: {:?}", self.opts.reasoning_effort))),
-                other => match other.parse::<ozgent_core::ReasoningEffort>() {
-                    Ok(level) => {
-                        self.opts.reasoning_effort = level;
-                        self.ui.say(dim(&format!("· effort {other}")));
-                    }
-                    Err(e) => self.ui.say(dim(&e)),
-                },
-            },
-
-            "/system" => {
-                if arg.is_empty() {
-                    match &self.opts.system_prompt {
-                        Some(s) => self.ui.say(dim(s)),
-                        None => self.ui.say(dim("no system prompt set")),
-                    }
-                } else {
-                    self.opts.system_prompt = Some(arg.to_string());
-                    self.ui.say(dim("· system prompt updated"));
-                }
+            // These are the model's settings, and the model is the daemon's.
+            // Writing them here would change a copy nothing reads.
+            "/effort" | "/system" => {
+                self.ui.say(dim(
+                    "that is a model setting now that the terminal is a client. \
+                     Set it in config.toml, or on the web interface's settings page.",
+                ));
             }
 
             "/remember" => {
@@ -2257,11 +979,6 @@ impl<'a> Chat<'a> {
                     // them to be remembered, so they should not depend on
                     // retrieval finding them again.
                     self.store.set_pinned(id, true)?;
-                    self.store.put_embedding(
-                        OwnerKind::Fact,
-                        id,
-                        &self.embedder.embed(arg),
-                    )?;
                     self.ui.say(dim("· remembered"));
                 }
             }
@@ -2280,13 +997,10 @@ impl<'a> Chat<'a> {
                 }
             }
 
-            "/call" => {
-                if arg.is_empty() {
-                    self.ui.say(dim("usage: /call <what you want done>"));
-                } else {
-                    self.forced_call(arg).await?;
-                }
-            }
+            "/call" => self.ui.say(dim(
+                "ask for it in a sentence instead — the model chooses the tool, \
+                 and the daemon runs it.",
+            )),
 
             "/models" | "/model" => {
                 if let Some(next) = self.pick_model(arg)? {
@@ -2302,11 +1016,7 @@ impl<'a> Chat<'a> {
                 // The alias when there is one: it is the name the user chose,
                 // it is what `ozgent list` shows, and it survives re-pulling
                 // the model at another quantisation.
-                let name = self
-                    .manifest
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| self.model.to_string());
+                let name = self.model.clone();
                 if arg == "clear" || arg == "off" {
                     self.config.default_model = None;
                     self.config.save(&self.paths)?;
@@ -2334,27 +1044,46 @@ impl<'a> Chat<'a> {
 
             "/tools" if !arg.is_empty() => self.configure_tool(arg)?,
 
-            "/tools" => match &self.tools {
-                Some(host) => {
-                    self.ui.say(dim(&format!("{} tools", host.tools().len())));
-                    for t in host.tools() {
-                        self.ui.say(dim(&format!("  {}  {}", t.name, ozgent_tools::first_line(&t.description))));
+            // Asked of the daemon, which is the only thing that knows what
+            // actually loaded — including tools from MCP servers this process
+            // has never spoken to.
+            "/tools" => match self.backend.get("/api/tools").await {
+                Ok(listed) => {
+                    let tools = listed["available"].as_array().cloned().unwrap_or_default();
+                    if listed["enabled"].as_bool() == Some(false) {
+                        self.ui.say(dim("tools are switched off"));
+                    }
+                    self.ui.say(dim(&format!("{} tools", tools.len())));
+                    for t in tools {
+                        let name = t["name"].as_str().unwrap_or("?");
+                        let about = t["description"].as_str().unwrap_or("");
+                        self.ui.say(dim(&format!(
+                            "  {name}  {}",
+                            ozgent_tools::first_line(about)
+                        )));
                     }
                 }
-                None => self.ui.say(dim("tools are disabled")),
+                Err(e) => self.ui.say(dim(&format!("could not ask the daemon: {e}"))),
             },
 
             "/stats" => {
+                let window = self
+                    .window
+                    .map(ozgent_core::format_count)
+                    .unwrap_or_else(|| "?".into());
+                let used = self
+                    .used
+                    .map(ozgent_core::format_count)
+                    .unwrap_or_else(|| "?".into());
+                let rate = self
+                    .last_rate
+                    .map(|r| format!("{r:.0} tok/s"))
+                    .unwrap_or_else(|| "no reply yet".into());
                 self.ui.say(dim(&format!(
-                        "{} · {} layers ({} gpu) · {} ctx, {} used, {} reused last turn · thinking {:?}",
-                        self.model,
-                        self.engine.n_layer(),
-                        self.engine.gpu_layers_used(),
-                        self.session.n_ctx(),
-                        self.session.used(),
-                        self.session.last_reused(),
-                        self.opts.thinking
-                    )));
+                    "{} · {used}/{window} ctx · {rate} · via {}",
+                    self.model,
+                    self.backend.base()
+                )));
             }
 
             other => self.ui.say(dim(&format!("unknown command {other}; try /help"))),
@@ -2439,7 +1168,7 @@ fn harden_config_permissions(path: &std::path::Path) {
 }
 
 /// Render arguments as `key: value` pairs rather than JSON.
-fn pretty_args(args: &serde_json::Value) -> String {
+pub(crate) fn pretty_args(args: &serde_json::Value) -> String {
     let Some(obj) = args.as_object() else {
         return String::new();
     };
@@ -2468,7 +1197,7 @@ fn pretty_args(args: &serde_json::Value) -> String {
 ///
 /// A search response is thousands of characters; the user wants to know it
 /// worked and roughly what came back, not to read it.
-fn summarise_result(value: &serde_json::Value) -> String {
+pub(crate) fn summarise_result(value: &serde_json::Value) -> String {
     if let Some(known) = ozgent_tools::summary::describe(value) {
         return known;
     }
@@ -2643,48 +1372,6 @@ fn catalog_agents(paths: &Paths) -> Vec<ozgent_core::Agent> {
     ozgent_core::AgentCatalog::load(paths).all().to_vec()
 }
 
-/// Load a model on another thread while this one draws how far along it is.
-///
-/// llama.cpp reports progress per tensor, from inside the load call; drawing
-/// from there would mean touching the screen from its callback. So the load
-/// runs beside, the fraction goes through an atomic, and this thread keeps
-/// the line moving — a large model takes long enough that a frozen line reads
-/// as a hang.
-fn load_with_bar(
-    ui: &mut Ui,
-    name: &str,
-    weights: std::path::PathBuf,
-    opts: &ozgent_core::Resolved,
-) -> Result<Engine> {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    let done = Arc::new(AtomicU32::new(0));
-    let seen = Arc::clone(&done);
-    let opts = opts.clone();
-    let loading = std::thread::spawn(move || {
-        Engine::load_reporting(&weights, &opts, move |p| seen.store((p * 1000.0) as u32, Ordering::Relaxed))
-    });
-    let mut shown = u32::MAX;
-    while !loading.is_finished() {
-        let per_mille = done.load(Ordering::Relaxed).min(1000);
-        if per_mille / 10 != shown {
-            shown = per_mille / 10;
-            ui.begin_activity(format!("loading {name}  {}", progress_bar(per_mille as f32 / 1000.0, 24)));
-        }
-        ui.tick();
-        std::thread::sleep(std::time::Duration::from_millis(60));
-    }
-    let engine = loading.join().map_err(|_| anyhow::anyhow!("the model loader crashed"))?;
-    // llama.cpp's last report is short of one, so a finished load would
-    // otherwise stand at 99%.
-    if engine.is_ok() {
-        ui.begin_activity(format!("loading {name}  {}", progress_bar(1.0, 24)));
-    }
-    ui.settle();
-    let engine = engine?;
-    Ok(engine)
-}
 
 /// `█████░░░░░  42%`: a bar a terminal can draw in any font.
 pub fn progress_bar(fraction: f32, width: usize) -> String {
@@ -3002,4 +1689,97 @@ mod command_tests {
         assert!(!looks_like_command("what is 2 + 2"));
         assert!(!looks_like_command(""));
     }
+}
+
+/// A picture's type, from its first bytes.
+///
+/// Sniffed rather than taken from the file name: people paste screenshots with
+/// no extension, and a wrong content type is refused by the API with a message
+/// about the data URL rather than about the picture.
+fn mime_of(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [b'G', b'I', b'F', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Base64, without a dependency for sixty lines of table lookup.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        let take = chunk.len() + 1;
+        for i in 0..4 {
+            if i < take {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_the_known_examples() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_handles_bytes_that_are_not_text() {
+        assert_eq!(base64(&[0x00, 0xFF, 0x80]), "AP+A");
+        assert_eq!(base64(&[0xFF; 3]), "////");
+    }
+
+    #[test]
+    fn a_picture_is_recognised_by_its_first_bytes_not_its_name() {
+        assert_eq!(mime_of(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]), "image/png");
+        assert_eq!(mime_of(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(mime_of(b"GIF89a"), "image/gif");
+        assert_eq!(mime_of(b"RIFF____WEBPVP8 "), "image/webp");
+        assert_eq!(mime_of(b"not a picture"), "application/octet-stream");
+        assert_eq!(mime_of(&[]), "application/octet-stream");
+    }
+}
+
+/// Answer a permission question the daemon asked, using the terminal's own
+/// prompt.
+///
+/// A free function taking the screen rather than a closure capturing it: the
+/// renderer already holds `&mut Ui`, and a closure that captured it too would
+/// be a second mutable borrow of the same thing.
+fn answer_permission(
+    ui: &mut Ui,
+    tool: &str,
+    arguments: &serde_json::Value,
+    effect: &str,
+) -> Option<String> {
+    let effect: ozgent_core::Effect = effect.parse().unwrap_or_default();
+    Some(
+        match ui.ask_permission(tool, effect, arguments) {
+            ozgent_core::Choice::Once => "once",
+            ozgent_core::Choice::Session => "session",
+            ozgent_core::Choice::Always => "always",
+            ozgent_core::Choice::Deny => "deny",
+            // The terminal never offers this one, but the type carries it.
+            ozgent_core::Choice::DenyAlways => "deny_always",
+        }
+        .to_string(),
+    )
 }

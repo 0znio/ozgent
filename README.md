@@ -126,11 +126,15 @@ bar showing the model, context used, and tokens/sec.
 
 ![terminal interface](docs/images/tui.png)
 
+It loads nothing itself: it asks the daemon, so a model already resident
+answers straight away and no second copy goes into VRAM.
+
 - **Shift+Enter** for a new line (Alt+Enter where the terminal can't report Shift).
 - **Drag over text** to select it — it's copied when you let go. `/copy` copies
   the whole last reply.
 - **Type `@`** for the agents; Tab or Enter picks one.
-- Loading a model shows a progress bar, not a frozen line.
+- Loading a model shows a progress bar, not a frozen line — on the rare turn
+  where one has to be loaded at all.
 
 ### Tools that run, with a prompt first
 
@@ -239,17 +243,31 @@ restart.
 
 → [docs/channels.md](docs/channels.md)
 
-### It runs in the background
+### One model, however many things are using it
 
 ```bash
 ozgent daemon install    # systemd, OpenRC, runit, s6, dinit or launchd
 ```
 
 One process owns the model, the database, the channels and the scheduler, and
-serves the web interface and the API over all of it. Everything else becomes a
-client of it: scheduled jobs run whether or not anything is open, Telegram is
-answered without a terminal left running, and nothing loads a second copy of
-the model.
+serves the web interface and the API over all of it. **Everything else is a
+client** — the browser, the terminal, your phone. Open `ozgent chat` beside a
+running daemon and it does not load anything:
+
+```
+$ ozgent chat Qwen3.5-4B
+Qwen3.5-4B-MTP:Q4_K_M · asking the ozgent daemon
+```
+
+Measured: the terminal added 100 MB beside a daemon holding a 4B model, not a
+second 3.9 GB copy. If nothing is listening, one is started and left running,
+so the first question of the day pays for the model load and the rest do not.
+
+Several models can be resident at once, bounded by the memory that is actually
+free — read from the driver, so it counts other programs on the card too.
+There is no maximum count, because every count is wrong for somebody: a 64 GB
+card holding ten models is fine. When the next one does not fit, ozgent
+offloads what does, and drops models nobody is using before it drops layers.
 
 It holds **no model at all** until something asks it a question, and drops it
 again after fifteen idle minutes — a 4B model at Q4 is around 3 GB, and holding

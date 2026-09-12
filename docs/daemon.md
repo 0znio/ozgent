@@ -61,6 +61,36 @@ minute doing a single indexed lookup that matches nothing.
 What is left is a tokio runtime, an HTTP listener, a SQLite handle, and one
 polling connection per configured channel.
 
+## Several models at once
+
+The daemon holds as many models as the card has room for. There is no maximum
+count — a count is always wrong for somebody, and on a 64 GB card ten models
+is perfectly reasonable. The limit is the memory free at the moment of
+loading, read from the driver, which means it also counts whatever else is on
+the card: a game, a notebook, another ozgent.
+
+When the next model does not fit, the answer is not "refuse":
+
+1. **Offload what fits.** Half a model on the GPU is far better than none.
+2. **If that would be a poor fit, drop models nobody is using** and decide
+   again. An idle model holding VRAM is worth less than the one wanted now.
+3. **Never drop one mid-answer.** Somebody is reading it.
+
+Measured on a 7.6 GB card holding a 3.9 GB 4B and asked for a 6.7 GB 9B, which
+cannot both fit:
+
+```
+unloading Qwen3.5-4B-MTP:Q4_K_M to make room
+unloaded 1 idle model(s) to make room: 11 of 33 layers -> all layers on the GPU
+```
+
+It chose one model wholly on the GPU over two crawling on the CPU. Where they
+do fit they coexist: a 4B and the embedding model together took that card from
+3881 to 5019 MiB, and the 4B then answered in 184 ms — still resident.
+
+Nothing needs configuring for this. `gpu_layers = auto` means "as much as fits
+right now" rather than "everything", which is what it always claimed to mean.
+
 ## Which init system
 
 `ozgent daemon install` works out what is supervising this machine and writes
@@ -135,12 +165,50 @@ is a different question from whether the service is up. Only one process does
 each, so a second ozgent started by hand will say `not running` there while
 working perfectly well for everything else.
 
-## The terminal, while a daemon is running
+## The terminal is a client too
 
-`ozgent chat` still loads its own model. On a machine with enough VRAM for two
-copies that is fine; on most it is not, and the daemon will have released its
-copy fifteen minutes later anyway. Use the browser or the API to talk to the
-daemon.
+`ozgent chat` and `ozgent run` load nothing. They ask the daemon, exactly as
+the browser does — so if it already holds the model you wanted, your question
+goes straight to it:
+
+```
+$ ozgent chat Qwen3.5-4B
+Qwen3.5-4B-MTP:Q4_K_M · asking the ozgent daemon
+```
+
+Measured: with a daemon already holding a 4B model, opening the terminal and
+asking a question moved VRAM from 3881 MiB to 3983 MiB — the daemon's own
+growth, not a second copy of the weights. Before this, a terminal beside a
+daemon meant two copies and roughly 7.8 GB.
+
+**If nothing is listening, one is started.** Not "fall back to loading a model
+here" — that keeps two implementations of a turn alive, and two
+implementations drift. The daemon that gets started is a real one and it stays
+up, which is the point: the first `ozgent run` of the day pays for the model
+load and every one after it does not.
+
+```
+$ ozgent run Qwen3.5-4B "say one"     # 6s — started a daemon, loaded the model
+$ ozgent run Qwen3.5-4B "say two"     # 2.2s — it was already there
+```
+
+To talk to a daemon somewhere else, `OZGENT_HOST=box:7333`. A remote address
+is never started for you — that is somebody else's machine, and starting one
+here would answer a different address from the one you asked for.
+
+### What moved to the daemon
+
+The terminal no longer assembles prompts, runs the tool loop, or decides what
+to remember, because all of that already existed in the server and two copies
+of it would drift. A few commands changed shape as a result:
+
+| | |
+|---|---|
+| `/tools` | asks the daemon, so it lists MCP tools this process never saw |
+| `/config` | edits `config.toml`; the daemon re-reads it, so a change lands on the next turn |
+| `/effort`, `/system` | model settings — set them in `config.toml` or the web settings page |
+| `/call` | gone. Ask in a sentence; the model picks the tool |
+| `/stats` | context and rate as the daemon reported them, not a local guess |
 
 ## Stopping it
 

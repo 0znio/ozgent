@@ -46,6 +46,23 @@ pub fn describe(value: &serde_json::Value) -> Option<String> {
         });
     }
 
+    // list_dir
+    if let (Some(entries), Some(path)) =
+        (obj.get("entries").and_then(|e| e.as_array()), obj.get("path").and_then(|p| p.as_str()))
+    {
+        // Nested listings put directories and their contents in one array, so
+        // the count is of lines rather than of files; said as "entries" for
+        // that reason rather than rounded up into a claim about files.
+        let n = entries.len();
+        let more = obj.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false);
+        let name = path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(path);
+        return Some(format!(
+            "{n} entr{} in {name}{}",
+            if n == 1 { "y" } else { "ies" },
+            if more { ", truncated" } else { "" }
+        ));
+    }
+
     // yahoo_finance
     if let Some(quotes) = obj.get("quotes").and_then(|q| q.as_array()) {
         let parts: Vec<String> = quotes
@@ -233,5 +250,50 @@ mod scheduler_tests {
     #[test]
     fn a_result_from_another_tool_that_happens_to_have_a_job_key_is_not_claimed() {
         assert_eq!(describe(&json!({ "job": "something", "unrelated": 1 })), None);
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::describe;
+    use serde_json::json;
+
+    #[test]
+    fn a_listing_says_how_much_is_in_where() {
+        // It used to fall through to the key-list fallback and read
+        // "entries, note, path, truncated", which says nothing.
+        let out = describe(&json!({
+            "path": "/home/someone/code/ozgent/docs",
+            "entries": ["a.md", "b.md", "c.md"],
+        }))
+        .unwrap();
+        assert_eq!(out, "3 entries in docs");
+    }
+
+    #[test]
+    fn one_entry_is_not_pluralised() {
+        let out = describe(&json!({ "path": "/tmp/x", "entries": ["only.txt"] })).unwrap();
+        assert_eq!(out, "1 entry in x");
+    }
+
+    #[test]
+    fn a_truncated_listing_says_so() {
+        let out = describe(&json!({
+            "path": "/big", "entries": ["a"], "truncated": true
+        }))
+        .unwrap();
+        assert!(out.ends_with("truncated"), "{out}");
+    }
+
+    #[test]
+    fn a_listing_of_nothing_still_reads_as_a_sentence() {
+        let out = describe(&json!({ "path": "/empty", "entries": [] })).unwrap();
+        assert_eq!(out, "0 entries in empty");
+    }
+
+    #[test]
+    fn a_path_with_no_directory_part_is_used_whole() {
+        let out = describe(&json!({ "path": ".", "entries": ["a"] })).unwrap();
+        assert_eq!(out, "1 entry in .");
     }
 }
