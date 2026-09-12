@@ -1121,7 +1121,10 @@ fn conversation(shared: &Arc<Shared>, kind: Kind, chat: &str, msg: &Msg) -> anyh
     }
     let title = format!("{kind} · {}", msg.name);
     let id = store.create_conversation(&title, None)?;
-    store.bind_channel_chat(kind.as_str(), chat, id, &msg.name)?;
+    // The identities are what the allowlist is written in, and are kept so a
+    // scheduled message can be sent to "whoever is allowed here" and checked
+    // against the list again at the moment it goes out.
+    store.bind_channel_chat(kind.as_str(), chat, id, &msg.name, &msg.identities())?;
     Ok(id)
 }
 
@@ -1171,7 +1174,7 @@ async fn turn_for(shared: Arc<Shared>, kind: Kind, chat: String, msg: Msg) {
                 origin: format!("chat:{kind}:{chat}"),
                 deliver: Some(ozgent_schedule::Deliver::Chat {
                     channel: kind.as_str().to_string(),
-                    to: chat.clone(),
+                    to: Some(chat.clone()),
                 }),
                 allowed_tools: access.tools.map(<[String]>::to_vec),
                 conversation_id: Some(conversation),

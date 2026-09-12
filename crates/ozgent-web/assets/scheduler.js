@@ -36,7 +36,7 @@ function when(unix) {
   return sameDay ? time : `${d.toLocaleDateString([], { day: "numeric", month: "short" })} ${time}`;
 }
 
-let state = { jobs: [], agents: [], channels: [], zone: "local", hosted: false };
+let state = { jobs: [], agents: [], channels: [], allowed: {}, zone: "local", hosted: false };
 let editing = null;   // the job being changed, or null when creating
 
 // ------------------------------------------------------------------- list
@@ -118,7 +118,9 @@ function card(job) {
     el(
       "span",
       "adm-chip-item",
-      job.deliver === "none" ? "kept on this page" : `→ ${job.deliver}`
+      job.deliver === "none"
+        ? "kept on this page"
+        : `→ ${job.deliver}${job.deliver_to ? ` · ${job.deliver_to}` : " · everyone allowed"}`
     )
   );
   if (job.only_if) chips.append(el("span", "adm-chip-item", `only if: ${job.only_if}`));
@@ -243,13 +245,18 @@ function closeForm() {
 function deliverChanged() {
   const to = $("f-deliver").value;
   $("to-field").hidden = to === "none";
+  if (to === "none") return;
+  // Left empty it goes to everyone that channel allows, which is what someone
+  // who already listed who may use it means. Nobody knows their own Telegram
+  // chat id, so demanding one here was the wrong question.
   const live = (state.channels ?? []).includes(to);
-  $("to-hint").textContent =
-    to === "none"
-      ? ""
-      : live
-        ? `${to} is connected.`
-        : `${to} is not connected right now, so this job's answers will not arrive until it is.`;
+  const who = (state.allowed ?? {})[to] ?? [];
+  const audience = who.length
+    ? `Leave it empty and the answer goes to everyone ${to} allows: ${who.join(", ")}.`
+    : `Leave it empty and the answer goes to everyone ${to} allows.`;
+  $("to-hint").textContent = live
+    ? audience
+    : `${audience} ${to} is not connected right now, so nothing arrives until it is.`;
 }
 
 /// Read the rule back from the server and show when it would actually fire.

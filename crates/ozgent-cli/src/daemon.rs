@@ -574,7 +574,7 @@ pub fn status(paths: &Paths, config: &Config) -> Result<()> {
     // an init system knows; the lock files are what actually decide.
     println!(
         "scheduler     {}",
-        held(&paths.root().join("scheduler.lock"))
+        held(&paths.scheduler_dir().join("lock"))
             .then_some("running jobs")
             .unwrap_or("not running")
     );

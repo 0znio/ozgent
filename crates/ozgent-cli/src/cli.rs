@@ -508,7 +508,8 @@ pub enum SchedulerCommand {
         /// Where the answer goes: telegram, whatsapp, or none.
         #[arg(long)]
         deliver: Option<String>,
-        /// The chat id or phone number to send it to.
+        /// One chat to send it to. Left out, it goes to everyone the channel
+        /// allows — which is usually what you want.
         #[arg(long)]
         to: Option<String>,
         /// An IANA zone like Asia/Kolkata. Local time by default.

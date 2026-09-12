@@ -94,7 +94,7 @@ fn list(paths: &Paths, store: &Store) -> Result<()> {
 
 /// Whether some process is running jobs.
 fn running(paths: &Paths) -> bool {
-    let path = paths.root().join("scheduler.lock");
+    let path = paths.scheduler_dir().join("lock");
     let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&path) else {
         return false;
     };
@@ -214,24 +214,48 @@ fn pick_delivery(config: &Config, store: &Store) -> Result<Deliver> {
             chats.push((channel.to_string(), chat.chat_id, who));
         }
     }
-    if chats.is_empty() {
-        // Nothing to offer, and inventing a prompt for a chat id would only
-        // produce a wrong one. The page and `--deliver` can still do it.
+    // Every channel that is on gets an "everyone allowed" option, whether or
+    // not anybody has messaged it yet — that is what most people want, and
+    // making it depend on having a chat on record would hide the obvious
+    // choice on a fresh install.
+    let channels: Vec<&str> = [
+        ("telegram", config.channels.telegram.enabled),
+        ("whatsapp", config.channels.whatsapp.enabled),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(name, _)| name)
+    .collect();
+    if channels.is_empty() {
         return Ok(Deliver::Nowhere);
     }
 
     println!();
     let mut options = vec!["keep it on the scheduler page".to_string()];
-    options.extend(chats.iter().map(|(c, _, who)| format!("{c}: {who}")));
+    let mut picks: Vec<Deliver> = vec![Deliver::Nowhere];
+    for channel in &channels {
+        let who = config.channels.access(match *channel {
+            "telegram" => ozgent_core::ChannelKind::Telegram,
+            _ => ozgent_core::ChannelKind::WhatsApp,
+        });
+        let audience = if who.allow.is_empty() {
+            "nobody is allowed there yet".to_string()
+        } else {
+            who.allow.join(", ")
+        };
+        options.push(format!("{channel} — everyone allowed ({audience})"));
+        picks.push(Deliver::Chat { channel: channel.to_string(), to: None });
+    }
+    // And any single chat it has actually spoken to, for a job meant for one
+    // person when several are allowed.
+    for (channel, to, who) in &chats {
+        options.push(format!("{channel} — only {who}"));
+        picks.push(Deliver::Chat { channel: channel.clone(), to: Some(to.clone()) });
+    }
+
     let refs: Vec<&str> = options.iter().map(String::as_str).collect();
     let picked = choose("  Where should the answer go?", &refs, 0)?;
-    Ok(match picked {
-        0 => Deliver::Nowhere,
-        n => {
-            let (channel, to, _) = &chats[n - 1];
-            Deliver::Chat { channel: channel.clone(), to: to.clone() }
-        }
-    })
+    Ok(picks.get(picked).cloned().unwrap_or(Deliver::Nowhere))
 }
 
 // ------------------------------------------------------------------ show

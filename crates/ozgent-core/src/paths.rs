@@ -75,6 +75,16 @@ impl Paths {
         self.root.join("cache")
     }
 
+    /// Where the scheduler keeps its own files.
+    ///
+    /// A directory of its own rather than a file loose in the root, so it is
+    /// obvious what belongs to the scheduler and what does not. The jobs
+    /// themselves are rows in `ozgent.db` — they are data, edited from three
+    /// surfaces at once, and a file would have to be locked by all of them.
+    pub fn scheduler_dir(&self) -> PathBuf {
+        self.root.join("scheduler")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }

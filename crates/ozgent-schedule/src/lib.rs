@@ -38,7 +38,15 @@ pub enum Deliver {
     /// browser, where there may be no chat to send to.
     Nowhere,
     /// To a chat on a channel.
-    Chat { channel: String, to: String },
+    ///
+    /// `to` names one chat. `None` means *everyone the channel allows*, which
+    /// is what someone who set a channel up and then said "send it to
+    /// Telegram" meant — they already named who may talk to it, and naming
+    /// them again in a chat id they have never seen is not a thing anyone can
+    /// do from memory. Who that is is resolved when the message is sent, not
+    /// when the job is written, so removing somebody from the allowlist stops
+    /// their deliveries.
+    Chat { channel: String, to: Option<String> },
 }
 
 impl Deliver {
@@ -52,35 +60,66 @@ impl Deliver {
     pub fn to(&self) -> Option<&str> {
         match self {
             Self::Nowhere => None,
-            Self::Chat { to, .. } => Some(to),
+            Self::Chat { to, .. } => to.as_deref(),
         }
     }
 
     /// Read a channel and chat back out of a stored job.
     pub fn read(channel: &str, to: Option<&str>) -> Self {
-        match (channel, to) {
-            ("telegram" | "whatsapp", Some(to)) if !to.is_empty() => {
-                Self::Chat { channel: channel.to_string(), to: to.to_string() }
-            }
+        match channel {
+            "telegram" | "whatsapp" => Self::Chat {
+                channel: channel.to_string(),
+                to: to.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
+            },
             _ => Self::Nowhere,
         }
     }
 
     /// Check a requested destination before it is saved.
+    ///
+    /// A channel with no chat named is not an error: it means everyone that
+    /// channel allows. Requiring an id here was the bug — a person who set
+    /// Telegram up has already said who may use it, and a Telegram chat id is
+    /// not something anyone knows by heart.
     pub fn parse(channel: &str, to: Option<&str>) -> Result<Self, String> {
         let channel = channel.trim().to_lowercase();
         match channel.as_str() {
             "" | "none" | "nowhere" => Ok(Self::Nowhere),
-            "telegram" | "whatsapp" => {
-                let to = to.map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| {
-                    format!("sending to {channel} needs a chat to send to")
-                })?;
-                Ok(Self::Chat { channel, to: to.to_string() })
-            }
+            "telegram" | "whatsapp" => Ok(Self::Chat {
+                channel,
+                to: to.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
+            }),
             other => Err(format!(
                 "{other:?} is not somewhere to send to — use telegram, whatsapp, or none"
             )),
         }
+    }
+
+    /// Who a message actually goes to.
+    ///
+    /// One chat when the job names one. Otherwise every chat this channel has
+    /// spoken to that its allowlist *still* admits — checked now rather than
+    /// when the job was written, so taking somebody off the list stops their
+    /// deliveries without touching the job.
+    pub fn recipients(&self, store: &Store, allow: &[String]) -> Vec<String> {
+        let Self::Chat { channel, to } = self else { return Vec::new() };
+        if let Some(one) = to {
+            return vec![one.clone()];
+        }
+        store
+            .channel_chats(channel)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|chat| {
+                // A chat bound before ozgent kept identities has none to check.
+                // Its chat id is the one identity always available, and for
+                // Telegram that *is* the numeric user id the list can name.
+                let mut ids: Vec<&str> = chat.identities.iter().map(String::as_str).collect();
+                ids.push(&chat.chat_id);
+                ozgent_core::channels::admits(allow, &ids)
+            })
+            .map(|chat| chat.chat_id)
+            .collect()
     }
 }
 
@@ -394,7 +433,12 @@ pub fn summarise(job: &Job) -> String {
         line.push_str(&format!(", asked of @{agent}"));
     }
     match Deliver::read(&job.deliver, job.deliver_to.as_deref()) {
-        Deliver::Chat { channel, .. } => line.push_str(&format!(", sent on {channel}")),
+        Deliver::Chat { channel, to: Some(_) } => {
+            line.push_str(&format!(", sent to one {channel} chat"))
+        }
+        Deliver::Chat { channel, to: None } => {
+            line.push_str(&format!(", sent to everyone {channel} allows"))
+        }
         Deliver::Nowhere => line.push_str(", kept on the scheduler page"),
     }
     if job.only_if.is_some() {
@@ -477,7 +521,7 @@ mod tests {
         let s = store();
         let mut d = draft("pre-market-brief", "every weekday at 9:20");
         d.agent = Some("@stock-guru".into());
-        d.deliver = Some(Deliver::Chat { channel: "telegram".into(), to: "4242".into() });
+        d.deliver = Some(Deliver::Chat { channel: "telegram".into(), to: Some("4242".into()) });
 
         let job = create(&s, &d).unwrap();
         assert_eq!(job.name, "pre-market-brief");
@@ -602,7 +646,7 @@ mod tests {
         let s = store();
         let mut d = draft("brief", "every day at 9:20");
         d.agent = Some("stock-guru".into());
-        d.deliver = Some(Deliver::Chat { channel: "telegram".into(), to: "4242".into() });
+        d.deliver = Some(Deliver::Chat { channel: "telegram".into(), to: Some("4242".into()) });
         let before = create(&s, &d).unwrap();
 
         let after = update(
@@ -668,11 +712,15 @@ mod tests {
         assert_eq!(Deliver::parse("", None).unwrap(), Deliver::Nowhere);
         assert_eq!(
             Deliver::parse("telegram", Some("4242")).unwrap(),
-            Deliver::Chat { channel: "telegram".into(), to: "4242".into() }
+            Deliver::Chat { channel: "telegram".into(), to: Some("4242".into()) }
         );
-        // A channel with nowhere to send to would fail silently every morning.
-        assert!(Deliver::parse("telegram", None).is_err());
-        assert!(Deliver::parse("telegram", Some("  ")).is_err());
+        // A channel with no chat named means everyone that channel allows —
+        // see the `delivery` tests. Demanding an id here was the bug: nobody
+        // knows their own Telegram chat id.
+        assert_eq!(
+            Deliver::parse("telegram", None).unwrap(),
+            Deliver::Chat { channel: "telegram".into(), to: None }
+        );
         assert!(Deliver::parse("email", Some("a@b.c")).is_err());
     }
 
@@ -680,8 +728,8 @@ mod tests {
     fn a_destination_reads_back_as_it_was_written() {
         for d in [
             Deliver::Nowhere,
-            Deliver::Chat { channel: "telegram".into(), to: "4242".into() },
-            Deliver::Chat { channel: "whatsapp".into(), to: "918638680186".into() },
+            Deliver::Chat { channel: "telegram".into(), to: Some("4242".into()) },
+            Deliver::Chat { channel: "whatsapp".into(), to: Some("918638680186".into()) },
         ] {
             assert_eq!(Deliver::read(d.channel(), d.to()), d);
         }
@@ -784,7 +832,7 @@ mod lifecycle {
             prompt: "a pre-market brief".into(),
             when: "every weekday at 9:20".into(),
             agent: Some("stock-guru".into()),
-            deliver: Some(Deliver::Chat { channel: "telegram".into(), to: "4242".into() }),
+            deliver: Some(Deliver::Chat { channel: "telegram".into(), to: Some("4242".into()) }),
             created_by: "chat:telegram:4242".into(),
             ..Default::default()
         }
@@ -901,5 +949,145 @@ mod lifecycle {
         // One failing does not touch the other's streak.
         s.job_fired(due[0].id, unix_now(), None, true).unwrap();
         assert_eq!(s.get_job(due[1].id).unwrap().unwrap().failures, 0);
+    }
+}
+
+/// Who a scheduled answer actually reaches.
+///
+/// The bug these exist for: a job that said "send it to Telegram" without a
+/// chat id was refused at creation, and a person who had already set Telegram
+/// up and listed who may use it had no way to name a chat — a Telegram chat id
+/// is not something anyone knows by heart.
+#[cfg(test)]
+mod delivery {
+    use super::*;
+    use ozgent_memory::Store;
+
+    fn store() -> Store {
+        Store::open_in_memory().unwrap()
+    }
+
+    /// A chat that has spoken to the bot, with the identities the allowlist
+    /// is written in.
+    fn seen(s: &Store, channel: &str, chat_id: &str, name: &str, identities: &[&str]) {
+        let c = s.create_conversation(name, None).unwrap();
+        s.bind_channel_chat(channel, chat_id, c, name, identities).unwrap();
+    }
+
+    #[test]
+    fn a_channel_with_no_chat_named_is_accepted_rather_than_refused() {
+        // This was the bug outright: `Deliver::parse` demanded an id.
+        let d = Deliver::parse("telegram", None).expect("must be allowed");
+        assert_eq!(d, Deliver::Chat { channel: "telegram".into(), to: None });
+        assert_eq!(Deliver::parse("telegram", Some("  ")).unwrap(), d, "blank is the same as none");
+        assert_eq!(Deliver::parse("whatsapp", None).unwrap().channel(), "whatsapp");
+    }
+
+    #[test]
+    fn everyone_the_allowlist_names_gets_it() {
+        // The case from the report: Telegram set up with `@Bzinga123`, a job
+        // that just says "Telegram", and it has to reach that person.
+        let s = store();
+        seen(&s, "telegram", "5752856642", "Marco", &["5752856642", "@Bzinga123"]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        assert_eq!(to.recipients(&s, &["@Bzinga123".into()]), ["5752856642"]);
+    }
+
+    #[test]
+    fn a_handle_matches_however_it_is_written() {
+        let s = store();
+        seen(&s, "telegram", "42", "Marco", &["42", "@Bzinga123"]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        for spelling in ["@Bzinga123", "Bzinga123", "@bzinga123", "  @BZINGA123  "] {
+            assert_eq!(to.recipients(&s, &[spelling.into()]), ["42"], "for {spelling:?}");
+        }
+    }
+
+    #[test]
+    fn a_whatsapp_number_matches_the_chat_it_belongs_to() {
+        let s = store();
+        seen(&s, "whatsapp", "918638680186@s.whatsapp.net", "me", &["918638680186"]);
+        let to = Deliver::parse("whatsapp", None).unwrap();
+        assert_eq!(
+            to.recipients(&s, &["918638680186".into()]),
+            ["918638680186@s.whatsapp.net"]
+        );
+    }
+
+    #[test]
+    fn several_allowed_people_all_get_it() {
+        let s = store();
+        seen(&s, "telegram", "1", "Ada", &["1", "@ada"]);
+        seen(&s, "telegram", "2", "Grace", &["2", "@grace"]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        let mut got = to.recipients(&s, &["@ada".into(), "@grace".into()]);
+        got.sort();
+        assert_eq!(got, ["1", "2"]);
+    }
+
+    #[test]
+    fn somebody_taken_off_the_list_stops_receiving() {
+        // Checked when the message is sent, not when the job was written —
+        // otherwise revoking access leaves scheduled messages still arriving.
+        let s = store();
+        seen(&s, "telegram", "1", "Ada", &["1", "@ada"]);
+        seen(&s, "telegram", "2", "Grace", &["2", "@grace"]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        assert_eq!(to.recipients(&s, &["@ada".into()]), ["1"], "Grace is no longer allowed");
+        assert!(to.recipients(&s, &[]).is_empty(), "an empty list admits nobody");
+    }
+
+    #[test]
+    fn a_job_that_names_one_chat_still_goes_only_there() {
+        let s = store();
+        seen(&s, "telegram", "1", "Ada", &["1", "@ada"]);
+        seen(&s, "telegram", "2", "Grace", &["2", "@grace"]);
+        let to = Deliver::parse("telegram", Some("2")).unwrap();
+        assert_eq!(to.recipients(&s, &["@ada".into(), "@grace".into()]), ["2"]);
+    }
+
+    #[test]
+    fn a_chat_bound_before_identities_were_kept_still_matches_by_its_id() {
+        // Rows written before the column existed have no identities. Their
+        // chat id is the one identity always available, and on Telegram that
+        // is the numeric user id an allowlist can name.
+        let s = store();
+        seen(&s, "telegram", "5752856642", "Marco", &[]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        assert_eq!(to.recipients(&s, &["5752856642".into()]), ["5752856642"]);
+    }
+
+    #[test]
+    fn a_channel_nobody_has_messaged_yet_has_nobody_to_send_to() {
+        // Not an error here — the runner turns it into a sentence that says
+        // to message the bot once.
+        let s = store();
+        let to = Deliver::parse("telegram", None).unwrap();
+        assert!(to.recipients(&s, &["@someone".into()]).is_empty());
+    }
+
+    #[test]
+    fn an_open_channel_reaches_everyone_it_has_spoken_to() {
+        let s = store();
+        seen(&s, "telegram", "1", "Ada", &["1", "@ada"]);
+        seen(&s, "telegram", "2", "Grace", &["2", "@grace"]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        assert_eq!(to.recipients(&s, &["*".into()]).len(), 2);
+    }
+
+    #[test]
+    fn chats_on_another_channel_are_never_included() {
+        let s = store();
+        seen(&s, "telegram", "1", "Ada", &["1", "@ada"]);
+        seen(&s, "whatsapp", "918638680186@s.whatsapp.net", "me", &["918638680186"]);
+        let to = Deliver::parse("telegram", None).unwrap();
+        assert_eq!(to.recipients(&s, &["*".into()]), ["1"]);
+    }
+
+    #[test]
+    fn sending_nowhere_has_no_recipients_at_all() {
+        let s = store();
+        seen(&s, "telegram", "1", "Ada", &["1", "@ada"]);
+        assert!(Deliver::Nowhere.recipients(&s, &["*".into()]).is_empty());
     }
 }

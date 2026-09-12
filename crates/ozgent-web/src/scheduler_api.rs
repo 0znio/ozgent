@@ -116,6 +116,9 @@ struct Overview {
     gateway: bool,
     /// Which channels are connected and could actually receive a delivery.
     channels: Vec<String>,
+    /// Who each channel admits, so the form can say where "everyone allowed"
+    /// actually goes rather than leaving it abstract.
+    allowed: std::collections::BTreeMap<String, Vec<String>>,
     /// The machine's zone, named, so the form can say what "local" means.
     zone: String,
     /// Agents a job can be handed to, for the picker.
@@ -209,6 +212,17 @@ async fn list(AxumState(state): AxumState<State>) -> Result<Json<Overview>, ApiE
         })
         .unwrap_or_default();
 
+    let allowed = {
+        let config = state.config.lock().unwrap();
+        [
+            ("telegram", ozgent_core::ChannelKind::Telegram),
+            ("whatsapp", ozgent_core::ChannelKind::WhatsApp),
+        ]
+        .into_iter()
+        .map(|(name, kind)| (name.to_string(), config.channels.access(kind).allow.to_vec()))
+        .collect()
+    };
+
     let catalog = ozgent_core::AgentCatalog::load(&state.paths);
     let agents = catalog.all().iter().map(|a| a.name.clone()).collect();
     let tools = crate::worker::current_tools(&state.tools)
@@ -229,6 +243,7 @@ async fn list(AxumState(state): AxumState<State>) -> Result<Json<Overview>, ApiE
         elsewhere: crate::scheduler::held_elsewhere(&state),
         gateway: gateway.is_some(),
         channels,
+        allowed,
         zone: ozgent_core::Zone::local().name().to_string(),
         agents,
         tools,

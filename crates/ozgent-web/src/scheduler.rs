@@ -130,8 +130,15 @@ pub fn held_elsewhere(state: &State) -> Option<String> {
     (!pid.is_empty()).then(|| format!("another ozgent (pid {pid})"))
 }
 
+/// The lock that decides which process runs jobs.
+///
+/// Under `~/ozgent/scheduler/` rather than loose in the root, so everything
+/// the scheduler owns is in one place a person can point at. The jobs
+/// themselves are rows in `ozgent.db`: they are edited from the terminal, the
+/// page and a chat, sometimes at once, and a file would have to be locked by
+/// all three.
 pub fn lock_path(paths: &ozgent_core::Paths) -> std::path::PathBuf {
-    paths.root().join("scheduler.lock")
+    paths.scheduler_dir().join("lock")
 }
 
 /// The scheduler's claim on this database, held for as long as it runs.
@@ -590,9 +597,14 @@ async fn worth_sending(
 }
 
 /// Send the answer where the job says. `false` means there was nowhere to send.
+///
+/// A job that names no chat goes to everyone the channel allows — which is
+/// what somebody who set the channel up and then said "send it to Telegram"
+/// meant. Who that is is worked out now rather than when the job was written,
+/// so taking a person off the allowlist stops their deliveries.
 fn deliver(state: &State, job: &Job, answer: &str) -> Result<bool, String> {
-    let Deliver::Chat { channel, to } = Deliver::read(&job.deliver, job.deliver_to.as_deref())
-    else {
+    let destination = Deliver::read(&job.deliver, job.deliver_to.as_deref());
+    let Deliver::Chat { channel, .. } = &destination else {
         return Ok(false);
     };
     let kind = match channel.as_str() {
@@ -605,7 +617,45 @@ fn deliver(state: &State, job: &Job, answer: &str) -> Result<bool, String> {
         .get()
         .ok_or("no gateway is running in this process, so there is nothing to send with")?;
 
-    gateway.deliver(kind, &to, &headed(job, answer)).map(|()| true)
+    let chats = {
+        let allow = {
+            let config = state.config.lock().unwrap();
+            config.channels.access(kind).allow.to_vec()
+        };
+        let store = state.store.lock().unwrap();
+        destination.recipients(&store, &allow)
+    };
+    if chats.is_empty() {
+        // Said as a failure rather than passed over: the job ran, produced an
+        // answer, and nobody got it. Silence here is the thing that makes a
+        // scheduler untrustworthy.
+        return Err(match job.deliver_to.as_deref() {
+            Some(_) => format!("{channel} has no chat matching this job's destination"),
+            None => format!(
+                "nobody on {channel}'s allow list has messaged ozgent yet, so there is \
+                 no chat to send to. Message it once from {channel} and it will know."
+            ),
+        });
+    }
+
+    let text = headed(job, answer);
+    let mut sent = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for chat in &chats {
+        match gateway.deliver(kind, chat, &text) {
+            Ok(()) => sent += 1,
+            Err(e) => failures.push(format!("{chat}: {e}")),
+        }
+    }
+    // One recipient failing is not the whole delivery failing — the others
+    // got it, and reporting nothing sent would be wrong.
+    if sent == 0 {
+        return Err(failures.join("; "));
+    }
+    if !failures.is_empty() {
+        tracing::warn!("{}: delivered to {sent} of {}; {}", job.name, chats.len(), failures.join("; "));
+    }
+    Ok(true)
 }
 
 /// The answer as it arrives in a chat.
@@ -695,9 +745,9 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_is_a_file_beside_the_database() {
+    fn the_lock_lives_in_the_schedulers_own_directory() {
         let paths = ozgent_core::Paths::with_root(std::path::Path::new("/tmp/ozgent-test"));
-        assert_eq!(lock_path(&paths), std::path::Path::new("/tmp/ozgent-test/scheduler.lock"));
+        assert_eq!(lock_path(&paths), std::path::Path::new("/tmp/ozgent-test/scheduler/lock"));
     }
 
     #[test]

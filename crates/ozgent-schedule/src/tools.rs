@@ -69,7 +69,7 @@ impl Caller {
     pub fn chat(channel: &str, chat_id: &str) -> Self {
         Self {
             origin: format!("chat:{channel}:{chat_id}"),
-            deliver: Some(Deliver::Chat { channel: channel.into(), to: chat_id.into() }),
+            deliver: Some(Deliver::Chat { channel: channel.into(), to: Some(chat_id.into()) }),
             ..Default::default()
         }
     }
@@ -431,8 +431,9 @@ here."
                 },
                 "deliver_to": {
                     "type": "string",
-                    "description": "The chat id or phone number to send to. Rarely needed — \
-                                    leave it out to use this chat.",
+                    "description": "One chat to send to. Almost never needed: left out, the \
+                                    answer goes to this chat when asked from one, and to \
+                                    everyone the channel allows otherwise.",
                 },
                 "timezone": {
                     "type": "string",

@@ -207,7 +207,10 @@ Anything that is not one of these is a question.
 `@agent` works here too, and the model can hand a question to an agent itself.
 
 You can also ask for something on a timer — *"every weekday at 9:20, send me a
-pre-market brief"* — and the answers arrive in this chat. A job created from a
+pre-market brief"* — and the answers arrive in this chat. A job set up from
+the terminal or the page with no chat named goes to everyone on this channel's
+list, re-checked each time it sends, so removing someone stops their
+deliveries. A job created from a
 chat may only answer back into that same chat, and gets that channel's tools
 and no more; otherwise "schedule me a reminder" would be a way to make ozgent
 message somebody else, or to reach a tool the channel does not allow. See

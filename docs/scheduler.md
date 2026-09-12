@@ -122,6 +122,24 @@ Three choices, and "nowhere" is a real one:
 - **Nowhere** — it still runs, and the answer is on `/scheduler` and in the
   conversation. Right for a job you read when you get to it.
 
+**You do not name a chat.** Say `--deliver telegram` and the answer goes to
+everyone that channel's allowlist admits — the people you already named when
+you set it up. Nobody knows their own Telegram chat id, and asking for one was
+simply a question with no answer.
+
+Who that is is worked out when the message is sent, not when the job was
+written, so taking somebody off the allowlist stops their deliveries without
+touching the job. Name one chat with `--to` if a job is meant for one person
+out of several.
+
+Ozgent learns a chat id the first time that person messages it. Until then
+there is nothing to send to, and a run says so in as many words:
+
+```
+nobody on telegram's allow list has messaged ozgent yet, so there is no chat
+to send to. Message it once from telegram and it will know.
+```
+
 Every run is recorded either way, including the boring ones. A job that quietly
 stopped working is the failure that matters: a brief that has not arrived for a
 week looks exactly like a week with no news.
@@ -215,11 +233,22 @@ to do.
 **The times look an hour out.** Check the timezone on the job. `ozgent scheduler
 show <job>` prints it, and `ozgent scheduler when` prints real times in it.
 
+## Where its files are
+
+```
+~/ozgent/scheduler/lock    which process is running jobs
+~/ozgent/ozgent.db         the jobs themselves, and every run
+```
+
+That is the whole list. The jobs are rows rather than files because they are
+data, not configuration: three surfaces edit them — the terminal, the page,
+and a chat — sometimes at once, and a file would have to be locked by all
+three. They are in the same database as your conversations, so a scheduled
+answer is a real thread you can open in the browser.
+
 ## Settings
 
-Jobs live in ozgent's database, not in `config.toml` — they are data, not
-configuration, and two surfaces edit them concurrently. Nothing here needs
-editing by hand.
+Jobs are not in `config.toml`. Nothing here needs editing by hand.
 
 The only related setting is how long a model is held after the last question:
 

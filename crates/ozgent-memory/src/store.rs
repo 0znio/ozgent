@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub struct Store {
     db: Connection,
@@ -43,6 +43,9 @@ pub struct ChannelChat {
     /// A human label — the sender's name or number — so `ozgent gateway status`
     /// shows who a chat belongs to rather than an opaque id.
     pub display: String,
+    /// What the allowlist is written in: a Telegram handle and numeric id, a
+    /// WhatsApp number. Empty for a chat bound before ozgent kept these.
+    pub identities: Vec<String>,
     pub last_seen_at: i64,
 }
 
@@ -226,6 +229,9 @@ impl Store {
         if current < 8 {
             self.db.execute_batch(SCHEMA_V8)?;
         }
+        if current < 9 {
+            self.db.execute_batch(SCHEMA_V9)?;
+        }
 
         self.db
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -402,21 +408,31 @@ impl Store {
     }
 
     /// Point a chat at a conversation, replacing any earlier binding.
+    /// Bind a chat to a conversation, remembering who its person is.
+    ///
+    /// `identities` are what the allowlist is written in — a Telegram handle
+    /// and numeric id, a WhatsApp number — and are kept so a scheduled message
+    /// can be addressed to "whoever is allowed on this channel" and re-checked
+    /// against the list at the moment it is sent.
     pub fn bind_channel_chat(
         &self,
         channel: &str,
         chat_id: &str,
         conversation_id: i64,
         display: &str,
+        identities: &[&str],
     ) -> Result<(), StoreError> {
+        let identities = serde_json::to_string(identities).unwrap_or_else(|_| "[]".into());
         self.db.execute(
-            "INSERT INTO channel_chats (channel, chat_id, conversation_id, display, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO channel_chats
+                 (channel, chat_id, conversation_id, display, identities, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (channel, chat_id) DO UPDATE SET
                  conversation_id = excluded.conversation_id,
                  display         = excluded.display,
+                 identities      = excluded.identities,
                  last_seen_at    = excluded.last_seen_at",
-            params![channel, chat_id, conversation_id, display, now()],
+            params![channel, chat_id, conversation_id, display, identities, now()],
         )?;
         Ok(())
     }
@@ -436,7 +452,7 @@ impl Store {
     /// Every chat bound on a channel, most recently active first.
     pub fn channel_chats(&self, channel: &str) -> Result<Vec<ChannelChat>, StoreError> {
         let mut stmt = self.db.prepare(
-            "SELECT chat_id, conversation_id, display, last_seen_at
+            "SELECT chat_id, conversation_id, display, identities, last_seen_at
                FROM channel_chats WHERE channel = ?1 ORDER BY last_seen_at DESC",
         )?;
         let rows = stmt
@@ -446,7 +462,11 @@ impl Store {
                     chat_id: r.get(0)?,
                     conversation_id: r.get(1)?,
                     display: r.get(2)?,
-                    last_seen_at: r.get(3)?,
+                    identities: r
+                        .get::<_, Option<String>>(3)?
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    last_seen_at: r.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1070,6 +1090,21 @@ CREATE TABLE job_runs (
 CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at DESC);
 ";
 
+/// The v9 step: a chat remembers who its person *is*, not just what they are
+/// called.
+///
+/// `display` is a name — "Marco" — which is what a listing should show and is
+/// useless for anything else. The allowlist is written in identities: a
+/// Telegram `@handle` or numeric id, a WhatsApp phone number. Without those
+/// stored, a scheduled job told to "send to Telegram" had nothing to resolve
+/// the allowlist against and no way to know who to send to.
+///
+/// Nullable, and backfilled by the next message from each chat: a row written
+/// before this step is not wrong, only incomplete.
+const SCHEMA_V9: &str = "
+ALTER TABLE channel_chats ADD COLUMN identities TEXT;
+";
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -1264,7 +1299,7 @@ mod channel_tests {
     fn a_chat_remembers_which_conversation_it_belongs_to() {
         let s = store();
         let c = s.create_conversation("from telegram", None).unwrap();
-        s.bind_channel_chat("telegram", "4242", c, "Ada").unwrap();
+        s.bind_channel_chat("telegram", "4242", c, "Ada", &[]).unwrap();
         assert_eq!(s.channel_conversation("telegram", "4242").unwrap(), Some(c));
     }
 
@@ -1275,8 +1310,8 @@ mod channel_tests {
         let s = store();
         let a = s.create_conversation("a", None).unwrap();
         let b = s.create_conversation("b", None).unwrap();
-        s.bind_channel_chat("telegram", "1", a, "").unwrap();
-        s.bind_channel_chat("whatsapp", "1", b, "").unwrap();
+        s.bind_channel_chat("telegram", "1", a, "", &[]).unwrap();
+        s.bind_channel_chat("whatsapp", "1", b, "", &[]).unwrap();
         assert_eq!(s.channel_conversation("telegram", "1").unwrap(), Some(a));
         assert_eq!(s.channel_conversation("whatsapp", "1").unwrap(), Some(b));
     }
@@ -1288,8 +1323,8 @@ mod channel_tests {
         let s = store();
         let first = s.create_conversation("first", None).unwrap();
         let second = s.create_conversation("second", None).unwrap();
-        s.bind_channel_chat("telegram", "1", first, "Ada").unwrap();
-        s.bind_channel_chat("telegram", "1", second, "Ada").unwrap();
+        s.bind_channel_chat("telegram", "1", first, "Ada", &[]).unwrap();
+        s.bind_channel_chat("telegram", "1", second, "Ada", &[]).unwrap();
         assert_eq!(s.channel_conversation("telegram", "1").unwrap(), Some(second));
         assert_eq!(s.channel_chats("telegram").unwrap().len(), 1);
     }
@@ -1301,7 +1336,7 @@ mod channel_tests {
         // person fails its foreign key instead of starting fresh.
         let s = store();
         let c = s.create_conversation("gone", None).unwrap();
-        s.bind_channel_chat("telegram", "1", c, "").unwrap();
+        s.bind_channel_chat("telegram", "1", c, "", &[]).unwrap();
         s.delete_conversation(c).unwrap();
         assert_eq!(s.channel_conversation("telegram", "1").unwrap(), None);
         assert!(s.channel_chats("telegram").unwrap().is_empty());
@@ -1312,7 +1347,7 @@ mod channel_tests {
         let s = store();
         let c = s.create_conversation("kept", None).unwrap();
         s.append_message(c, "user", "hello", 0).unwrap();
-        s.bind_channel_chat("telegram", "1", c, "").unwrap();
+        s.bind_channel_chat("telegram", "1", c, "", &[]).unwrap();
 
         assert!(s.unbind_channel_chat("telegram", "1").unwrap());
         assert!(!s.unbind_channel_chat("telegram", "1").unwrap(), "already gone");
@@ -1325,8 +1360,8 @@ mod channel_tests {
         let s = store();
         let a = s.create_conversation("a", None).unwrap();
         let b = s.create_conversation("b", None).unwrap();
-        s.bind_channel_chat("telegram", "old", a, "Ada").unwrap();
-        s.bind_channel_chat("telegram", "new", b, "Grace").unwrap();
+        s.bind_channel_chat("telegram", "old", a, "Ada", &[]).unwrap();
+        s.bind_channel_chat("telegram", "new", b, "Grace", &[]).unwrap();
         // `now()` has second resolution, so order the two explicitly rather
         // than depending on the clock ticking between two inserts.
         s.raw()
@@ -1418,6 +1453,43 @@ mod migration_tests {
         // And the new tables actually work, rather than merely existing.
         let id = store.create_job(&crate::jobs::NewJob::new("j", "p", "cron 0 9 * * *")).unwrap();
         assert!(store.get_job(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_chat_bound_before_identities_were_kept_survives_the_upgrade() {
+        // The column is nullable and backfilled by the next message, so an
+        // existing install keeps its chats rather than losing the binding and
+        // starting a fresh conversation for everyone.
+        let db = Connection::open_in_memory().unwrap();
+        for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V8] {
+            db.execute_batch(step).unwrap();
+        }
+        db.pragma_update(None, "user_version", 8i64).unwrap();
+        db.execute(
+            "INSERT INTO conversations (id, uuid, title, created_at, updated_at)
+             VALUES (1, 'u', 'chat', 1, 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO channel_chats (channel, chat_id, conversation_id, display, last_seen_at)
+             VALUES ('telegram', '5752856642', 1, 'Marco', 1)",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::init(db).expect("a v8 database must upgrade");
+        let chats = store.channel_chats("telegram").unwrap();
+        assert_eq!(chats.len(), 1, "the binding survived");
+        assert_eq!(chats[0].display, "Marco");
+        assert!(chats[0].identities.is_empty(), "and has none yet, which is allowed");
+
+        // The next message from that chat fills them in.
+        store
+            .bind_channel_chat("telegram", "5752856642", 1, "Marco", &["5752856642", "@Bzinga123"])
+            .unwrap();
+        let chats = store.channel_chats("telegram").unwrap();
+        assert_eq!(chats[0].identities, ["5752856642", "@Bzinga123"]);
     }
 
     #[test]

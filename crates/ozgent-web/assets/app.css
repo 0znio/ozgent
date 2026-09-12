@@ -2269,3 +2269,20 @@ a.ghost-btn { text-decoration: none; }
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 .search-none { padding: var(--s3); font-size: var(--t-small); color: var(--ink-faint); }
+
+/* The scheduler's header buttons.
+   ----------------------------------------------------------------------
+   `.primary-btn` styles a button with a label in it, and nothing more; an
+   icon put inside one is a block-level child that takes its own line, which
+   made "New job" two rows tall and half again the height of the Admin link
+   beside it. These two sit next to each other in the header, so they are
+   laid out together and matched deliberately rather than by coincidence. */
+.adm-top .primary-btn,
+.adm-top .ghost-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  /* One height for both, so the row reads as a pair rather than as a button
+     and an accident. */
+  padding: 7px var(--s3); line-height: 1.2; white-space: nowrap;
+}
+.adm-top .primary-btn .ic,
+.adm-top .ghost-btn .ic { width: 15px; height: 15px; flex: none; }
