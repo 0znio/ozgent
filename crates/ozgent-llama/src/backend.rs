@@ -357,6 +357,15 @@ pub struct Plan {
     pub free_bytes: u64,
 }
 
+/// The window the placement decision reserves cache for.
+///
+/// Not the window the model will run with — that is decided afterwards, from
+/// what the weights left behind, and is usually far larger. This is only "how
+/// much cache must fit for the result to be worth loading at all", so that a
+/// model with an enormous default window does not reserve its way out of the
+/// GPU entirely.
+const PLANNING_WINDOW: u32 = 8192;
+
 impl Plan {
     /// Everything on the GPU, for when there is nothing to weigh up.
     fn wide_open(total_layers: u32, free_bytes: u64) -> Self {
@@ -380,26 +389,35 @@ impl Plan {
             return Self::wide_open(layout.layers, free);
         }
 
-        // The KV cache and compute buffers stay resident whatever else is
-        // evicted, so they come off the budget before any weight does.
+        // Some KV cache has to stay resident whatever else is evicted, so it
+        // comes off the budget before any weight does — but only a *floor* of
+        // it, and that distinction is the whole of this comment.
         //
-        // Which cache, though, is decided later — and `auto` picks the
-        // *smallest type that fits* when memory is tight, down to q4_0. So
-        // assuming f16 here is not the conservative choice it looks like: it
-        // doubles the overhead against a cache the runtime would have
-        // quantised, and on a card that already holds another model it ate the
-        // entire budget and offloaded nothing. Measured: a second 4B model got
-        // 0 layers where 14 fit.
+        // The cache is elastic and the weights are not. `fit_context` sizes
+        // the real window to whatever is left once the weights are placed, so
+        // reserving the full requested window here is reserving memory that
+        // will never be asked for. On a model whose default window is its
+        // trained one — 107k tokens is ordinary now — that reservation is
+        // larger than the card, the budget for weights comes out at zero, and
+        // a 4B model that fits four times over lands 4 of 33 layers on the
+        // GPU with 5.9 GB free beside it. Measured, on an 8 GB card.
         //
-        // q8_0 is what `auto` actually lands on under pressure, and pressure is
-        // the only regime where this number changes the answer — with room to
-        // spare every layer fits whatever the cache costs.
+        // So the floor is a window worth having rather than the window asked
+        // for. Place the weights, then let the context take what is left:
+        // layers on the GPU are worth far more than a window nothing will use.
+        let window = opts.context_length.min(PLANNING_WINDOW);
+
+        // Which cache type is decided later, and `auto` picks the smallest
+        // that fits when memory is tight, down to q4_0. Assuming f16 is not
+        // the conservative choice it looks like — it doubles the floor against
+        // a cache the runtime would have quantised. q8_0 is where `auto`
+        // actually lands under pressure.
         let assumed = match opts.cache_type_k {
             ozgent_core::accel::CacheType::Auto => ozgent_core::accel::CacheType::Q8_0,
             explicit => explicit,
         };
         let overhead =
-            ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, opts.context_length, assumed);
+            ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed);
         let (layers, experts) = resolve_auto(
             opts.gpu_layers,
             opts.cpu_moe,
@@ -483,5 +501,63 @@ mod plan_tests {
     fn a_full_gpu_offloads_nothing_rather_than_overcommitting() {
         let est = fit_to_vram(512 << 20, 32, 200 << 20, 0, 1 << 30);
         assert_eq!(est.layers, 0, "overhead alone does not fit");
+    }
+}
+
+#[cfg(test)]
+mod elastic_cache_tests {
+    use super::*;
+
+    /// Roughly a 4B at Q4 with a 107k trained window, on an 8 GB card — the
+    /// case that put 4 of 33 layers on the GPU and left 5.9 GB unused.
+    const LAYERS: u32 = 33;
+    const PER_LAYER: u64 = 103 << 20;
+    const FREE: u64 = 7680 << 20;
+
+    /// What the old planner did: reserve the whole requested window first.
+    fn reserving(window_bytes: u64) -> FitEstimate {
+        fit_to_vram(FREE, LAYERS, PER_LAYER, 0, window_bytes)
+    }
+
+    #[test]
+    fn reserving_a_huge_window_first_is_what_emptied_the_gpu() {
+        // Not a test of current behaviour — a record of why the floor exists.
+        // A 107k window costs more than the card, so nothing was left for
+        // weights.
+        let whole_window = 7500u64 << 20;
+        assert!(reserving(whole_window).layers < 5, "this is the bug being fixed");
+    }
+
+    #[test]
+    fn reserving_only_a_usable_floor_puts_the_whole_model_on_the_gpu() {
+        // 8k of cache for this model is a few hundred MB, and 3.3 GB of
+        // weights fits the remaining budget several times over.
+        let floor = 300u64 << 20;
+        let est = reserving(floor);
+        assert_eq!(est.layers, LAYERS, "every layer should fit");
+    }
+
+    #[test]
+    fn the_planning_window_is_a_floor_not_the_window_that_gets_used() {
+        // A model asking for less than the floor reserves only what it asked
+        // for; one asking for more still reserves just the floor, and takes
+        // the rest for context afterwards.
+        assert_eq!(4096u32.min(PLANNING_WINDOW), 4096);
+        assert_eq!(107_008u32.min(PLANNING_WINDOW), PLANNING_WINDOW);
+        assert_eq!(32_768u32.min(PLANNING_WINDOW), PLANNING_WINDOW);
+    }
+
+    #[test]
+    fn a_model_too_big_for_the_card_still_offloads_what_fits() {
+        // The floor must not make the planner optimistic to the point of
+        // claiming a model fits when it does not.
+        let est = fit_to_vram(FREE, LAYERS, 400 << 20, 0, 300 << 20);
+        assert!(est.layers > 0 && est.layers < LAYERS, "got {}", est.layers);
+    }
+
+    #[test]
+    fn a_card_with_nothing_spare_still_offloads_nothing() {
+        let est = fit_to_vram(200 << 20, LAYERS, PER_LAYER, 0, 300 << 20);
+        assert_eq!(est.layers, 0);
     }
 }

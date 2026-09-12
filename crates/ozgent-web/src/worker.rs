@@ -565,6 +565,22 @@ fn serve_model(
             return Ok(None);
         }
     };
+    // Said on every load, not only a partial one. "How much of this is on the
+    // GPU" is the first question when something is slow, and a line that only
+    // appears when the answer is bad means silence has to be read as good
+    // news — which nobody does.
+    tracing::info!(
+        "{}: {} of {} layers on the GPU{}",
+        found.model,
+        engine.gpu_layers_used(),
+        engine.n_layer(),
+        if engine.gpu_layers_used() >= engine.n_layer() {
+            String::new()
+        } else {
+            format!(", {} on the CPU", engine.n_layer() - engine.gpu_layers_used())
+        }
+    );
+
     // The weights are resident, so the next model may now plan against a
     // figure that includes them. Held any longer — to the end of this
     // function, which is the whole life of the thread — and the second model
