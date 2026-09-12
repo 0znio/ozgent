@@ -338,3 +338,150 @@ mod tests {
         assert_eq!(f.layers, 0);
     }
 }
+
+/// What of a model to put on the GPU, decided against the memory that is
+/// actually free right now.
+///
+/// Read from the driver at load time rather than tracked, which matters once
+/// more than one model can be resident: the figure then accounts for the other
+/// models, and for anything else on the card — a game, a notebook, a second
+/// ozgent. Bookkeeping of our own would drift from all three.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plan {
+    /// Layers to offload. Every layer when the model fits.
+    pub layers: u32,
+    /// Layers to evict routed experts from. Zero on a dense model.
+    pub experts: u32,
+    pub total_layers: u32,
+    /// Free device memory the decision was made against.
+    pub free_bytes: u64,
+}
+
+impl Plan {
+    /// Everything on the GPU, for when there is nothing to weigh up.
+    fn wide_open(total_layers: u32, free_bytes: u64) -> Self {
+        // `u32::MAX` rather than `total_layers`: llama.cpp clamps it, and a
+        // file whose tensor table could not be read reports zero layers, which
+        // must not become "offload nothing".
+        Self { layers: u32::MAX, experts: 0, total_layers, free_bytes }
+    }
+
+    pub fn for_model(path: &std::path::Path, opts: &ozgent_core::Resolved) -> Self {
+        let layout = crate::layout::read(path).unwrap_or_default();
+        let device = best_gpu();
+        let free = device.as_ref().map(|d| d.memory_free as u64).unwrap_or(0);
+
+        // No GPU, or a file we could not measure. Hand it to llama.cpp as
+        // before rather than inventing a number from nothing.
+        let Some(device) = device.filter(Device::is_gpu) else {
+            return Self::wide_open(layout.layers, free);
+        };
+        if layout.layers == 0 || layout.bytes_per_layer == 0 {
+            return Self::wide_open(layout.layers, free);
+        }
+
+        // The KV cache and compute buffers stay resident whatever else is
+        // evicted, so they come off the budget before any weight does.
+        //
+        // Which cache, though, is decided later — and `auto` picks the
+        // *smallest type that fits* when memory is tight, down to q4_0. So
+        // assuming f16 here is not the conservative choice it looks like: it
+        // doubles the overhead against a cache the runtime would have
+        // quantised, and on a card that already holds another model it ate the
+        // entire budget and offloaded nothing. Measured: a second 4B model got
+        // 0 layers where 14 fit.
+        //
+        // q8_0 is what `auto` actually lands on under pressure, and pressure is
+        // the only regime where this number changes the answer — with room to
+        // spare every layer fits whatever the cache costs.
+        let assumed = match opts.cache_type_k {
+            ozgent_core::accel::CacheType::Auto => ozgent_core::accel::CacheType::Q8_0,
+            explicit => explicit,
+        };
+        let overhead =
+            ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, opts.context_length, assumed);
+        let (layers, experts) = resolve_auto(
+            opts.gpu_layers,
+            opts.cpu_moe,
+            Some(&device),
+            layout.layers,
+            layout.bytes_per_layer,
+            layout.expert_bytes_per_layer,
+            overhead,
+        );
+        Self { layers, experts, total_layers: layout.layers, free_bytes: free }
+    }
+
+    /// Whether this is the whole model on the GPU.
+    pub fn is_full(&self) -> bool {
+        self.total_layers == 0 || self.layers >= self.total_layers
+    }
+
+    /// How much of the model lands on the GPU, 0 to 1. What a caller uses to
+    /// decide whether a load is worth doing or whether to make room first.
+    pub fn share(&self) -> f32 {
+        if self.total_layers == 0 {
+            return 1.0;
+        }
+        (self.layers.min(self.total_layers) as f32) / (self.total_layers as f32)
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn plan(layers: u32, total: u32) -> Plan {
+        Plan { layers, experts: 0, total_layers: total, free_bytes: 0 }
+    }
+
+    #[test]
+    fn a_model_that_fits_is_reported_as_fully_offloaded() {
+        assert!(plan(32, 32).is_full());
+        assert_eq!(plan(32, 32).share(), 1.0);
+        // llama.cpp is handed u32::MAX when there is nothing to weigh up, and
+        // clamps it itself; that is still the whole model.
+        assert!(Plan::wide_open(32, 0).is_full());
+    }
+
+    #[test]
+    fn a_partial_offload_reports_the_share_that_landed_on_the_gpu() {
+        assert!(!plan(16, 32).is_full());
+        assert_eq!(plan(16, 32).share(), 0.5);
+        assert_eq!(plan(0, 32).share(), 0.0);
+    }
+
+    #[test]
+    fn a_file_we_could_not_measure_offloads_everything_rather_than_nothing() {
+        // layout::read failing reports zero layers. Treating that as "offload
+        // nothing" would silently move a working model onto the CPU.
+        let unknown = Plan::wide_open(0, 0);
+        assert!(unknown.is_full());
+        assert_eq!(unknown.share(), 1.0);
+        assert_eq!(unknown.layers, u32::MAX, "hand it to llama.cpp as before");
+    }
+
+    #[test]
+    fn an_empty_gpu_still_takes_the_whole_model() {
+        // The regression this guards: making `auto` mean "what fits" must not
+        // make the ordinary single-model case offload less than it used to.
+        let est = fit_to_vram(8 << 30, 32, 100 << 20, 0, 1 << 30);
+        assert_eq!(est.layers, 32, "3.2 GB of layers into 8 GB free");
+        assert_eq!(est.cpu_moe, None);
+    }
+
+    #[test]
+    fn a_gpu_with_another_model_on_it_takes_what_is_left() {
+        // 8 GB card, 3.9 GB already used by another model, 1 GB of overhead:
+        // some layers fit, not all, and the answer is a number rather than a
+        // failure.
+        let est = fit_to_vram(4 << 30, 32, 200 << 20, 0, 1 << 30);
+        assert!(est.layers > 0 && est.layers < 32, "got {}", est.layers);
+    }
+
+    #[test]
+    fn a_full_gpu_offloads_nothing_rather_than_overcommitting() {
+        let est = fit_to_vram(512 << 20, 32, 200 << 20, 0, 1 << 30);
+        assert_eq!(est.layers, 0, "overhead alone does not fit");
+    }
+}

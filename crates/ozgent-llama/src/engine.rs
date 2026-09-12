@@ -115,11 +115,24 @@ impl Engine {
             return Err(EngineError::Missing { path: path.display().to_string() });
         }
 
+        // What `auto` should mean, and now does.
+        //
+        // It used to become u32::MAX — "every layer on the GPU" — and llama.cpp
+        // would clamp that to the layer count and try. On an empty GPU with a
+        // model that fits, that is the right answer and still is. On a GPU that
+        // already holds something else it is not an answer at all: the load
+        // either fails or thrashes, and neither says why.
+        //
+        // The planner in backend.rs knows how to choose, from the file's own
+        // tensor table and the driver's live free-memory figure. It was written
+        // and tested and then wired only to expert eviction, so the option
+        // documented as "the smallest offload that fits in VRAM" never searched
+        // for anything on a dense model. It searches now.
+        let plan = crate::backend::Plan::for_model(path, opts);
         let requested_layers = match opts.gpu_layers {
             GpuLayers::Count(n) => n,
             GpuLayers::Keyword(GpuKeyword::Off) => 0,
-            // llama.cpp clamps to the real layer count.
-            GpuLayers::Keyword(GpuKeyword::Auto) => u32::MAX,
+            GpuLayers::Keyword(GpuKeyword::Auto) => plan.layers,
         };
 
         let mut params = Box::pin(LlamaModelParams::default()
@@ -138,44 +151,18 @@ impl Engine {
         // nothing. Resolving it needs the per-layer and per-expert byte costs,
         // which come from the file's tensor table rather than from llama.cpp.
         let resolved_moe = match opts.cpu_moe {
+            // Both halves of the decision come from one plan: choosing layers
+            // and choosing experts against different readings of free VRAM
+            // would be two answers to one question.
             MoeOffload::Keyword(MoeKeyword::Auto) => {
-                let layout = crate::layout::read(path).unwrap_or_default();
-                if layout.is_moe() {
-                    let device = crate::backend::best_gpu();
-                    // The KV cache and compute buffers have to stay resident,
-                    // so they come off the budget before any weight does.
-                    let overhead = ozgent_core::accel::kv_bytes(
-                        layout.kv_elements_per_token,
-                        opts.context_length,
-                        // Auto KV sizing happens later against the loaded
-                        // model; F16 is the conservative assumption here, so a
-                        // wrong guess leaves headroom rather than overcommitting.
-                        if opts.cache_type_k == ozgent_core::accel::CacheType::Auto {
-                            ozgent_core::accel::CacheType::F16
-                        } else {
-                            opts.cache_type_k
-                        },
+                if plan.experts > 0 {
+                    tracing::info!(
+                        "cpu-moe auto: evicting routed experts from {} of {} layers",
+                        plan.experts,
+                        plan.total_layers
                     );
-                    let (_, moe) = crate::backend::resolve_auto(
-                        opts.gpu_layers,
-                        opts.cpu_moe,
-                        device.as_ref(),
-                        layout.layers,
-                        layout.bytes_per_layer,
-                        layout.expert_bytes_per_layer,
-                        overhead,
-                    );
-                    if moe > 0 {
-                        tracing::info!(
-                            "cpu-moe auto: evicting routed experts from {moe} of {} layers",
-                            layout.layers
-                        );
-                    }
-                    MoeOffload::Layers(moe)
-                } else {
-                    // Nothing to evict on a dense model.
-                    MoeOffload::Layers(0)
                 }
+                MoeOffload::Layers(plan.experts)
             }
             other => other,
         };
