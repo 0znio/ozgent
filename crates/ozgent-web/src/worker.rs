@@ -19,7 +19,7 @@ use ozgent_tools::Toolbox;
 use std::sync::Arc;
 use ozgent_llama::engine::{Engine, StopReason};
 use ozgent_llama::thinking::{Chunk, ThinkingFilter};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, channel};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A unit of work for the inference thread.
@@ -161,10 +161,12 @@ pub enum Event {
     AgentEnd { name: String, ok: bool, ms: u64, calls: usize, rounds: usize },
 }
 
-/// Handle to the inference thread.
+/// Handle to the models. Routes each job to the thread holding its model,
+/// starting one when nothing has it yet.
 #[derive(Clone)]
 pub struct Worker {
-    tx: Sender<Job>,
+    pool: Arc<crate::pool::Pool>,
+    context: Context,
 }
 
 /// The projector type, aliased so the lifetime stays readable in signatures.
@@ -204,8 +206,26 @@ pub fn current_tools(tools: &SharedTools) -> Option<Tools> {
     tools.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Everything a model thread needs, shared by all of them.
+#[derive(Clone)]
+struct Context {
+    paths: Paths,
+    config: SharedConfig,
+    tools: SharedTools,
+    permissions: Permissions,
+    cli: CliOptions,
+}
+
+/// The key embeddings are held under.
+///
+/// Its own thread rather than a branch inside a chat model's loop: the
+/// embedding model is a different model, and pinning it to whichever chat
+/// model happened to be resident meant it was dropped and reloaded every time
+/// that one changed.
+const EMBED_KEY: &str = "\u{0}embeddings";
+
 impl Worker {
-    /// Start the thread. It lives for the process.
+    /// Start the router. Model threads come and go beneath it.
     pub fn spawn(
         paths: Paths,
         config: SharedConfig,
@@ -213,37 +233,104 @@ impl Worker {
         permissions: Permissions,
         cli: CliOptions,
     ) -> Self {
-        let (tx, rx) = channel::<Job>();
-        std::thread::Builder::new()
-            .name("ozgent-inference".into())
-            .spawn(move || run(paths, config, tools, permissions, cli, rx))
-            .expect("spawning the inference thread");
-        Self { tx }
+        Self {
+            pool: Arc::new(crate::pool::Pool::default()),
+            context: Context { paths, config, tools, permissions, cli },
+        }
     }
 
-    /// Queue a generation. Returns an error only if the thread has died.
+    /// Queue a generation, loading the model if it is not already resident.
     pub fn submit(&self, request: Request) -> Result<(), &'static str> {
-        self.tx
-            .send(Job::Generate(Box::new(request)))
-            .map_err(|_| "the inference thread is not running")
+        // Keyed on the canonical reference, not on what the caller typed: an
+        // alias and the full `name:tag` are one model, and keying on the text
+        // would load it twice and hold two copies in VRAM.
+        let key = match ozgent_core::resolve(&self.context.paths, &request.model) {
+            Ok(found) => found.model.to_string(),
+            Err(e) => {
+                // Reported on the turn's own stream. The alternative — an
+                // error from `submit` — reaches an HTTP handler that has
+                // already started streaming and cannot say anything.
+                let _ = request.out.send(Event::Error { message: e.to_string() });
+                return Ok(());
+            }
+        };
+        self.send(&key, Job::Generate(Box::new(request)))
     }
 
-    /// Embed texts on the inference thread.
-    ///
-    /// Synchronous by design: an embedding request has nothing to stream, and
-    /// the caller wants the vectors or an error, not a channel.
+    /// Embed texts. Synchronous: there is nothing to stream, and the caller
+    /// wants the vectors or an error rather than a channel.
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.tx
-            .send(Job::Embed { texts, reply: tx })
-            .map_err(|_| "the inference thread is not running".to_string())?;
-        rx.recv().map_err(|_| "the inference thread stopped".to_string())?
+        let (tx, rx) = channel();
+        self.send(EMBED_KEY, Job::Embed { texts, reply: tx })
+            .map_err(str::to_string)?;
+        rx.recv().map_err(|_| "the embedding thread stopped".to_string())?
     }
 
+    /// Drop every loaded model and free its VRAM.
     pub fn unload(&self) {
-        let _ = self.tx.send(Job::Unload);
+        self.pool.unload_all();
+    }
+
+    /// Which models are resident, most recently used first.
+    pub fn loaded(&self) -> Vec<String> {
+        self.pool.names().into_iter().filter(|n| n != EMBED_KEY).collect()
+    }
+
+    /// Hand a job to the thread for `key`, starting one if there is none.
+    fn send(&self, key: &str, job: Job) -> Result<(), &'static str> {
+        // Retried once. A model thread can time out and exit in the moment
+        // between being found in the pool and being sent to, and a person
+        // should not see that race as a failure. `SendError` hands the job
+        // back, so the second attempt sends the same one rather than a copy.
+        let mut job = job;
+        for attempt in 0..2 {
+            let tx = {
+                // Checking and starting are one step: two callers that both
+                // find nothing would otherwise each start a thread, and the
+                // second would replace the first in the pool while the first
+                // went on holding a model nobody could reach.
+                let _starting = self.pool.starting();
+                match self.pool.get(key) {
+                    Some(tx) => tx,
+                    None => self.start(key),
+                }
+            };
+            match tx.send(job) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::SendError(returned)) if attempt == 0 => job = returned,
+                Err(_) => break,
+            }
+        }
+        Err("the model stopped before it could be given the work")
+    }
+
+    /// Start a thread for a model and register it.
+    fn start(&self, key: &str) -> std::sync::mpsc::Sender<Job> {
+        let (tx, rx) = channel::<Job>();
+        let member = self.pool.insert(key, tx.clone());
+        let context = self.context.clone();
+        let key = key.to_string();
+        let embedding = key == EMBED_KEY;
+        let name = format!("ozgent-{}", if embedding { "embed" } else { &key });
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                if embedding {
+                    run_embeddings(context, rx);
+                } else {
+                    run_model(context, rx, &member);
+                }
+                member.leave();
+                // The engine was dropped with the frame above. Freeing it is
+                // not the same as giving it back; see `release_memory`.
+                release_memory();
+            })
+            .expect("spawning a model thread");
+        tx
     }
 }
+
+
 
 /// Outer loop: owns nothing but the channel, and loads a model on demand.
 /// The server's configuration, shared with the HTTP handlers that edit it.
@@ -287,44 +374,78 @@ pub type CliOptions = std::sync::Arc<ozgent_core::Options>;
 
 pub type SharedGrants = std::sync::Arc<std::sync::Mutex<ozgent_core::Grants>>;
 
-fn run(
-    paths: Paths,
-    config: SharedConfig,
-    tools: SharedTools,
-    permissions: Permissions,
-    cli: CliOptions,
-    rx: Receiver<Job>,
-) {
-    let mut pending: Option<Box<Request>> = None;
-    // Held across model loads: the embedding model is independent of whichever
-    // chat model happens to be resident.
+/// One model's thread: load it, serve it, and stop when it goes idle.
+///
+/// Pinned to a single model, which is what lets several be resident at once.
+/// It used to swap models in place, which meant a browser on one and a
+/// terminal on another reloaded on every alternation.
+fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membership) {
+    // Nothing is loaded until there is something to answer. A model thread
+    // that started because a request arrived always has one waiting.
     let mut embedder: Option<ozgent_llama::embed::Embedder> = None;
-    loop {
-        // Either carry over the job that forced a model switch, or wait.
-        let request = match pending.take() {
-            Some(r) => r,
-            None => match rx.recv() {
-                Ok(Job::Generate(r)) => r,
-                Ok(Job::Embed { texts, reply }) => {
-                    let _ = reply.send(serve_embeddings(&paths, &snapshot(&config), &mut embedder, texts));
-                    continue;
-                }
-                Ok(Job::Unload) => continue, // nothing loaded
-                Err(_) => return,            // all senders dropped
-            },
-        };
-
-        // Loading and the session that borrows it both live in this scope, so
-        // the borrow checker is satisfied without any self-referential trick.
-        match serve_model(&paths, &config, &tools, &permissions, &cli, &mut embedder, request, &rx) {
-            Ok(next) => pending = next,
-            Err(e) => tracing::error!("inference thread: {e}"),
+    let first = loop {
+        match rx.recv() {
+            Ok(Job::Generate(r)) => break r,
+            // Embeddings have their own thread; one arriving here is a caller
+            // that has not been updated, and answering it is cheaper than
+            // failing it.
+            Ok(Job::Embed { texts, reply }) => {
+                let _ = reply.send(serve_embeddings(
+                    &context.paths,
+                    &snapshot(&context.config),
+                    &mut embedder,
+                    texts,
+                ));
+            }
+            Ok(Job::Unload) => return,
+            Err(_) => return,
         }
-        // The engine was dropped by the line above, whether it was unloaded,
-        // timed out, or swapped for another model. Freeing it is not the same
-        // as giving it back: see `release_memory`.
-        if pending.is_none() {
-            release_memory();
+    };
+
+    // Loading and the session that borrows it both live in this scope, so the
+    // borrow checker is satisfied without any self-referential trick — and
+    // that is exactly why each model gets a thread rather than a slot in a
+    // collection.
+    if let Err(e) = serve_model(
+        &context.paths,
+        &context.config,
+        &context.tools,
+        &context.permissions,
+        &context.cli,
+        &mut embedder,
+        first,
+        &rx,
+        member,
+    ) {
+        tracing::error!("{e}");
+    }
+}
+
+/// The embedding model's thread.
+///
+/// Separate because it is a separate model: held inside a chat model's loop it
+/// was dropped and reloaded every time that model changed, which is a load of
+/// its own for every switch.
+fn run_embeddings(context: Context, rx: Receiver<Job>) {
+    let mut embedder: Option<ozgent_llama::embed::Embedder> = None;
+    while let Ok(job) = rx.recv() {
+        match job {
+            Job::Embed { texts, reply } => {
+                let _ = reply.send(serve_embeddings(
+                    &context.paths,
+                    &snapshot(&context.config),
+                    &mut embedder,
+                    texts,
+                ));
+            }
+            Job::Unload => return,
+            // Not this thread's work. Answered rather than dropped so the
+            // turn ends with a reason instead of a closed stream.
+            Job::Generate(request) => {
+                let _ = request.out.send(Event::Error {
+                    message: "that request reached the embedding model".into(),
+                });
+            }
         }
     }
 }
@@ -367,7 +488,12 @@ fn serve_model(
     embedder: &mut Option<ozgent_llama::embed::Embedder>,
     first: Box<Request>,
     rx: &Receiver<Job>,
+    member: &crate::pool::Membership,
 ) -> anyhow::Result<Option<Box<Request>>> {
+    // The name this thread answers to, canonically. Comparing the raw strings
+    // callers send would treat an alias and its own `name:tag` as different
+    // models — the pool keys on the resolved reference, so the check here must
+    // too or every alias request would bounce straight back out.
     let wanted = first.model.clone();
     let found = match ozgent_core::resolve(paths, &wanted) {
         Ok(f) => f,
@@ -399,6 +525,31 @@ fn serve_model(
     let name = found.model.to_string();
     let _ = out.send(Event::Loading { model: name.clone(), progress: 0.0 });
     let mut last = 0u32;
+
+    // Planning and loading under one lock. Two models loading at once would
+    // each read the same free memory, each conclude they fit, and together
+    // not: the driver's figure only falls once the weights are actually
+    // resident. Generation is not serialised — only this is.
+    //
+    // If what is left would squeeze this model badly, idle models are dropped
+    // first and the plan is made again. A model half on the GPU is fine; one
+    // pushed almost entirely onto the CPU because something nobody is using
+    // still holds VRAM is not.
+    let (admitted, plan) = {
+        let weights = weights.clone();
+        let resolved = resolved.clone();
+        member.admit(crate::pool::PlanFor(move || {
+            ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+        }))
+    };
+    if !plan.is_full() {
+        tracing::info!(
+            "{name}: {} of {} layers on the GPU, the rest on the CPU",
+            plan.layers,
+            plan.total_layers
+        );
+    }
+
     let engine = match Engine::load_reporting(&weights, &resolved, move |p| {
         let pct = (p * 100.0) as u32;
         if pct > last {
@@ -414,7 +565,18 @@ fn serve_model(
             return Ok(None);
         }
     };
+    // The weights are resident, so the next model may now plan against a
+    // figure that includes them. Held any longer — to the end of this
+    // function, which is the whole life of the thread — and the second model
+    // blocks for ever on a lock the first never lets go of. Not hypothetical:
+    // that is what the first version of this did, and it hung on the 9B.
+    drop(admitted);
+
     let mut session = engine.session(&resolved)?;
+    // Registered busy so nothing evicts it mid-load; it is loaded now, and the
+    // turn loop below takes the flag again for each answer. Without this a
+    // model would stay marked busy for ever and never become evictable.
+    member.working(false);
     // Loaded on the first turn that needs it and kept: it costs VRAM, but a
     // conversation with one image usually has more.
     let mut projector: Option<crate::worker::LoadedProjector<'_>> = None;
@@ -468,7 +630,11 @@ fn serve_model(
             }
         }
 
-        if let Err(e) = turn(
+        // Held across the turn so this model cannot be chosen as the one to
+        // evict while somebody is reading its answer. Cleared afterwards,
+        // which also stamps it as recently used for the eviction order.
+        member.working(true);
+        let outcome = turn(
             &engine,
             &mut session,
             &per_turn,
@@ -477,7 +643,9 @@ fn serve_model(
             permissions,
             projector.as_ref(),
             &request,
-        ) {
+        );
+        member.working(false);
+        if let Err(e) = outcome {
             let _ = request.out.send(Event::Error { message: e.to_string() });
         }
         // A turn that ended while a question was outstanding leaves nobody to
@@ -520,7 +688,14 @@ fn serve_model(
                 Job::Unload => return Ok(None),
             }
         };
-        if request.model != wanted {
+        // The pool routes by resolved reference, so this should never differ.
+        // Checked anyway, and compared the way the pool compares: a request
+        // that did somehow reach the wrong model must not be answered by it.
+        let same = request.model == wanted
+            || ozgent_core::resolve(paths, &request.model)
+                .map(|f| f.model.to_string() == found.model.to_string())
+                .unwrap_or(false);
+        if !same {
             return Ok(Some(request));
         }
     }
@@ -1895,19 +2070,28 @@ mod tests {
         assert_eq!(summarise(&serde_json::json!("first\nsecond")), "first");
     }
 
-    #[test]
-    fn a_dead_worker_is_reported_rather_than_panicking() {
-        // Dropping the receiver simulates the thread having exited; submitting
-        // must surface an error so the handler can return a 500 instead of
-        // hanging the request forever.
-        let (tx, rx) = channel::<Job>();
-        drop(rx);
-        let worker = Worker { tx };
-        let (out, _keep) = tokio::sync::mpsc::unbounded_channel();
-        let result = worker.submit(Request {
+    /// A worker over an empty ozgent directory: no models are installed, so
+    /// nothing can ever be loaded and no thread is ever started.
+    fn empty_worker(root: &std::path::Path) -> Worker {
+        let config: SharedConfig = Arc::new(std::sync::Mutex::new(Config::default()));
+        Worker::spawn(
+            Paths::with_root(root),
+            Arc::clone(&config),
+            Arc::new(std::sync::Mutex::new(None)),
+            Permissions {
+                pending: Arc::new(crate::permission::Pending::default()),
+                grants: Arc::new(std::sync::Mutex::new(ozgent_core::Grants::default())),
+                config,
+            },
+            Arc::new(ozgent_core::Options::default()),
+        )
+    }
+
+    fn request(model: &str, out: tokio::sync::mpsc::UnboundedSender<Event>) -> Request {
+        Request {
             // No stream is being watched in a test.
             can_ask: false,
-            model: "any".into(),
+            model: model.into(),
             messages: Vec::new(),
             thinking: None,
             max_tokens: None,
@@ -1921,7 +2105,39 @@ mod tests {
             tools_off: Vec::new(),
             handoff: Vec::new(),
             out,
-        });
-        assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn a_model_that_is_not_installed_is_reported_on_the_turns_own_stream() {
+        // Not as an error from `submit`: by the time a turn is submitted the
+        // handler has already started streaming and has no way to say
+        // anything except through the stream itself.
+        let dir = std::env::temp_dir().join(format!("ozgent-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = empty_worker(&dir);
+
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        assert!(worker.submit(request("not-installed", out)).is_ok());
+
+        match events.try_recv() {
+            Ok(Event::Error { message }) => assert!(!message.is_empty(), "must say why"),
+            other => panic!("expected an error event, got {other:?}"),
+        }
+        assert_eq!(worker.loaded(), Vec::<String>::new(), "and nothing was loaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_worker_starts_with_nothing_loaded() {
+        // The pool is empty until something is asked for. A daemon that has
+        // answered nothing holds no model at all.
+        let dir = std::env::temp_dir().join(format!("ozgent-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = empty_worker(&dir);
+        assert!(worker.loaded().is_empty());
+        // Unloading nothing is not an error.
+        worker.unload();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

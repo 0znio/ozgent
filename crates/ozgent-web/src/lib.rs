@@ -13,6 +13,7 @@ pub mod hub;
 pub mod media;
 pub mod openai;
 pub mod permission;
+pub mod pool;
 pub mod scheduler;
 pub mod scheduler_api;
 pub mod state;

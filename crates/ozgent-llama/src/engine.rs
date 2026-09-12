@@ -511,6 +511,10 @@ impl Engine {
         // the same reason at a smaller size, and the last one before the floor
         // says least about what actually went wrong.
         let mut first_reason: Option<String> = None;
+        let mut params = params;
+        // Whether the quantised KV cache has already been given up on. Once,
+        // and then never again, so a genuine out-of-memory does not loop.
+        let mut plain_cache = false;
 
         loop {
             crate::llamalog::clear();
@@ -530,6 +534,30 @@ impl Engine {
                     // `e` alone says nothing but "null reference".
                     let reason = crate::llamalog::reason().unwrap_or_else(|| e.to_string());
                     tracing::debug!("context of {window} failed: {reason}");
+
+                    // A quantised KV cache needs flash attention, and whether
+                    // there *is* any is not knowable before the context
+                    // exists: `flash_attention = true` asks llama.cpp for
+                    // AUTO, and it decides per architecture — an MTP model
+                    // gets none. So the cache policy reasons about a feature
+                    // it cannot see, picks q5_1, and the context is refused.
+                    //
+                    // Shrinking the window does not help; the type is the
+                    // problem. Fall back to f16 once, at the full window, and
+                    // let the loop below shrink it if the bigger cache no
+                    // longer fits. Without this the model does not load at
+                    // all, which is how it was found.
+                    if !plain_cache && needs_flash_attention(&reason) {
+                        tracing::info!(
+                            "this model has no flash attention, so the KV cache cannot be \
+                             quantised; using f16"
+                        );
+                        let f16 = ggml_type(ozgent_core::accel::CacheType::F16);
+                        params = params.with_type_k(f16).with_type_v(f16);
+                        plain_cache = true;
+                        window = requested;
+                        continue;
+                    }
                     first_reason.get_or_insert(reason);
 
                     if window <= ozgent_core::accel::MIN_CONTEXT {
@@ -2248,5 +2276,52 @@ mod tests {
     fn a_normal_temperature_builds_a_full_chain() {
         let opts = Options::default().resolve();
         let _ = build_sampler(&opts);
+    }
+}
+
+/// Whether llama.cpp refused a context because the KV cache is quantised and
+/// there is no flash attention to support it.
+///
+/// Matched on the message because llama.cpp reports every context failure as a
+/// null pointer and explains itself only through its log callback.
+fn needs_flash_attention(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("flash attention") && reason.contains("cache")
+}
+
+#[cfg(test)]
+mod flash_fallback_tests {
+    use super::needs_flash_attention;
+
+    #[test]
+    fn llama_cpps_own_wording_is_recognised() {
+        // The message this exists for, verbatim from a 9B MTP model that
+        // could not load at all until the fallback was added.
+        assert!(needs_flash_attention(
+            "llama_init_from_model: failed to initialize the context: quantized V cache \
+             was requested, but this requires Flash Attention"
+        ));
+        assert!(needs_flash_attention(
+            "quantized K cache was requested, but this requires flash attention"
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_out_of_memory_is_not_mistaken_for_it() {
+        // Falling back to an f16 cache would make a genuine shortage worse,
+        // and the retry loop shrinking the window is the right answer there.
+        for other in [
+            "failed to allocate compute buffers",
+            "cuda error: out of memory",
+            "failed to initialize the context",
+            "",
+        ] {
+            assert!(!needs_flash_attention(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_match_does_not_depend_on_how_llama_cpp_capitalises_it() {
+        assert!(needs_flash_attention("QUANTIZED V CACHE ... REQUIRES FLASH ATTENTION"));
     }
 }
