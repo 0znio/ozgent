@@ -1116,14 +1116,32 @@ fn effects(shared: &Arc<Shared>) -> HashMap<String, Effect> {
 /// The conversation this chat continues, creating one if there is none.
 fn conversation(shared: &Arc<Shared>, kind: Kind, chat: &str, msg: &Msg) -> anyhow::Result<i64> {
     let store = shared.app.store.lock().unwrap();
-    if let Some(id) = store.channel_conversation(kind.as_str(), chat)? {
-        return Ok(id);
-    }
-    let title = format!("{kind} · {}", msg.name);
-    let id = store.create_conversation(&title, None)?;
-    // The identities are what the allowlist is written in, and are kept so a
-    // scheduled message can be sent to "whoever is allowed here" and checked
-    // against the list again at the moment it goes out.
+    bind(&store, kind, chat, msg)
+}
+
+/// The store half of [`conversation`], apart so it can be tested without a
+/// whole running gateway.
+fn bind(
+    store: &ozgent_memory::Store,
+    kind: Kind,
+    chat: &str,
+    msg: &Msg,
+) -> anyhow::Result<i64> {
+    let id = match store.channel_conversation(kind.as_str(), chat)? {
+        Some(id) => id,
+        None => {
+            let title = format!("{kind} · {}", msg.name);
+            store.create_conversation(&title, None)?
+        }
+    };
+    // Re-bound on every message, not only the first. The identities are what
+    // the allowlist is written in, and are kept so a scheduled message can be
+    // sent to "whoever is allowed here" and checked against the list again at
+    // the moment it goes out. Binding only when the conversation was created
+    // meant a chat first seen by an older ozgent kept its empty identities for
+    // ever — messaging again could never fix it, because messaging again took
+    // the early return. It also keeps `last_seen_at`, and a display name that
+    // someone has since changed, true.
     store.bind_channel_chat(kind.as_str(), chat, id, &msg.name, &msg.identities())?;
     Ok(id)
 }
@@ -1300,6 +1318,46 @@ async fn say(shared: &Arc<Shared>, kind: Kind, chat: &str, markdown: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(handle: Option<&str>, name: &str) -> Msg {
+        Msg {
+            chat: "c".into(),
+            sender_id: "5752856642".into(),
+            handle: handle.map(str::to_string),
+            name: name.into(),
+            text: "hello".into(),
+            images: Vec::new(),
+            group: false,
+            own: false,
+        }
+    }
+
+    #[test]
+    fn a_chat_bound_before_ozgent_kept_identities_learns_them_on_the_next_message() {
+        // The bug this covers: binding only happened when the conversation was
+        // created, so a chat first seen by an older ozgent kept its empty
+        // identities for ever. Its owner was told to message ozgent — and
+        // messaging ozgent took the early return and changed nothing.
+        let store = ozgent_memory::Store::open_in_memory().unwrap();
+        let c = store.create_conversation("telegram · Marco", None).unwrap();
+        store.bind_channel_chat("telegram", "c", c, "Marco", &[]).unwrap();
+
+        let id = bind(&store, Kind::Telegram, "c", &msg(Some("@Bzinga123"), "Marco")).unwrap();
+
+        assert_eq!(id, c, "the same conversation continues");
+        let chat = store.channel_chats("telegram").unwrap().remove(0);
+        assert!(chat.identities.iter().any(|i| i == "@Bzinga123"), "{:?}", chat.identities);
+        assert!(chat.identities.iter().any(|i| i == "5752856642"), "{:?}", chat.identities);
+    }
+
+    #[test]
+    fn a_display_name_someone_has_changed_is_not_kept_for_ever() {
+        let store = ozgent_memory::Store::open_in_memory().unwrap();
+        bind(&store, Kind::Telegram, "c", &msg(None, "Marco")).unwrap();
+        bind(&store, Kind::Telegram, "c", &msg(None, "Marco P")).unwrap();
+        assert_eq!(store.channel_chats("telegram").unwrap()[0].display, "Marco P");
+        assert_eq!(store.channel_chats("telegram").unwrap().len(), 1, "one chat, not two");
+    }
 
     #[test]
     fn arguments_are_shown_as_lines_a_phone_can_hold() {

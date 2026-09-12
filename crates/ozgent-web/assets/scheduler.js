@@ -25,8 +25,8 @@ function el(tag, cls, text) {
   return e;
 }
 
-/// A unix time as a short local string. The server sends instants; only the
-/// browser knows what the reader's clock says.
+// A unix time as a short local string. The server sends instants; only the
+// browser knows what the reader's clock says.
 function when_(unix) {
   if (!unix) return "";
   const d = new Date(unix * 1000);
@@ -161,10 +161,10 @@ function card(job) {
   return c;
 }
 
-/// Which job histories are open, so redrawing does not shut them.
+// Which job histories are open, so redrawing does not shut them.
 const open = new Set();
 
-/// What the closed row says, so it is worth opening — or worth not opening.
+// What the closed row says, so it is worth opening — or worth not opening.
 function historyLabel(job) {
   if (!job.runs) return "Never run";
   const when = job.last_run_at ? when_(job.last_run_at) : "";
@@ -228,7 +228,7 @@ async function fillHistory(body, name) {
   }
 }
 
-/// The pill colour for a run, so a failure is visible while scrolling.
+// The pill colour for a run, so a failure is visible while scrolling.
 function runKind(run) {
   return { ok: "good", error: "bad", missed: "warn", running: "live" }[run.status] ?? "";
 }
@@ -247,8 +247,8 @@ function button(label, icon, onclick, disabled) {
   return b;
 }
 
-/// How the last run went, as one word. A job failing since Tuesday has to be
-/// visible without opening it.
+// How the last run went, as one word. A job failing since Tuesday has to be
+// visible without opening it.
 function statusPill(job) {
   const map = {
     ok: ["ok", "good"],
@@ -278,20 +278,42 @@ async function change(name, body) {
 }
 
 async function runNow(name) {
+  let hosted = false;
   try {
     const out = await api(`/api/scheduler/${encodeURIComponent(name)}/run`, { method: "POST" });
+    hosted = out.hosted;
     // Never claim it ran: it is queued, and with nothing hosting it is queued
     // indefinitely.
     banner(
-      out.hosted
-        ? `${name} will run within a minute. Its answer goes where the job says.`
+      hosted
+        ? `${name} is starting. Its answer goes where the job says.`
         : `${name} is due, but nothing is running jobs yet.`,
-      out.hosted ? "" : "bad"
+      hosted ? "" : "bad"
     );
   } catch (e) {
     banner(e.message, "bad");
+    return;
   }
-  load();
+  await load();
+  if (hosted) chase(name);
+}
+
+// Watch one job closely for a few seconds.
+//
+// The list refreshes every twenty seconds, which is right for jobs firing on
+// their own and far too slow just after a button was pressed: the run starts
+// at once and the page still said nothing about it for most of a minute,
+// which reads as a button that did not work. This follows it until it is
+// running, then hands back to the ordinary refresh — the run itself can take
+// minutes, and polling for all of it would be a page that never rests.
+async function chase(name) {
+  for (const wait of [500, 1000, 1500, 2000, 3000, 4000]) {
+    await new Promise((r) => setTimeout(r, wait));
+    if (!$("sheet").hidden) return;
+    await load();
+    const job = (state.jobs ?? []).find((j) => j.name === name);
+    if (job?.last_status === "running") return;
+  }
 }
 
 async function remove(job) {
@@ -349,7 +371,7 @@ function deliverChanged() {
     : `${audience} ${to} is not connected right now, so nothing arrives until it is.`;
 }
 
-/// Read the rule back from the server and show when it would actually fire.
+// Read the rule back from the server and show when it would actually fire.
 let previewTimer = null;
 function schedulePreview() {
   clearTimeout(previewTimer);

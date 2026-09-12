@@ -42,9 +42,9 @@ use crate::worker::Event;
 ///
 /// It normally sleeps until the next job is due, which for an overnight gap is
 /// hours. This ceiling exists because the database is shared: a job created in
-/// another process, or made due by "run now", changes when the next wake
-/// *should* be, and nothing tells this loop. A minute is the promise the
-/// `schedule` tool makes to the model about how soon `run` takes effect.
+/// *another* process changes when the next wake should be, and nothing tells
+/// this loop. Anything happening in *this* process rings
+/// [`ozgent_schedule::wake`] instead and does not wait for the ceiling at all.
 const MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The shortest, so a job that reschedules itself into the past cannot spin.
@@ -94,7 +94,11 @@ pub fn start(state: &State) {
             // tick. With nothing scheduled this is one wake a minute, and the
             // work each one does is a single indexed lookup that matches
             // nothing — which is what lets the daemon sit idle for days.
-            tokio::time::sleep(if held { until_next(&state) } else { MAX_SLEEP }).await;
+            let nap = if held { until_next(&state) } else { MAX_SLEEP };
+            tokio::select! {
+                _ = tokio::time::sleep(nap) => {}
+                _ = ozgent_schedule::woken() => {}
+            }
         }
     });
 }
@@ -428,7 +432,8 @@ fn model_for(state: &State, job: &Job) -> Result<String, String> {
         return Ok(named.clone());
     }
     state.config.lock().unwrap().answering_model().ok_or_else(|| {
-        "no model is set to answer with. Pick one with `ozgent default <model>`,          or give this job its own on the scheduler page."
+        "no model is set to answer with. Pick one with `ozgent default <model>`, \
+         or give this job its own on the scheduler page."
             .to_string()
     })
 }
@@ -617,23 +622,35 @@ fn deliver(state: &State, job: &Job, answer: &str) -> Result<bool, String> {
         .get()
         .ok_or("no gateway is running in this process, so there is nothing to send with")?;
 
-    let chats = {
-        let allow = {
-            let config = state.config.lock().unwrap();
-            config.channels.access(kind).allow.to_vec()
-        };
+    let allow = {
+        let config = state.config.lock().unwrap();
+        config.channels.access(kind).allow.to_vec()
+    };
+    let (chats, known) = {
         let store = state.store.lock().unwrap();
-        destination.recipients(&store, &allow)
+        (destination.recipients(&store, &allow), store.channel_chats(channel).unwrap_or_default())
     };
     if chats.is_empty() {
         // Said as a failure rather than passed over: the job ran, produced an
         // answer, and nobody got it. Silence here is the thing that makes a
         // scheduler untrustworthy.
+        //
+        // And said with what is actually on both sides of the comparison.
+        // "Nobody has messaged ozgent yet" is a lie when somebody has and the
+        // allow list simply names them differently, and it sends whoever
+        // reads it to do the one thing that will not help.
         return Err(match job.deliver_to.as_deref() {
             Some(_) => format!("{channel} has no chat matching this job's destination"),
+            None if known.is_empty() => format!(
+                "nobody has messaged ozgent on {channel} yet, so there is no chat to \
+                 send to. Message it once from {channel} and it will know."
+            ),
             None => format!(
-                "nobody on {channel}'s allow list has messaged ozgent yet, so there is \
-                 no chat to send to. Message it once from {channel} and it will know."
+                "{channel} knows {}, but the allow list says {} and none of them match. \
+                 Add one of those to [channels.{channel}] allow, or message ozgent once \
+                 from {channel} so it learns that account's other names.",
+                describe(&known),
+                allow.join(", "),
             ),
         });
     }
@@ -658,6 +675,29 @@ fn deliver(state: &State, job: &Job, answer: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The chats a channel has bound, as something a person can compare against
+/// their allow list.
+fn describe(chats: &[ozgent_memory::ChannelChat]) -> String {
+    let mut parts: Vec<String> = chats
+        .iter()
+        .take(4)
+        .map(|c| {
+            let mut names: Vec<&str> = c.identities.iter().map(String::as_str).collect();
+            if !names.contains(&c.chat_id.as_str()) {
+                names.push(&c.chat_id);
+            }
+            match c.display.trim() {
+                "" => names.join("/"),
+                display => format!("{display} ({})", names.join("/")),
+            }
+        })
+        .collect();
+    if chats.len() > parts.len() {
+        parts.push(format!("and {} more", chats.len() - parts.len()));
+    }
+    parts.join(", ")
+}
+
 /// The answer as it arrives in a chat.
 ///
 /// Headed with the job's name because it arrives unprompted: a block of text
@@ -680,6 +720,47 @@ fn headed(job: &Job, answer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::describe;
+
+    fn chat(display: &str, id: &str, identities: &[&str]) -> ozgent_memory::ChannelChat {
+        ozgent_memory::ChannelChat {
+            channel: "telegram".into(),
+            chat_id: id.into(),
+            conversation_id: 1,
+            display: display.into(),
+            identities: identities.iter().map(|s| s.to_string()).collect(),
+            last_seen_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_failed_delivery_names_what_the_channel_actually_knows() {
+        // So the person reading it can compare it against their allow list
+        // rather than being told to do the one thing that will not help.
+        let text = describe(&[chat("Marco", "5752856642", &["5752856642", "@Bzinga123"])]);
+        assert!(text.contains("Marco"), "{text}");
+        assert!(text.contains("@Bzinga123"), "{text}");
+    }
+
+    #[test]
+    fn a_chat_with_no_identities_is_still_named_by_its_id() {
+        let text = describe(&[chat("", "5752856642", &[])]);
+        assert_eq!(text, "5752856642");
+    }
+
+    #[test]
+    fn an_id_already_among_the_identities_is_not_said_twice() {
+        let text = describe(&[chat("Marco", "42", &["42"])]);
+        assert_eq!(text, "Marco (42)");
+    }
+
+    #[test]
+    fn a_long_list_is_cut_rather_than_filling_the_error() {
+        let chats: Vec<_> = (0..9).map(|n| chat("", &n.to_string(), &[])).collect();
+        let text = describe(&chats);
+        assert!(text.ends_with("and 5 more"), "{text}");
+    }
+
     use super::*;
     use ozgent_memory::jobs::NewJob;
 

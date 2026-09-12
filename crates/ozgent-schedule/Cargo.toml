@@ -9,6 +9,7 @@ ozgent-core.workspace = true
 ozgent-memory.workspace = true
 ozgent-tools.workspace = true
 serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 serde_json.workspace = true
 tracing.workspace = true
 

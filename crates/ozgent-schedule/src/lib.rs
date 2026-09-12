@@ -123,6 +123,33 @@ impl Deliver {
     }
 }
 
+/// Rung when something has changed when the next job is due.
+///
+/// The runner sleeps until the job it can see is due, which is what lets a
+/// daemon sit idle for a day. That figure is worked out *before* the sleep, so
+/// anything that writes an earlier due time — "run now", a new job a minute
+/// out, a job switched back on — has to say so, or it waits out a sleep that
+/// was correct when it started and is not any more.
+///
+/// It lives here rather than in the runner because the people who need to ring
+/// it are the `schedule` tool and the HTTP handlers, and both already depend on
+/// this crate while neither should depend on the other.
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Tell the runner to look again now.
+///
+/// Safe with no runner in this process, and safe outside a tokio runtime: a
+/// notify with nobody waiting keeps one permit, which the runner takes as soon
+/// as it waits.
+pub fn wake() {
+    WAKE.notify_one();
+}
+
+/// Wait until someone rings [`wake`]. For the runner.
+pub async fn woken() {
+    WAKE.notified().await;
+}
+
 /// Everything needed to create a job, before it is checked.
 #[derive(Debug, Clone, Default)]
 pub struct Draft {
@@ -281,6 +308,9 @@ pub fn create(store: &Store, draft: &Draft) -> Result<Job, Problem> {
         Problem::NameTaken(_) => Problem::NameTaken(name.clone()),
         other => other,
     })?;
+    // Rung here rather than at each of the three callers, so a fourth cannot
+    // forget: a job due in thirty seconds is due in thirty seconds.
+    wake();
     store.get_job(id)?.ok_or_else(|| Problem::Store("the job vanished as it was written".into()))
 }
 
@@ -375,9 +405,11 @@ pub fn update(store: &Store, name: &str, edit: &Change) -> Result<Job, Problem> 
     if apply.is_empty() {
         return Ok(job);
     }
-    store
+    let job = store
         .update_job(job.id, &apply)?
-        .ok_or_else(|| Problem::NoSuchJob(name.to_string()))
+        .ok_or_else(|| Problem::NoSuchJob(name.to_string()))?;
+    wake();
+    Ok(job)
 }
 
 /// A requested change. `None` leaves a field alone; `Some(None)` clears it.
@@ -498,6 +530,31 @@ pub fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_runner_is_woken_whether_or_not_it_is_already_waiting() {
+        // One test, not two: the bell is global, so two of them racing in the
+        // same process would each satisfy the other's wait.
+        //
+        // Rung first, waited on after — which is the "run now" case, where the
+        // runner is busy finishing the previous job when the button is
+        // pressed. A ring dropped here leaves the button as slow as it was
+        // before there was a bell.
+        wake();
+        tokio::time::timeout(std::time::Duration::from_millis(200), woken())
+            .await
+            .expect("a ring with nobody waiting should be kept");
+
+        // And the ordinary case: asleep until something says to look.
+        let waiting = tokio::spawn(woken());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        wake();
+        tokio::time::timeout(std::time::Duration::from_millis(500), waiting)
+            .await
+            .expect("a sleeping runner should be woken")
+            .unwrap();
+    }
+
+
     use super::*;
 
     fn store() -> Store {

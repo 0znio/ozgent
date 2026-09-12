@@ -227,13 +227,15 @@ impl ScheduleTools {
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| describe(Problem::NoSuchJob(name.clone())))?;
                 store.set_next_run(job.id, Some(unix_now())).map_err(|e| e.to_string())?;
+                crate::wake();
                 Ok(json!({
                     "job": job.name,
                     "queued": true,
                     // Said plainly because it is not instant, and a model that
                     // thinks it is will report an answer that has not happened.
-                    "note": "It will run within about a minute. Its answer is delivered \
-                             the way the job says, not as part of this conversation.",
+                    "note": "It starts in a moment, and takes as long as the question \
+                             takes. Its answer is delivered the way the job says, not \
+                             as part of this conversation.",
                 }))
             }
 

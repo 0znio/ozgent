@@ -133,12 +133,24 @@ written, so taking somebody off the allowlist stops their deliveries without
 touching the job. Name one chat with `--to` if a job is meant for one person
 out of several.
 
-Ozgent learns a chat id the first time that person messages it. Until then
-there is nothing to send to, and a run says so in as many words:
+Ozgent learns who a chat belongs to when that person messages it — their
+numeric id, their handle, whichever of them the allowlist happens to be written
+in. Until then there is nothing to send to, and a run says so in as many words:
 
 ```
-nobody on telegram's allow list has messaged ozgent yet, so there is no chat
-to send to. Message it once from telegram and it will know.
+nobody has messaged ozgent on telegram yet, so there is no chat to send to.
+Message it once from telegram and it will know.
+```
+
+When somebody *has* messaged and the delivery still finds nobody, the allowlist
+and the chat are naming the same person differently — an allowlist that says
+`@handle` against a chat ozgent only ever knew by number. The failure says what
+is on both sides rather than repeating advice that cannot help:
+
+```
+telegram knows Marco (5752856642), but the allow list says @Bzinga123 and none
+of them match. Add one of those to [channels.telegram] allow, or message ozgent
+once from telegram so it learns that account's other names.
 ```
 
 Every run is recorded either way, including the boring ones. A job that quietly

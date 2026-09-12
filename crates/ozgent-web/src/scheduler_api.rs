@@ -364,6 +364,10 @@ async fn run_now(
     store
         .set_next_run(job.id, Some(unix_now()))
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Written, then said out loud. The loop is asleep on a figure worked out
+    // before that write, and without this the button did nothing visible
+    // until the next look — up to a minute of a page that looks broken.
+    ozgent_schedule::wake();
     Ok(Json(serde_json::json!({
         "queued": job.name,
         "hosted": crate::scheduler::hosted(),
