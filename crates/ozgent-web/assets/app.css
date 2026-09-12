@@ -2082,3 +2082,190 @@ a.ghost-btn { text-decoration: none; }
   .tools-tray-head .hint { display: none; }
   .tray-chip { display: none; }
 }
+
+/* ======================================================================
+   /scheduler
+   ----------------------------------------------------------------------
+   Built on the admin page's vocabulary — the same cards, pills, fields and
+   switches — because they are the same kind of page and a second set of
+   idioms would be two things to keep in step. What is new here is the job
+   card and the two sheets, and nothing else.
+   ====================================================================== */
+
+.sch-list { display: flex; flex-direction: column; gap: var(--s4); }
+
+.sch-job { display: flex; flex-direction: column; gap: var(--s3); padding: var(--s4) var(--s5); }
+/* A paused job stays legible — it is still information — but stops competing
+   with the ones that are actually going to run. */
+.sch-job.off { opacity: .62; }
+.sch-job-head { display: flex; align-items: center; gap: var(--s3); }
+.sch-job-head h2 { margin: 0; font-size: 17px; letter-spacing: -.01em; }
+
+.sch-when { margin: 0; color: var(--accent); font-size: 14px; }
+.sch-asks {
+  margin: 0; color: var(--ink-soft); font-size: 14px; line-height: 1.5;
+  /* The prompt can be long; two lines is enough to recognise it by. */
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sch-chips { margin: 0; }
+
+.sch-job-foot {
+  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+  padding-top: var(--s3); border-top: 1px solid var(--line-soft);
+}
+.sch-next { font-size: var(--t-small); color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.sch-act { display: inline-flex; align-items: center; gap: 6px; font-size: var(--t-small); padding: 5px 10px; }
+.sch-act .ic { width: 14px; height: 14px; }
+.sch-act:disabled { opacity: .4; cursor: default; }
+
+.adm-pill.warn {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+/* --- nothing scheduled yet ------------------------------------------- */
+
+.sch-empty {
+  display: flex; flex-direction: column; align-items: center; gap: var(--s3);
+  text-align: center; padding: var(--s8) var(--s4);
+  color: var(--ink-soft); max-width: 44ch; margin: 0 auto;
+}
+.sch-empty p { margin: 0; }
+.sch-empty-ic { width: 32px; height: 32px; color: var(--ink-faint); }
+
+/* --- the editor and the run history ---------------------------------- */
+
+.sch-sheet {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: var(--s5) var(--s4); overflow-y: auto;
+}
+.sch-sheet-bg { position: fixed; inset: 0; background: rgb(16 21 26 / .45); }
+.sch-panel {
+  position: relative; width: min(620px, 100%);
+  display: flex; flex-direction: column; gap: var(--s4);
+  box-shadow: var(--shadow-lift);
+  /* Its own scroll, so a long run history does not scroll the page behind it. */
+  max-height: calc(100dvh - var(--s7));
+  overflow-y: auto;
+}
+.sch-panel-head { display: flex; align-items: center; gap: var(--s3); }
+.sch-panel-head h2 { margin: 0; font-size: 18px; }
+.sch-panel-foot { display: flex; align-items: center; gap: var(--s2); }
+.sch-two { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s4); }
+.sch-panel textarea.text-input { resize: vertical; font: inherit; line-height: 1.5; }
+
+/* --- reading the rule back ------------------------------------------- */
+
+.sch-preview {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  background: var(--accent-soft);
+  border-radius: var(--radius); padding: var(--s3);
+  font-size: 13px; display: flex; flex-direction: column; gap: var(--s2);
+}
+.sch-preview.bad {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+  color: var(--danger);
+}
+.sch-preview-words { font-weight: 600; }
+.sch-preview-times { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.sch-preview-times li { display: flex; gap: var(--s3); }
+.sch-preview-at { font-variant-numeric: tabular-nums; min-width: 13ch; }
+
+/* --- what happened last time ----------------------------------------- */
+
+.sch-run {
+  border-top: 1px solid var(--line-soft); padding: var(--s3) 0;
+  display: flex; flex-direction: column; gap: var(--s2);
+}
+.sch-run-head { display: flex; align-items: center; gap: var(--s3); }
+.sch-run-when { font-size: var(--t-small); font-variant-numeric: tabular-nums; color: var(--ink-soft); }
+.sch-run-out {
+  margin: 0; padding: var(--s3);
+  background: var(--panel); border-radius: var(--radius-sm);
+  font: inherit; font-size: 13px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  /* Long enough to judge the answer by, short enough to scan a fortnight. */
+  max-height: 16em; overflow-y: auto;
+}
+
+@media (max-width: 560px) {
+  .sch-two { grid-template-columns: 1fr; }
+  .sch-job-foot { gap: var(--s1); }
+  .sch-next { width: 100%; }
+}
+
+/* A scheduled job, in a transcript.
+   ----------------------------------------------------------------------
+   Deliberately not a tool card. A tool card says "this was looked up and
+   here is what came back"; a job is a commitment that something will happen
+   later, which is a different kind of thing and reads as one. */
+.job-pill {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  margin: var(--s2) 0;
+  padding: 7px var(--s3);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: var(--accent-soft);
+  border-radius: 999px;
+  font-size: var(--t-small); color: var(--ink);
+  text-decoration: none; max-width: 100%;
+}
+.job-pill:hover { border-color: var(--accent); }
+.job-pill .ic { width: 14px; height: 14px; color: var(--accent); flex: none; }
+.job-pill .job-verb { font-weight: 600; }
+.job-pill .job-name { font-family: var(--mono); }
+.job-pill .job-when {
+  color: var(--ink-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Per-message actions.
+   ----------------------------------------------------------------------
+   Hidden until the message is hovered or something in it has focus. These are
+   corrections, not part of reading a conversation, and a row of buttons under
+   every turn makes a transcript look like a control panel. Always visible on
+   a touch screen, where there is no hover to reveal them with. */
+.msg-acts {
+  grid-column: 2;
+  display: flex; gap: var(--s1); margin-top: var(--s1);
+  opacity: 0; transition: opacity .12s ease;
+}
+.msg:hover .msg-acts,
+.msg:focus-within .msg-acts { opacity: 1; }
+@media (hover: none) { .msg-acts { opacity: 1; } }
+
+.msg-act {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 0; background: none; cursor: pointer;
+  padding: 3px 6px; border-radius: var(--radius-sm);
+  color: var(--ink-faint); font: inherit; font-size: var(--t-micro);
+}
+.msg-act:hover { color: var(--ink); background: var(--panel); }
+.msg-act .ic { width: 13px; height: 13px; }
+
+/* Searching every conversation.
+   ----------------------------------------------------------------------
+   In the sidebar, above the list it filters, because that is the list you
+   were looking at when you gave up finding it by eye. */
+.search-box { position: relative; display: flex; align-items: center; }
+.search-box .ic {
+  position: absolute; left: 9px; width: 14px; height: 14px;
+  color: var(--ink-faint); pointer-events: none;
+}
+.search-box input { padding-left: 30px; }
+.search-results { display: flex; flex-direction: column; gap: 2px; }
+.search-hit {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: var(--s2) var(--s3); border-radius: var(--radius-sm);
+  cursor: pointer; border: 0; background: none; text-align: left;
+  font: inherit; color: var(--ink-soft); width: 100%;
+}
+.search-hit:hover { background: var(--panel); }
+.search-hit .hit-title { color: var(--ink); font-size: var(--t-small); font-weight: 600; }
+.search-hit .hit-text {
+  font-size: var(--t-small); line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.search-none { padding: var(--s3); font-size: var(--t-small); color: var(--ink-faint); }

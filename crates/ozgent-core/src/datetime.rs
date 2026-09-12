@@ -81,6 +81,34 @@ impl DateTime {
     /// market" depend on it, and a model cannot derive it from the date.
     /// UTC is stated rather than implied, so the model does not assume local
     /// time it has no way to know.
+    /// A wall-clock time, with no zone attached.
+    ///
+    /// `weekday` is derived, so callers building a time never have to know it.
+    pub fn civil(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Self {
+        let days = days_from_civil(year, month, day);
+        Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            weekday: (days + 4).rem_euclid(7) as u32,
+        }
+    }
+
+    /// Seconds since the epoch, reading these fields as UTC.
+    ///
+    /// The exact inverse of [`DateTime::from_unix`]. A scheduler needs both
+    /// directions: "09:20 on the next weekday" is decided in civil fields and
+    /// has to come back as an instant.
+    pub fn to_unix(&self) -> i64 {
+        days_from_civil(self.year, self.month, self.day) * 86_400
+            + self.hour as i64 * 3600
+            + self.minute as i64 * 60
+            + self.second as i64
+    }
+
     pub fn prompt_line(&self) -> String {
         format!(
             "Today is {}, {} {} {}. The current time is {:02}:{:02} UTC.",
@@ -98,7 +126,7 @@ impl DateTime {
 ///
 /// Howard Hinnant's `civil_from_days`, which is exact for the proleptic
 /// Gregorian calendar over any range that fits in `i64`.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -109,6 +137,22 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days since the Unix epoch from a civil date.
+///
+/// Hinnant's `days_from_civil`, the exact inverse of [`civil_from_days`] for
+/// any date the proleptic Gregorian calendar defines.
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let m = month as i64;
+    let d = day as i64;
+    let y = if m <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -215,5 +259,41 @@ mod tests {
         assert!((1..=12).contains(&t.month));
         assert!((1..=31).contains(&t.day));
         assert!(t.hour < 24 && t.minute < 60);
+    }
+
+    #[test]
+    fn the_two_conversions_are_exact_inverses() {
+        // Every scheduled fire is computed in civil fields and stored as an
+        // instant, so a one-day drift here is a brief delivered on the wrong
+        // morning.
+        for secs in [
+            0, -1, 1, 1_000_000_000, 1_600_000_000, 1_767_225_600, 1_709_164_800,
+            4_107_456_000, 951_782_400, -2_208_988_800,
+        ] {
+            assert_eq!(DateTime::from_unix(secs).to_unix(), secs, "for {secs}");
+        }
+    }
+
+    #[test]
+    fn a_civil_time_knows_its_own_weekday() {
+        // Callers build "09:20 on the 20th" without knowing the weekday; the
+        // recurrence rules then match on it.
+        let t = DateTime::civil(2025, 8, 20, 9, 20, 0);
+        assert_eq!(t.weekday_name(), "Wednesday");
+        assert_eq!(t.to_unix(), 1_755_648_000 + 9 * 3600 + 20 * 60);
+    }
+
+    #[test]
+    fn every_day_of_a_leap_year_round_trips() {
+        let mut day = days_from_civil(2024, 1, 1);
+        let end = days_from_civil(2025, 1, 1);
+        let mut seen = 0;
+        while day < end {
+            let t = DateTime::from_unix(day * 86_400);
+            assert_eq!(days_from_civil(t.year, t.month, t.day), day);
+            day += 1;
+            seen += 1;
+        }
+        assert_eq!(seen, 366, "2024 is a leap year");
     }
 }

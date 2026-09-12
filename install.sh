@@ -22,6 +22,7 @@ ASSUME_YES=0
 SKIP_DEPS=0
 DRY_RUN=0
 UNINSTALL=0
+NO_SERVICE=0
 
 usage() {
   cat <<'USAGE'
@@ -33,6 +34,7 @@ Usage: ./install.sh [options]
   --skip-deps      do not install system packages
   --yes            do not ask before installing packages
   --dry-run        print what would happen, change nothing
+  --no-service     do not offer to run ozgent in the background
   --uninstall      remove a previous installation and exit
   -h, --help       this
 
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
     --yes|-y)    ASSUME_YES=1; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --no-service) NO_SERVICE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -82,6 +85,26 @@ run() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Whether ozgent already has a service installed, whatever the init system.
+# Asking ozgent itself rather than guessing at paths keeps the two from
+# disagreeing about where a service lives.
+ozgent_service_installed() {
+  [ -x "$BINLINK" ] || return 1
+  "$BINLINK" daemon status 2>/dev/null | grep -q '^service *[^ ]' &&
+    ! "$BINLINK" daemon status 2>/dev/null | grep -q 'not installed'
+}
+
+# Pick up a newly installed binary. Each init spells this differently, and a
+# failure is not worth stopping an install over.
+restart_service() {
+  case "$("$BINLINK" daemon status 2>/dev/null | awk '/^init/ {print $2}')" in
+    systemd) run systemctl --user restart ozgent 2>/dev/null || true ;;
+    launchd) run launchctl kickstart -k "gui/$(id -u)/com.ozgent.daemon" 2>/dev/null || true ;;
+    dinit)   run dinitctl restart ozgent 2>/dev/null || true ;;
+    *)       note "restart it yourself so it picks up the new binary" ;;
+  esac
+}
 
 # Ask, unless told not to. Defaults to yes, because someone who ran an
 # installer has already said what they want.
@@ -128,6 +151,11 @@ ours() {
 if [ "$UNINSTALL" = "1" ]; then
   step "Removing ozgent"
   removed=0
+  # Before the binary goes: `ozgent daemon uninstall` is what knows where the
+  # service file is, and it cannot answer once it has been deleted.
+  if [ -x "$BINLINK" ]; then
+    run "$BINLINK" daemon uninstall >/dev/null 2>&1 || true
+  fi
   for target in "$LIBDIR" "$BINLINK"; do
     if [ -e "$target" ] || [ -L "$target" ]; then
       if [ -w "$(dirname "$target")" ]; then run rm -rf "$target"
@@ -169,8 +197,22 @@ elif [ -r /etc/os-release ]; then
       fedora|rhel|centos)          PM="dnf";    break ;;
       opensuse*|suse|sles)         PM="zypper"; break ;;
       alpine)                      PM="apk";    break ;;
+      void)                        PM="xbps";   break ;;
+      gentoo)                      PM="emerge"; break ;;
+      solus)                       PM="eopkg";  break ;;
+      # Nothing is installed imperatively on NixOS, so there is nothing here
+      # to do — the flags below skip the dependency step and say why.
+      nixos)                       PM="nix";    break ;;
     esac
   done
+  # Older releases of some distributions have no ID_LIKE at all. The command
+  # that is present is then the only evidence, and it is good evidence.
+  if [ -z "$PM" ]; then
+    for candidate in pacman:pacman apt-get:apt dnf:dnf zypper:zypper apk:apk \
+                     xbps-install:xbps emerge:emerge eopkg:eopkg; do
+      command -v "${candidate%%:*}" >/dev/null 2>&1 && { PM="${candidate##*:}"; break; }
+    done
+  fi
 fi
 
 ok "$DISTRO_NAME ($ARCH)"
@@ -259,11 +301,16 @@ esac
 # installed" has no portable answer.
 pkg_for() {
   case "$1:$PM" in
+    cmake:emerge)     echo "dev-build/cmake" ;;
     cmake:*)          echo "cmake" ;;
+    git:emerge)       echo "dev-vcs/git" ;;
     git:*)            echo "git" ;;
+    curl:emerge)      echo "net-misc/curl" ;;
     curl:*)           echo "curl" ;;
 
     python:pacman)    echo "python" ;;
+    python:xbps)      echo "python3" ;;
+    python:emerge)    echo "dev-lang/python" ;;
     python:*)         echo "python3" ;;
 
     compiler:pacman)  echo "base-devel" ;;
@@ -271,6 +318,9 @@ pkg_for() {
     compiler:dnf)     echo "gcc gcc-c++ make" ;;
     compiler:zypper)  echo "gcc gcc-c++ make" ;;
     compiler:apk)     echo "build-base" ;;
+    compiler:xbps)    echo "base-devel" ;;
+    compiler:emerge)  echo "sys-devel/gcc" ;;
+    compiler:eopkg)   echo "-c system.devel" ;;
     compiler:brew)    echo "" ;;          # Xcode command line tools, not brew
 
     # bindgen loads libclang at run time; without it the mtmd bindings fail
@@ -280,11 +330,16 @@ pkg_for() {
     libclang:dnf)     echo "clang-devel" ;;
     libclang:zypper)  echo "clang-devel" ;;
     libclang:apk)     echo "clang-dev" ;;
+    libclang:xbps)    echo "clang" ;;
+    libclang:emerge)  echo "sys-devel/clang" ;;
+    libclang:eopkg)   echo "llvm-clang-devel" ;;
     libclang:brew)    echo "llvm" ;;
 
     pkgconfig:pacman) echo "pkgconf" ;;
     pkgconfig:apt)    echo "pkg-config" ;;
     pkgconfig:dnf)    echo "pkgconf-pkg-config" ;;
+    pkgconfig:xbps)   echo "pkg-config" ;;
+    pkgconfig:emerge) echo "dev-util/pkgconf" ;;
     pkgconfig:*)      echo "pkg-config" ;;
 
     cuda:pacman)      echo "cuda" ;;
@@ -295,6 +350,7 @@ pkg_for() {
     vulkan:apt)       echo "libvulkan-dev glslc spirv-tools" ;;
     vulkan:dnf)       echo "vulkan-headers vulkan-loader-devel glslc" ;;
     vulkan:zypper)    echo "vulkan-devel shaderc" ;;
+    vulkan:xbps)      echo "vulkan-loader-devel Vulkan-Headers shaderc" ;;
     vulkan:*)         echo "" ;;
   esac
 }
@@ -387,7 +443,13 @@ install_pkgs() {
     dnf)    run $SUDO dnf install -y "$@" ;;
     zypper) run $SUDO zypper --non-interactive install "$@" ;;
     apk)    run $SUDO apk add --no-cache "$@" ;;
+    xbps)   run $SUDO xbps-install -Sy "$@" ;;
+    emerge) run $SUDO emerge --noreplace "$@" ;;
+    eopkg)  run $SUDO eopkg install -y "$@" ;;
     brew)   run brew install "$@" ;;
+    # NixOS installs nothing imperatively; `nix-shell -p` is the equivalent
+    # and is the user's call, not this script's.
+    nix)    return 1 ;;
     *)      return 1 ;;
   esac
 }
@@ -431,6 +493,13 @@ elif [ "$SKIP_DEPS" = "1" ]; then
 elif [ -z "$PM" ]; then
   bad "missing:$NEEDED, and there is no known package manager here"
   note "Install them by hand, then re-run with --skip-deps."
+  exit 1
+elif [ "$PM" = "nix" ]; then
+  # Nothing on NixOS is installed imperatively, so offering to try would only
+  # fail confusingly. The shell that does work is one line, so it is given.
+  bad "missing:$NEEDED"
+  note "On NixOS, build inside a shell that has them:"
+  note "  nix-shell -p cmake gcc clang pkg-config python3 git curl --run './install.sh --skip-deps'"
   exit 1
 else
   packages=""
@@ -700,12 +769,38 @@ case ":$PATH:" in
     ;;
 esac
 
+# ------------------------------------------------------------- the daemon
+
+# ozgent knows which init system this is and how to write a service for it —
+# systemd, OpenRC, runit, s6, dinit or launchd. All this has to decide is
+# whether to ask.
+step "Background service"
+
+if [ "$NO_SERVICE" = "1" ]; then
+  note "skipped (--no-service)"
+elif [ "${MOVED:-0}" = "1" ] || ozgent_service_installed; then
+  # Already there: re-running the installer replaces the binary underneath it,
+  # so the service only needs a nudge to pick the new one up.
+  ok "a service is already installed"
+  restart_service
+else
+  note "One ozgent in the background means scheduled jobs run, Telegram and"
+  note "WhatsApp are answered, and nothing loads a second copy of the model."
+  note "It holds no model at all until something asks it a question."
+  if confirm "Run ozgent in the background, starting at login?"; then
+    run "$BINLINK" daemon install || warn "could not install the service; 'ozgent daemon install' says why"
+  else
+    note "later:  ozgent daemon install"
+  fi
+fi
+
 cat <<DONE
 
 ${B}Done.${R} Next:
 
   ozgent pull unsloth/Qwen3.5-4B-GGUF:Q4_K_M    a model to start with
   ozgent                                        chat in the terminal
+  ozgent daemon install                         run it in the background
   ozgent web                                    browser, http://localhost:7333
   ozgent doctor                                 what this machine can do
 

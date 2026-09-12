@@ -181,6 +181,14 @@ pub struct Tools {
     /// has to know which is which.
     pub host: Arc<Toolbox>,
     pub runtime: tokio::runtime::Handle,
+    /// The scheduler, kept separately as well as inside the toolbox.
+    ///
+    /// It is the one tool that needs to know *who* is asking: a job created
+    /// from a Telegram chat answers back into that chat, and may not be given
+    /// tools that chat did not have. The toolbox deliberately hides which
+    /// source a tool came from, so the handle is held here instead of
+    /// downcasting back out of it.
+    pub scheduler: Option<Arc<ozgent_schedule::ScheduleTools>>,
 }
 
 /// The Python tool host, shared so the settings page can replace it.
@@ -311,6 +319,37 @@ fn run(
         match serve_model(&paths, &config, &tools, &permissions, &cli, &mut embedder, request, &rx) {
             Ok(next) => pending = next,
             Err(e) => tracing::error!("inference thread: {e}"),
+        }
+        // The engine was dropped by the line above, whether it was unloaded,
+        // timed out, or swapped for another model. Freeing it is not the same
+        // as giving it back: see `release_memory`.
+        if pending.is_none() {
+            release_memory();
+        }
+    }
+}
+
+/// Return freed heap to the operating system.
+///
+/// `free()` hands memory back to the allocator, not to the kernel — glibc
+/// keeps it in its arenas ready for the next allocation, so a process that
+/// loads and unloads a model looks, to `ps` and to anyone watching a systemd
+/// unit, as though it never released anything. For a daemon that idles for
+/// twenty hours between two briefs, that difference is the whole point of
+/// unloading, so it is asked for explicitly.
+///
+/// glibc-only and advisory: every other allocator either does this already or
+/// has no equivalent, and there is nothing to do on a failure.
+pub fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: malloc_trim takes a byte count and only ever returns unused
+        // arena pages to the kernel. It cannot invalidate a live pointer.
+        unsafe {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> i32;
+            }
+            malloc_trim(0);
         }
     }
 }
@@ -449,15 +488,36 @@ fn serve_model(
 
         // Keep waiting until something to generate arrives: an embedding
         // request is answered here and does not end the turn loop.
+        // Held only while someone is using it. Returning drops the engine with
+        // this scope, which is the same path `Unload` takes — a server left
+        // running overnight should not be holding several gigabytes of VRAM
+        // for a conversation that ended at six.
+        let idle_for = snapshot(shared).web.idle_unload();
         request = loop {
-            match rx.recv() {
-                Ok(Job::Generate(r)) => break r,
-                Ok(Job::Embed { texts, reply }) => {
+            let job = match idle_for {
+                Some(limit) => match rx.recv_timeout(limit) {
+                    Ok(job) => job,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        tracing::info!(
+                            "idle for {} minutes; unloading {wanted}",
+                            limit.as_secs() / 60
+                        );
+                        return Ok(None);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+                },
+                None => match rx.recv() {
+                    Ok(job) => job,
+                    Err(_) => return Ok(None),
+                },
+            };
+            match job {
+                Job::Generate(r) => break r,
+                Job::Embed { texts, reply } => {
                     let _ = reply.send(serve_embeddings(paths, &snapshot(shared), embedder, texts));
                 }
                 // Unloading means returning so the engine is dropped with the scope.
-                Ok(Job::Unload) => return Ok(None),
-                Err(_) => return Ok(None),
+                Job::Unload => return Ok(None),
             }
         };
         if request.model != wanted {
@@ -1239,6 +1299,8 @@ fn rounds(
             }
         }
         out.calls += approved.iter().filter(|a| a.is_some()).count();
+        // Captured before the futures borrow the request.
+        let can_ask = request.can_ask;
         let outcomes = t.runtime.block_on(futures_util::future::join_all(
             parsed.calls.iter().zip(&approved).zip(&reachable).map(|((call, allowed), reachable)| {
                 let offered_names = offered_names.clone();
@@ -1253,7 +1315,17 @@ fn rounds(
                         );
                     }
                     let Some(by_user) = *allowed else {
-                        return (Err(ozgent_tools::ToolCallError::Declined { name: call.name.clone() }), 0);
+                        // "Declined" and "nobody was there" are different
+                        // facts, and a model told the first apologises to
+                        // somebody who never spoke. On a scheduled run there
+                        // is no user in the conversation at all.
+                        let name = call.name.clone();
+                        let refused = if can_ask {
+                            ozgent_tools::ToolCallError::Declined { name }
+                        } else {
+                            ozgent_tools::ToolCallError::Unattended { name }
+                        };
+                        return (Err(refused), 0);
                     };
                     let started = std::time::Instant::now();
                     let outcome =

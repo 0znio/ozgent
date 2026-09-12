@@ -9,6 +9,7 @@ const el = {
   thinking: $("thinking"), convs: $("conversations"), empty: $("empty"),
   send: $("send"), sidebar: $("sidebar"), attachments: $("attachments"),
   quick: $("quick"),
+  search: $("search"), results: $("search-results"), export: $("export"),
 };
 
 // The handful of settings worth reaching for mid-conversation. Everything else
@@ -725,10 +726,13 @@ async function copyText(text) {
 // The answer lives in its own child so the reasoning block can sit above it
 // inside the body. Putting reasoning beside `.body` made it a flex item of
 // `.msg`, which rendered it as a narrow column next to the text.
-function addMessage(role, text = "") {
+function addMessage(role, text = "", seq = null) {
   document.getElementById("empty")?.remove();
   const wrap = document.createElement("div");
   wrap.className = `msg ${role}`;
+  // What a rewind is addressed by. Present on stored messages; absent on the
+  // pair being written right now, which has no position yet.
+  if (seq != null) wrap.dataset.seq = seq;
   wrap.innerHTML =
     `<div class="who">${role === "user" ? "you" : "oz"}</div>` +
     `<div class="body"><div class="answer"></div></div>`;
@@ -736,9 +740,83 @@ function addMessage(role, text = "") {
   const answer = wrap.querySelector(".answer");
   if (role === "user") answer.innerHTML = withMentions(text);
   else { answer.innerHTML = markdown(text); dressCode(answer); }
+  if (seq != null) wrap.append(messageActions(role, seq, text));
   el.thread.append(wrap);
   scrollToTail();
   return { body, answer };
+}
+
+/// The row of actions under a stored message.
+///
+/// Both of them are a rewind underneath: "regenerate" drops the reply and
+/// asks the same question again; "edit" drops the question too and puts it
+/// back in the composer. One operation, so the two cannot disagree about what
+/// happens to everything after them.
+function messageActions(role, seq, text) {
+  const row = document.createElement("div");
+  row.className = "msg-acts";
+  const add = (label, icon, onclick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "msg-act";
+    b.title = label;
+    b.innerHTML = `<svg class="ic"><use href="#${icon}"></use></svg><span>${label}</span>`;
+    b.onclick = onclick;
+    row.append(b);
+  };
+
+  if (role === "user") {
+    add("Edit", "i-edit", () => editFrom(seq));
+  } else {
+    add("Retry", "i-retry", () => regenerate(seq));
+    add("Copy", "i-copy", async () => {
+      try { await navigator.clipboard.writeText(text); el.stat.textContent = "copied"; }
+      catch { el.stat.textContent = "could not copy"; }
+    });
+  }
+  return row;
+}
+
+/// Drop this reply and everything after it, then ask the question again.
+async function regenerate(seq) {
+  if (state.streaming || !state.conversation) return;
+  // The question is the user message just before the reply being dropped.
+  const question = [...el.thread.querySelectorAll(".msg.user")]
+    .map((m) => ({ seq: Number(m.dataset.seq), text: m.querySelector(".answer")?.textContent ?? "" }))
+    .filter((m) => Number.isFinite(m.seq) && m.seq < seq)
+    .pop();
+  if (!question) return;
+  const out = await rewind(question.seq);
+  send(out?.message ?? question.text);
+}
+
+/// Put a message back in the composer, dropping it and everything after.
+async function editFrom(seq) {
+  if (state.streaming || !state.conversation) return;
+  const out = await rewind(seq);
+  el.input.value = out?.message ?? "";
+  el.input.focus();
+  el.input.dispatchEvent(new Event("input"));
+}
+
+/// Remove everything from `seq` on, on the server and on screen.
+async function rewind(seq) {
+  let out = null;
+  try {
+    out = await api(`/api/conversations/${state.conversation}/rewind`, {
+      method: "POST",
+      body: JSON.stringify({ seq }),
+    });
+  } catch (e) {
+    el.stat.textContent = e.message;
+    return null;
+  }
+  for (const node of [...el.thread.querySelectorAll(".msg")]) {
+    const at = Number(node.dataset.seq);
+    if (Number.isFinite(at) && at >= seq) node.remove();
+  }
+  loadConversations();
+  return out;
 }
 
 /// Reasoning is rendered as markdown too — models format it, and showing the
@@ -1301,6 +1379,10 @@ function noteConsent(answerEl, event, choice) {
 /// Fill in a card once the tool has returned./// Fill in a card once the tool has returned.
 function closeToolCard(card, event) {
   if (!card) return;
+  // A scheduled job is not something the model looked up, it is something
+  // that now exists and will happen later. A collapsed row of JSON says that
+  // badly, so it becomes a pill that links to where the job lives.
+  if (event.ok && event.name === "schedule" && jobPill(card, event)) return;
   card.classList.remove("running");
   card.classList.toggle("bad", !event.ok);
   card.querySelector(".ms").textContent =
@@ -1341,6 +1423,41 @@ function closeToolCard(card, event) {
     pre.textContent = JSON.stringify(event.detail, null, 2).slice(0, 4000);
     detail.append(pre);
   }
+}
+
+/// Replace a `schedule` tool card with a pill naming the job.
+///
+/// Returns false for the calls that are ordinary tool output — listing jobs,
+/// or reading one back — since nothing happened and announcing that it did
+/// would be a lie in the transcript.
+function jobPill(card, event) {
+  const d = event.detail ?? {};
+  const name = typeof d.job === "string" ? d.job : null;
+  if (!name) return false;
+  const verb =
+    d.scheduled ? "Job scheduled"
+    : d.changed ? "Job changed"
+    : d.deleted ? "Job deleted"
+    : d.queued ? "Job queued"
+    : d.paused === true ? "Job paused"
+    : d.paused === false ? "Job resumed"
+    : null;
+  if (!verb) return false;
+
+  const pill = document.createElement("a");
+  pill.className = "job-pill";
+  // Deleted jobs have nowhere of their own to go, but the list still does.
+  pill.href = "/scheduler";
+  pill.innerHTML =
+    '<svg class="ic"><use href="#i-clock"></use></svg>' +
+    '<span class="job-verb"></span><span class="job-name"></span>' +
+    '<span class="job-when"></span>';
+  pill.querySelector(".job-verb").textContent = verb;
+  pill.querySelector(".job-name").textContent = name;
+  const when = d.next_run ? `runs ${d.next_run}` : d.summary ?? "";
+  pill.querySelector(".job-when").textContent = when;
+  card.replaceWith(pill);
+  return true;
 }
 
 /// Arguments on one line, short enough for a transcript row.
@@ -1441,7 +1558,11 @@ async function openConversation(id, { route = true } = {}) {
       '<div class="empty" id="empty"><h1>ozgent</h1><p>Say something to begin.</p></div>';
   }
   for (const m of messages) {
-    const { body, answer } = addMessage(m.role === "user" ? "user" : "assistant", m.text);
+    const { body, answer } = addMessage(
+      m.role === "user" ? "user" : "assistant",
+      m.text,
+      m.seq,
+    );
     // A reload must show the whole turn, not just its conclusion.
     imageStrip(body, (m.media ?? []).map((src) => ({ src, alt: "attachment" })));
     if (m.thinking && m.thinking.trim()) {
@@ -1458,6 +1579,7 @@ async function openConversation(id, { route = true } = {}) {
   }
   loadConversations();
   setDrawer(false);
+  syncExport();
 }
 
 /// Create the conversation the next message will be written to.
@@ -1474,6 +1596,7 @@ async function startConversation() {
   });
   state.conversation = id;
   setRoute(uuid);
+  syncExport();
   return id;
 }
 
@@ -1488,6 +1611,7 @@ function newConversation() {
   setRoute(null);
   loadConversations();
   setDrawer(false);
+  syncExport();
   el.input.focus();
 }
 
@@ -2863,6 +2987,78 @@ el.model.addEventListener("change", async () => {
   settingsCache.options = await api(`/api/models/${encodeURIComponent(el.model.value)}/options`);
   renderParams(settingsCache.options);
 });
+
+// ------------------------------------------------------- search & export
+
+/// Search every conversation, not just this one.
+///
+/// Across all of them because that is the question people actually have:
+/// "where did I talk about the deploy script", with no memory of which thread
+/// it was in. Replaces the conversation list while there is a query, and puts
+/// it back the moment the box is cleared.
+let searchTimer = null;
+el.search?.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const query = el.search.value.trim();
+  if (!query) {
+    el.results.hidden = true;
+    el.convs.hidden = false;
+    return;
+  }
+  // Typed a letter at a time; one request per keystroke would be one per
+  // letter of every word.
+  searchTimer = setTimeout(() => runSearch(query), 220);
+});
+
+async function runSearch(query) {
+  let hits;
+  try {
+    hits = await api(`/api/search?q=${encodeURIComponent(query)}`);
+  } catch {
+    return;
+  }
+  // The box may have been cleared or retyped while this was in flight.
+  if (el.search.value.trim() !== query) return;
+
+  el.convs.hidden = true;
+  el.results.hidden = false;
+  el.results.replaceChildren();
+  if (!hits.length) {
+    const none = document.createElement("p");
+    none.className = "search-none";
+    none.textContent = `Nothing matches “${query}”.`;
+    el.results.append(none);
+    return;
+  }
+  for (const hit of hits) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "search-hit";
+    row.innerHTML = '<span class="hit-title"></span><span class="hit-text"></span>';
+    row.querySelector(".hit-title").textContent = hit.title || "Untitled";
+    row.querySelector(".hit-text").textContent =
+      `${hit.role === "user" ? "you: " : ""}${hit.snippet}`;
+    row.onclick = () => {
+      openConversation(hit.conversation);
+      el.search.value = "";
+      el.results.hidden = true;
+      el.convs.hidden = false;
+    };
+    el.results.append(row);
+  }
+}
+
+/// Download this conversation as Markdown.
+el.export?.addEventListener("click", () => {
+  if (!state.conversation) return;
+  // A plain navigation, so the server's Content-Disposition names the file.
+  window.location.href = `/api/conversations/${state.conversation}/export`;
+});
+
+/// Only offer the download once there is something to download.
+function syncExport() {
+  if (el.export) el.export.hidden = !state.conversation;
+}
 
 boot().catch((e) => {
   el.thread.innerHTML =

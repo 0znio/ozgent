@@ -72,10 +72,18 @@ It is also Settings → General in the web interface, and `default_model` in
 ```toml
 [web]
 admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$…"   # written by `ozgent admin setup`
+idle_unload_minutes = 15   # drop the model after this long with no questions; 0 never does
 
 [tools]
 handoff = true    # the model may pass a request to an @agent by itself
 ```
+
+`idle_unload_minutes` matters most on a machine running
+[the daemon](daemon.md), which is awake for twenty-three hours a day doing
+nothing: a model held for one 9:20 brief holds several gigabytes until
+midnight. The cost of dropping it is one reload — the same wait the first
+question of the day pays anyway. Set `0` if you have VRAM to spare and use the
+same model all day.
 
 The admin password is never stored — only an Argon2id hash of it, set with
 `ozgent admin setup` and replaced with `ozgent admin reset` if it is
@@ -178,6 +186,13 @@ enabled = true
 token   = "…"            # or $OZGENT_TELEGRAM_TOKEN
 allow   = ["@ada"]       # empty admits nobody
 ```
+
+## Scheduled jobs
+
+Jobs are **not** in `config.toml`. They live in ozgent's database, because they
+are data rather than configuration and three surfaces edit them concurrently —
+`ozgent scheduler`, the `/scheduler` page, and the model itself when you ask
+for one in a chat. See [the scheduler](scheduler.md).
 
 ## MCP servers
 

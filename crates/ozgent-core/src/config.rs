@@ -48,8 +48,8 @@ pub struct Config {
     pub web: WebConfig,
 }
 
-/// `[web]`: settings for `ozgent web` itself.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// `[web]`: settings for `ozgent web` and `ozgent daemon`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
     /// An Argon2id hash of the password for `/admin`, where the messaging
@@ -61,12 +61,38 @@ pub struct WebConfig {
     /// says how to open it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_password_hash: Option<String>,
+
+    /// Drop the loaded model after this many idle minutes. `0` never does.
+    ///
+    /// A server holds its model so the next question is instant, which is
+    /// right while someone is using it and wrong for the nineteen hours a day
+    /// they are not — a model kept for one 9:20 brief holds several gigabytes
+    /// of VRAM until midnight. The cost of getting it wrong is one reload,
+    /// which is the same wait the first question of the day pays anyway.
+    #[serde(default = "default_idle_unload")]
+    pub idle_unload_minutes: u64,
+}
+
+fn default_idle_unload() -> u64 {
+    15
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self { admin_password_hash: None, idle_unload_minutes: default_idle_unload() }
+    }
 }
 
 impl WebConfig {
     /// The stored admin password hash, if one is set and is not blank.
     pub fn admin_hash(&self) -> Option<&str> {
         self.admin_password_hash.as_deref().map(str::trim).filter(|p| !p.is_empty())
+    }
+
+    /// How long to hold an idle model, or `None` to hold it indefinitely.
+    pub fn idle_unload(&self) -> Option<std::time::Duration> {
+        (self.idle_unload_minutes > 0)
+            .then(|| std::time::Duration::from_secs(self.idle_unload_minutes * 60))
     }
 }
 

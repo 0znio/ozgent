@@ -4,16 +4,18 @@ Run language models on your own machine — and let them actually *do* things.
 
 ozgent is one Rust binary over llama.cpp. It gives you a terminal app, a web
 interface, an OpenAI- and Anthropic-compatible API, tools that really run,
-`@agents` that use them, and a permission prompt before anything touches your
-disk.
+`@agents` that use them, a scheduler for the things you want without asking,
+and a permission prompt before anything touches your disk.
 
 ![ozgent web interface](docs/images/web.png)
 
 ```bash
 ozgent                    # chat in the terminal
+ozgent daemon install     # run it in the background: jobs, channels, web, API
 ozgent web                # chat in a browser — and answer Telegram and WhatsApp
-ozgent serve              # OpenAI- and Anthropic-compatible API on :7337
 ozgent gateway telegram   # set up a chat app by answering a few questions
+ozgent scheduler add      # something on a timer, with the answer sent to you
+ozgent serve              # the API on its own, on :7337
 ```
 
 ---
@@ -237,6 +239,54 @@ restart.
 
 → [docs/channels.md](docs/channels.md)
 
+### It runs in the background
+
+```bash
+ozgent daemon install    # systemd, OpenRC, runit, s6, dinit or launchd
+```
+
+One process owns the model, the database, the channels and the scheduler, and
+serves the web interface and the API over all of it. Everything else becomes a
+client of it: scheduled jobs run whether or not anything is open, Telegram is
+answered without a terminal left running, and nothing loads a second copy of
+the model.
+
+It holds **no model at all** until something asks it a question, and drops it
+again after fifteen idle minutes — a 4B model at Q4 is around 3 GB, and holding
+it overnight for one morning brief is 3 GB of nothing. Freed memory is returned
+to the kernel rather than parked in the allocator, and the scheduler sleeps
+until the next job is due instead of ticking.
+
+→ [docs/daemon.md](docs/daemon.md)
+
+### Things on a timer
+
+> every weekday at 9:20, send me a pre-market brief on Telegram
+
+Say that in any chat — terminal, browser, phone — and ozgent schedules it. The
+reply carries a **Job scheduled** pill, and the job is then on `/scheduler`,
+where you can retime it, pause it, run it now, or read what last Thursday's
+answer actually said.
+
+```bash
+ozgent scheduler                       what is scheduled
+ozgent scheduler add                   set one up, question by question
+ozgent scheduler when "every weekday at 9:20"   what that actually means
+```
+
+A job can carry a condition — *only if the price moved more than 2%* — so it
+runs on its timer, is recorded every time, and only speaks when there is
+something to say. That is the difference between a brief you read and a
+notification you learn to swipe away.
+
+A scheduled run happens with nobody watching, so it can never approve a tool
+call: tools that run outright still run, anything that would ask is refused,
+and the refusal is part of what arrives.
+
+![the scheduler](docs/images/scheduler.png)
+
+→ [docs/scheduler.md](docs/scheduler.md)
+
 ### An admin page, behind a password
 
 `/admin` holds what should not be one click away from anyone on your network:
@@ -255,6 +305,14 @@ machine is always the way back in.
 Conversations live in SQLite and are shared by every surface — start in the
 terminal, continue in the browser, pick it up on your phone. Facts worth
 keeping are retrieved into later chats.
+
+**Search** goes across every conversation, not just the one you are in — the
+question is always "where did I talk about the deploy script", and nobody
+remembers which thread it was. **Retry** regenerates a reply, **Edit** puts one
+of your messages back in the composer, and either way everything after it is
+dropped, including facts learned from it. Any conversation downloads as
+Markdown, because a local-first program should never be the only thing that can
+read your own data.
 
 ### An OpenAI- and Anthropic-compatible API
 
@@ -298,6 +356,8 @@ ozgent web --inference-mode gpu_ram
 | [agents.md](docs/agents.md) | `@agents`: the built-in ones and making your own |
 | [mcp.md](docs/mcp.md) | connecting MCP servers |
 | [channels.md](docs/channels.md) | Telegram and WhatsApp, and the admin page |
+| [scheduler.md](docs/scheduler.md) | jobs on a timer, and where the answers go |
+| [daemon.md](docs/daemon.md) | running ozgent in the background |
 | [api.md](docs/api.md) | the HTTP API, endpoint by endpoint |
 | [install.md](docs/install.md) | deploying to another machine |
 

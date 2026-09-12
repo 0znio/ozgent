@@ -357,6 +357,32 @@ impl Gateway {
 }
 
 impl GatewayControl for Gateway {
+    fn deliver(&self, kind: Kind, chat: &str, markdown: &str) -> Result<(), String> {
+        if self.shared.lock.lock().unwrap().is_none() {
+            return Err(match self.holder() {
+                Some(who) => format!("{who} is answering the channels, not this process"),
+                None => "this process is not answering the channels".into(),
+            });
+        }
+        let sender = self
+            .shared
+            .senders
+            .lock()
+            .unwrap()
+            .get(&kind)
+            .cloned()
+            .ok_or_else(|| format!("{kind} is not connected"))?;
+        // A fresh token: this is a new message, not an edit of one already
+        // sent, and reusing a token would rewrite somebody's earlier reply.
+        sender
+            .send(Command::Post {
+                chat: chat.to_string(),
+                token: self.shared.tokens.next(),
+                markdown: markdown.to_string(),
+            })
+            .map_err(|_| format!("{kind} stopped before the message could be sent"))
+    }
+
     fn view(&self) -> GatewayView {
         let hosted = self.shared.lock.lock().unwrap().is_some();
         let runtime = self.shared.runtime.lock().unwrap().clone();
@@ -1137,6 +1163,19 @@ async fn turn_for(shared: Arc<Shared>, kind: Kind, chat: String, msg: Msg) {
             // what the rules allow outright runs, and anything that would ask
             // is refused.
             can_ask: access.approve,
+            // A job scheduled from here answers back into this chat, and gets
+            // this channel's tools and no more. Someone messaging a bot is not
+            // necessarily the owner of the machine, and a scheduled job must
+            // not be a way around that.
+            caller: Some(ozgent_schedule::Caller {
+                origin: format!("chat:{kind}:{chat}"),
+                deliver: Some(ozgent_schedule::Deliver::Chat {
+                    channel: kind.as_str().to_string(),
+                    to: chat.clone(),
+                }),
+                allowed_tools: access.tools.map(<[String]>::to_vec),
+                conversation_id: Some(conversation),
+            }),
         },
     );
     let mut events = match started {

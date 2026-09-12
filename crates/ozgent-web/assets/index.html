@@ -89,6 +89,18 @@
   <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <path d="M4.5 12.5l5 5 10-11"/>
   </symbol>
+  <symbol id="i-retry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>
+  </symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z"/>
+  </symbol>
+  <symbol id="i-export" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 16V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4.5 15.5v2A2.5 2.5 0 0 0 7 20h10a2.5 2.5 0 0 0 2.5-2.5v-2"/>
+  </symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>
+  </symbol>
   <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M4 7h16M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7M6.5 7l.8 12A1.5 1.5 0 0 0 8.8 20h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12"/>
   </symbol>
@@ -122,13 +134,25 @@
       </button>
     </div>
 
+    <!-- Above the list it searches, because that is the list you were
+         looking at when you gave up finding it by eye. -->
+    <label class="search-box">
+      <svg class="ic"><use href="#i-search"></use></svg>
+      <input type="search" id="search" class="text-input" placeholder="Search conversations"
+             autocomplete="off" spellcheck="false" aria-label="Search every conversation">
+    </label>
+
     <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
+    <nav class="conversations search-results" id="search-results" hidden aria-label="Search results"></nav>
 
     <div class="sidebar-foot">
       <button class="ghost-btn" id="open-settings">
         <svg class="ic"><use href="#i-settings"></use></svg><span>Settings</span>
       </button>
       <!-- Models and the Telegram/WhatsApp gateway, behind a password. -->
+      <a class="ghost-btn" id="open-scheduler" href="/scheduler">
+        <svg class="ic"><use href="#i-clock"></use></svg><span>Scheduler</span>
+      </a>
       <a class="ghost-btn" id="open-admin" href="/admin">
         <svg class="ic"><use href="#i-shield"></use></svg><span>Admin</span>
       </a>
@@ -152,6 +176,12 @@
       </select>
       <span class="spacer"></span>
       <span class="stat" id="stat"></span>
+      <!-- A local-first program should never be the only thing that can read
+           your own conversations. -->
+      <button class="icon-btn" id="export" data-tip="Download as Markdown"
+              aria-label="Download this conversation as Markdown" hidden>
+        <svg class="ic"><use href="#i-export"></use></svg>
+      </button>
       <!-- The window this model is running with, and how much of it the
            conversation has used. Hidden until a turn reports its cost. -->
       <span class="gauge" id="gauge" title="Context used">

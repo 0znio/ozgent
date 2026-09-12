@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>ozgent scheduler</title>
+  <script>
+    try {
+      var saved = localStorage.getItem("ozgent-theme");
+      if (saved === "light" || saved === "dark") {
+        document.documentElement.setAttribute("data-theme", saved);
+      }
+    } catch (e) { /* private browsing; fall back to the system preference */ }
+  </script>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="adm">
+
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15 6l-6 6 6 6"/>
+  </symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>
+  </symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 5.5l10 6.5-10 6.5z"/>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/>
+  </symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z"/>
+  </symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+    <path d="M12 5v14M5 12h14"/>
+  </symbol>
+</svg>
+
+<div class="adm-shell" id="shell">
+  <header class="adm-top">
+    <a class="icon-btn" href="/" aria-label="Back to the chat" data-tip="Back to the chat">
+      <svg class="ic"><use href="#i-back"></use></svg>
+    </a>
+    <span class="mark">ozgent</span><span class="adm-tag">scheduler</span>
+    <span class="spacer"></span>
+    <a class="ghost-btn auto" href="/admin">Admin</a>
+    <button type="button" class="primary-btn auto" id="new-job">
+      <svg class="ic"><use href="#i-plus"></use></svg> New job
+    </button>
+  </header>
+
+  <section class="adm-view">
+    <div class="adm-head">
+      <h1>Scheduled jobs</h1>
+      <p class="adm-lede">
+        Things ozgent asks itself on a timer, and where the answers go. You can also
+        just say it in a chat — “every weekday at 9:20, send me a pre-market brief”.
+      </p>
+    </div>
+
+    <!-- The failure nobody diagnoses: good jobs, and nothing awake to run them. -->
+    <div class="adm-banner" id="banner" hidden></div>
+
+    <div class="sch-list" id="list"></div>
+
+    <div class="sch-empty" id="empty" hidden>
+      <svg class="ic sch-empty-ic"><use href="#i-clock"></use></svg>
+      <p>Nothing is scheduled yet.</p>
+      <p class="hint">
+        A job is a question ozgent asks itself on a timer — a morning brief, a
+        watch on something that changes, a weekly summary. The answer can come
+        to Telegram, to WhatsApp, or just wait here.
+      </p>
+      <button type="button" class="primary-btn auto" id="empty-new">Schedule something</button>
+    </div>
+  </section>
+</div>
+
+<!-- The editor. One form for both creating and changing, because they are the
+     same fields and two of them would drift apart. -->
+<div class="sch-sheet" id="sheet" hidden>
+  <div class="sch-sheet-bg" data-close></div>
+  <form class="sch-panel adm-card" id="form">
+    <header class="sch-panel-head">
+      <h2 id="form-title">New job</h2>
+      <span class="spacer"></span>
+      <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+    </header>
+
+    <label class="adm-field">
+      <span>Name</span>
+      <input type="text" id="f-name" class="text-input" placeholder="pre-market-brief"
+             autocomplete="off" spellcheck="false" required>
+      <span class="hint inline">What you call it in a chat. Lower case, hyphens.</span>
+    </label>
+
+    <label class="adm-field">
+      <span>Ask it</span>
+      <textarea id="f-prompt" class="text-input" rows="3" required
+                placeholder="A pre-market brief on the Nifty: overnight moves, anything to watch today."></textarea>
+      <span class="hint inline">Write it as a whole question. The job has no other context.</span>
+    </label>
+
+    <label class="adm-field">
+      <span>When</span>
+      <input type="text" id="f-when" class="text-input" required
+             placeholder="every weekday at 9:20" autocomplete="off" spellcheck="false">
+      <span class="hint inline">
+        Plain words, or cron. Try “every day at 6pm”, “every 30 minutes”, “20 9 * * 1-5”.
+      </span>
+    </label>
+
+    <!-- Reading the rule back is what catches a swapped minute and hour before
+         the job silently misses a week. -->
+    <div class="sch-preview" id="preview" hidden></div>
+
+    <div class="sch-two">
+      <label class="adm-field">
+        <span>Asked of</span>
+        <select id="f-agent" class="select"></select>
+      </label>
+      <label class="adm-field">
+        <span>Answer goes to</span>
+        <select id="f-deliver" class="select">
+          <option value="none">nowhere — keep it on this page</option>
+          <option value="telegram">Telegram</option>
+          <option value="whatsapp">WhatsApp</option>
+        </select>
+      </label>
+    </div>
+
+    <label class="adm-field" id="to-field" hidden>
+      <span>Chat</span>
+      <input type="text" id="f-to" class="text-input" placeholder="chat id, or a phone number with its country code"
+             autocomplete="off" spellcheck="false">
+      <span class="hint inline" id="to-hint"></span>
+    </label>
+
+    <label class="adm-field">
+      <span>Only send when <span class="hint">(optional)</span></span>
+      <input type="text" id="f-only-if" class="text-input" autocomplete="off"
+             placeholder="the price moved more than 2%">
+      <span class="hint inline">
+        Leave empty to send every time. With a condition, the job still runs and is
+        recorded, but only speaks when the condition holds — which is the difference
+        between a brief you read and a notification you switch off.
+      </span>
+    </label>
+
+    <label class="adm-field">
+      <span>Timezone <span class="hint">(optional)</span></span>
+      <input type="text" id="f-zone" class="text-input" autocomplete="off"
+             spellcheck="false" placeholder="local">
+      <span class="hint inline" id="zone-hint"></span>
+    </label>
+
+    <p class="error" id="form-error" hidden></p>
+
+    <footer class="sch-panel-foot">
+      <button type="button" class="ghost-btn auto" data-close>Cancel</button>
+      <span class="spacer"></span>
+      <button type="submit" class="primary-btn auto" id="save">Schedule it</button>
+    </footer>
+  </form>
+</div>
+
+<!-- A job's history. Read-only: this is where you find out why Tuesday's brief
+     never arrived. -->
+<div class="sch-sheet" id="runs-sheet" hidden>
+  <div class="sch-sheet-bg" data-close-runs></div>
+  <div class="sch-panel adm-card">
+    <header class="sch-panel-head">
+      <h2 id="runs-title">Runs</h2>
+      <span class="spacer"></span>
+      <button type="button" class="icon-btn" data-close-runs aria-label="Close">✕</button>
+    </header>
+    <div id="runs-body"></div>
+  </div>
+</div>
+
+<script src="/scheduler.js"></script>
+</body>
+</html>

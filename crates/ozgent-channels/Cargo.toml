@@ -8,6 +8,7 @@ license.workspace = true
 ozgent-core.workspace = true
 ozgent-memory.workspace = true
 ozgent-web.workspace = true
+ozgent-schedule.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

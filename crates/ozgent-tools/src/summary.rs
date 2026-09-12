@@ -10,6 +10,42 @@ pub fn describe(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     let action = obj.get("action").and_then(|a| a.as_str()).unwrap_or("");
 
+    // The scheduler. Worth recognising above everything else because the
+    // result is not information the model looked up — it is a thing that now
+    // exists and will happen later, and every surface should say so plainly.
+    if let Some(job) = obj.get("job").and_then(|j| j.as_str()) {
+        let flag = |key: &str| obj.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+        let next = obj.get("next_run").and_then(|n| n.as_str());
+        let verb = if flag("scheduled") {
+            "Job scheduled"
+        } else if flag("changed") {
+            "Job changed"
+        } else if flag("deleted") {
+            "Job deleted"
+        } else if flag("queued") {
+            "Job queued"
+        } else if obj.get("paused").and_then(|p| p.as_bool()) == Some(true) {
+            "Job paused"
+        } else if obj.get("paused").and_then(|p| p.as_bool()) == Some(false) {
+            "Job resumed"
+        } else {
+            ""
+        };
+        if !verb.is_empty() {
+            return Some(match next {
+                Some(next) => format!("{verb} — {job} · runs {next}"),
+                None => format!("{verb} — {job}"),
+            });
+        }
+    }
+    if let Some(jobs) = obj.get("jobs").and_then(|j| j.as_array()) {
+        return Some(match jobs.len() {
+            0 => "nothing is scheduled".to_string(),
+            1 => "1 scheduled job".to_string(),
+            n => format!("{n} scheduled jobs"),
+        });
+    }
+
     // yahoo_finance
     if let Some(quotes) = obj.get("quotes").and_then(|q| q.as_array()) {
         let parts: Vec<String> = quotes
@@ -143,5 +179,59 @@ mod tests {
             "price_vs": {"sma200": 12.34},
         });
         assert_eq!(describe(&v).as_deref(), Some("NVDA technicals · RSI 62 · +12.3% vs 200-day"));
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::describe;
+    use serde_json::json;
+
+    #[test]
+    fn a_scheduled_job_reads_as_a_thing_that_now_exists() {
+        // Not "the tool returned an object": a job was created and will run.
+        let out = describe(&json!({
+            "scheduled": true, "job": "pre-market-brief", "next_run": "in 14 hours",
+            "summary": "every weekday at 09:20"
+        }))
+        .expect("the scheduler must be recognised");
+        assert!(out.starts_with("Job scheduled — pre-market-brief"), "{out}");
+        assert!(out.contains("in 14 hours"), "{out}");
+    }
+
+    #[test]
+    fn every_change_to_a_job_says_which_change_it_was() {
+        let cases = [
+            (json!({"changed": true, "job": "brief"}), "Job changed"),
+            (json!({"deleted": true, "job": "brief"}), "Job deleted"),
+            (json!({"queued": true, "job": "brief"}), "Job queued"),
+            (json!({"paused": true, "job": "brief"}), "Job paused"),
+            (json!({"paused": false, "job": "brief"}), "Job resumed"),
+        ];
+        for (value, expected) in cases {
+            let out = describe(&value).unwrap_or_else(|| panic!("not recognised: {value}"));
+            assert!(out.starts_with(expected), "{value} gave {out:?}");
+            assert!(out.contains("brief"), "{out}");
+        }
+    }
+
+    #[test]
+    fn listing_jobs_counts_them_rather_than_naming_every_one() {
+        assert_eq!(describe(&json!({ "count": 0, "jobs": [] })).unwrap(), "nothing is scheduled");
+        assert_eq!(describe(&json!({ "jobs": [{}] })).unwrap(), "1 scheduled job");
+        assert_eq!(describe(&json!({ "jobs": [{}, {}, {}] })).unwrap(), "3 scheduled jobs");
+    }
+
+    #[test]
+    fn showing_one_job_is_left_to_the_generic_summary() {
+        // `show` returns the job's settings, which is ordinary tool output —
+        // nothing happened, so announcing that something did would be wrong.
+        let out = describe(&json!({ "job": "brief", "asks": "a brief", "paused": null }));
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn a_result_from_another_tool_that_happens_to_have_a_job_key_is_not_claimed() {
+        assert_eq!(describe(&json!({ "job": "something", "unrelated": 1 })), None);
     }
 }

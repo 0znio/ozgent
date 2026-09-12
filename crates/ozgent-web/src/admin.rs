@@ -63,6 +63,16 @@ pub trait GatewayControl: Send + Sync {
     fn link_whatsapp(&self) -> Fut<'_, Result<(), String>>;
     /// Log the linked device out on WhatsApp's side and forget it here.
     fn unlink_whatsapp(&self) -> Fut<'_, Result<(), String>>;
+
+    /// Send a message to a chat that nobody asked a question in.
+    ///
+    /// Every other message a channel sends is a reply, written while a turn is
+    /// running and addressed to whoever spoke. A scheduled job has neither: it
+    /// starts on a timer and has to reach a chat that may have been quiet for
+    /// a week. Failing here is ordinary — the channel may be off, or another
+    /// process may hold it — so the reason comes back to be recorded against
+    /// the run rather than logged and lost.
+    fn deliver(&self, kind: Kind, chat: &str, markdown: &str) -> Result<(), String>;
 }
 
 /// The gateway as a whole.

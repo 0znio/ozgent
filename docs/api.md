@@ -360,7 +360,11 @@ No authentication, except for the `/admin` routes below. `ozgent web` binds
 `--host 127.0.0.1` keeps it to this machine.
 
 All bodies are JSON. Failures are `{"error": "..."}` with `400` when the
-request was wrong and `500` when ozgent was.
+request was wrong, `404` when the thing asked for is not there, and `500` when
+ozgent was wrong. The distinction is load-bearing rather than cosmetic: a
+client that retries on `500` would keep resending a request that can never
+succeed, and a log full of `500`s hides the ones that are actually ozgent's
+fault.
 
 ## Pages and assets
 
@@ -369,7 +373,100 @@ request was wrong and `500` when ozgent was.
 | `GET` | `/`, `/new`, `/chat` | the interface (same HTML; the browser routes) |
 | `GET` | `/app.css`, `/app.js` | its assets, compiled into the binary |
 | `GET` | `/admin`, `/admin.js` | the admin page |
+| `GET` | `/scheduler`, `/scheduler.js` | scheduled jobs |
 | `GET` | `/media/{name}` | an image that was attached to a message |
+
+## Conversations, across all of them
+
+### `GET /api/search?q=…&limit=30`
+
+Full-text search over every message in every conversation. Ranked by bm25;
+each hit carries enough to render a result and open the thread it is in.
+
+```json
+[{ "conversation": 4, "uuid": "…", "title": "the deploy script", "seq": 6,
+   "role": "user", "snippet": "…the deploy script keeps timing out…",
+   "created_at": 1755648000 }]
+```
+
+A query that matches nothing is `[]`, not an error, and a query full of FTS5
+operators is neutralised rather than rejected — the box is free text and people
+paste anything into it.
+
+### `POST /api/conversations/{id}/rewind`
+
+```json
+{ "seq": 4 }
+```
+
+Drops that message and everything after it, and answers
+`{ "removed": 2, "message": "the text that was at seq 4" }`. What "regenerate
+this reply" and "edit and resend" both are underneath — one operation, so the
+two cannot disagree. Facts extracted from the removed messages go too;
+otherwise a fact learned from a turn that no longer exists keeps being recalled
+as though you had said it.
+
+### `GET /api/conversations/{id}/export`
+
+The conversation as Markdown, with a `Content-Disposition` naming the file
+after its title. Tool results are omitted — they are the machinery of a turn —
+but each turn says which tools it used, so an answer full of current facts does
+not read as invented.
+
+## The scheduler
+
+Every route here is open, like the rest of the interface: scheduling does
+nothing the chat page does not already do. See [the scheduler](scheduler.md).
+
+### `GET /api/scheduler`
+
+Every job, plus what the page needs around them: whether this process is the
+one running jobs (`hosted`), who is if not (`elsewhere`), which channels are
+connected, this machine's timezone, and the agents and tools a job can be
+given.
+
+### `POST /api/scheduler`, `PUT /api/scheduler/{name}`
+
+Create or change one. Every field is optional on a `PUT`, and only what is sent
+is written — two surfaces edit these rows, and sending a whole job back would
+let a stale page revert a change made from a chat a moment earlier. An empty
+`agent` or `only_if` **clears** it; an absent one leaves it alone.
+
+`400` for anything about the request that cannot work — an unreadable time, a
+name already taken, a channel with nowhere to send to. `404` for no such job.
+
+### `POST /api/scheduler/preview`
+
+```json
+{ "when": "every weekday at 9:20", "zone": "Asia/Kolkata" }
+```
+
+Reads a rule back and says when it would actually fire:
+
+```json
+{ "when": "cron 20 9 * * 1,2,3,4,5", "words": "every weekday at 09:20 UTC+5:30",
+  "zone": "Asia/Kolkata",
+  "fires": [{ "at": 1757648400, "in": "in 14 hours" }, …] }
+```
+
+The form calls this as you type. `20 9 * * 1-5` and `9 20 * * 1-5` are both
+valid and only one of them is nine twenty in the morning.
+
+### `GET /api/scheduler/{name}`
+
+The job and its last thirty runs, each with its status, whether it was
+delivered, and what it answered.
+
+### `POST /api/scheduler/{name}/run`
+
+Marks it due. Answers `{ "queued": "<name>", "hosted": true }` — `hosted` is
+false when nothing is running jobs, in which case it stays queued rather than
+running. It is never run from the handler: the scheduler runs jobs one at a
+time, and this would be the one path that ignores that.
+
+### `DELETE /api/scheduler/{name}`
+
+Removes it and its history.
 
 ## Models
 

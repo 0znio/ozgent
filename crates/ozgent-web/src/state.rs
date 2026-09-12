@@ -211,10 +211,24 @@ pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools
     let python = ozgent_tools::ToolHost::start(host_config).await?;
     // A server that will not start is reported and skipped: one bad entry in
     // config.toml must not take away the tools that do work.
-    let (sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
+    let (mut sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
     for problem in &problems {
         tracing::warn!("mcp: {problem}");
     }
+    // The scheduler, so the model can make and change jobs mid-conversation.
+    // Offered as a source rather than a Python tool because it writes to
+    // ozgent's own database, which the Python worker is sandboxed away from.
+    let scheduler = match ozgent_schedule::ScheduleTools::open(paths.root()) {
+        Ok(s) => {
+            let s = std::sync::Arc::new(s);
+            sources.push(s.clone());
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!("the scheduler tool is unavailable: {e}");
+            None
+        }
+    };
 
     let host = ozgent_tools::Toolbox::new(Some(python), sources);
     for shadowed in host.shadowed() {
@@ -227,5 +241,6 @@ pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools
     Ok(Tools {
         host: std::sync::Arc::new(host),
         runtime: tokio::runtime::Handle::current(),
+        scheduler,
     })
 }

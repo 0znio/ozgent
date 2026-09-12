@@ -152,6 +152,48 @@ pub enum Command {
         options: OptionFlags,
     },
 
+    /// Run ozgent in the background, so everything else can just connect.
+    ///
+    ///   ozgent daemon install     run it now, and at every login
+    ///   ozgent daemon status      is it running, and what is it doing
+    ///   ozgent daemon uninstall   stop it and remove the service
+    ///   ozgent daemon             run it in this terminal instead
+    ///
+    /// One process owns the model, the database, the messaging channels and
+    /// the scheduler, and serves the web interface and the API over them. A
+    /// scheduled job runs whether or not anything is open, and nothing loads a
+    /// second copy of the model. With no question in flight it holds no model
+    /// at all.
+    #[command(alias = "service")]
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+        /// Address to bind. This machine only by default; 0.0.0.0 to let
+        /// phones and other computers on the same network reach it.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 7333)]
+        port: u16,
+        #[command(flatten)]
+        options: OptionFlags,
+    },
+
+    /// Things ozgent does on a timer, and where the answers go.
+    ///
+    ///   ozgent scheduler                      what is scheduled
+    ///   ozgent scheduler add                  set one up, question by question
+    ///   ozgent scheduler show <job>           its settings and recent runs
+    ///   ozgent scheduler run <job>            run it now
+    ///
+    /// Jobs run inside `ozgent daemon` (or `ozgent web`). Ask for one in a
+    /// chat — "every weekday at 9:20, send me a pre-market brief" — and it
+    /// appears here. The /scheduler page does everything these commands do.
+    #[command(alias = "schedule", alias = "jobs")]
+    Scheduler {
+        #[command(subcommand)]
+        command: Option<SchedulerCommand>,
+    },
+
     /// The password for the web interface's /admin page.
     ///
     ///   ozgent admin setup      choose the password
@@ -416,6 +458,110 @@ pub enum ChannelAction {
     On,
     /// Stop answering on this channel, keeping its settings.
     Off,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Install the service for whatever init system this machine runs, then
+    /// start it.
+    ///
+    /// The address is baked into the service file, so it is asked for here
+    /// rather than inherited — a service that only works when you remember to
+    /// pass a flag is not a service.
+    Install {
+        /// Address to bind. This machine only by default; 0.0.0.0 to let
+        /// phones and other computers on the same network reach it.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 7333)]
+        port: u16,
+    },
+    /// Whether it is running, and what it is doing.
+    Status,
+    /// Stop it and remove the service. Your data is untouched.
+    #[command(alias = "remove")]
+    Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SchedulerCommand {
+    /// Everything scheduled, and when each next runs.
+    List,
+    /// Set up a job, question by question.
+    #[command(alias = "new")]
+    Add {
+        /// Skip the questions and give everything at once.
+        #[arg(long)]
+        name: Option<String>,
+        /// What to ask each time it runs.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// "every weekday at 9:20", "every 2 hours", or cron "20 9 * * 1-5".
+        #[arg(long)]
+        when: Option<String>,
+        /// An agent to ask, without the @.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only send the answer when this is true.
+        #[arg(long)]
+        only_if: Option<String>,
+        /// Where the answer goes: telegram, whatsapp, or none.
+        #[arg(long)]
+        deliver: Option<String>,
+        /// The chat id or phone number to send it to.
+        #[arg(long)]
+        to: Option<String>,
+        /// An IANA zone like Asia/Kolkata. Local time by default.
+        #[arg(long)]
+        timezone: Option<String>,
+    },
+    /// A job's settings and how its recent runs went.
+    Show { job: String },
+    /// Change one thing about a job. Same flags as `add`.
+    #[command(alias = "edit")]
+    Set {
+        job: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        when: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        only_if: Option<String>,
+        #[arg(long)]
+        deliver: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        timezone: Option<String>,
+    },
+    /// Stop a job running, keeping its settings.
+    #[command(alias = "disable")]
+    Pause { job: String },
+    /// Start it again.
+    #[command(alias = "enable")]
+    Resume { job: String },
+    /// Run it now, without waiting for its next time.
+    Run { job: String },
+    /// Delete it, and its history.
+    #[command(alias = "delete")]
+    Rm {
+        job: String,
+        /// Don't ask first.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Read a time back and say when it would actually fire.
+    ///
+    /// `ozgent scheduler when "every weekday at 9:20"`
+    When {
+        when: Vec<String>,
+        #[arg(long)]
+        timezone: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

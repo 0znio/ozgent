@@ -26,14 +26,14 @@ fn read_line() -> Option<String> {
     }
 }
 
-fn ask(prompt: &str) -> Result<String> {
+pub(crate) fn ask(prompt: &str) -> Result<String> {
     print!("{prompt}");
     std::io::stdout().flush()?;
     read_line().context("no more input")
 }
 
 /// A yes/no question. Enter takes the default.
-fn confirm(prompt: &str, default: bool) -> Result<bool> {
+pub(crate) fn confirm(prompt: &str, default: bool) -> Result<bool> {
     let hint = if default { "[Y/n]" } else { "[y/N]" };
     loop {
         let a = ask(&format!("{prompt} {hint} "))?;
@@ -47,7 +47,7 @@ fn confirm(prompt: &str, default: bool) -> Result<bool> {
 }
 
 /// Pick one of several numbered options. Returns the index.
-fn choose(prompt: &str, options: &[&str], default: usize) -> Result<usize> {
+pub(crate) fn choose(prompt: &str, options: &[&str], default: usize) -> Result<usize> {
     println!("{prompt}");
     for (i, o) in options.iter().enumerate() {
         println!("  {}  {o}", i + 1);

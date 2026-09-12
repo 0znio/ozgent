@@ -1392,6 +1392,7 @@ dependencies = [
  "anyhow",
  "ozgent-core",
  "ozgent-memory",
+ "ozgent-schedule",
  "ozgent-web",
  "pulldown-cmark",
  "reqwest",
@@ -1408,6 +1409,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "dirs",
  "ozgent-channels",
  "ozgent-core",
  "ozgent-hub",
@@ -1415,6 +1417,7 @@ dependencies = [
  "ozgent-mcp",
  "ozgent-memory",
  "ozgent-render",
+ "ozgent-schedule",
  "ozgent-tools",
  "ozgent-web",
  "rustyline",
@@ -1515,6 +1518,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ozgent-schedule"
+version = "0.1.0"
+dependencies = [
+ "ozgent-core",
+ "ozgent-memory",
+ "ozgent-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ozgent-tools"
 version = "0.1.0"
 dependencies = [
@@ -1540,6 +1556,7 @@ dependencies = [
  "ozgent-llama",
  "ozgent-mcp",
  "ozgent-memory",
+ "ozgent-schedule",
  "ozgent-tools",
  "qrcode",
  "serde",

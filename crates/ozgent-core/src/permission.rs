@@ -316,6 +316,31 @@ impl Permissions {
 /// Phrased as the user's decision rather than an error, because it is not one:
 /// a model told "tool failed" retries, while a model told the user declined
 /// asks what to do instead.
+/// What the model is told when a call needed approval and nobody was there.
+///
+/// Distinct from [`refusal`] because the two are different facts and lead to
+/// different behaviour. "The user declined" invites an apology to somebody who
+/// never said anything — and at 9:20 in the morning, on a scheduled run, there
+/// is no user in the conversation at all. Saying *why* it could not run lets
+/// the model finish with what it does have and note the gap, which is the
+/// answer a person reading the brief later actually wants.
+pub fn unattended(tool: &str) -> String {
+    format!(
+        "{tool} needs approval before it can run, and this is running \
+         unattended — there is {UNATTENDED_MARK}. Do not try it again. Carry \
+         on with the tools that do run, and say plainly which part you could \
+         not do and that {tool} would have needed approval."
+    )
+}
+
+/// The phrase that identifies an unattended refusal in a tool summary.
+///
+/// The scheduler reads it back out to note, in the brief it delivers, that a
+/// tool could not run. Named here rather than spelled out there so the two
+/// cannot drift apart — the first attempt matched on "refused", a word the
+/// real message has never contained, and silently did nothing.
+pub const UNATTENDED_MARK: &str = "nobody to ask";
+
 pub fn refusal(tool: &str) -> String {
     format!(
         "The user declined to run {tool}. Do not try it again in this turn; \
@@ -443,5 +468,45 @@ mod tests {
         let text = refusal("run_command");
         assert!(text.contains("run_command"));
         assert!(text.contains("not try it again"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod unattended_tests {
+    use super::*;
+
+    #[test]
+    fn the_marker_is_actually_in_the_message() {
+        // The scheduler matches on UNATTENDED_MARK to note in a delivered
+        // brief that a tool could not run. If the wording is reworded without
+        // the marker, that note silently stops appearing — which is how the
+        // first version of it shipped broken.
+        let text = unattended("run_command");
+        assert!(text.contains(UNATTENDED_MARK), "{text}");
+        assert!(text.contains("run_command"), "{text}");
+    }
+
+    #[test]
+    fn it_does_not_blame_a_user_who_was_never_there() {
+        // "The user declined" invites an apology to somebody who never spoke,
+        // and at 9:20 in the morning there is no user in the conversation.
+        let text = unattended("run_command");
+        assert!(!text.contains("declined"), "{text}");
+        assert!(!text.to_lowercase().contains("the user"), "{text}");
+    }
+
+    #[test]
+    fn a_refusal_and_an_unattended_run_say_different_things() {
+        assert_ne!(refusal("write_file"), unattended("write_file"));
+        assert!(refusal("write_file").contains("declined"));
+        assert!(!refusal("write_file").contains(UNATTENDED_MARK));
+    }
+
+    #[test]
+    fn it_tells_the_model_to_carry_on_rather_than_stop() {
+        // A brief that is thin is better than no brief, as long as it says why.
+        let text = unattended("run_command");
+        assert!(text.contains("Carry on"), "{text}");
+        assert!(text.contains("Do not try it again"), "{text}");
     }
 }

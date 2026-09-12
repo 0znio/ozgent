@@ -171,8 +171,15 @@ ignored, deliberately, since replying to strangers confirms the bot is live.
 
 ## Running it
 
-`ozgent web` answers the channels that are set up, sharing the model it has
-loaded. To answer them without the web interface:
+The best answer is [the daemon](daemon.md) — one process in the background that
+answers the channels whether or not anything is open:
+
+```
+ozgent daemon install
+```
+
+`ozgent web` answers them too, while it runs. To answer them from a terminal
+without the web interface:
 
 ```
 ozgent gateway              answer messages from this terminal
@@ -198,6 +205,13 @@ Anything that is not one of these is a question.
 | `/pair <code>` | the only thing it answers for someone not yet allowed |
 
 `@agent` works here too, and the model can hand a question to an agent itself.
+
+You can also ask for something on a timer — *"every weekday at 9:20, send me a
+pre-market brief"* — and the answers arrive in this chat. A job created from a
+chat may only answer back into that same chat, and gets that channel's tools
+and no more; otherwise "schedule me a reminder" would be a way to make ozgent
+message somebody else, or to reach a tool the channel does not allow. See
+[the scheduler](scheduler.md).
 
 ## How a reply arrives
 

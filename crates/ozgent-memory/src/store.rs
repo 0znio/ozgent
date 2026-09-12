@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub struct Store {
     db: Connection,
@@ -60,6 +60,19 @@ pub struct StoredMessage {
     /// JSON array of file names under the media directory.
     pub media: Option<String>,
     pub tokens: i64,
+    pub created_at: i64,
+}
+
+/// One message that matched a search, with enough around it to show a result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub message_id: i64,
+    pub conversation_id: i64,
+    pub conversation_uuid: String,
+    pub title: String,
+    pub seq: i64,
+    pub role: String,
+    pub content: String,
     pub created_at: i64,
 }
 
@@ -160,9 +173,17 @@ impl Store {
     fn init(db: Connection) -> Result<Self, StoreError> {
         db.execute_batch(
             // WAL lets the web UI read while the TUI writes.
+            //
+            // busy_timeout is what makes that actually true for *writers*.
+            // WAL allows one writer at a time, and without a timeout the
+            // second one fails instantly with SQLITE_BUSY rather than
+            // waiting — which shows up as a scheduled job failing to record
+            // its run because a chat happened to be saving a message at the
+            // same moment. Five seconds is far longer than any write here.
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;",
         )?;
         let mut store = Self { db };
         store.migrate()?;
@@ -201,6 +222,9 @@ impl Store {
         // 6 is deliberately absent; see SCHEMA_V7.
         if current < 7 {
             self.db.execute_batch(SCHEMA_V7)?;
+        }
+        if current < 8 {
+            self.db.execute_batch(SCHEMA_V8)?;
         }
 
         self.db
@@ -519,6 +543,80 @@ impl Store {
                 row_to_message,
             )
             .optional()?)
+    }
+
+    /// Remove every message from `seq` onwards, and say how many went.
+    ///
+    /// What "regenerate this reply" and "edit my message and send it again"
+    /// both actually are: the conversation is rewound to a point and carries
+    /// on from there. Facts extracted from the removed messages go too —
+    /// `source_message_id` is `ON DELETE SET NULL`, so a fact learned from a
+    /// turn that no longer exists would otherwise outlive its evidence and
+    /// keep being recalled as though the user had said it.
+    pub fn truncate_conversation(&self, conversation_id: i64, from_seq: i64) -> Result<usize, StoreError> {
+        self.db.execute(
+            "DELETE FROM facts
+              WHERE source_message_id IN (
+                    SELECT id FROM messages WHERE conversation_id = ?1 AND seq >= ?2)",
+            params![conversation_id, from_seq],
+        )?;
+        let gone = self.db.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND seq >= ?2",
+            params![conversation_id, from_seq],
+        )?;
+        if gone > 0 {
+            self.db.execute(
+                "UPDATE conversations SET updated_at = ?2 WHERE id = ?1",
+                params![conversation_id, now()],
+            )?;
+        }
+        Ok(gone)
+    }
+
+    /// The highest `seq` in a conversation, or `None` when it is empty.
+    pub fn last_seq(&self, conversation_id: i64) -> Result<Option<i64>, StoreError> {
+        self.db
+            .query_row(
+                "SELECT MAX(seq) FROM messages WHERE conversation_id = ?1",
+                params![conversation_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Search every conversation for a phrase.
+    ///
+    /// Across conversations rather than within one, which is the whole point:
+    /// the question people have is "where did I talk about the deploy script",
+    /// and they do not remember which thread it was in. Ranked by FTS5's own
+    /// bm25, newest first among equals.
+    pub fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>, StoreError> {
+        let Some(fts) = crate::retrieve::to_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.db.prepare(
+            "SELECT m.id, m.conversation_id, c.uuid, c.title, m.seq, m.role,
+                    m.content, m.created_at
+               FROM messages_fts f
+               JOIN messages m ON m.id = f.rowid
+               JOIN conversations c ON c.id = m.conversation_id
+              WHERE messages_fts MATCH ?1 AND m.content != ''
+              ORDER BY bm25(messages_fts), m.created_at DESC
+              LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![fts, limit], |r| {
+            Ok(SearchHit {
+                message_id: r.get(0)?,
+                conversation_id: r.get(1)?,
+                conversation_uuid: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                title: r.get(3)?,
+                seq: r.get(4)?,
+                role: r.get(5)?,
+                content: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
     }
 
     pub fn message_count(&self, conversation_id: i64) -> Result<i64, StoreError> {
@@ -916,6 +1014,62 @@ CREATE TRIGGER embeddings_gc_fact AFTER DELETE ON facts BEGIN
 END;
 "#;
 
+/// The v8 step: scheduled jobs, and the record of each time one ran.
+///
+/// In the database rather than in a process because the program that creates a
+/// job is usually not the one that runs it: a job written at the terminal is
+/// picked up by whichever `ozgent web` is running, and has to outlive both
+/// being restarted.
+///
+/// `conversation_id` is `ON DELETE SET NULL` rather than `CASCADE`: deleting a
+/// conversation in the browser must not delete the job that was writing into
+/// it. The job simply starts a fresh thread on its next run — the same choice
+/// `channel_chats` makes, for the same reason.
+const SCHEMA_V8: &str = "
+CREATE TABLE jobs (
+    id              INTEGER PRIMARY KEY,
+    uuid            TEXT    NOT NULL UNIQUE,
+    name            TEXT    NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    prompt          TEXT    NOT NULL,
+    agent           TEXT,
+    model           TEXT,
+    recur           TEXT    NOT NULL,
+    zone            TEXT    NOT NULL DEFAULT 'local',
+    only_if         TEXT,
+    tools           TEXT,
+    deliver         TEXT    NOT NULL DEFAULT 'none',
+    deliver_to      TEXT,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    created_by      TEXT    NOT NULL DEFAULT 'cli',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    next_run_at     INTEGER,
+    last_run_at     INTEGER,
+    runs            INTEGER NOT NULL DEFAULT 0,
+    failures        INTEGER NOT NULL DEFAULT 0
+);
+
+-- The name is what a chat message refers to, so it has to be unique, and
+-- case-insensitively so: nobody types `Pre-Market-Brief` the same way twice.
+CREATE UNIQUE INDEX jobs_name ON jobs(name COLLATE NOCASE);
+
+-- The scheduler's only hot query is 'what is due', once a tick.
+CREATE INDEX idx_jobs_due ON jobs(next_run_at) WHERE enabled = 1;
+
+CREATE TABLE job_runs (
+    id          INTEGER PRIMARY KEY,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER,
+    status      TEXT    NOT NULL DEFAULT 'running',
+    output      TEXT,
+    error       TEXT,
+    delivered   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at DESC);
+";
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -1005,7 +1159,7 @@ DROP TABLE IF EXISTS flows;
 /// Hand-rolled rather than pulling in a crate for sixteen bytes: the only
 /// requirements are the version/variant bits and enough entropy that two
 /// conversations never collide.
-fn new_uuid() -> String {
+pub(crate) fn new_uuid() -> String {
     // A counter, a clock and the process id, in that order of importance.
     //
     // The counter is what actually guarantees uniqueness: two calls in the
@@ -1241,12 +1395,38 @@ mod migration_tests {
     }
 
     #[test]
+    fn a_database_from_before_the_scheduler_gains_its_tables() {
+        let db = Connection::open_in_memory().unwrap();
+        for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5] {
+            db.execute_batch(step).unwrap();
+        }
+        db.pragma_update(None, "user_version", 7i64).unwrap();
+        // A conversation written before the upgrade must still be there after.
+        db.execute(
+            "INSERT INTO conversations (uuid, title, created_at, updated_at)
+             VALUES ('u', 'kept', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::init(db).expect("a v7 database must upgrade");
+        let names = tables(&store);
+        for expected in ["jobs", "job_runs"] {
+            assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+        }
+        assert_eq!(store.list_conversations(10).unwrap().len(), 1, "history survived");
+        // And the new tables actually work, rather than merely existing.
+        let id = store.create_job(&crate::jobs::NewJob::new("j", "p", "cron 0 9 * * *")).unwrap();
+        assert!(store.get_job(id).unwrap().is_some());
+    }
+
+    #[test]
     fn a_fresh_database_never_makes_them_in_the_first_place() {
         let store = Store::open_in_memory().unwrap();
         let names = tables(&store);
         assert!(!names.iter().any(|n| n.starts_with("flow")), "{names:?}");
         // And everything that is still a feature is there.
-        for expected in ["conversations", "messages", "facts", "embeddings", "channel_chats"] {
+        for expected in ["conversations", "messages", "facts", "embeddings", "channel_chats", "jobs", "job_runs"] {
             assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
         }
     }
@@ -1275,5 +1455,150 @@ mod migration_tests {
         db.execute_batch(SCHEMA_V1).unwrap();
         db.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
         assert!(matches!(Store::init(db), Err(StoreError::FutureSchema { .. })));
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open_in_memory().unwrap()
+    }
+
+    /// A conversation with a few turns in it, returned with its id.
+    fn thread(s: &Store, title: &str, turns: &[(&str, &str)]) -> i64 {
+        let c = s.create_conversation(title, None).unwrap();
+        for (i, (role, text)) in turns.iter().enumerate() {
+            s.append_message(c, role, text, i as i64).unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn a_phrase_is_found_in_whichever_conversation_holds_it() {
+        // The actual question people have: "where did I talk about that",
+        // without remembering which thread it was in.
+        let s = store();
+        thread(&s, "cooking", &[("user", "how long do I boil an egg")]);
+        let deploys = thread(
+            &s,
+            "work",
+            &[("user", "the deploy script keeps timing out"), ("assistant", "check the retry budget")],
+        );
+
+        let hits = s.search_messages("deploy script", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id, deploys);
+        assert_eq!(hits[0].title, "work");
+        assert_eq!(hits[0].role, "user");
+        assert!(hits[0].content.contains("deploy script"));
+        assert!(!hits[0].conversation_uuid.is_empty(), "the hit is linkable");
+    }
+
+    #[test]
+    fn both_sides_of_a_conversation_are_searchable() {
+        let s = store();
+        thread(&s, "work", &[("user", "why is it slow"), ("assistant", "the retry budget is wrong")]);
+        let hits = s.search_messages("retry budget", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, "assistant");
+    }
+
+    #[test]
+    fn a_search_that_matches_nothing_is_empty_rather_than_an_error() {
+        let s = store();
+        thread(&s, "work", &[("user", "hello")]);
+        assert!(s.search_messages("kangaroo", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_search_full_of_operators_does_not_error() {
+        // The box is free text and people paste anything into it; FTS5 syntax
+        // errors must not reach the page.
+        let s = store();
+        thread(&s, "work", &[("user", "hello there")]);
+        for hostile in ["\"", "NEAR(", "a OR b AND", "*", "^ ~ :", "", "   ", "hello\" OR \"1"] {
+            assert!(s.search_messages(hostile, 10).is_ok(), "{hostile:?} errored");
+        }
+    }
+
+    #[test]
+    fn a_search_respects_its_limit() {
+        let s = store();
+        for i in 0..20 {
+            thread(&s, &format!("t{i}"), &[("user", "the deploy script again")]);
+        }
+        assert_eq!(s.search_messages("deploy script", 5).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn a_deleted_conversation_stops_appearing_in_results() {
+        let s = store();
+        let c = thread(&s, "work", &[("user", "the deploy script")]);
+        assert_eq!(s.search_messages("deploy", 10).unwrap().len(), 1);
+        s.delete_conversation(c).unwrap();
+        assert!(s.search_messages("deploy", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rewinding_a_conversation_removes_that_turn_and_everything_after() {
+        // What "regenerate" and "edit and resend" both are underneath.
+        let s = store();
+        let c = thread(
+            &s,
+            "work",
+            &[("user", "one"), ("assistant", "two"), ("user", "three"), ("assistant", "four")],
+        );
+        assert_eq!(s.truncate_conversation(c, 2).unwrap(), 2);
+        let left: Vec<String> = s.messages(c).unwrap().into_iter().map(|m| m.content).collect();
+        assert_eq!(left, ["one", "two"]);
+        assert_eq!(s.last_seq(c).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn rewinding_forgets_what_was_learned_from_the_removed_turns() {
+        // A fact extracted from a message that no longer exists would go on
+        // being recalled as though the user had said it.
+        let s = store();
+        let c = s.create_conversation("work", None).unwrap();
+        let kept = s.append_message(c, "user", "I use vim", 0).unwrap();
+        let gone = s.append_message(c, "user", "I moved to helix", 1).unwrap();
+        s.add_fact(Some(c), Scope::User, "uses vim", Some(kept)).unwrap();
+        s.add_fact(Some(c), Scope::User, "uses helix", Some(gone)).unwrap();
+
+        s.truncate_conversation(c, 1).unwrap();
+        let left: Vec<String> = s.facts_for(c).unwrap().into_iter().map(|f| f.text).collect();
+        assert_eq!(left, ["uses vim"]);
+    }
+
+    #[test]
+    fn rewinding_past_the_end_changes_nothing() {
+        let s = store();
+        let c = thread(&s, "work", &[("user", "one"), ("assistant", "two")]);
+        assert_eq!(s.truncate_conversation(c, 99).unwrap(), 0);
+        assert_eq!(s.messages(c).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rewinding_to_the_start_empties_the_conversation_without_deleting_it() {
+        let s = store();
+        let c = thread(&s, "work", &[("user", "one"), ("assistant", "two")]);
+        assert_eq!(s.truncate_conversation(c, 0).unwrap(), 2);
+        assert!(s.messages(c).unwrap().is_empty());
+        assert_eq!(s.last_seq(c).unwrap(), None);
+        assert!(s.get_conversation(c).unwrap().is_some(), "the thread itself stays");
+    }
+
+    #[test]
+    fn a_rewound_message_stops_being_searchable() {
+        // The FTS index is kept by trigger; a delete that missed it would
+        // leave search returning text that is no longer in the conversation.
+        let s = store();
+        let c = thread(&s, "work", &[("user", "keep this"), ("user", "the deploy script")]);
+        assert_eq!(s.search_messages("deploy", 10).unwrap().len(), 1);
+        s.truncate_conversation(c, 1).unwrap();
+        assert!(s.search_messages("deploy", 10).unwrap().is_empty());
+        assert_eq!(s.search_messages("keep this", 10).unwrap().len(), 1);
     }
 }

@@ -50,6 +50,13 @@ pub struct Turn {
     /// Whether there is a person on the other end who can answer a permission
     /// question.
     pub can_ask: bool,
+    /// Who is asking, for the tools that need to know.
+    ///
+    /// Only the scheduler does, and it needs to: a job created from a chat
+    /// answers back into that chat and inherits its tool allowlist, neither of
+    /// which can be worked out from the message. `None` is the browser and the
+    /// terminal — trusted, and with no chat to default to.
+    pub caller: Option<ozgent_schedule::Caller>,
 }
 
 /// Start a turn. The receiver yields every event until `Done` or `Error`.
@@ -124,6 +131,24 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
     } else {
         Vec::new()
     };
+
+    // Set before the turn is submitted, and read on the inference thread when
+    // the model actually calls the tool. Safe because turns are serialised:
+    // one inference thread runs one turn at a time, so the caller in force is
+    // always this turn's.
+    if let Some(tools) = crate::worker::current_tools(&state.tools) {
+        if let Some(scheduler) = &tools.scheduler {
+            let mut caller = turn.caller.clone().unwrap_or_else(|| {
+                ozgent_schedule::Caller::local("web")
+            });
+            caller.conversation_id = Some(turn.conversation);
+            // A job may never be given tools this conversation did not have.
+            if caller.allowed_tools.is_none() {
+                caller.allowed_tools = turn.native_tools.clone();
+            }
+            scheduler.set_caller(caller);
+        }
+    }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     state

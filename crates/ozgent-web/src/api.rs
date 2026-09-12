@@ -66,40 +66,54 @@ async fn js() -> impl IntoResponse {
 // ------------------------------------------------------------------- errors
 
 /// Any handler failure, rendered as JSON so the frontend can show it.
-struct ApiError {
+#[derive(Debug)]
+pub struct ApiError {
     error: anyhow::Error,
-    /// What the caller sent was wrong, as opposed to something failing here.
+    /// Which status to answer with.
     ///
-    /// Worth the extra field: a client that retries on 500 would keep resending
-    /// a request that can never succeed, and a log full of 500s hides the ones
-    /// that are actually ozgent's fault.
-    bad_request: bool,
+    /// Worth carrying rather than defaulting everything to 500: a client that
+    /// retries on 500 would keep resending a request that can never succeed, a
+    /// log full of 500s hides the ones that are actually ozgent's fault, and a
+    /// page asking for something that is gone should be told it is gone rather
+    /// than that the server broke.
+    status: StatusCode,
 }
 
 impl ApiError {
-    fn bad_request(message: impl std::fmt::Display) -> Self {
-        Self { error: anyhow::anyhow!("{message}"), bad_request: true }
+    pub fn bad_request(message: impl std::fmt::Display) -> Self {
+        Self { error: anyhow::anyhow!("{message}"), status: StatusCode::BAD_REQUEST }
+    }
+
+    pub fn not_found(message: impl std::fmt::Display) -> Self {
+        Self { error: anyhow::anyhow!("{message}"), status: StatusCode::NOT_FOUND }
+    }
+
+    pub fn internal(message: impl std::fmt::Display) -> Self {
+        Self { error: anyhow::anyhow!("{message}"), status: StatusCode::INTERNAL_SERVER_ERROR }
+    }
+
+    #[cfg(test)]
+    pub fn status(&self) -> u16 {
+        self.status.as_u16()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        Self { error: e.into(), bad_request: false }
+        Self { error: e.into(), status: StatusCode::INTERNAL_SERVER_ERROR }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = if self.bad_request {
+        if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!("{:#}", self.error);
+        } else {
             // Not logged as an error: the caller made a mistake, and ozgent's
             // log is for ozgent's mistakes.
             tracing::debug!("rejected: {:#}", self.error);
-            StatusCode::BAD_REQUEST
-        } else {
-            tracing::error!("{:#}", self.error);
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(serde_json::json!({ "error": self.error.to_string() }))).into_response()
+        }
+        (self.status, Json(serde_json::json!({ "error": self.error.to_string() }))).into_response()
     }
 }
 
@@ -470,6 +484,9 @@ async fn rename_conversation(
 #[derive(Serialize)]
 struct MessageInfo {
     id: i64,
+    /// Position in the conversation. What a rewind is addressed by, so
+    /// "regenerate" and "edit and resend" have something to name.
+    seq: i64,
     role: String,
     text: String,
     created_at: i64,
@@ -495,6 +512,7 @@ async fn messages(
         .into_iter()
         .map(|m| MessageInfo {
             id: m.id,
+            seq: m.seq,
             role: m.role,
             text: m.content,
             created_at: m.created_at,
@@ -630,6 +648,8 @@ async fn chat(
             images,
             // The browser can show a permission card and answer it.
             can_ask: true,
+            // Someone at this machine, or on a network its owner chose.
+            caller: None,
         },
     )?;
 

@@ -461,6 +461,10 @@ pub enum ToolCallError {
     /// tool result either way.
     #[error("{name} was declined")]
     Declined { name: String },
+    /// The call needed approval and there was nobody to ask — a scheduled
+    /// run, or an API client. Not the same as being refused.
+    #[error("{name} needed approval and nobody was there to give it")]
+    Unattended { name: String },
     /// Called by name, but not one of the tools this turn was offered — an
     /// agent reaching past its list. Nobody refused it; it was never there.
     #[error("{name} is not available here")]
@@ -496,6 +500,7 @@ impl ToolCallError {
                 format!("The tool system is unavailable: {e}. Do not retry; tell the user.")
             }
             Self::Declined { name } => ozgent_core::permission::refusal(name),
+            Self::Unattended { name } => ozgent_core::permission::unattended(name),
             Self::NotOffered { name, offered } if offered.is_empty() => format!(
                 "{name} is not available to you, and you have no tools here. \
                  Answer from what you already have."

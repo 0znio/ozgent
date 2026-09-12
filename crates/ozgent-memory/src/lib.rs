@@ -8,13 +8,16 @@
 pub mod context;
 pub mod embed;
 pub mod facts;
+pub mod jobs;
 pub mod retrieve;
 pub mod store;
 
 pub use context::{AssembledContext, Budget, ContextBuilder, estimate_tokens};
 pub use embed::{Embedder, HashingEmbedder, cosine};
 pub use facts::{Candidate, parse_extraction, store_candidates};
+pub use jobs::{Job, JobEdit, JobRun, NewJob, Status as JobStatus};
 pub use retrieve::{Hit, Retriever};
 pub use store::{
-    ChannelChat, Conversation, Fact, OwnerKind, Scope, StoredMessage, Store, StoreError,
+    ChannelChat, Conversation, Fact, OwnerKind, Scope, SearchHit, StoredMessage, Store,
+    StoreError,
 };

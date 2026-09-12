@@ -1,10 +1,12 @@
 //! The `ozgent` binary.
 
+mod daemon;
 mod chat;
 mod input;
 mod cli;
 mod logging;
 mod permission;
+mod scheduler;
 mod setup;
 mod status;
 mod tui;
@@ -26,7 +28,15 @@ async fn main() -> Result<()> {
         Some(dir) => Paths::with_root(dir),
         None => Paths::discover().context("locating the ozgent directory")?,
     };
-    logging::init(cli.verbose, Some(&paths.logs_dir()));
+    // A daemon's standard output *is* its log — journalctl, or whatever the
+    // init system captures — and nobody is watching a terminal to be spared
+    // the detail. So it starts at info rather than warn, which is the right
+    // default for a command someone typed and the wrong one for a service.
+    let verbose = match (&cli.command, cli.verbose) {
+        (Some(Command::Daemon { .. }), 0) => 1,
+        (_, v) => v,
+    };
+    logging::init(verbose, Some(&paths.logs_dir()));
     let config = Config::load(&paths).context("loading config.toml")?;
 
     match cli.command {
@@ -55,6 +65,20 @@ async fn main() -> Result<()> {
         Some(Command::Gateway { command: None, web, port, host, options }) => {
             gateway(paths, config, web, &host, port, options.to_options()?).await
         }
+        Some(Command::Daemon {
+            command: Some(cli::DaemonCommand::Install { host, port }),
+            ..
+        }) => daemon::install(&paths, &host, port),
+        Some(Command::Daemon { command: Some(cli::DaemonCommand::Status), .. }) => {
+            daemon::status(&paths, &config)
+        }
+        Some(Command::Daemon { command: Some(cli::DaemonCommand::Uninstall), .. }) => {
+            daemon::uninstall(&paths)
+        }
+        Some(Command::Daemon { command: None, host, port, options }) => {
+            daemon::run(paths, config, &host, port, options.to_options()?).await
+        }
+        Some(Command::Scheduler { command }) => scheduler::run(&paths, &config, command),
         Some(Command::Admin { command }) => setup::admin(&paths, config, command),
         Some(Command::Agent { command }) => agent(&paths, command),
         Some(Command::Mcp) => mcp(&config).await,
@@ -706,9 +730,16 @@ pub(crate) async fn start_tools(paths: &Paths, config: &Config) -> Result<Toolbo
         .await
         .context("starting the Python tool worker")?;
 
-    let (sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
+    let (mut sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
     for problem in &problems {
         eprintln!("warning: mcp: {problem}");
+    }
+    // The scheduler, so "do that every weekday at 9:20" works from the
+    // terminal too. The job is stored here and runs wherever a scheduler is
+    // up — usually `ozgent web`.
+    match ozgent_schedule::ScheduleTools::open(paths.root()) {
+        Ok(s) => sources.push(std::sync::Arc::new(s)),
+        Err(e) => eprintln!("warning: the scheduler tool is unavailable: {e}"),
     }
     Ok(Toolbox::new(Some(python), sources))
 }
