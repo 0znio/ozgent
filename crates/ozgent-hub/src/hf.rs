@@ -231,12 +231,18 @@ pub enum HubError {
     #[error("repository {repo:?} not found on Hugging Face")]
     NotFound { repo: String },
 
+    /// Hugging Face answers 401 for a repository that does not exist as well
+    /// as for one you may not read — deliberately, so that a private name
+    /// cannot be confirmed by probing. The message has to carry both
+    /// possibilities or a typo reads as "you are not allowed", which sends
+    /// people looking for a token they do not need.
     #[error(
-        "access to {repo:?} was denied.{}",
+        "{repo:?} could not be read. Check the spelling first — Hugging Face answers the \
+         same way for a repository that does not exist.{}",
         if *has_token {
-            " Your token may lack access, or you may need to accept the model's licence on its Hugging Face page."
+            " If it does exist, your token may lack access, or the model's licence may need accepting on its Hugging Face page."
         } else {
-            " It is probably a gated model: accept its licence on Hugging Face, then set HF_TOKEN."
+            " If it does exist it is gated: accept its licence on Hugging Face, then set HF_TOKEN."
         }
     )]
     Unauthorized { repo: String, has_token: bool },
@@ -278,6 +284,12 @@ mod tests {
 
         let with = HubError::Unauthorized { repo: "meta/x".into(), has_token: true };
         assert!(with.to_string().contains("licence"), "{with}");
+
+        // Hugging Face returns 401 for a name that does not exist too, so the
+        // message must not send someone hunting for a token they do not need.
+        for e in [without, with] {
+            assert!(e.to_string().contains("spelling"), "{e}");
+        }
     }
 
     #[test]

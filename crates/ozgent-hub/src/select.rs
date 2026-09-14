@@ -38,6 +38,11 @@ const QUANTS: &[&str] = &[
     "Q2_K_L", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q4_K_M", "Q4_K_S",
     "Q5_K_M", "Q5_K_S", "TQ1_0", "TQ2_0",
     "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q6_K", "Q8_0", "Q2_K",
+    // The 4-bit float formats. A repository that offers one and nothing else
+    // listed here showed no quantisations at all, because `quantisations`
+    // counts only files whose name it can place — the file was not rejected,
+    // it simply vanished from the page with nothing said.
+    "NVFP4", "MXFP4",
     "BF16", "F16", "F32",
 ];
 
@@ -48,6 +53,16 @@ const QUANTS: &[&str] = &[
 /// boundaries within the stem rather than a fixed position.
 pub fn quant_of(path: &str) -> Option<String> {
     let stem = file_name(path).trim_end_matches(".gguf").trim_end_matches(".GGUF");
+    if let Some(found) = match_quant(stem) {
+        return Some(found);
+    }
+    // Some repositories put the quantisation in a directory rather than in the
+    // filename — `IQ4_XS/model.gguf`. Looking only at the last path segment
+    // dropped those entirely.
+    path.rsplit_once('/').and_then(|(dir, _)| match_quant(dir.rsplit('/').next().unwrap_or(dir)))
+}
+
+fn match_quant(stem: &str) -> Option<String> {
     let upper = stem.to_ascii_uppercase();
 
     let mut best: Option<(usize, &str)> = None;
@@ -371,6 +386,30 @@ mod quant_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quantisation_in_a_directory_is_still_found() {
+        // Some repositories lay themselves out this way, and looking only at
+        // the filename dropped every one of their files.
+        assert_eq!(quant_of("IQ4_XS/model.gguf").as_deref(), Some("IQ4_XS"));
+        assert_eq!(quant_of("repo/Q4_K_M/weights-00001-of-00002.gguf").as_deref(), Some("Q4_K_M"));
+    }
+
+    #[test]
+    fn the_filename_wins_over_the_directory() {
+        // A directory named for one quantisation holding a file named for
+        // another is the file's answer, not the directory's.
+        assert_eq!(quant_of("Q4_K_M/model-IQ4_XS.gguf").as_deref(), Some("IQ4_XS"));
+    }
+
+    #[test]
+    fn the_four_bit_float_formats_are_recognised() {
+        // A repo offering only these listed no quantisations at all: files
+        // whose name cannot be placed are not counted, so they disappeared
+        // from the page with nothing said.
+        assert_eq!(quant_of("Ornith-1.5-9B-MTP-NVFP4.gguf").as_deref(), Some("NVFP4"));
+        assert_eq!(quant_of("gpt-oss-20b-MXFP4.gguf").as_deref(), Some("MXFP4"));
+    }
+
     use super::*;
 
     fn f(path: &str, size: u64) -> RepoFile {
