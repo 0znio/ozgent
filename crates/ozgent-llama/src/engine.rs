@@ -226,8 +226,25 @@ impl Engine {
         let head_dim = (model.n_embd() as u32) / model.n_head().max(1);
         let k_len = meta_u32(&model, &format!("{arch}.attention.key_length")).unwrap_or(head_dim);
         let v_len = meta_u32(&model, &format!("{arch}.attention.value_length")).unwrap_or(head_dim);
+        // Counted from the file, not from `n_layer`, because a hybrid model
+        // caches on only some of its layers. Qwen3.5 runs linear attention on
+        // three of every four and holds a fixed-size recurrent state there —
+        // real memory, but the same amount at one token as at a hundred
+        // thousand, so it belongs in no per-token figure. Pricing all 33
+        // blocks of a 4B reserved 2176 MiB where 550 was needed.
+        //
+        // llama.cpp knows this from the architecture and does not expose it,
+        // so it is read back out of the GGUF. A file that cannot be measured
+        // falls back to every layer, which is what this always did.
+        let caching = crate::layout::read(path)
+            .map(|l| l.caching_layers)
+            .filter(|&c| c > 0)
+            .unwrap_or(n_layer);
+        if caching < n_layer {
+            tracing::debug!("{caching} of {n_layer} layers keep a growing cache");
+        }
         let kv_shape =
-            ozgent_core::accel::KvShape::new(n_layer, model.n_head_kv(), k_len, v_len);
+            ozgent_core::accel::KvShape::new(caching, model.n_head_kv(), k_len, v_len);
         let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
         // Speculative decoding rejects drafts by discarding the KV entries
@@ -517,8 +534,22 @@ impl Engine {
         backend: &'static LlamaBackend,
         params: LlamaContextParams,
         requested: u32,
+        mut split: ozgent_core::accel::KvSplit,
+        shape: ozgent_core::reserve::Shape,
     ) -> Result<LlamaContext<'_>, EngineError> {
         let mut window = requested;
+        // The retreat bisects rather than stepping by a fixed ratio.
+        //
+        // A ratio has to be chosen against an error whose size is unknown: a
+        // half throws away three quarters of the context when the estimate
+        // missed by five percent, and three quarters takes so many steps that
+        // it overshoots further down. Bisecting between the largest window
+        // known to work and the smallest known to fail lands within a few
+        // percent in three or four attempts however wrong the first guess
+        // was, and an attempt is only an allocation — the weights are already
+        // resident and nothing is recomputed.
+        let mut good: u32 = 0;
+        let mut bad = requested.saturating_add(1);
         // The first failure is the informative one: later attempts fail for
         // the same reason at a smaller size, and the last one before the floor
         // says least about what actually went wrong.
@@ -531,11 +562,62 @@ impl Engine {
         loop {
             crate::llamalog::clear();
             let attempt = params.clone().with_n_ctx(NonZeroU32::new(window));
+            // Read immediately before, so anything else on the card that
+            // moved between planning and now is already accounted for.
+            let before = crate::backend::best_gpu().map(|d| d.memory_free as u64);
             match self.model.new_context(backend, attempt) {
                 Ok(context) => {
+                    // A success narrows the search from below. If there is
+                    // still a meaningful gap to the smallest known failure,
+                    // the context is dropped and a larger one tried: keeping
+                    // the first window that happened to work would leave
+                    // whatever the bisection had not yet recovered.
+                    good = window;
+                    let midpoint = good + (bad - good) / 2;
+                    if bad > good && midpoint > good + good / 20 && midpoint < bad {
+                        drop(context);
+                        window = midpoint;
+                        continue;
+                    }
                     if window < requested {
                         tracing::warn!(
                             "a context of {requested} could not be allocated; opened {window} instead"
+                        );
+                    }
+                    // What it actually cost, beyond the cache we asked for.
+                    // This is the entire feedback loop: the reservation stops
+                    // being a number somebody guessed and becomes one this
+                    // machine measured, and the next load is that much less
+                    // wrong.
+                    // llama.cpp prints what its compute buffers actually
+                    // cost. That exact figure is worth far more than a
+                    // free-memory delta, which also catches anything else on
+                    // the card that moved during the allocation.
+                    let reported = crate::llamalog::compute_buffers();
+                    let measured = if reported > 0 {
+                        reported
+                    } else if let (Some(before), Some(after)) =
+                        (before, crate::backend::best_gpu().map(|d| d.memory_free as u64))
+                    {
+                        before
+                            .saturating_sub(after)
+                            .saturating_sub(self.kv_shape.bytes(window, split))
+                    } else {
+                        0
+                    };
+                    if measured > 0 {
+                        tracing::info!(
+                            "compute buffers: {} MiB at {window} ctx",
+                            measured / (1024 * 1024)
+                        );
+                        crate::backend::record_reserve(
+                            crate::backend::reserve_shape(
+                                shape.ubatch,
+                                shape.n_embd,
+                                window,
+                                shape.n_batch,
+                            ),
+                            measured,
                         );
                     }
                     return Ok(context);
@@ -547,25 +629,30 @@ impl Engine {
                     let reason = crate::llamalog::reason().unwrap_or_else(|| e.to_string());
                     tracing::debug!("context of {window} failed: {reason}");
 
-                    // A quantised KV cache needs flash attention, and whether
-                    // there *is* any is not knowable before the context
-                    // exists: `flash_attention = true` asks llama.cpp for
-                    // AUTO, and it decides per architecture — an MTP model
-                    // gets none. So the cache policy reasons about a feature
-                    // it cannot see, picks q5_1, and the context is refused.
+                    // Whether this model gets flash attention is not knowable
+                    // before the context exists: `flash_attention = true` asks
+                    // llama.cpp for AUTO, which is resolved by probing whether
+                    // the fused op lands on the same device as its layer. So
+                    // the cache policy reasons about a feature it cannot see,
+                    // and if it guessed wrong the context is refused.
+                    //
+                    // Only **V** is given up. llama.cpp's rule is "V cache
+                    // quantization requires flash_attn" and there is no
+                    // matching one for K — this used to surrender both, which
+                    // doubled the cache of every model without flash
+                    // attention for no reason at all.
                     //
                     // Shrinking the window does not help; the type is the
-                    // problem. Fall back to f16 once, at the full window, and
-                    // let the loop below shrink it if the bigger cache no
-                    // longer fits. Without this the model does not load at
-                    // all, which is how it was found.
+                    // problem. Fall back once, at the full window, and let the
+                    // loop below shrink it if the bigger cache no longer fits.
                     if !plain_cache && needs_flash_attention(&reason) {
                         tracing::info!(
-                            "this model has no flash attention, so the KV cache cannot be \
-                             quantised; using f16"
+                            "this model has no flash attention, so the value cache cannot \
+                             be quantised; keeping {:?} keys and f16 values",
+                            split.k
                         );
-                        let f16 = ggml_type(ozgent_core::accel::CacheType::F16);
-                        params = params.with_type_k(f16).with_type_v(f16);
+                        split.v = ozgent_core::accel::CacheType::F16;
+                        params = params.with_type_v(ggml_type(split.v));
                         plain_cache = true;
                         window = requested;
                         continue;
@@ -578,7 +665,9 @@ impl Engine {
                             "{reason} (tried down to {window} tokens of context)"
                         )));
                     }
-                    window = (window / 2).max(ozgent_core::accel::MIN_CONTEXT);
+                    bad = window;
+                    let midpoint = good + (bad - good) / 2;
+                    window = midpoint.max(ozgent_core::accel::MIN_CONTEXT).min(window - 1);
                 }
             }
         }
@@ -602,12 +691,39 @@ impl Engine {
         // the VRAM left *after* the weights are resident, which is only known
         // once the model has loaded.
         let free = crate::backend::best_gpu().map(|d| d.memory_free as u64).unwrap_or(0);
+        // One budget, computed once, used both to choose how the cache is
+        // stored and to size the window. See `choose_kv_split`.
+        let host = ozgent_core::accel::available_host_memory();
+        let shape = crate::backend::reserve_shape(
+            opts.ubatch.unwrap_or(512),
+            self.model.n_embd() as u32,
+            requested,
+            opts.batch_size,
+        );
+        let reserve = crate::backend::reserve_for(shape);
+        let budget = if opts.kv_offload {
+            ozgent_core::accel::kv_budget_reserving(
+                free,
+                host,
+                self.gpu_layers_used,
+                self.n_layer,
+                Some(reserve),
+            )
+        } else {
+            ozgent_core::accel::kv_budget(0, host, 0, self.n_layer)
+        };
+        tracing::debug!(
+            "kv budget {} MiB of {} MiB free, reserving {} MiB",
+            budget / (1024 * 1024),
+            free / (1024 * 1024),
+            reserve / (1024 * 1024)
+        );
         let split = match (opts.cache_type_k, opts.cache_type_v) {
             (CacheType::Auto, CacheType::Auto) => ozgent_core::accel::choose_kv_split(
                 self.kv_shape,
                 requested,
                 self.weight_bytes,
-                free,
+                budget,
                 opts.flash_attention,
             ),
             // One named and the other left alone is someone saying "store the
@@ -626,7 +742,7 @@ impl Engine {
                 self.kv_shape,
                 requested,
                 self.weight_bytes,
-                free,
+                budget,
                 opts.flash_attention,
             );
             tracing::warn!(
@@ -650,12 +766,9 @@ impl Engine {
         // memory it is bounded by RAM instead, which is usually far larger —
         // that is the trade `kv_offload = false` buys, and it costs reading
         // the whole cache across PCIe on every token.
-        let host = ozgent_core::accel::available_host_memory();
-        let budget = if opts.kv_offload {
-            ozgent_core::accel::kv_budget(free, host, self.gpu_layers_used, self.n_layer)
-        } else {
-            ozgent_core::accel::kv_budget(0, host, 0, self.n_layer)
-        };
+        // `budget` was computed above, against a measured reserve rather than
+        // a share of the card: the share allowed 3514 MiB of 5020 free, so a
+        // cache that would have fitted at f16 was quantised for nothing.
         let requested =
             ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
         if requested < opts.context_length.min(self.n_ctx_train.max(512)) {
@@ -729,7 +842,7 @@ impl Engine {
                 .with_n_threads_batch(opts.threads as i32);
         }
 
-        let mut context = self.open_context(backend, params, requested)?;
+        let mut context = self.open_context(backend, params, requested, split, shape)?;
 
         // Steering belongs to the context, not the turn: installed once here,
         // it shapes every generation until the session ends. Loading it lazily

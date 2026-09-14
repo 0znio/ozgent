@@ -28,6 +28,67 @@ static PARTIAL: Mutex<String> = Mutex::new(String::new());
 /// that continue an info line would be filed as errors.
 static IN_ERROR: AtomicBool = AtomicBool::new(false);
 
+/// Whether llama.cpp said flash attention resolved on, off, or said nothing.
+///
+/// It announces the answer — "Flash Attention enabled", or "not supported, set
+/// to disabled" — and ozgent used to throw the line away, because the sink
+/// keeps error level only. So the KV policy *guessed* at a feature llama.cpp
+/// had already reported, and found out it had guessed wrong by having a
+/// context refused. Reading the answer is strictly better than inferring it
+/// from a failure.
+static FLASH: Mutex<Option<bool>> = Mutex::new(None);
+
+/// What llama.cpp decided about flash attention for the last context, if it
+/// said. `None` means it has not been resolved yet in this process.
+pub fn flash_attention() -> Option<bool> {
+    FLASH.lock().ok().and_then(|f| *f)
+}
+
+/// Compute buffers llama.cpp reported for the last context it built, in bytes.
+///
+/// It prints these itself — "CUDA0 compute buffer size = 1234.56 MiB" — and
+/// ozgent was modelling the same quantity from first principles and getting it
+/// wrong. Reading the number llama.cpp already published is strictly better
+/// than deriving it: it needs no assumption about which buffers exist, it
+/// follows llama.cpp's own changes, and it is exact.
+static COMPUTE_BYTES: Mutex<u64> = Mutex::new(0);
+
+/// Total compute buffer bytes since the last [`clear`].
+pub fn compute_buffers() -> u64 {
+    COMPUTE_BYTES.lock().map(|b| *b).unwrap_or(0)
+}
+
+/// Record a resolution line. Public for tests; called from the sink.
+pub fn note_line(line: &str) {
+    // "resolve_fused_ops: Flash Attention enabled" / "... not supported, set
+    // to disabled". Matched on both halves so an unrelated line mentioning
+    // flash attention cannot flip it.
+    if !line.contains("Flash Attention") {
+        return;
+    }
+    let verdict = if line.contains("not supported") || line.contains("disabled") {
+        Some(false)
+    } else if line.contains("enabled") {
+        Some(true)
+    } else {
+        None
+    };
+    if let (Some(v), Ok(mut f)) = (verdict, FLASH.lock()) {
+        *f = Some(v);
+    }
+}
+
+/// Add up a "compute buffer size = N MiB" line, whichever device it names.
+fn note_buffer(line: &str) {
+    let Some(rest) = line.split_once("compute buffer size =").map(|(_, r)| r) else { return };
+    let Some(mib) = rest.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()) else {
+        return;
+    };
+    if let Ok(mut total) = COMPUTE_BYTES.lock() {
+        *total += (mib * 1024.0 * 1024.0) as u64;
+    }
+}
+
 /// Route llama.cpp's output into the ring rather than onto stderr.
 pub fn capture() {
     // SAFETY: the callback holds no borrowed state and takes no user data.
@@ -43,6 +104,9 @@ pub fn clear() {
         p.clear();
     }
     IN_ERROR.store(false, Ordering::Relaxed);
+    if let Ok(mut b) = COMPUTE_BYTES.lock() {
+        *b = 0;
+    }
 }
 
 /// The most useful error line llama.cpp logged, if it logged one.
@@ -75,11 +139,15 @@ unsafe extern "C" fn sink(
     if level != sys::GGML_LOG_LEVEL_CONT {
         IN_ERROR.store(level == sys::GGML_LOG_LEVEL_ERROR, Ordering::Relaxed);
     }
+    // SAFETY: llama.cpp always passes a NUL-terminated string.
+    let chunk = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    // Read at every level, because the answer arrives at info or warn — this
+    // is the one non-error line worth keeping.
+    note_line(&chunk);
+    note_buffer(&chunk);
     if !IN_ERROR.load(Ordering::Relaxed) {
         return;
     }
-    // SAFETY: llama.cpp always passes a NUL-terminated string.
-    let chunk = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
 
     let Ok(mut partial) = PARTIAL.lock() else { return };
     partial.push_str(&chunk);
@@ -120,5 +188,43 @@ mod tests {
     fn the_line_that_names_the_cause_is_a_reason() {
         assert!(is_informative("error loading model architecture: unknown model architecture: 'bailingmoe3'"));
         assert!(is_informative("llama_model_load: error loading model: tensor 'blk.0.attn_q.weight' not found"));
+    }
+}
+
+#[cfg(test)]
+mod flash_verdict_tests {
+    use super::*;
+
+    fn read(line: &str) -> Option<bool> {
+        if let Ok(mut f) = FLASH.lock() {
+            *f = None;
+        }
+        note_line(line);
+        flash_attention()
+    }
+
+    #[test]
+    fn llama_cpp_saying_it_is_on_is_believed() {
+        assert_eq!(read("resolve_fused_ops: Flash Attention enabled\n"), Some(true));
+    }
+
+    #[test]
+    fn llama_cpp_saying_it_is_off_is_believed() {
+        // The line that used to be discarded, leaving the cache policy to
+        // find out by having a context refused.
+        assert_eq!(
+            read("resolve_fused_ops: Flash Attention not supported, set to disabled\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn an_unresolved_process_says_it_does_not_know() {
+        assert_eq!(read("llama_model_loader: loaded meta data\n"), None);
+    }
+
+    #[test]
+    fn a_line_that_only_mentions_the_feature_does_not_decide_it() {
+        assert_eq!(read("Flash Attention is a thing that exists\n"), None);
     }
 }

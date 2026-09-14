@@ -3,6 +3,7 @@
 //! processes, so every other crate can depend on it freely.
 
 pub mod accel;
+pub mod reserve;
 pub mod agents;
 pub mod channels;
 pub mod chat;

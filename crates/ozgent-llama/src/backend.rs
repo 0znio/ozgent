@@ -81,9 +81,13 @@ pub fn fit_to_vram(
     kind_bytes: [u64; 3],
     overhead_bytes: u64,
 ) -> FitEstimate {
-    // Leave headroom: llama.cpp allocates scratch beyond what we can predict,
-    // and an over-tight fit fails at load time rather than degrading.
-    let budget = free_bytes.saturating_sub(overhead_bytes).saturating_mul(92) / 100;
+    // `overhead_bytes` already carries the KV floor *and* a measured reserve
+    // for llama.cpp's own scratch, so there is no percentage to take here.
+    // There used to be a flat 8% on top, which stacked with a separate 30% on
+    // the cache side and between them left well over a gigabyte of an 8 GB
+    // card unused — a margin that grew with the card instead of with the
+    // model, which is the wrong way round.
+    let budget = free_bytes.saturating_sub(overhead_bytes);
 
     if bytes_per_layer == 0 || total_layers == 0 {
         return FitEstimate { layers: 0, cpu_moe: None, cpu_moe_tensors: 0, bytes_used: 0 };
@@ -475,6 +479,67 @@ pub struct Plan {
     pub free_bytes: u64,
 }
 
+/// What this machine has learned about llama.cpp's own memory cost.
+///
+/// Held per process rather than per engine: the expensive half of it is the
+/// backend context, which every model in the process shares. See
+/// [`ozgent_core::reserve`].
+fn learned() -> &'static std::sync::Mutex<ozgent_core::reserve::Reserve> {
+    static LEARNED: std::sync::OnceLock<std::sync::Mutex<ozgent_core::reserve::Reserve>> =
+        std::sync::OnceLock::new();
+    LEARNED.get_or_init(|| {
+        let loaded = ozgent_core::Paths::discover()
+            .map(|p| ozgent_core::reserve::Reserve::load(&p))
+            .unwrap_or_default();
+        std::sync::Mutex::new(loaded)
+    })
+}
+
+/// Set once a model has been loaded in this process, so the next one is not
+/// charged for bringing the backend up a second time.
+static BACKEND_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The shape of a load, for predicting and for learning what it costs.
+pub fn reserve_shape(
+    ubatch: u32,
+    n_embd: u32,
+    n_ctx: u32,
+    n_batch: u32,
+) -> ozgent_core::reserve::Shape {
+    ozgent_core::reserve::Shape {
+        first_in_process: !BACKEND_UP.load(std::sync::atomic::Ordering::SeqCst),
+        ubatch,
+        n_embd,
+        n_ctx,
+        n_batch,
+    }
+}
+
+/// Bytes to keep back from a load of this shape.
+pub fn reserve_for(shape: ozgent_core::reserve::Shape) -> u64 {
+    learned().lock().map(|r| r.predict(shape)).unwrap_or(512 * 1024 * 1024)
+}
+
+/// Fold in what a load actually cost, and remember it for next time.
+///
+/// `overhead` is what disappeared beyond the weights and the cache. This is
+/// the whole of the adaptation: the reservation stops being a number somebody
+/// guessed and becomes a number this machine measured.
+pub fn record_reserve(shape: ozgent_core::reserve::Shape, overhead: u64) {
+    BACKEND_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+    let Ok(mut learned) = learned().lock() else { return };
+    learned.observe(shape, overhead);
+    if let Ok(paths) = ozgent_core::Paths::discover() {
+        learned.save(&paths);
+    }
+    tracing::debug!(
+        "vram reserve: {} MiB once + {:.0} B per ubatch-element, after {} sample(s)",
+        learned.process_bytes / (1024 * 1024),
+        learned.rate,
+        learned.samples
+    );
+}
+
 /// The tensor-name pattern that sends routed experts to the CPU.
 ///
 /// `whole` layers give up all three of their expert tensors; the layer after
@@ -565,8 +630,13 @@ impl Plan {
             ozgent_core::accel::CacheType::Auto => ozgent_core::accel::CacheType::Q8_0,
             explicit => explicit,
         };
-        let overhead =
-            ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed);
+        // Two things must survive the weights: a floor of KV cache, and
+        // whatever llama.cpp allocates for itself. The second used to be a
+        // percentage of the card; it is now a measured figure that scales
+        // with the model rather than with the hardware.
+        let shape = reserve_shape(opts.ubatch.unwrap_or(512), layout.n_embd, window, opts.batch_size);
+        let overhead = ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
+            + reserve_for(shape);
         let (layers, experts, expert_tensors) = resolve_auto(
             opts.gpu_layers,
             opts.cpu_moe,

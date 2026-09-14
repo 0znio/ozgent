@@ -97,10 +97,13 @@ pub fn kv_bytes(elements_per_token: u64, n_ctx: u32, t: CacheType) -> u64 {
     (elements_per_token as f64 * n_ctx as f64 * t.bits() as f64 / 8.0) as u64
 }
 
-/// Fraction of free VRAM the KV cache may claim.
+/// Fraction of free VRAM the KV cache may claim when nothing better is known.
 ///
-/// The rest is compute buffers and llama.cpp scratch, which are not predictable
-/// from metadata; an over-tight fit fails at load rather than degrading.
+/// Only a fallback now. The real answer comes from [`crate::reserve`], which
+/// subtracts a *measured* number of bytes rather than a share of whatever the
+/// card happens to have — see the note there for why a percentage is the
+/// wrong shape. This remains for the paths that have no reserve to hand, and
+/// for host memory, where there is no backend context to measure.
 const KV_VRAM_SHARE: u64 = 70;
 
 /// Above this ratio of KV traffic to weight traffic, quantising the cache is a
@@ -330,14 +333,18 @@ pub fn kv_ladder(flash: bool, shape: KvShape) -> Vec<KvSplit> {
 /// Same two pressures as before — it has to fit, and past a certain size
 /// quantising is a speed win rather than a compromise — but now spent on the
 /// half that can afford it. See [`KvSplit`].
+/// `budget` is the memory the cache may actually claim — the same figure the
+/// window is then fitted against. These used to be computed separately, from
+/// two different rules, so a type could be chosen against one budget and the
+/// window sized against another; at a 262,144-token window that disagreement
+/// picked a cache 600 MiB larger than would fit and llama.cpp refused it.
 pub fn choose_kv_split(
     shape: KvShape,
     n_ctx: u32,
     weight_bytes: u64,
-    free_bytes: u64,
+    budget: u64,
     flash: bool,
 ) -> KvSplit {
-    let budget = free_bytes / 100 * KV_VRAM_SHARE;
     let avg_f16 = kv_bytes(shape.total(), n_ctx / 2, CacheType::F16);
     let traffic_bound =
         weight_bytes > 0 && avg_f16 as f64 > weight_bytes as f64 * KV_TRAFFIC_RATIO;
@@ -386,14 +393,37 @@ pub fn fit_context_split(shape: KvShape, requested: u32, split: KvSplit, budget:
 /// llama.cpp's own scratch are not predictable from metadata, and an
 /// over-tight fit fails at allocation rather than degrading.
 pub fn kv_budget(free_vram: u64, available_ram: u64, gpu_layers: u32, n_layer: u32) -> u64 {
+    kv_budget_reserving(free_vram, available_ram, gpu_layers, n_layer, None)
+}
+
+/// As [`kv_budget`], but taking a measured reserve off the VRAM side instead
+/// of a percentage of it.
+///
+/// The percentage was costing real memory: on an 8 GB card with 5020 MiB free
+/// after the weights, it allowed 3514 and left 1506 idle — enough that a cache
+/// which would have fitted at f16 was quantised for no reason. Host memory
+/// still uses the share, because nothing there corresponds to a backend
+/// context and system RAM has no hard edge to fall off.
+pub fn kv_budget_reserving(
+    free_vram: u64,
+    available_ram: u64,
+    gpu_layers: u32,
+    n_layer: u32,
+    reserve_bytes: Option<u64>,
+) -> u64 {
+    let vram = match reserve_bytes {
+        Some(r) => free_vram.saturating_sub(r),
+        None => free_vram / 100 * KV_VRAM_SHARE,
+    };
     let share = |bytes: u64| bytes / 100 * KV_VRAM_SHARE;
+    let vram_share = |_bytes: u64| vram;
     if n_layer == 0 {
-        return share(free_vram.max(available_ram));
+        return vram.max(share(available_ram));
     }
     let on_gpu = gpu_layers.min(n_layer) as u64;
     let on_cpu = (n_layer as u64).saturating_sub(on_gpu);
     let total = n_layer as u64;
-    share(free_vram) * on_gpu / total + share(available_ram) * on_cpu / total
+    vram_share(free_vram) * on_gpu / total + share(available_ram) * on_cpu / total
 }
 
 /// Memory the host can still hand out, in bytes. Zero when it cannot be read.

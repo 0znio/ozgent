@@ -35,6 +35,13 @@ pub struct Layout {
     /// KV elements stored per token across all layers, for sizing the cache
     /// that has to stay resident whatever else is evicted.
     pub kv_elements_per_token: u64,
+    /// Blocks that keep a cache growing with the context. Fewer than
+    /// `layers` on a hybrid model; see [`caching_layers`].
+    pub caching_layers: u32,
+    /// The model's embedding width, which together with the micro-batch
+    /// decides how large llama.cpp's scratch allocations are. Zero when the
+    /// file does not say.
+    pub n_embd: u32,
     /// The context the model was trained for, from its own metadata. Zero
     /// when the file does not say. Asking for more than this is not a longer
     /// memory, it is a model reading positions it has never seen.
@@ -78,7 +85,13 @@ pub fn read(path: &Path) -> Option<Layout> {
     let mut layout = scan(gguf);
     if let Some(l) = layout.as_mut() {
         l.kv_elements_per_token = kv_elements(gguf, l.layers);
+        l.caching_layers = string_key(gguf, "general.architecture")
+            .map(|arch| caching_layers(gguf, &arch, l.layers))
+            .unwrap_or(l.layers);
         l.context_train = context_train(gguf);
+        l.n_embd = string_key(gguf, "general.architecture")
+            .and_then(|arch| u32_key(gguf, &format!("{arch}.embedding_length")))
+            .unwrap_or(0);
     }
     unsafe { sys::gguf_free(gguf) };
     layout
@@ -150,6 +163,8 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         expert_kind_bytes: kind_bytes.map(|b| b / layers as u64),
         layers,
         kv_elements_per_token: 0,
+        caching_layers: layers,
+        n_embd: 0,
         context_train: 0,
     })
 }
@@ -177,7 +192,54 @@ fn kv_elements(gguf: *mut sys::gguf_context, layers: u32) -> u64 {
     let fallback = if heads > 0 { embd / heads } else { 0 };
     let k = u32_key(gguf, &format!("{arch}.attention.key_length")).unwrap_or(fallback);
     let v = u32_key(gguf, &format!("{arch}.attention.value_length")).unwrap_or(fallback);
-    fold_kv(layers, &heads_kv, k, v)
+    // Only the layers that actually keep a cache are priced. See
+    // [`caching_layers`] — on a model that interleaves linear attention this
+    // is a quarter of them, and pricing all of them over-reserves by 4x.
+    let caching = caching_layers(gguf, &arch, layers);
+    fold_kv(caching, &heads_kv, k, v)
+}
+
+/// How many blocks keep a cache that grows with the context.
+///
+/// A hybrid model runs linear attention on most of its layers and full
+/// attention on the rest. The linear ones hold a fixed-size recurrent state —
+/// real memory, but the same amount at one token as at a hundred thousand —
+/// so they contribute nothing to a *per-token* figure.
+///
+/// Some models say which layers those are by declaring `head_count_kv` as an
+/// array, and [`fold_kv`] already handles that. Qwen3.5 does not: it declares
+/// a scalar `head_count_kv = 4` and puts the pattern in a separate key. Taking
+/// the scalar at face value priced all 33 of a 4B's blocks when only 9 of them
+/// cache anything, reserving 2176 MiB where 550 was needed — and that 1.6 GB
+/// came straight off the budget the weights were placed against.
+///
+/// The rule is llama.cpp's own, from `models/qwen35.cpp`:
+///
+/// ```text
+/// is_recr[i] = (i < n_layer) && ((i + 1) % full_attn_interval != 0)
+/// ```
+///
+/// which also says the appended MTP blocks are attention-only, and so do
+/// cache. Anything that declares no interval is not hybrid and prices every
+/// layer, exactly as before.
+fn caching_layers(gguf: *mut sys::gguf_context, arch: &str, layers: u32) -> u32 {
+    // An explicit per-layer list wins over any derived pattern, the same
+    // precedence llama.cpp applies.
+    let explicit = u32_values(gguf, &format!("{arch}.attention.recurrent_layers"));
+    if explicit.len() == layers as usize {
+        return explicit.iter().filter(|&&recurrent| recurrent == 0).count() as u32;
+    }
+
+    let interval = u32_key(gguf, &format!("{arch}.full_attention_interval")).unwrap_or(0);
+    if interval <= 1 {
+        return layers;
+    }
+    // The multi-token-prediction blocks sit beyond the main stack and are
+    // never recurrent.
+    let nextn = u32_key(gguf, &format!("{arch}.nextn_predict_layers")).unwrap_or(0);
+    let main = layers.saturating_sub(nextn);
+    let full = (0..main).filter(|i| (i + 1) % interval == 0).count() as u32;
+    (full + nextn).max(1)
 }
 
 /// Turn declared KV-head counts into elements cached per token.
@@ -288,6 +350,46 @@ fn is_routed_expert(tail: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The rule from llama.cpp's `models/qwen35.cpp`, in isolation.
+    fn caching(layers: u32, interval: u32, nextn: u32) -> u32 {
+        if interval <= 1 {
+            return layers;
+        }
+        let main = layers.saturating_sub(nextn);
+        let full = (0..main).filter(|i| (i + 1) % interval == 0).count() as u32;
+        (full + nextn).max(1)
+    }
+
+    #[test]
+    fn a_hybrid_model_prices_only_the_layers_that_cache() {
+        // Qwen3.5-4B: 33 blocks, one of them multi-token prediction, full
+        // attention every fourth. Pricing all 33 reserved 2176 MiB where 550
+        // was needed, and that 1.6 GB came off the weights' budget.
+        assert_eq!(caching(33, 4, 1), 9);
+    }
+
+    #[test]
+    fn the_prediction_blocks_cache_even_though_they_sit_outside_the_stack() {
+        // `is_recr[i] = (i < n_layer) && ...` — the appended blocks fail the
+        // first clause, so they are attention and do cache.
+        assert_eq!(caching(33, 4, 1) - caching(32, 4, 0), 1);
+    }
+
+    #[test]
+    fn a_dense_model_is_untouched_by_any_of_this() {
+        // No interval declared means not hybrid, and every layer is priced
+        // exactly as it always was.
+        assert_eq!(caching(32, 0, 0), 32);
+        assert_eq!(caching(32, 1, 0), 32);
+    }
+
+    #[test]
+    fn a_hybrid_model_never_prices_zero_layers() {
+        // An interval longer than the stack would otherwise round to nothing,
+        // and a cache of zero bytes is a window of infinity.
+        assert!(caching(4, 64, 0) >= 1);
+    }
+
     use super::*;
 
     #[test]
@@ -314,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_dense_layout_reports_no_experts() {
-        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, expert_kind_bytes: [0; 3], layers: 32, kv_elements_per_token: 0, context_train: 0 };
+        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, expert_kind_bytes: [0; 3], layers: 32, kv_elements_per_token: 0, caching_layers: 32, n_embd: 0, context_train: 0 };
         assert!(!l.is_moe());
     }
 
