@@ -622,8 +622,27 @@ pub struct OptionFlags {
     #[arg(long, global = true, conflicts_with = "gpu_layers")]
     pub no_gpu: bool,
 
-    /// Keep the routed experts of the first N layers in system RAM.
-    #[arg(long, value_name = "N", global = true)]
+    /// Run a mixture-of-experts model far larger than the GPU, by keeping its
+    /// routed experts in system RAM. Bare for all of them, or `N` for the
+    /// first N layers.
+    ///
+    /// This is the flag that turns "will not fit" into "will run". Experts are
+    /// most of a mixture-of-experts model's weight and only a fraction of the
+    /// work per token, so moving them to the host trades a memory wall for a
+    /// bandwidth cost — attention stays on the GPU and the model becomes
+    /// bounded by system RAM instead of VRAM.
+    #[arg(
+        long,
+        value_name = "N",
+        global = true,
+        num_args = 0..=1,
+        // `--cpu-moe=12`, not `--cpu-moe 12`. Without this an optional value
+        // swallows whatever follows, so `ozgent run --cpu-moe my-model "hi"`
+        // reads the model name as a layer count and refuses it.
+        require_equals = true,
+        default_missing_value = "all",
+        alias = "cmoe"
+    )]
     pub cpu_moe: Option<MoeOffload>,
 
     /// Steer generation with a control-vector GGUF.
@@ -761,7 +780,17 @@ impl OptionFlags {
         };
 
         Ok(Options {
-            gpu_layers: if self.no_gpu { Some(GpuLayers::OFF) } else { self.gpu_layers },
+            // Sending every expert to the host and then letting `auto` also
+            // drop layers is the worst of both: the experts are gone from the
+            // GPU *and* so is the attention that was supposed to stay on it.
+            // Asking for all the experts means asking for all the layers.
+            gpu_layers: if self.no_gpu {
+                Some(GpuLayers::OFF)
+            } else if self.gpu_layers.is_none() && self.cpu_moe == Some(MoeOffload::ALL) {
+                Some(GpuLayers::Count(u32::MAX))
+            } else {
+                self.gpu_layers
+            },
             cpu_moe: self.cpu_moe,
             ubatch: self.ubatch,
             control_vector: self.control_vector.clone(),
@@ -874,6 +903,49 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_cpu_moe_means_all_of_them() {
+        // The flag has to be usable without knowing how many layers the model
+        // has, which is the number nobody has to hand.
+        let opts = parse(&["ozgent", "--cpu-moe"]).options.to_options().unwrap();
+        assert_eq!(opts.cpu_moe, Some(MoeOffload::ALL));
+    }
+
+    #[test]
+    fn the_model_after_the_flag_is_not_eaten_as_its_value() {
+        // An optional value is greedy: without `require_equals` this parsed
+        // the model name as a layer count and refused to start.
+        let cli = parse(&["ozgent", "run", "--cpu-moe", "some-model", "hello"]);
+        assert_eq!(cli.options.to_options().unwrap().cpu_moe, Some(MoeOffload::ALL));
+    }
+
+    #[test]
+    fn cpu_moe_still_takes_a_count() {
+        let opts = parse(&["ozgent", "--cpu-moe=12"]).options.to_options().unwrap();
+        assert_eq!(opts.cpu_moe, Some(MoeOffload::Layers(12)));
+    }
+
+    #[test]
+    fn sending_every_expert_to_the_host_keeps_every_layer_on_the_gpu() {
+        // Otherwise `auto` would drop layers as well, and the attention that
+        // was the whole point of keeping the GPU busy goes with them.
+        let opts = parse(&["ozgent", "--cpu-moe"]).options.to_options().unwrap();
+        assert!(
+            matches!(opts.gpu_layers, Some(GpuLayers::Count(n)) if n > 900),
+            "{:?}",
+            opts.gpu_layers
+        );
+    }
+
+    #[test]
+    fn an_explicit_layer_count_still_wins_over_that() {
+        let opts = parse(&["ozgent", "--cpu-moe", "--gpu-layers", "20"])
+            .options
+            .to_options()
+            .unwrap();
+        assert_eq!(opts.gpu_layers, Some(GpuLayers::Count(20)));
+    }
+
+    #[test]
     fn gpu_layers_accepts_counts_and_keywords() {
         for (arg, expected) in [
             ("24", GpuLayers::Count(24)),
@@ -910,7 +982,7 @@ mod tests {
 
     #[test]
     fn cpu_moe_parses() {
-        let opts = parse(&["ozgent", "--cpu-moe", "12"]).options.to_options().unwrap();
+        let opts = parse(&["ozgent", "--cpu-moe=12"]).options.to_options().unwrap();
         assert_eq!(opts.cpu_moe, Some(MoeOffload::Layers(12)));
         let all = parse(&["ozgent", "--cpu-moe", "all"]).options.to_options().unwrap();
         assert_eq!(all.cpu_moe, Some(MoeOffload::ALL));

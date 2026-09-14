@@ -55,6 +55,9 @@ pub struct Engine {
     n_layer: u32,
     n_ctx_train: u32,
     gpu_layers_used: u32,
+    /// Layers whose routed experts were evicted to host memory. Non-zero
+    /// means system RAM is holding weights, and is contended.
+    cpu_moe_layers: u32,
     /// True when the chat template wraps reasoning in `<think>` tags, i.e.
     /// this is a model that reasons unless told not to.
     reasoning: bool,
@@ -173,6 +176,38 @@ impl Engine {
             }
             other => other,
         };
+        // Say plainly whether the host can actually hold what is being sent to
+        // it. A mixture-of-experts model with its experts in system RAM reads
+        // them on every token; if they do not fit, the kernel pages them from
+        // disk instead, and mmap means that degrades silently to one or two
+        // tokens a second rather than failing. Measured on an NVMe at
+        // 1.4 GB/s of page-fault-driven reads, a 20% shortfall is the
+        // difference between 15 tok/s and 4.
+        let layout = crate::layout::read(path).unwrap_or_default();
+        if let Some(expert_bytes) = host_expert_bytes(&layout, resolved_moe) {
+            let available = ozgent_core::accel::available_host_memory();
+            if available > 0 && expert_bytes > available {
+                tracing::warn!(
+                    "experts need {} GB of system ram and {} GB is available; \
+                     the shortfall is read from disk on every token, which is far \
+                     slower than it sounds. A smaller quantisation would fit.",
+                    expert_bytes / (1 << 30),
+                    available / (1 << 30),
+                );
+            } else if available > 0 {
+                tracing::info!(
+                    "experts on the cpu: {} GB of system ram, {} GB available",
+                    expert_bytes / (1 << 30),
+                    available / (1 << 30),
+                );
+            }
+        }
+
+        let evicted_expert_layers = match resolved_moe {
+            MoeOffload::Layers(n) => n,
+            MoeOffload::Keyword(MoeKeyword::All) => u32::MAX,
+            _ => 0,
+        };
         // Only `auto` lands on a partial layer; an explicit count means whole
         // layers and nothing finer.
         let resolved_tensors = match opts.cpu_moe {
@@ -283,6 +318,7 @@ impl Engine {
         Ok(Self {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
+            cpu_moe_layers: evicted_expert_layers,
             reasoning,
             gen_prompt_tokens: Self::measure_generation_prompt(&model, &jinja, template.as_ref()),
             jinja,
@@ -879,6 +915,7 @@ impl Engine {
             rollback_safe: self.rollback_safe,
             gen_prompt_tokens: self.gen_prompt_tokens,
             media_dirty: false,
+            cpu_moe_layers: self.cpu_moe_layers,
             checkpoints: Vec::new(),
             checkpoint_tick: 0,
             tool_grammars: Vec::new(),
@@ -1149,6 +1186,20 @@ struct PromptCheckpoint {
     used: u64,
 }
 
+/// Bytes of routed expert weight this placement sends to the host, or `None`
+/// when none is going there.
+fn host_expert_bytes(layout: &crate::layout::Layout, moe: MoeOffload) -> Option<u64> {
+    if layout.expert_bytes_per_layer == 0 {
+        return None;
+    }
+    let layers = match moe {
+        MoeOffload::Keyword(MoeKeyword::All) => layout.layers,
+        MoeOffload::Layers(n) if n > 0 => n.min(layout.layers),
+        _ => return None,
+    };
+    Some(layout.expert_bytes_per_layer * layers as u64)
+}
+
 /// The saved boundary that shares the longest whole prefix with `tokens`.
 ///
 /// Whole, because a state that agrees with the prompt for a while and then
@@ -1173,6 +1224,9 @@ fn lru_victim(used: &[u64]) -> Option<usize> {
 
 /// One conversation against one KV cache.
 pub struct Session<'a> {
+    /// Layers whose routed experts sit in host memory, carried from the
+    /// engine so the checkpoint budget can stand aside for them.
+    cpu_moe_layers: u32,
     model: &'a LlamaModel,
     context: LlamaContext<'a>,
     sampler: LlamaSampler,
@@ -1337,6 +1391,16 @@ impl<'a> Session<'a> {
             .into_iter()
             .find(|d| !d.is_gpu())
             .map(|d| d.memory_free)?;
+        // Nothing at all when the host is already holding weights.
+        //
+        // A mixture-of-experts model with experts evicted to system RAM reads
+        // them on every single token. Saved prompt states are pure cache and
+        // can always be rebuilt by prefilling; expert weights cannot, and a
+        // host short of room for them pages from disk at a gigabyte a token.
+        // Prompt latency is worth a great deal, but not that.
+        if self.cpu_moe_layers > 0 {
+            return Some(0);
+        }
         Some(free / CHECKPOINT_RAM_SHARE)
     }
 
@@ -2545,6 +2609,48 @@ mod tests {
 fn needs_flash_attention(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     reason.contains("flash attention") && reason.contains("cache")
+}
+
+#[cfg(test)]
+mod expert_offload_tests {
+    use super::host_expert_bytes;
+    use crate::layout::Layout;
+    use ozgent_core::accel::{MoeKeyword, MoeOffload};
+
+    fn moe(layers: u32, per_layer: u64) -> Layout {
+        Layout { layers, expert_bytes_per_layer: per_layer, ..Default::default() }
+    }
+
+    #[test]
+    fn every_expert_on_the_host_is_the_whole_stack() {
+        let l = moe(48, 400 << 20);
+        assert_eq!(host_expert_bytes(&l, MoeOffload::ALL), Some(48 * (400 << 20)));
+    }
+
+    #[test]
+    fn a_partial_offload_is_counted_by_the_layers_it_names() {
+        let l = moe(48, 400 << 20);
+        assert_eq!(host_expert_bytes(&l, MoeOffload::Layers(12)), Some(12 * (400 << 20)));
+        // More layers than the model has cannot cost more than the model has.
+        assert_eq!(host_expert_bytes(&l, MoeOffload::Layers(99)), Some(48 * (400 << 20)));
+    }
+
+    #[test]
+    fn a_dense_model_sends_nothing_to_the_host() {
+        // There is no such thing as a routed expert here, so the warning about
+        // system memory must not fire on a model that will never touch it.
+        let dense = moe(32, 0);
+        assert_eq!(host_expert_bytes(&dense, MoeOffload::ALL), None);
+        assert_eq!(host_expert_bytes(&dense, MoeOffload::Layers(8)), None);
+    }
+
+    #[test]
+    fn nothing_offloaded_costs_nothing() {
+        let l = moe(48, 400 << 20);
+        assert_eq!(host_expert_bytes(&l, MoeOffload::OFF), None);
+        assert_eq!(host_expert_bytes(&l, MoeOffload::Layers(0)), None);
+        assert_eq!(host_expert_bytes(&l, MoeOffload::Keyword(MoeKeyword::Auto)), None);
+    }
 }
 
 #[cfg(test)]

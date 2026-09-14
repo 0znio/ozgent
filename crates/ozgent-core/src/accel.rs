@@ -300,9 +300,21 @@ pub fn kv_split_allowed(split: KvSplit, flash: bool, shape: KvShape) -> bool {
 /// floor — see [`KvSplit`] for why that is the right order. The list is also
 /// monotonically smaller, so the first rung that fits is both the best
 /// available and the largest that fits.
-const FLASH_LADDER: [KvSplit; 6] = [
-    KvSplit { k: CacheType::F16, v: CacheType::F16 },   // 32.0 bits
-    KvSplit { k: CacheType::Q8_0, v: CacheType::Q8_0 }, // 17.0
+/// `f16` is deliberately *not* the first rung.
+///
+/// It is the most precise, and on a machine with memory to spare that looks
+/// like the obvious default — which is how ozgent ended up spending a freed
+/// gigabyte of an 8 GB card on it and using more VRAM than before a round of
+/// work meant to use less. The precision bought nothing measurable: `q8_0` is
+/// near-lossless by construction, and generation measured 48.3 tok/s against
+/// f16's 48.5 — inside the noise.
+///
+/// So the ceiling is `q8_0` and the memory goes back to the card, where it can
+/// hold another model, more offloaded layers, or a longer window. `f16` is
+/// still reached when a model cannot take a quantised key cache at all; see
+/// [`kv_ladder`], which filters this list.
+const FLASH_LADDER: [KvSplit; 5] = [
+    KvSplit { k: CacheType::Q8_0, v: CacheType::Q8_0 }, // 17.0 bits
     KvSplit { k: CacheType::Q8_0, v: CacheType::Q5_1 }, // 14.5
     KvSplit { k: CacheType::Q8_0, v: CacheType::Q4_0 }, // 13.0
     KvSplit { k: CacheType::Q5_1, v: CacheType::Q4_0 }, // 10.5
@@ -315,9 +327,8 @@ const FLASH_LADDER: [KvSplit; 6] = [
 /// rule the wrong way round and believed K was the restricted half. Every one
 /// of these rungs was unreachable, and a model with no flash attention paid
 /// full price for a cache whose keys it could always have quantised.
-const PLAIN_LADDER: [KvSplit; 4] = [
-    KvSplit { k: CacheType::F16, v: CacheType::F16 },  // 32.0 bits
-    KvSplit { k: CacheType::Q8_0, v: CacheType::F16 }, // 24.5
+const PLAIN_LADDER: [KvSplit; 3] = [
+    KvSplit { k: CacheType::Q8_0, v: CacheType::F16 }, // 24.5 bits
     KvSplit { k: CacheType::Q5_1, v: CacheType::F16 }, // 22.0
     KvSplit { k: CacheType::Q4_0, v: CacheType::F16 }, // 20.5
 ];
@@ -325,7 +336,15 @@ const PLAIN_LADDER: [KvSplit; 4] = [
 /// The pairs worth trying on this model. Ordered best-first and smallest-last.
 pub fn kv_ladder(flash: bool, shape: KvShape) -> Vec<KvSplit> {
     let ladder: &[KvSplit] = if flash { &FLASH_LADDER } else { &PLAIN_LADDER };
-    ladder.iter().copied().filter(|s| kv_split_allowed(*s, flash, shape)).collect()
+    let usable: Vec<KvSplit> =
+        ladder.iter().copied().filter(|s| kv_split_allowed(*s, flash, shape)).collect();
+    if usable.is_empty() {
+        // Every quantised form was refused for this model — a head width that
+        // does not divide the block size, most likely. f16 always works, and
+        // is the only reason it is still reachable at all.
+        return vec![KvSplit::uniform(CacheType::F16)];
+    }
+    usable
 }
 
 /// Choose how to store each half of the cache on this hardware.
@@ -688,6 +707,32 @@ mod tests {
             previous = split;
         }
         assert!(PLAIN_LADDER.len() > 1, "there must be something to fall back to");
+    }
+
+    #[test]
+    fn a_roomy_card_is_not_spent_on_precision_nobody_can_measure() {
+        // The regression this guards: after the cache was corrected to a
+        // quarter of its old size, f16 became affordable and `auto` took it —
+        // spending a freed gigabyte of an 8 GB card on a difference that
+        // measured 48.5 tok/s against q8_0's 48.3. The memory is worth more
+        // than the precision; it holds another model or more layers.
+        let shape = qwen_shape();
+        let roomy = shape.bytes(32_768, KvSplit::uniform(CacheType::F16)) * 8;
+        let chosen = choose_kv_split(shape, 32_768, 2_740_000_000, roomy, true);
+        assert_eq!(chosen.k, CacheType::Q8_0, "{chosen:?}");
+        assert_eq!(chosen.v, CacheType::Q8_0, "{chosen:?}");
+    }
+
+    #[test]
+    fn a_model_that_cannot_quantise_at_all_still_gets_a_cache() {
+        // f16 is no longer a rung, so it has to be reachable some other way.
+        // A head width that does not divide the block size filters every
+        // quantised pair out, and the answer must not be "no cache".
+        let odd = KvShape::new(32, 8, 80, 80);
+        let ladder = kv_ladder(true, odd);
+        assert_eq!(ladder, vec![KvSplit::uniform(CacheType::F16)]);
+        let chosen = choose_kv_split(odd, 32_768, 2_740_000_000, 8 * GIB, true);
+        assert_eq!(chosen, KvSplit::uniform(CacheType::F16));
     }
 
     #[test]
