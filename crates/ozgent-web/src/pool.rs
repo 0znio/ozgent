@@ -325,7 +325,7 @@ mod tests {
     use ozgent_llama::backend::Plan;
 
     fn plan(layers: u32, total: u32) -> Plan {
-        Plan { layers, experts: 0, total_layers: total, free_bytes: 0 }
+        Plan { layers, experts: 0, expert_tensors: 0, total_layers: total, free_bytes: 0 }
     }
 
     #[test]

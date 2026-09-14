@@ -22,6 +22,14 @@ pub struct Layout {
     pub bytes_per_layer: u64,
     /// Of that, the bytes belonging to routed experts. Zero for a dense model.
     pub expert_bytes_per_layer: u64,
+    /// The same figure split by which of the three routed-expert tensors it
+    /// belongs to, in the order they are evicted: down, gate, up.
+    ///
+    /// Kept apart because they are not equal. `_K` quantisations routinely
+    /// store `ffn_down_exps` at a higher precision than the other two, so a
+    /// third of the layer is the wrong answer by as much as 20% — and the
+    /// whole point of measuring at tensor granularity is to stop rounding.
+    pub expert_kind_bytes: [u64; 3],
     /// Blocks found in the file.
     pub layers: u32,
     /// KV elements stored per token across all layers, for sizing the cache
@@ -33,9 +41,23 @@ pub struct Layout {
     pub context_train: u32,
 }
 
+/// The routed-expert tensors, in the order eviction spends them.
+///
+/// Order among them barely matters — they are within a fifth of each other in
+/// size and each costs the same single activation round trip when it is the
+/// one that splits a layer. What matters is that it is *fixed*, so that a
+/// plan and the regex built from it cannot disagree about which was meant.
+pub const EXPERT_KINDS: [&str; 3] = ["down", "gate", "up"];
+
 impl Layout {
     pub fn is_moe(&self) -> bool {
         self.expert_bytes_per_layer > 0
+    }
+
+    /// Bytes freed by evicting `tensors` individual expert tensors, counting
+    /// from the start of [`EXPERT_KINDS`].
+    pub fn expert_prefix_bytes(&self, tensors: u32) -> u64 {
+        self.expert_kind_bytes.iter().take(tensors as usize).sum()
     }
 }
 
@@ -90,6 +112,7 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
 
     let mut block_bytes = 0u64;
     let mut expert_bytes = 0u64;
+    let mut kind_bytes = [0u64; 3];
     let mut highest_block: i64 = -1;
 
     for i in 0..count {
@@ -111,6 +134,9 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         // every token uses and which therefore must stay resident.
         if is_routed_expert(tail) {
             expert_bytes += size;
+            if let Some(k) = EXPERT_KINDS.iter().position(|k| tail.starts_with(&format!("ffn_{k}_"))) {
+                kind_bytes[k] += size;
+            }
         }
     }
 
@@ -121,6 +147,7 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
     Some(Layout {
         bytes_per_layer: block_bytes / layers as u64,
         expert_bytes_per_layer: expert_bytes / layers as u64,
+        expert_kind_bytes: kind_bytes.map(|b| b / layers as u64),
         layers,
         kv_elements_per_token: 0,
         context_train: 0,
@@ -287,7 +314,7 @@ mod tests {
 
     #[test]
     fn a_dense_layout_reports_no_experts() {
-        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, layers: 32, kv_elements_per_token: 0, context_train: 0 };
+        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, expert_kind_bytes: [0; 3], layers: 32, kv_elements_per_token: 0, context_train: 0 };
         assert!(!l.is_moe());
     }
 

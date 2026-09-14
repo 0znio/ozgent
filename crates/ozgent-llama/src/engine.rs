@@ -155,16 +155,29 @@ impl Engine {
             // and choosing experts against different readings of free VRAM
             // would be two answers to one question.
             MoeOffload::Keyword(MoeKeyword::Auto) => {
-                if plan.experts > 0 {
+                if plan.experts > 0 || plan.expert_tensors > 0 {
                     tracing::info!(
-                        "cpu-moe auto: evicting routed experts from {} of {} layers",
+                        "cpu-moe auto: evicting routed experts from {} of {} layers{}",
                         plan.experts,
-                        plan.total_layers
+                        plan.total_layers,
+                        match plan.expert_tensors {
+                            0 => String::new(),
+                            n => format!(
+                                ", and {} of 3 from layer {}",
+                                n, plan.experts
+                            ),
+                        }
                     );
                 }
                 MoeOffload::Layers(plan.experts)
             }
             other => other,
+        };
+        // Only `auto` lands on a partial layer; an explicit count means whole
+        // layers and nothing finer.
+        let resolved_tensors = match opts.cpu_moe {
+            MoeOffload::Keyword(MoeKeyword::Auto) => plan.expert_tensors,
+            _ => 0,
         };
 
         // Evicting routed experts frees far more VRAM per lost token/sec than
@@ -176,17 +189,16 @@ impl Engine {
         let moe_pattern;
         match resolved_moe {
             MoeOffload::Keyword(MoeKeyword::All) => params.as_mut().add_cpu_moe_override(),
-            MoeOffload::Layers(n) if n > 0 => {
-                // One override covering every evicted layer, not one per
+            MoeOffload::Layers(n) if n > 0 || resolved_tensors > 0 => {
+                // One override covering everything evicted, not one per
                 // layer. `add_cpu_buft_override` always fills slot zero, so a
                 // second call trips its own "last buft_override was not empty"
                 // assertion — which is why this panicked on the first real
-                // mixture-of-experts model to reach it. The alternation names
-                // the same tensors llama.cpp's own --n-cpu-moe targets.
-                let blocks = (0..n).map(|l| l.to_string()).collect::<Vec<_>>().join("|");
-                moe_pattern =
-                    std::ffi::CString::new(format!("blk\\.({blocks})\\.ffn_(up|down|gate)_(ch|)exps"))
-                        .ok();
+                // mixture-of-experts model to reach it. Alternation is how
+                // two rules become one, and it is also what lets a single
+                // layer be split: whole layers, plus part of the next.
+                moe_pattern = crate::backend::moe_pattern(n, resolved_tensors)
+                    .and_then(|p| std::ffi::CString::new(p).ok());
                 if let Some(c) = moe_pattern.as_deref() {
                     params.as_mut().add_cpu_buft_override(c);
                 }

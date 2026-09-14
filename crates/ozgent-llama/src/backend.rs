@@ -43,8 +43,13 @@ impl Device {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitEstimate {
     pub layers: u32,
-    /// Experts to evict, when the model is a mixture of experts.
+    /// Whole layers to evict experts from, when the model is a mixture of
+    /// experts.
     pub cpu_moe: Option<u32>,
+    /// Individual expert tensors to evict from the *next* layer after those,
+    /// 0 to 2. This is what makes the step size a third of a layer rather
+    /// than a whole one, and at most one layer is ever left split.
+    pub cpu_moe_tensors: u32,
     pub bytes_used: u64,
 }
 
@@ -56,13 +61,24 @@ pub struct FitEstimate {
 /// layers are only dropped once that is exhausted.
 ///
 /// `expert_bytes_per_layer` is the portion of each layer that is routed
-/// experts, and is zero for a dense model. `overhead_bytes` covers the KV
-/// cache and compute buffers, which must stay resident.
+/// experts, and is zero for a dense model. `kind_bytes` is that figure split
+/// across the three routed-expert tensors, which is what allows a partial
+/// layer. `overhead_bytes` covers the KV cache and compute buffers, which
+/// must stay resident.
+///
+/// **Why thirds.** A whole layer is a coarse unit: on a 40-layer model with
+/// 19 GB of experts each step is ~475 MB, so the search rounds down by up to
+/// half a gigabyte of VRAM that then sits idle. Splitting one layer's experts
+/// across the two devices costs a single activation round trip per token —
+/// tens of kilobytes at batch 1, which is nothing beside the layer it buys —
+/// and only ever one layer is split, because whole layers are always spent
+/// first.
 pub fn fit_to_vram(
     free_bytes: u64,
     total_layers: u32,
     bytes_per_layer: u64,
     expert_bytes_per_layer: u64,
+    kind_bytes: [u64; 3],
     overhead_bytes: u64,
 ) -> FitEstimate {
     // Leave headroom: llama.cpp allocates scratch beyond what we can predict,
@@ -70,25 +86,43 @@ pub fn fit_to_vram(
     let budget = free_bytes.saturating_sub(overhead_bytes).saturating_mul(92) / 100;
 
     if bytes_per_layer == 0 || total_layers == 0 {
-        return FitEstimate { layers: 0, cpu_moe: None, bytes_used: 0 };
+        return FitEstimate { layers: 0, cpu_moe: None, cpu_moe_tensors: 0, bytes_used: 0 };
     }
 
     let all_layers_cost = bytes_per_layer * total_layers as u64;
     if all_layers_cost <= budget {
-        return FitEstimate { layers: total_layers, cpu_moe: None, bytes_used: all_layers_cost };
+        return FitEstimate {
+            layers: total_layers,
+            cpu_moe: None,
+            cpu_moe_tensors: 0,
+            bytes_used: all_layers_cost,
+        };
     }
 
-    // Try keeping every layer resident but evicting experts from as few as
-    // possible, which is the smallest loss that still fits.
+    // Try keeping every layer resident but evicting as little as possible,
+    // which is the smallest loss that still fits. The search walks in thirds
+    // of a layer: `whole` layers fully evicted, then `tensors` more from the
+    // layer after them.
     if expert_bytes_per_layer > 0 {
-        let dense_cost = bytes_per_layer - expert_bytes_per_layer;
-        for evicted in 1..=total_layers {
-            let cost = dense_cost * evicted as u64
-                + bytes_per_layer * (total_layers - evicted) as u64;
+        // A measured split is used where there is one, and an even one is
+        // assumed otherwise — a file we could not break down is still better
+        // served by approximate thirds than by whole layers.
+        let kinds = if kind_bytes.iter().sum::<u64>() > 0 {
+            kind_bytes
+        } else {
+            [expert_bytes_per_layer / 3; 3]
+        };
+        for step in 1..=(total_layers as u64 * 3) {
+            let whole = (step / 3) as u32;
+            let tensors = (step % 3) as u32;
+            let partial: u64 = kinds.iter().take(tensors as usize).sum();
+            let freed = expert_bytes_per_layer * whole as u64 + partial;
+            let cost = all_layers_cost.saturating_sub(freed);
             if cost <= budget {
                 return FitEstimate {
                     layers: total_layers,
-                    cpu_moe: Some(evicted),
+                    cpu_moe: Some(whole),
+                    cpu_moe_tensors: tensors,
                     bytes_used: cost,
                 };
             }
@@ -100,6 +134,7 @@ pub fn fit_to_vram(
     FitEstimate {
         layers,
         cpu_moe: expert_bytes_per_layer.gt(&0).then_some(total_layers),
+        cpu_moe_tensors: 0,
         bytes_used: bytes_per_layer * layers as u64,
     }
 }
@@ -112,8 +147,9 @@ pub fn resolve_auto(
     total_layers: u32,
     bytes_per_layer: u64,
     expert_bytes_per_layer: u64,
+    kind_bytes: [u64; 3],
     overhead_bytes: u64,
-) -> (u32, u32) {
+) -> (u32, u32, u32) {
     let explicit_layers = match gpu_layers {
         GpuLayers::Count(n) => Some(n.min(total_layers)),
         GpuLayers::Keyword(ozgent_core::options::GpuKeyword::Off) => Some(0),
@@ -123,10 +159,10 @@ pub fn resolve_auto(
     // With no GPU, or with the GPU switched off, nothing is offloaded and
     // expert eviction is meaningless.
     let Some(device) = device.filter(|d| d.is_gpu()) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
     if explicit_layers == Some(0) {
-        return (0, 0);
+        return (0, 0, 0);
     }
 
     let estimate = fit_to_vram(
@@ -134,19 +170,23 @@ pub fn resolve_auto(
         total_layers,
         bytes_per_layer,
         expert_bytes_per_layer,
+        kind_bytes,
         overhead_bytes,
     );
 
     let layers = explicit_layers.unwrap_or(estimate.layers);
-    let moe = match cpu_moe {
-        MoeOffload::Layers(n) => n,
-        MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::Off) => 0,
-        MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::All) => total_layers,
+    // A number the person typed means whole layers and nothing finer; the
+    // partial layer only ever comes from `auto`, which is the only setting
+    // that is trying to land on an exact figure.
+    let (moe, tensors) = match cpu_moe {
+        MoeOffload::Layers(n) => (n, 0),
+        MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::Off) => (0, 0),
+        MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::All) => (total_layers, 0),
         MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::Auto) => {
-            estimate.cpu_moe.unwrap_or(0)
+            (estimate.cpu_moe.unwrap_or(0), estimate.cpu_moe_tensors)
         }
     };
-    (layers, moe)
+    (layers, moe, tensors)
 }
 
 #[cfg(feature = "llama")]
@@ -202,9 +242,83 @@ mod tests {
 
     #[test]
     fn everything_fits_when_there_is_room() {
-        let f = fit_to_vram(24 * GIB, 32, 200 * 1024 * 1024, 0, GIB);
+        let f = fit_to_vram(24 * GIB, 32, 200 * 1024 * 1024, 0, [0; 3], GIB);
         assert_eq!(f.layers, 32);
         assert_eq!(f.cpu_moe, None, "no need to evict experts when it all fits");
+    }
+
+    #[test]
+    fn a_partial_layer_lands_closer_to_the_memory_that_exists() {
+        // The point of thirds. Whole-layer steps round down by up to a whole
+        // layer of experts, and on a card with nothing else running that
+        // rounding is VRAM left idle for the life of the process.
+        let per_layer = 300 * 1024 * 1024;
+        let expert = 240 * 1024 * 1024;
+        let kinds = [expert / 3; 3];
+        // A budget deliberately landing between two whole-layer steps.
+        let free = 8 * GIB;
+        let f = fit_to_vram(free, 32, per_layer, expert, kinds, GIB);
+        let whole_only = fit_to_vram(free, 32, per_layer, expert, [0, 0, 0], GIB);
+        assert_eq!(f.layers, 32, "every layer should stay resident");
+        // With thirds available the plan uses at least as much of the card.
+        assert!(
+            f.bytes_used >= whole_only.bytes_used,
+            "thirds used {} but whole layers used {}",
+            f.bytes_used, whole_only.bytes_used
+        );
+    }
+
+    #[test]
+    fn at_most_one_layer_is_ever_left_split() {
+        // Splitting a layer costs an activation round trip per token, so it
+        // is spent once and never as a general strategy.
+        let per_layer = 300 * 1024 * 1024;
+        let expert = 240 * 1024 * 1024;
+        for free in [2 * GIB, 4 * GIB, 6 * GIB, 8 * GIB] {
+            let f = fit_to_vram(free, 32, per_layer, expert, [expert / 3; 3], GIB);
+            assert!(f.cpu_moe_tensors <= 2, "free={free}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_split_still_gets_thirds() {
+        // A file whose tensor table could not be broken down is better served
+        // by approximate thirds than by whole layers only.
+        let per_layer = 300 * 1024 * 1024;
+        let expert = 240 * 1024 * 1024;
+        let f = fit_to_vram(5 * GIB, 32, per_layer, expert, [0; 3], GIB);
+        assert_eq!(f.layers, 32);
+        assert!(f.cpu_moe.is_some());
+    }
+
+    #[test]
+    fn the_pattern_names_whole_layers_and_the_part_layer_together() {
+        let p = moe_pattern(3, 2).expect("something is evicted");
+        // Whole layers 0..2, then two of three kinds from layer 3.
+        assert!(p.contains("(0|1|2)"), "{p}");
+        assert!(p.contains(r"blk\.3\."), "{p}");
+        assert!(p.contains("down|gate"), "{p}");
+        assert!(!p.contains("up|down|gate|"), "the part layer must not take all three: {p}");
+    }
+
+    #[test]
+    fn a_whole_number_of_layers_keeps_the_pattern_it_always_had() {
+        let p = moe_pattern(3, 0).expect("something is evicted");
+        assert_eq!(p, r"blk\.(0|1|2)\.ffn_(up|down|gate)_(ch|)exps");
+    }
+
+    #[test]
+    fn evicting_nothing_produces_no_pattern() {
+        // An empty pattern would match every tensor name and move the whole
+        // model to the CPU, which is the opposite of what it means.
+        assert_eq!(moe_pattern(0, 0), None);
+    }
+
+    #[test]
+    fn a_split_with_no_whole_layers_still_names_layer_zero() {
+        let p = moe_pattern(0, 1).expect("something is evicted");
+        assert!(p.contains(r"blk\.0\."), "{p}");
+        assert!(p.contains("down"), "{p}");
     }
 
     #[test]
@@ -213,7 +327,7 @@ mod tests {
         // every layer's attention on the GPU and moves experts out.
         let per_layer = 600 * 1024 * 1024;
         let expert = 500 * 1024 * 1024;
-        let f = fit_to_vram(8 * GIB, 32, per_layer, expert, GIB);
+        let f = fit_to_vram(8 * GIB, 32, per_layer, expert, [expert / 3; 3], GIB);
 
         assert_eq!(f.layers, 32, "layers should stay resident");
         assert!(f.cpu_moe.is_some(), "experts should be evicted instead");
@@ -226,7 +340,7 @@ mod tests {
         // loss. The estimate must not evict more than necessary.
         let per_layer = 400 * 1024 * 1024;
         let expert = 300 * 1024 * 1024;
-        let f = fit_to_vram(8 * GIB, 32, per_layer, expert, GIB);
+        let f = fit_to_vram(8 * GIB, 32, per_layer, expert, [expert / 3; 3], GIB);
         let evicted = f.cpu_moe.expect("should evict");
 
         let dense = per_layer - expert;
@@ -238,7 +352,7 @@ mod tests {
     #[test]
     fn layers_are_dropped_only_when_eviction_is_not_enough() {
         // A dense model has no experts to evict.
-        let f = fit_to_vram(2 * GIB, 32, 500 * 1024 * 1024, 0, GIB);
+        let f = fit_to_vram(2 * GIB, 32, 500 * 1024 * 1024, 0, [0; 3], GIB);
         assert!(f.layers < 32, "must offload fewer layers");
         assert_eq!(f.cpu_moe, None);
     }
@@ -246,7 +360,7 @@ mod tests {
     #[test]
     fn headroom_is_reserved_rather_than_filling_vram_exactly() {
         let free = 8 * GIB;
-        let f = fit_to_vram(free, 100, 100 * 1024 * 1024, 0, 0);
+        let f = fit_to_vram(free, 100, 100 * 1024 * 1024, 0, [0; 3], 0);
         assert!(
             f.bytes_used < free,
             "an exact fit fails at load time; got {} of {free}",
@@ -256,8 +370,8 @@ mod tests {
 
     #[test]
     fn no_gpu_means_nothing_is_offloaded() {
-        let (layers, moe) = resolve_auto(
-            GpuLayers::AUTO, MoeOffload::AUTO, None, 32, GIB, 0, GIB,
+        let (layers, moe, _) = resolve_auto(
+            GpuLayers::AUTO, MoeOffload::AUTO, None, 32, GIB, 0, [0; 3], GIB,
         );
         assert_eq!((layers, moe), (0, 0));
     }
@@ -273,8 +387,8 @@ mod tests {
             memory_free: 32 * GIB as usize,
         };
         assert!(!cpu.is_gpu());
-        let (layers, _) = resolve_auto(
-            GpuLayers::AUTO, MoeOffload::AUTO, Some(&cpu), 32, GIB, 0, GIB,
+        let (layers, _, _) = resolve_auto(
+            GpuLayers::AUTO, MoeOffload::AUTO, Some(&cpu), 32, GIB, 0, [0; 3], GIB,
         );
         assert_eq!(layers, 0, "the CPU backend must not be offloaded to");
     }
@@ -289,8 +403,8 @@ mod tests {
             memory_total: 24 * GIB as usize,
             memory_free: 24 * GIB as usize,
         };
-        let (layers, moe) = resolve_auto(
-            GpuLayers::OFF, MoeOffload::AUTO, Some(&gpu), 32, GIB, 0, GIB,
+        let (layers, moe, _) = resolve_auto(
+            GpuLayers::OFF, MoeOffload::AUTO, Some(&gpu), 32, GIB, 0, [0; 3], GIB,
         );
         assert_eq!((layers, moe), (0, 0), "--no-gpu must mean no GPU");
     }
@@ -305,13 +419,13 @@ mod tests {
             memory_total: 24 * GIB as usize,
             memory_free: 24 * GIB as usize,
         };
-        let (layers, _) = resolve_auto(
-            GpuLayers::Count(10), MoeOffload::OFF, Some(&gpu), 32, GIB / 4, 0, GIB,
+        let (layers, _, _) = resolve_auto(
+            GpuLayers::Count(10), MoeOffload::OFF, Some(&gpu), 32, GIB / 4, 0, [0; 3], GIB,
         );
         assert_eq!(layers, 10);
 
-        let (clamped, _) = resolve_auto(
-            GpuLayers::Count(999), MoeOffload::OFF, Some(&gpu), 32, GIB / 4, 0, GIB,
+        let (clamped, _, _) = resolve_auto(
+            GpuLayers::Count(999), MoeOffload::OFF, Some(&gpu), 32, GIB / 4, 0, [0; 3], GIB,
         );
         assert_eq!(clamped, 32, "cannot offload more layers than the model has");
     }
@@ -326,15 +440,15 @@ mod tests {
             memory_total: 8 * GIB as usize,
             memory_free: 8 * GIB as usize,
         };
-        let (_, moe) = resolve_auto(
-            GpuLayers::AUTO, MoeOffload::ALL, Some(&gpu), 48, GIB / 8, GIB / 16, GIB,
+        let (_, moe, _) = resolve_auto(
+            GpuLayers::AUTO, MoeOffload::ALL, Some(&gpu), 48, GIB / 8, GIB / 16, [0; 3], GIB,
         );
         assert_eq!(moe, 48);
     }
 
     #[test]
     fn zero_sized_models_do_not_divide_by_zero() {
-        let f = fit_to_vram(8 * GIB, 0, 0, 0, 0);
+        let f = fit_to_vram(8 * GIB, 0, 0, 0, [0; 3], 0);
         assert_eq!(f.layers, 0);
     }
 }
@@ -352,9 +466,44 @@ pub struct Plan {
     pub layers: u32,
     /// Layers to evict routed experts from. Zero on a dense model.
     pub experts: u32,
+    /// Individual expert tensors evicted from the layer after those, 0 to 2.
+    /// The step that makes placement land within a third of a layer of the
+    /// memory actually available instead of rounding a whole one away.
+    pub expert_tensors: u32,
     pub total_layers: u32,
     /// Free device memory the decision was made against.
     pub free_bytes: u64,
+}
+
+/// The tensor-name pattern that sends routed experts to the CPU.
+///
+/// `whole` layers give up all three of their expert tensors; the layer after
+/// them gives up the first `tensors` of [`crate::layout::EXPERT_KINDS`]. One
+/// pattern covers both, because the vendored binding fills slot zero on every
+/// call and asserts on the second — so a second override is not available,
+/// and alternation is how two rules become one.
+///
+/// llama.cpp matches with `std::regex_search`, so this need not anchor.
+pub fn moe_pattern(whole: u32, tensors: u32) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if whole > 0 {
+        let blocks = (0..whole).map(|l| l.to_string()).collect::<Vec<_>>().join("|");
+        parts.push(format!(r"blk\.({blocks})\.ffn_(up|down|gate)_(ch|)exps"));
+    }
+    if tensors > 0 {
+        let kinds = crate::layout::EXPERT_KINDS
+            .iter()
+            .take(tensors.min(3) as usize)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("|");
+        parts.push(format!(r"blk\.{whole}\.ffn_({kinds})_(ch|)exps"));
+    }
+    match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        _ => Some(parts.iter().map(|p| format!("({p})")).collect::<Vec<_>>().join("|")),
+    }
 }
 
 /// The window the placement decision reserves cache for.
@@ -372,7 +521,7 @@ impl Plan {
         // `u32::MAX` rather than `total_layers`: llama.cpp clamps it, and a
         // file whose tensor table could not be read reports zero layers, which
         // must not become "offload nothing".
-        Self { layers: u32::MAX, experts: 0, total_layers, free_bytes }
+        Self { layers: u32::MAX, experts: 0, expert_tensors: 0, total_layers, free_bytes }
     }
 
     pub fn for_model(path: &std::path::Path, opts: &ozgent_core::Resolved) -> Self {
@@ -418,16 +567,17 @@ impl Plan {
         };
         let overhead =
             ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed);
-        let (layers, experts) = resolve_auto(
+        let (layers, experts, expert_tensors) = resolve_auto(
             opts.gpu_layers,
             opts.cpu_moe,
             Some(&device),
             layout.layers,
             layout.bytes_per_layer,
             layout.expert_bytes_per_layer,
+            layout.expert_kind_bytes,
             overhead,
         );
-        Self { layers, experts, total_layers: layout.layers, free_bytes: free }
+        Self { layers, experts, expert_tensors, total_layers: layout.layers, free_bytes: free }
     }
 
     /// Whether this is the whole model on the GPU.
@@ -450,7 +600,7 @@ mod plan_tests {
     use super::*;
 
     fn plan(layers: u32, total: u32) -> Plan {
-        Plan { layers, experts: 0, total_layers: total, free_bytes: 0 }
+        Plan { layers, experts: 0, expert_tensors: 0, total_layers: total, free_bytes: 0 }
     }
 
     #[test]
@@ -483,7 +633,7 @@ mod plan_tests {
     fn an_empty_gpu_still_takes_the_whole_model() {
         // The regression this guards: making `auto` mean "what fits" must not
         // make the ordinary single-model case offload less than it used to.
-        let est = fit_to_vram(8 << 30, 32, 100 << 20, 0, 1 << 30);
+        let est = fit_to_vram(8 << 30, 32, 100 << 20, 0, [0; 3], 1 << 30);
         assert_eq!(est.layers, 32, "3.2 GB of layers into 8 GB free");
         assert_eq!(est.cpu_moe, None);
     }
@@ -493,13 +643,13 @@ mod plan_tests {
         // 8 GB card, 3.9 GB already used by another model, 1 GB of overhead:
         // some layers fit, not all, and the answer is a number rather than a
         // failure.
-        let est = fit_to_vram(4 << 30, 32, 200 << 20, 0, 1 << 30);
+        let est = fit_to_vram(4 << 30, 32, 200 << 20, 0, [0; 3], 1 << 30);
         assert!(est.layers > 0 && est.layers < 32, "got {}", est.layers);
     }
 
     #[test]
     fn a_full_gpu_offloads_nothing_rather_than_overcommitting() {
-        let est = fit_to_vram(512 << 20, 32, 200 << 20, 0, 1 << 30);
+        let est = fit_to_vram(512 << 20, 32, 200 << 20, 0, [0; 3], 1 << 30);
         assert_eq!(est.layers, 0, "overhead alone does not fit");
     }
 }
@@ -516,7 +666,7 @@ mod elastic_cache_tests {
 
     /// What the old planner did: reserve the whole requested window first.
     fn reserving(window_bytes: u64) -> FitEstimate {
-        fit_to_vram(FREE, LAYERS, PER_LAYER, 0, window_bytes)
+        fit_to_vram(FREE, LAYERS, PER_LAYER, 0, [0; 3], window_bytes)
     }
 
     #[test]
@@ -551,13 +701,13 @@ mod elastic_cache_tests {
     fn a_model_too_big_for_the_card_still_offloads_what_fits() {
         // The floor must not make the planner optimistic to the point of
         // claiming a model fits when it does not.
-        let est = fit_to_vram(FREE, LAYERS, 400 << 20, 0, 300 << 20);
+        let est = fit_to_vram(FREE, LAYERS, 400 << 20, 0, [0; 3], 300 << 20);
         assert!(est.layers > 0 && est.layers < LAYERS, "got {}", est.layers);
     }
 
     #[test]
     fn a_card_with_nothing_spare_still_offloads_nothing() {
-        let est = fit_to_vram(200 << 20, LAYERS, PER_LAYER, 0, 300 << 20);
+        let est = fit_to_vram(200 << 20, LAYERS, PER_LAYER, 0, [0; 3], 300 << 20);
         assert_eq!(est.layers, 0);
     }
 }
