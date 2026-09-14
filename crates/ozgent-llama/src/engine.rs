@@ -71,7 +71,7 @@ pub struct Engine {
     /// so it can never be reused — which is why the checkpoint stops short.
     gen_prompt_tokens: usize,
     /// KV elements stored per token across all layers, for cache sizing.
-    kv_elements: u64,
+    kv_shape: ozgent_core::accel::KvShape,
     /// On-disk size of the weights, used as the denominator when deciding
     /// whether KV traffic dominates weight traffic.
     weight_bytes: u64,
@@ -214,8 +214,8 @@ impl Engine {
         let head_dim = (model.n_embd() as u32) / model.n_head().max(1);
         let k_len = meta_u32(&model, &format!("{arch}.attention.key_length")).unwrap_or(head_dim);
         let v_len = meta_u32(&model, &format!("{arch}.attention.value_length")).unwrap_or(head_dim);
-        let kv_elements =
-            ozgent_core::accel::kv_elements_per_token(n_layer, model.n_head_kv(), k_len, v_len);
+        let kv_shape =
+            ozgent_core::accel::KvShape::new(n_layer, model.n_head_kv(), k_len, v_len);
         let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
         // Speculative decoding rejects drafts by discarding the KV entries
@@ -259,7 +259,7 @@ impl Engine {
             jinja,
             n_layer,
             rollback_safe,
-            kv_elements,
+            kv_shape,
             weight_bytes,
             template,
             model,
@@ -590,20 +590,40 @@ impl Engine {
         // the VRAM left *after* the weights are resident, which is only known
         // once the model has loaded.
         let free = crate::backend::best_gpu().map(|d| d.memory_free as u64).unwrap_or(0);
-        let resolve_kv = |requested_type: CacheType| -> CacheType {
-            if requested_type != CacheType::Auto {
-                return requested_type;
-            }
-            ozgent_core::accel::choose_kv_type(
-                self.kv_elements,
+        let split = match (opts.cache_type_k, opts.cache_type_v) {
+            (CacheType::Auto, CacheType::Auto) => ozgent_core::accel::choose_kv_split(
+                self.kv_shape,
                 requested,
                 self.weight_bytes,
                 free,
                 opts.flash_attention,
-            )
+            ),
+            // One named and the other left alone is someone saying "store the
+            // cache like this", not asking for a mixed one.
+            (k, CacheType::Auto) => ozgent_core::accel::KvSplit::uniform(k),
+            (CacheType::Auto, v) => ozgent_core::accel::KvSplit::uniform(v),
+            (k, v) => ozgent_core::accel::KvSplit { k, v },
         };
-        let type_k = resolve_kv(opts.cache_type_k);
-        let type_v = resolve_kv(opts.cache_type_v);
+        // A pair llama.cpp will refuse returns a null context with the reason
+        // only in its own log, so it is caught here while there is still
+        // something useful to say and a working pair to fall back to.
+        let split = if ozgent_core::accel::kv_split_allowed(split, opts.flash_attention, self.kv_shape) {
+            split
+        } else {
+            let safe = ozgent_core::accel::choose_kv_split(
+                self.kv_shape,
+                requested,
+                self.weight_bytes,
+                free,
+                opts.flash_attention,
+            );
+            tracing::warn!(
+                "this model cannot store its cache as {:?}/{:?}; using {:?}/{:?}",
+                split.k, split.v, safe.k, safe.v
+            );
+            safe
+        };
+        let (type_k, type_v) = (split.k, split.v);
 
         // Training context is a claim about which positions the model
         // understands, not a promise that the cache for them fits in memory.
@@ -624,32 +644,30 @@ impl Engine {
         } else {
             ozgent_core::accel::kv_budget(0, host, 0, self.n_layer)
         };
-        // K and V can end up on different types; sizing against the wider one
-        // keeps the estimate on the safe side of the real allocation.
-        let widest = if type_k.bits() >= type_v.bits() { type_k } else { type_v };
         let requested =
-            ozgent_core::accel::fit_context(self.kv_elements, requested, widest, budget);
+            ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
         if requested < opts.context_length.min(self.n_ctx_train.max(512)) {
-            let wanted = ozgent_core::accel::kv_bytes(
-                self.kv_elements,
-                opts.context_length.min(self.n_ctx_train.max(512)),
-                widest,
-            ) / (1024 * 1024);
+            let wanted = self
+                .kv_shape
+                .bytes(opts.context_length.min(self.n_ctx_train.max(512)), split)
+                / (1024 * 1024);
             let where_ = if opts.kv_offload { "vram" } else { "system ram" };
             tracing::warn!(
-                "context {} needs {wanted} MiB of {widest:?} kv cache; only {} MiB of {where_} \
-                 is free, so the window is {requested}",
+                "context {} needs {wanted} MiB of {k:?} K / {v:?} V kv cache; only {} MiB \
+                 of {where_} is free, so the window is {requested}",
                 opts.context_length,
                 budget / (1024 * 1024),
+                k = split.k,
+                v = split.v,
             );
             // Only worth suggesting when it would actually help. On a machine
             // whose RAM is no larger than its spare VRAM, moving the cache
             // buys nothing and costs the token rate.
             if opts.kv_offload
-                && ozgent_core::accel::fit_context(
-                    self.kv_elements,
+                && ozgent_core::accel::fit_context_split(
+                    self.kv_shape,
                     opts.context_length,
-                    widest,
+                    split,
                     ozgent_core::accel::kv_budget(0, host, 0, self.n_layer),
                 ) > requested
             {
@@ -660,8 +678,10 @@ impl Engine {
         }
         if opts.cache_type_k == CacheType::Auto {
             tracing::info!(
-                "kv cache: {type_k:?} ({} MiB at {requested} ctx, {} MiB free)",
-                ozgent_core::accel::kv_bytes(self.kv_elements, requested, type_k) / (1024 * 1024),
+                "kv cache: {:?} K / {:?} V ({} MiB at {requested} ctx, {} MiB free)",
+                type_k,
+                type_v,
+                self.kv_shape.bytes(requested, split) / (1024 * 1024),
                 free / (1024 * 1024),
             );
         }

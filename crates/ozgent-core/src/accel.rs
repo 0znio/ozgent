@@ -199,6 +199,181 @@ pub fn fit_context(elements_per_token: u64, requested: u32, t: CacheType, budget
     rounded.max(MIN_CONTEXT)
 }
 
+// --------------------------------------------------- the two halves of a cache
+
+/// How many elements per token each half of the cache holds, and how wide a
+/// single head is in each — which llama.cpp needs to divide by the block size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvShape {
+    pub k: u64,
+    pub v: u64,
+    pub k_len: u32,
+    pub v_len: u32,
+}
+
+impl KvShape {
+    pub fn new(n_layer: u32, n_head_kv: u32, k_len: u32, v_len: u32) -> Self {
+        let per = n_layer as u64 * n_head_kv as u64;
+        Self { k: per * k_len as u64, v: per * v_len as u64, k_len, v_len }
+    }
+
+    /// Both halves together, for callers that size against a single type.
+    pub fn total(self) -> u64 {
+        self.k + self.v
+    }
+
+    /// Bytes at `n_ctx` tokens, with each half stored its own way.
+    pub fn bytes(self, n_ctx: u32, split: KvSplit) -> u64 {
+        kv_bytes(self.k, n_ctx, split.k) + kv_bytes(self.v, n_ctx, split.v)
+    }
+}
+
+/// How each half of the cache is stored. They are not the same question.
+///
+/// K is what every query is scored against: an error there moves attention to
+/// the wrong token, and the mistake compounds through the rest of the sequence.
+/// V is only summed *after* the weights have been decided, so an error there is
+/// averaged across however many tokens attended — it fades instead of steering.
+///
+/// So the two degrade at very different rates, and giving them one type throws
+/// that away. `q8_0` K with `q4_0` V costs 13 bits per element against `q5_1`
+/// everywhere at 12, and is markedly better output for that 8%: the sensitive
+/// half stays near-lossless and the forgiving half absorbs the loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSplit {
+    pub k: CacheType,
+    pub v: CacheType,
+}
+
+impl KvSplit {
+    pub const fn uniform(t: CacheType) -> Self {
+        Self { k: t, v: t }
+    }
+}
+
+impl Default for KvSplit {
+    fn default() -> Self {
+        Self::uniform(CacheType::F16)
+    }
+}
+
+/// Every block-quantised cache type ggml offers has 32 elements to a block, so
+/// a head narrower than that — or not a multiple of it — cannot be stored in
+/// one. llama.cpp checks this per layer and returns a null context if it fails.
+const KV_BLOCK: u32 = 32;
+
+/// Whether llama.cpp will accept this pair, given flash attention and the
+/// model's head widths.
+///
+/// The rules are *asymmetric*, and getting them the wrong way round is
+/// expensive: ozgent previously believed a quantised **K** needed flash
+/// attention, when in fact it is **V** that does. Every model with no flash
+/// attention was therefore given an f16 cache on both halves when its K could
+/// have been quantised for free — which on a 9B at 32k is over a gigabyte of
+/// VRAM handed back for nothing.
+pub fn kv_split_allowed(split: KvSplit, flash: bool, shape: KvShape) -> bool {
+    // "V cache quantization requires flash_attn" — llama-context.cpp. There is
+    // no matching rule for K.
+    if split.v.is_quantized() && !flash {
+        return false;
+    }
+    // With flash attention on, both halves must divide the block size. With it
+    // off the check is skipped entirely, which is why an odd head width can
+    // still take a quantised K.
+    if flash {
+        if split.k.is_quantized() && shape.k_len % KV_BLOCK != 0 {
+            return false;
+        }
+        if split.v.is_quantized() && shape.v_len % KV_BLOCK != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pairs to try when flash attention is on, best quality first.
+///
+/// V is spent before K at every step, and K only moves once V has reached the
+/// floor — see [`KvSplit`] for why that is the right order. The list is also
+/// monotonically smaller, so the first rung that fits is both the best
+/// available and the largest that fits.
+const FLASH_LADDER: [KvSplit; 6] = [
+    KvSplit { k: CacheType::F16, v: CacheType::F16 },   // 32.0 bits
+    KvSplit { k: CacheType::Q8_0, v: CacheType::Q8_0 }, // 17.0
+    KvSplit { k: CacheType::Q8_0, v: CacheType::Q5_1 }, // 14.5
+    KvSplit { k: CacheType::Q8_0, v: CacheType::Q4_0 }, // 13.0
+    KvSplit { k: CacheType::Q5_1, v: CacheType::Q4_0 }, // 10.5
+    KvSplit { k: CacheType::Q4_0, v: CacheType::Q4_0 }, //  9.0
+];
+
+/// Pairs to try without flash attention, where V must stay f16.
+///
+/// This ladder used to be the single entry `f16`/`f16`, because ozgent had the
+/// rule the wrong way round and believed K was the restricted half. Every one
+/// of these rungs was unreachable, and a model with no flash attention paid
+/// full price for a cache whose keys it could always have quantised.
+const PLAIN_LADDER: [KvSplit; 4] = [
+    KvSplit { k: CacheType::F16, v: CacheType::F16 },  // 32.0 bits
+    KvSplit { k: CacheType::Q8_0, v: CacheType::F16 }, // 24.5
+    KvSplit { k: CacheType::Q5_1, v: CacheType::F16 }, // 22.0
+    KvSplit { k: CacheType::Q4_0, v: CacheType::F16 }, // 20.5
+];
+
+/// The pairs worth trying on this model. Ordered best-first and smallest-last.
+pub fn kv_ladder(flash: bool, shape: KvShape) -> Vec<KvSplit> {
+    let ladder: &[KvSplit] = if flash { &FLASH_LADDER } else { &PLAIN_LADDER };
+    ladder.iter().copied().filter(|s| kv_split_allowed(*s, flash, shape)).collect()
+}
+
+/// Choose how to store each half of the cache on this hardware.
+///
+/// Same two pressures as before — it has to fit, and past a certain size
+/// quantising is a speed win rather than a compromise — but now spent on the
+/// half that can afford it. See [`KvSplit`].
+pub fn choose_kv_split(
+    shape: KvShape,
+    n_ctx: u32,
+    weight_bytes: u64,
+    free_bytes: u64,
+    flash: bool,
+) -> KvSplit {
+    let budget = free_bytes / 100 * KV_VRAM_SHARE;
+    let avg_f16 = kv_bytes(shape.total(), n_ctx / 2, CacheType::F16);
+    let traffic_bound =
+        weight_bytes > 0 && avg_f16 as f64 > weight_bytes as f64 * KV_TRAFFIC_RATIO;
+
+    let usable = kv_ladder(flash, shape);
+
+    for split in &usable {
+        // Past the traffic threshold an f16 K is the slow choice, not the
+        // accurate one; skip it while anything smaller is still available.
+        if traffic_bound && split.k == CacheType::F16 && usable.len() > 1 {
+            continue;
+        }
+        if shape.bytes(n_ctx, *split) <= budget {
+            return *split;
+        }
+    }
+    // Nothing fits cleanly. The smallest pair this model can take is the only
+    // chance of opening a context at all.
+    *usable.last().unwrap_or(&KvSplit::uniform(CacheType::F16))
+}
+
+/// The largest window that fits, with each half stored its own way.
+pub fn fit_context_split(shape: KvShape, requested: u32, split: KvSplit, budget: u64) -> u32 {
+    if requested == 0 || shape.total() == 0 {
+        return requested;
+    }
+    let per_token = shape.k as f64 * split.k.bits() as f64 / 8.0
+        + shape.v as f64 * split.v.bits() as f64 / 8.0;
+    if per_token <= 0.0 {
+        return requested;
+    }
+    let affordable = (budget as f64 / per_token) as u64;
+    let affordable = u32::try_from(affordable).unwrap_or(u32::MAX).min(requested);
+    (affordable / CONTEXT_GRAIN * CONTEXT_GRAIN).max(MIN_CONTEXT)
+}
+
 /// Memory the KV cache may claim, given where the model's layers ended up.
 ///
 /// llama.cpp places each layer's cache next to that layer's weights, so a
@@ -432,6 +607,113 @@ mod tests {
     fn qwen_elements() -> u64 {
         let (l, h, k, v) = QWEN;
         kv_elements_per_token(l, h, k, v)
+    }
+
+    fn qwen_shape() -> KvShape {
+        let (l, h, k, v) = QWEN;
+        KvShape::new(l, h, k, v)
+    }
+
+    #[test]
+    fn the_two_halves_sum_to_what_one_number_used_to_say() {
+        assert_eq!(qwen_shape().total(), qwen_elements());
+    }
+
+    #[test]
+    fn every_ladder_gets_smaller_as_it_goes() {
+        // The fit search takes the first rung that fits, so a rung larger than
+        // the one above it would be skipped over and never chosen — and the
+        // last rung has to be the smallest or the fallback is not a fallback.
+        for (name, ladder) in [("flash", &FLASH_LADDER[..]), ("plain", &PLAIN_LADDER[..])] {
+            let shape = qwen_shape();
+            let sizes: Vec<u64> = ladder.iter().map(|s| shape.bytes(4096, *s)).collect();
+            for pair in sizes.windows(2) {
+                assert!(pair[0] > pair[1], "{name} ladder is not descending: {sizes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keys_are_never_stored_worse_than_values() {
+        // The asymmetry the split exists for. Both halves degrade down the
+        // ladder, but K stays at least as precise as V at every rung, because
+        // an error in K steers attention and an error in V only blurs it.
+        let mut previous = FLASH_LADDER[0];
+        for split in FLASH_LADDER {
+            assert!(split.k.bits() >= split.v.bits(), "K is worse than V at {split:?}");
+            assert!(split.k.bits() <= previous.k.bits(), "K went back up at {split:?}");
+            assert!(split.v.bits() <= previous.v.bits(), "V went back up at {split:?}");
+            previous = split;
+        }
+    }
+
+    #[test]
+    fn without_flash_attention_only_the_keys_can_give() {
+        // llama.cpp pins V to f16 here, so this ladder spends K — which it
+        // could never do while ozgent had the rule the wrong way round.
+        let mut previous = PLAIN_LADDER[0];
+        for split in PLAIN_LADDER {
+            assert_eq!(split.v, CacheType::F16, "V must stay f16: {split:?}");
+            assert!(split.k.bits() <= previous.k.bits(), "K went back up at {split:?}");
+            previous = split;
+        }
+        assert!(PLAIN_LADDER.len() > 1, "there must be something to fall back to");
+    }
+
+    #[test]
+    fn a_model_without_flash_attention_can_still_quantise_its_keys() {
+        // The bug: ozgent believed a quantised K needed flash attention, so a
+        // model without it got f16 on both halves. llama.cpp restricts V, not
+        // K, and the difference here is a quarter of the cache.
+        let shape = qwen_shape();
+        let tight = shape.bytes(32_768, KvSplit::uniform(CacheType::F16)) * 2;
+        let chosen = choose_kv_split(shape, 32_768, 2_740_000_000, tight, false);
+        assert!(chosen.k.is_quantized(), "K should be quantised: {chosen:?}");
+        assert_eq!(chosen.v, CacheType::F16, "V cannot be, without flash attention");
+    }
+
+    #[test]
+    fn a_quantised_value_cache_is_never_chosen_without_flash_attention() {
+        // llama.cpp returns a null context for this, so it must be unreachable
+        // however tight memory gets.
+        let shape = qwen_shape();
+        for free in [64 * 1024 * 1024, GIB, 8 * GIB] {
+            let chosen = choose_kv_split(shape, 32_768, 2_740_000_000, free, false);
+            assert!(!chosen.v.is_quantized(), "free={free}: {chosen:?}");
+            assert!(kv_split_allowed(chosen, false, shape));
+        }
+    }
+
+    #[test]
+    fn a_head_that_does_not_divide_the_block_size_is_not_quantised() {
+        // With flash attention on, llama.cpp checks head width against the
+        // block size and returns null if it does not divide. 80 does not.
+        let odd = KvShape::new(32, 8, 80, 80);
+        let chosen = choose_kv_split(odd, 32_768, 2_740_000_000, 64 * 1024 * 1024, true);
+        assert!(kv_split_allowed(chosen, true, odd), "{chosen:?}");
+    }
+
+    #[test]
+    fn the_mixed_pair_beats_a_uniform_one_of_the_same_size() {
+        // q8_0/q4_0 is 13 bits against q5_1/q5_1 at 12 — close enough in size
+        // to be a fair trade, and much better where it matters.
+        let shape = qwen_shape();
+        let mixed = shape.bytes(32_768, KvSplit { k: CacheType::Q8_0, v: CacheType::Q4_0 });
+        let uniform = shape.bytes(32_768, KvSplit::uniform(CacheType::Q5_1));
+        assert!(mixed < uniform * 110 / 100, "mixed {mixed} vs uniform {uniform}");
+    }
+
+    #[test]
+    fn a_window_is_sized_against_both_halves_not_the_wider_one() {
+        // Sizing everything against the wider half was the old approximation
+        // and it under-sized the window whenever the halves differed.
+        let shape = qwen_shape();
+        let split = KvSplit { k: CacheType::Q8_0, v: CacheType::Q4_0 };
+        let budget = shape.bytes(16_384, split);
+        let fitted = fit_context_split(shape, 65_536, split, budget);
+        assert!(fitted >= 16_000 && fitted <= 16_384, "got {fitted}");
+        let pessimistic = fit_context(shape.total(), 65_536, CacheType::Q8_0, budget);
+        assert!(fitted > pessimistic, "{fitted} should beat the widest-half guess {pessimistic}");
     }
 
     #[test]

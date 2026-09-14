@@ -2057,7 +2057,8 @@ const PARAMS = [
   { key: "context_length", label: "Context length",  type: "number", step: "256" },
   { key: "gpu_layers",     label: "GPU layers",      type: "text",   placeholder: "auto, off, or a number" },
   { key: "cpu_moe",        label: "CPU MoE layers",  type: "text",   placeholder: "auto, off, all, or a number" },
-  { key: "cache_type_k",   label: "KV cache",        type: "select", options: ["", "auto", "f16", "q8_0", "q5_1", "q4_0"] },
+  { key: "cache_type_k",   label: "Key cache",       type: "select", options: ["", "auto", "f16", "q8_0", "q5_1", "q4_0"] },
+  { key: "cache_type_v",   label: "Value cache",     type: "select", options: ["", "auto", "f16", "q8_0", "q5_1", "q4_0"] },
   { key: "thinking",       label: "Reasoning",       type: "select", options: ["", "auto", "on", "off"] },
   { key: "flash_attention",label: "Flash attention", type: "select", options: ["", "true", "false"] },
   { key: "tools",          label: "Tools",           type: "select", options: ["", "true", "false"] },
@@ -2278,8 +2279,11 @@ function collectParams() {
       if (!Number.isNaN(n)) out[spec.key] = n;
     } else out[spec.key] = raw;
   }
-  // K and V are one control; llama.cpp wants them set together.
-  if (out.cache_type_k) out.cache_type_v = out.cache_type_k;
+  // Two controls, deliberately. They were one, which threw away the fact that
+  // keys and values tolerate very different precision — `auto` now holds the
+  // keys high and spends the values first. Naming one and leaving the other on
+  // auto still means "store the cache like this", which `auto` resolution in
+  // the engine handles; nothing is forced here any more.
   return out;
 }
 

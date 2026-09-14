@@ -519,11 +519,16 @@ impl Resolved {
         self.prefix_reuse = src.prefix_reuse;
     }
 
-    /// llama.cpp cannot use a quantised K cache without flash attention.
+    /// llama.cpp cannot use a quantised **V** cache without flash attention.
     /// Rather than fail at load time, report whether the combination the user
     /// asked for had to be adjusted.
+    ///
+    /// This used to name K, which is the wrong half: "V cache quantization
+    /// requires flash_attn" is the only rule llama.cpp has here, and there is
+    /// no matching one for K. Believing otherwise cost every model without
+    /// flash attention an f16 K cache it never needed.
     pub fn kv_needs_flash_attention(&self) -> bool {
-        self.cache_type_k.is_quantized() && !self.flash_attention
+        self.cache_type_v.is_quantized() && !self.flash_attention
     }
 }
 
@@ -757,7 +762,7 @@ mod tests {
         let r = Options::default().resolve();
         // Auto, not a fixed type: the right cache depends on how much VRAM is
         // left after the weights and on how long the context is. See
-        // `accel::choose_kv_type`.
+        // `accel::choose_kv_split`.
         assert_eq!(r.cache_type_k, CacheType::Auto, "KV cache is sized at load time");
         assert_eq!(r.cpu_moe, MoeOffload::AUTO);
         assert_eq!(r.speculative, Speculative::Auto);
@@ -766,27 +771,40 @@ mod tests {
     }
 
     #[test]
-    fn quantised_kv_without_flash_attention_is_flagged() {
-        // Explicitly asking for a quantised cache with flash attention off is
-        // a real conflict and must be reported.
+    fn a_quantised_v_without_flash_attention_is_flagged() {
+        // llama.cpp's only rule here is about V, so this is the conflict.
         let o = Options {
             flash_attention: Some(false),
-            cache_type_k: Some(CacheType::Q8_0),
+            cache_type_v: Some(CacheType::Q8_0),
             ..Default::default()
         };
         assert!(o.resolve().kv_needs_flash_attention());
 
-        // The default is `auto`, which resolves to f16 in that situation
-        // rather than conflicting, so it must not be flagged.
+        // The default is `auto`, which resolves to something allowed rather
+        // than conflicting, so it must not be flagged.
         let auto = Options { flash_attention: Some(false), ..Default::default() };
         assert!(!auto.resolve().kv_needs_flash_attention());
 
         let ok = Options {
             flash_attention: Some(false),
-            cache_type_k: Some(CacheType::F16),
+            cache_type_v: Some(CacheType::F16),
             ..Default::default()
         };
         assert!(!ok.resolve().kv_needs_flash_attention());
+    }
+
+    #[test]
+    fn a_quantised_k_without_flash_attention_is_perfectly_fine() {
+        // The regression this guards: ozgent believed K was the restricted
+        // half and gave every model without flash attention a full f16 cache.
+        // llama.cpp has no such rule, and on a 9B at 32k this is over a
+        // gigabyte of VRAM that was being handed back for nothing.
+        let o = Options {
+            flash_attention: Some(false),
+            cache_type_k: Some(CacheType::Q8_0),
+            ..Default::default()
+        };
+        assert!(!o.resolve().kv_needs_flash_attention());
     }
 
     #[test]
