@@ -144,6 +144,12 @@ pub enum Event {
         /// Time spent on prefill. Reported so a caller can see prefix reuse
         /// working: a turn that reuses its prefix pays almost nothing here.
         prompt_ms: u64,
+        /// Draft tokens proposed, and how many the model kept. Zero when
+        /// nothing was drafting.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        drafted: usize,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        accepted: usize,
     },
     Error { message: String },
     /// An agent has taken over the turn. Everything until the matching
@@ -159,6 +165,12 @@ pub enum Event {
     },
     /// The agent finished. `ok` is false when it produced no report.
     AgentEnd { name: String, ok: bool, ms: u64, calls: usize, rounds: usize },
+}
+
+/// Omit a count that carries no information. A turn with nothing drafting
+/// should not report drafting nothing.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Handle to the models. Routes each job to the thread holding its model,
@@ -981,6 +993,8 @@ fn turn(
         stop: if totals.handed_back { "ToolCalls".to_string() } else { format!("{:?}", totals.stop) },
         prompt: totals.prompt_tokens,
         prompt_ms: totals.prompt_ms as u64,
+        drafted: totals.proposed,
+        accepted: totals.accepted,
     });
     Ok(())
 }
@@ -1234,6 +1248,14 @@ struct Outcome {
     elapsed_ms: u128,
     prompt_ms: u128,
     reused: usize,
+    /// Tokens a drafter proposed, and how many of those the model kept.
+    ///
+    /// Collected by the engine since speculation was written and surfaced
+    /// nowhere, which made the one setting that trades correctness-preserving
+    /// work for latency impossible to tune: a drafter landing 10% of its
+    /// guesses is costing time, and looked exactly like one landing 80%.
+    proposed: usize,
+    accepted: usize,
     stop: StopReason,
     /// The turn ended because the caller has a tool to run, which is a
     /// different thing from the model choosing to stop.
@@ -1254,6 +1276,8 @@ impl Default for Outcome {
             elapsed_ms: 0,
             prompt_ms: 0,
             reused: 0,
+            proposed: 0,
+            accepted: 0,
             stop: StopReason::EndOfText,
             handed_back: false,
             calls: 0,
@@ -1270,6 +1294,8 @@ impl Outcome {
         self.elapsed_ms += other.elapsed_ms;
         self.prompt_ms += other.prompt_ms;
         self.reused += other.reused;
+        self.proposed += other.proposed;
+        self.accepted += other.accepted;
         self.stop = other.stop;
         self.handed_back |= other.handed_back;
         self.calls += other.calls;
@@ -1336,6 +1362,8 @@ fn rounds(
         out.elapsed_ms += stats.generation_ms;
         out.prompt_ms += stats.prompt_ms;
         out.reused += stats.reused_tokens;
+        out.proposed += stats.proposed_drafts;
+        out.accepted += stats.accepted_drafts;
         out.stop = reason;
 
         let mut parsed = ozgent_llama::extract_tool_calls(&reply);
@@ -1997,14 +2025,37 @@ mod tests {
             stop: "EndOfText".into(),
             prompt: 40,
             prompt_ms: 210,
+            drafted: 30,
+            accepted: 21,
         })
         .unwrap();
         assert_eq!(json["type"], "done");
         assert_eq!(json["generated"], 120);
         assert_eq!(json["reused"], 64);
         assert_eq!(json["prompt"], 40, "the API reports prompt tokens from this");
+        assert_eq!(json["drafted"], 30);
+        assert_eq!(json["accepted"], 21);
         // The client calls .toFixed(1) on this, so it must be a number.
         assert!(json["tokens_per_second"].is_f64());
+    }
+
+    #[test]
+    fn a_turn_with_nothing_drafting_does_not_report_drafting_nothing() {
+        // Zeroes here would read as "speculation ran and landed none of it",
+        // which is the opposite of what an absent drafter means.
+        let json = serde_json::to_value(Event::Done {
+            generated: 10,
+            tokens_per_second: 20.0,
+            reused: 0,
+            stop: "EndOfText".into(),
+            prompt: 5,
+            prompt_ms: 10,
+            drafted: 0,
+            accepted: 0,
+        })
+        .unwrap();
+        assert!(json.get("drafted").is_none(), "{json}");
+        assert!(json.get("accepted").is_none(), "{json}");
     }
 
     #[test]

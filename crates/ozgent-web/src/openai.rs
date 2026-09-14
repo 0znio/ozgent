@@ -794,6 +794,16 @@ pub struct Timings {
     pub completion_ms: u64,
     pub tokens_per_second: f64,
     pub cached_prompt_tokens: usize,
+    /// Speculation, when something was drafting. The ratio is what matters:
+    /// a draft the model rejects is verification work paid for nothing.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub drafted_tokens: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub accepted_drafts: usize,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Collect a whole turn into one OpenAI response object.
@@ -829,10 +839,12 @@ async fn collect(
                 "type": "function",
                 "function": { "name": name, "arguments": arguments.to_string() },
             })),
-            Event::Done { generated, tokens_per_second, reused, stop: reason, prompt, prompt_ms } => {
+            Event::Done { generated, tokens_per_second, reused, stop: reason, prompt, prompt_ms, drafted, accepted } => {
                 timings.completion_tokens = generated;
                 timings.tokens_per_second = tokens_per_second;
                 timings.cached_prompt_tokens = reused;
+                timings.drafted_tokens = drafted;
+                timings.accepted_drafts = accepted;
                 timings.prompt_tokens = prompt;
                 timings.prompt_ms = prompt_ms;
                 timings.prompt_tokens_per_second = if prompt_ms > 0 {
@@ -982,7 +994,7 @@ fn stream_chunks(
                     }]),
                 );
             }
-            Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms } => {
+            Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms, drafted, accepted } => {
                 let usage = serde_json::json!({
                     "prompt_tokens": prompt,
                     "completion_tokens": generated,
@@ -993,6 +1005,11 @@ fn stream_chunks(
                         "cached_prompt_tokens": reused,
                         "prompt_tokens": prompt,
                         "prompt_ms": prompt_ms,
+                        // Speculation, when something was drafting. The ratio
+                        // is the number that matters: drafts that are not
+                        // accepted are verification work paid for nothing.
+                        "drafted_tokens": drafted,
+                        "accepted_drafts": accepted,
                     },
                 });
                 let mut final_chunk = chunk(&st, serde_json::json!({}), Some(finish_reason(&stop)));
