@@ -14,6 +14,7 @@ pub mod layout;
 pub mod llamalog;
 #[cfg(feature = "llama")]
 pub mod mtmd;
+pub mod nextn;
 pub mod ngram;
 pub mod template;
 pub mod thinking;

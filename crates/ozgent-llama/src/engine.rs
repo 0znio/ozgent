@@ -1457,6 +1457,54 @@ impl<'a> Session<'a> {
         Some(n)
     }
 
+    /// Whether this model carries a trained NextN head, and how many.
+    ///
+    /// Zero means there is nothing to draft from, which is most models.
+    pub fn nextn_heads(&self) -> i32 {
+        // SAFETY: the model outlives this call.
+        unsafe { ozgent_mtmd_sys::llama_cpp_sys_2::llama_model_n_layer_nextn(self.model.as_ptr()) }
+    }
+
+    /// Ask the model's own NextN head what comes after the prompt.
+    ///
+    /// The whole feasibility question in one call: turn NextN embeddings on,
+    /// decode the prompt, and see whether a usable row comes back. A drafter
+    /// built on a head that returns nothing would be a great deal of work
+    /// producing zero drafts, so this is answered before any of it is written.
+    ///
+    /// Returns the embedding row's width and the sum of its absolute values —
+    /// a row of zeros links and reads perfectly well while meaning the head
+    /// never ran.
+    pub fn probe_nextn(&mut self, prompt: &str) -> Result<(usize, f32), EngineError> {
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        self.reset();
+
+        let n_embd = self.model.n_embd() as usize;
+        let ptr = self.context.as_ptr();
+        // Unmasked. llama.cpp's own driver sets the *target* context this way
+        // and reserves `masked` for the draft context: the target has to emit
+        // a hidden state for every prompt position, because those rows are
+        // what the NextN block is then fed. Masked, only the position that
+        // asked for logits produces one, and the probe saw nothing at all.
+        unsafe { crate::nextn::set_enabled(ptr, true, false) };
+        unsafe { crate::nextn::set_head(ptr, 0) };
+
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        self.prefill(&tokens, &mut batch, n_batch, true)?;
+
+        let row = unsafe { crate::nextn::embedding(ptr, 0, n_embd) };
+        unsafe { crate::nextn::set_enabled(ptr, false, false) };
+
+        match row {
+            Some(v) => Ok((v.len(), v.iter().map(|x| x.abs()).sum())),
+            None => Ok((0, 0.0)),
+        }
+    }
+
     /// Check that a snapshot really can rewind this model mid-generation.
     ///
     /// Generates `k` tokens, rewinds, and generates `k` again. The two runs
