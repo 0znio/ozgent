@@ -879,7 +879,8 @@ impl Engine {
             rollback_safe: self.rollback_safe,
             gen_prompt_tokens: self.gen_prompt_tokens,
             media_dirty: false,
-            checkpoint: None,
+            checkpoints: Vec::new(),
+            checkpoint_tick: 0,
             tool_grammars: Vec::new(),
             gate_applied: false,
             opts: opts.clone(),
@@ -1089,14 +1090,29 @@ pub enum StopReason {
     Cancelled,
 }
 
-/// Ceiling on a saved prompt state, as a share of free memory.
+/// Ceiling on the whole set of saved prompt states, as a fraction of free
+/// host memory.
 ///
-/// The copy is held for the whole conversation, so it has to leave room for
-/// the turn it is meant to speed up.
-const CHECKPOINT_VRAM_SHARE: usize = 4;
+/// This used to bound a single checkpoint and allowed a quarter of what was
+/// free. A set needs to be meaner: these are pure cache, droppable and
+/// rebuildable, while the host memory they compete for holds things that are
+/// not — a mixture-of-experts model's evicted experts above all, where being
+/// short pushes the whole thing into paging from disk. An eighth buys several
+/// conversations at any ordinary length and cannot crowd out the work.
+const CHECKPOINT_RAM_SHARE: usize = 8;
 
 /// Below this many tokens, a full prefill is cheaper than the state copy.
 const CHECKPOINT_MIN_TOKENS: usize = 256;
+
+/// How many conversations' prompt states to hold at once.
+///
+/// One was enough while these existed only to work around a cache that cannot
+/// trim. They now also carry a conversation across a switch to another one, and
+/// a daemon has a handful in flight at any time — the browser, the terminal,
+/// each channel, each scheduled job. Eight covers that without the set itself
+/// becoming the thing that uses the memory; the byte budget bounds it anyway,
+/// and this only stops a great many tiny conversations accumulating.
+const CHECKPOINT_SLOTS: usize = 8;
 
 /// A prompt boundary the cache can be returned to.
 ///
@@ -1105,20 +1121,54 @@ const CHECKPOINT_MIN_TOKENS: usize = 256;
 /// already in the cache. Reusing it means dropping whatever sits *after* the
 /// shared prefix, which for a plain attention cache is a `seq_rm` away.
 ///
-/// A hybrid model cannot do that. Its recurrent layers hold a state that was
-/// folded forward token by token and cannot be unwound, so llama.cpp refuses
-/// the partial removal and the only correct answer is to clear the cache and
-/// prefill the whole conversation again. On a 9,000-token chat that is 4.7
-/// seconds per turn, every turn, growing as the conversation does.
+/// Two things defeat that, and a saved state answers both.
 ///
-/// Saving the state at the end of the prompt sidesteps it. There is nothing to
-/// unwind next turn because the checkpoint predates the generated tokens: put
-/// the state back and the cache holds exactly the prompt, ready to be extended
-/// by whatever the new turn adds.
+/// A hybrid model cannot trim at all. Its recurrent layers hold a state that
+/// was folded forward token by token and cannot be unwound, so llama.cpp
+/// refuses the partial removal and the only correct answer would be to prefill
+/// the whole conversation again. On a 9,000-token chat that is 4.7 seconds per
+/// turn, every turn, growing as the conversation does.
+///
+/// And **there is only one cache, but many conversations.** A daemon answers
+/// the browser, the terminal, Telegram and the scheduler from one model, and
+/// each of them is a different conversation. Whichever spoke last owns the
+/// cache; everyone else pays a cold prefill. Measured on an 8 GB card with two
+/// 700-token conversations alternating: within a conversation 673 of 715
+/// tokens were reused and the prompt took 76 ms, and on every switch the reuse
+/// fell to **zero** and the prompt took 383 ms.
+///
+/// So these are kept per boundary and several at a time, and restoring one is
+/// a host-to-device copy rather than a prefill.
 struct PromptCheckpoint {
     /// Exactly the tokens the saved state was built from.
     tokens: Vec<LlamaToken>,
     state: SeqState,
+    /// What the copy costs, so a set of them can be held to a budget.
+    bytes: usize,
+    /// When it was last saved or restored, for eviction.
+    used: u64,
+}
+
+/// The saved boundary that shares the longest whole prefix with `tokens`.
+///
+/// Whole, because a state that agrees with the prompt for a while and then
+/// diverges would leave the cache describing tokens that are not there — the
+/// positions are right and the contents are wrong, which reads as the model
+/// having hallucinated its own history. Strictly shorter, too, so at least one
+/// token is left to decode and produce logits from.
+fn best_prefix_match(saved: &[&[LlamaToken]], tokens: &[LlamaToken]) -> Option<(usize, usize)> {
+    saved
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.len() < tokens.len())
+        .filter(|(_, s)| common_prefix(s, tokens) == s.len())
+        .max_by_key(|(_, s)| s.len())
+        .map(|(i, s)| (i, s.len()))
+}
+
+/// Which saved state to drop, given when each was last useful.
+fn lru_victim(used: &[u64]) -> Option<usize> {
+    used.iter().enumerate().min_by_key(|(_, u)| **u).map(|(i, _)| i)
 }
 
 /// One conversation against one KV cache.
@@ -1149,7 +1199,9 @@ pub struct Session<'a> {
     media_dirty: bool,
     /// The sequence state as it stood at a prompt boundary, with the tokens
     /// that produced it. See [`PromptCheckpoint`].
-    checkpoint: Option<PromptCheckpoint>,
+    checkpoints: Vec<PromptCheckpoint>,
+    /// Monotonic tick, so the least recently useful one can be dropped.
+    checkpoint_tick: u64,
     /// Mirrors [`Engine::gen_prompt_tokens`].
     gen_prompt_tokens: usize,
     /// Per-opener tool grammars, compiled once when tools are configured.
@@ -1194,33 +1246,33 @@ impl<'a> Session<'a> {
     /// Save the cache as it stands, which the caller guarantees is exactly
     /// `tokens`.
     ///
-    /// Only for models whose cache cannot be trimmed. Everywhere else a
-    /// `seq_rm` already reuses the prefix for free, and copying the state
-    /// would be pure cost.
+    /// Kept for every model now, not only for those whose cache cannot be
+    /// trimmed. Trimming recovers a prefix of whatever the cache currently
+    /// holds, and on a switch to a different conversation that is the wrong
+    /// conversation entirely — there is no prefix of it to keep. A saved state
+    /// is the only way back to a conversation the cache has moved on from.
     fn save_checkpoint(&mut self, tokens: &[LlamaToken]) {
-        if self.rollback_safe && self.can_trim {
-            return;
-        }
         if tokens.len() < CHECKPOINT_MIN_TOKENS {
             return;
         }
+        self.checkpoint_tick += 1;
         // Already holding exactly this boundary — usually because it was just
-        // restored from. Copying the same state again buys nothing.
-        if self.checkpoint.as_ref().is_some_and(|c| c.tokens == tokens) {
+        // restored from. Copying the same state again buys nothing, but it is
+        // still the most recently useful one.
+        if let Some(existing) = self.checkpoints.iter_mut().find(|c| c.tokens == tokens) {
+            existing.used = self.checkpoint_tick;
             return;
         }
-        self.checkpoint = None;
 
         let bytes = self.state_bytes(false, false);
-        if let Some(budget) = self.checkpoint_budget() {
-            if bytes > budget {
-                tracing::debug!(
-                    "checkpoint skipped: {} MiB of state against a {} MiB budget",
-                    bytes / (1024 * 1024),
-                    budget / (1024 * 1024)
-                );
-                return;
-            }
+        let budget = self.checkpoint_budget();
+        if budget.is_some_and(|b| bytes > b) {
+            tracing::debug!(
+                "checkpoint skipped: {} MiB of state against a {} MiB budget",
+                bytes / (1024 * 1024),
+                budget.unwrap_or(0) / (1024 * 1024)
+            );
+            return;
         }
         // Host-side, not ON_DEVICE. A device-held state is a list of views
         // into the cache as it stood, and restoring one rebuilds that list
@@ -1231,12 +1283,20 @@ impl<'a> Session<'a> {
         // milliseconds against the seconds of prefill it saves.
         match self.snapshot(false, false) {
             Ok(state) => {
+                let tick = self.checkpoint_tick;
+                self.checkpoints.push(PromptCheckpoint {
+                    tokens: tokens.to_vec(),
+                    state,
+                    bytes,
+                    used: tick,
+                });
+                self.evict_checkpoints(budget);
                 tracing::debug!(
-                    "checkpoint saved: {} tokens, {} MiB",
+                    "checkpoint saved: {} tokens, {} MiB ({} held)",
                     tokens.len(),
-                    bytes / (1024 * 1024)
+                    bytes / (1024 * 1024),
+                    self.checkpoints.len()
                 );
-                self.checkpoint = Some(PromptCheckpoint { tokens: tokens.to_vec(), state });
             }
             // Not fatal: without a checkpoint the next turn prefills in full,
             // which is what happened before this existed.
@@ -1244,36 +1304,76 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Bytes a checkpoint may occupy, or `None` when free memory is unknown.
+    /// Drop the least recently useful states until the set is within bounds.
+    ///
+    /// The one just added is never the victim: it is the most recent by
+    /// construction, and evicting it would make saving a no-op on any machine
+    /// where the budget is tight.
+    fn evict_checkpoints(&mut self, budget: Option<usize>) {
+        loop {
+            let total: usize = self.checkpoints.iter().map(|c| c.bytes).sum();
+            let over_budget = budget.is_some_and(|b| total > b);
+            if !over_budget && self.checkpoints.len() <= CHECKPOINT_SLOTS {
+                return;
+            }
+            let ticks: Vec<u64> = self.checkpoints.iter().map(|c| c.used).collect();
+            let Some(oldest) = lru_victim(&ticks) else { return };
+            if self.checkpoints.len() == 1 {
+                return;
+            }
+            let dropped = self.checkpoints.remove(oldest);
+            tracing::debug!(
+                "checkpoint evicted: {} tokens, {} MiB",
+                dropped.tokens.len(),
+                dropped.bytes / (1024 * 1024)
+            );
+        }
+    }
+
+    /// Bytes the whole set of checkpoints may occupy, or `None` when free
+    /// memory is unknown.
     fn checkpoint_budget(&self) -> Option<usize> {
         let free = crate::backend::devices()
             .into_iter()
             .find(|d| !d.is_gpu())
             .map(|d| d.memory_free)?;
-        Some(free / CHECKPOINT_VRAM_SHARE)
+        Some(free / CHECKPOINT_RAM_SHARE)
     }
 
-    /// Put the cache back to a saved prompt boundary, if that boundary starts
-    /// `tokens`. Returns how many tokens are then resident.
+    /// The saved state that shares the longest whole prefix with `tokens`.
     ///
-    /// Asked only once a trim has been refused, because until then the live
-    /// cache is the cheaper answer. The checkpoint has to be a *whole* prefix
-    /// of the new prompt: restoring a state that disagrees partway through
-    /// would leave the cache describing tokens that are not there.
-    fn restore_checkpoint(&mut self, tokens: &[LlamaToken]) -> Option<usize> {
+    /// A checkpoint has to be a *whole* prefix of the new prompt: restoring a
+    /// state that disagrees partway through would leave the cache describing
+    /// tokens that are not there. Strictly shorter, too, so at least one token
+    /// is left to decode for logits.
+    fn best_checkpoint(&self, tokens: &[LlamaToken]) -> Option<(usize, usize)> {
         if matches!(self.reuse, PrefixReuse::Off) {
             return None;
         }
-        let checkpoint = self.checkpoint.take()?;
-        let n = checkpoint.tokens.len();
-        // Strictly shorter, so at least one token is left to decode for logits.
-        if n >= tokens.len() || common_prefix(&checkpoint.tokens, tokens) != n {
-            self.checkpoint = Some(checkpoint);
-            return None;
-        }
-        if let Err(e) = self.restore(&checkpoint.state) {
+        let saved: Vec<&[LlamaToken]> =
+            self.checkpoints.iter().map(|c| c.tokens.as_slice()).collect();
+        best_prefix_match(&saved, tokens)
+    }
+
+    /// Put the cache back to a saved prompt boundary. Returns how many tokens
+    /// are then resident.
+    fn restore_checkpoint(&mut self, tokens: &[LlamaToken]) -> Option<usize> {
+        let (index, n) = self.best_checkpoint(tokens)?;
+        // Taken out so the restore can borrow the context mutably, and put
+        // back either way: a checkpoint is not spent by being used. A turn
+        // that adds nothing before the boundary — the same question asked
+        // twice — saves no new one, and dropping this would send the turn
+        // after it back to a cold prefill.
+        let mut checkpoint = self.checkpoints.remove(index);
+        let restored = self.restore(&checkpoint.state);
+        self.checkpoint_tick += 1;
+        checkpoint.used = self.checkpoint_tick;
+
+        if let Err(e) = restored {
             tracing::debug!("checkpoint restore failed: {e}");
-            // The cache is now of unknown shape; force a clean prefill.
+            // The cache is now of unknown shape; force a clean prefill. The
+            // state itself is not at fault, so it is kept.
+            self.checkpoints.push(checkpoint);
             self.context.clear_kv_cache();
             self.cached.clear();
             self.n_past = 0;
@@ -1281,11 +1381,7 @@ impl<'a> Session<'a> {
         }
         self.n_past = n as i32;
         self.cached = checkpoint.tokens.clone();
-        // Kept, not consumed. A turn that adds nothing before the boundary —
-        // the same question asked twice, say — saves no new checkpoint, and
-        // dropping this one would send the turn after it back to a cold
-        // prefill. Restoring does not spend it.
-        self.checkpoint = Some(checkpoint);
+        self.checkpoints.push(checkpoint);
         Some(n)
     }
 
@@ -1838,7 +1934,24 @@ impl<'a> Session<'a> {
 
                 let mut reuse = reuse;
                 let mut restored = false;
-                if reuse < self.cached.len() {
+
+                // A saved state may hold far more of this prompt than the
+                // live cache does, and on a switch between conversations it
+                // usually does: the cache belongs to whoever spoke last, and
+                // a prefix of the wrong conversation is worth nothing.
+                // Restoring is a host-to-device copy, so it only wins when it
+                // recovers meaningfully more than trimming would — a margin,
+                // not a tie-break.
+                if let Some((_, saved)) = self.best_checkpoint(&tokens) {
+                    if saved > reuse + CHECKPOINT_MIN_TOKENS {
+                        if let Some(n) = self.restore_checkpoint(&tokens) {
+                            reuse = n;
+                            restored = true;
+                        }
+                    }
+                }
+
+                if !restored && reuse < self.cached.len() {
                     // Drop everything after the shared prefix; those positions
                     // are about to be occupied by different tokens.
                     if self.can_trim
@@ -2432,6 +2545,63 @@ mod tests {
 fn needs_flash_attention(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     reason.contains("flash attention") && reason.contains("cache")
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::{best_prefix_match, lru_victim};
+    use llama_cpp_2::token::LlamaToken;
+
+    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
+        ids.iter().map(|&i| LlamaToken(i)).collect()
+    }
+
+    #[test]
+    fn the_longest_whole_prefix_wins() {
+        // Several conversations are held at once, and the one that shares
+        // most of this prompt is the one worth restoring.
+        let a = toks(&[1, 2, 3]);
+        let b = toks(&[1, 2, 3, 4, 5]);
+        let c = toks(&[9, 9]);
+        let saved: Vec<&[LlamaToken]> = vec![&a, &b, &c];
+        let prompt = toks(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(best_prefix_match(&saved, &prompt), Some((1, 5)));
+    }
+
+    #[test]
+    fn a_state_that_diverges_partway_is_refused() {
+        // Restoring it would leave the cache describing tokens that are not
+        // there: right positions, wrong contents, which reads as the model
+        // having invented its own history.
+        let a = toks(&[1, 2, 99]);
+        let saved: Vec<&[LlamaToken]> = vec![&a];
+        let prompt = toks(&[1, 2, 3, 4]);
+        assert_eq!(best_prefix_match(&saved, &prompt), None);
+    }
+
+    #[test]
+    fn a_state_covering_the_whole_prompt_is_refused() {
+        // The last token has to be decoded to produce logits, so a state can
+        // never cover all of it.
+        let a = toks(&[1, 2, 3]);
+        let saved: Vec<&[LlamaToken]> = vec![&a];
+        assert_eq!(best_prefix_match(&saved, &toks(&[1, 2, 3])), None);
+        assert_eq!(best_prefix_match(&saved, &toks(&[1, 2])), None);
+    }
+
+    #[test]
+    fn nothing_saved_matches_nothing() {
+        assert_eq!(best_prefix_match(&[], &toks(&[1, 2, 3])), None);
+    }
+
+    #[test]
+    fn the_least_recently_useful_state_is_the_one_dropped() {
+        // Ticks rise on both saving and restoring, so "useful" is the right
+        // word: a conversation being returned to repeatedly keeps its state
+        // even if it has not grown.
+        assert_eq!(lru_victim(&[7, 2, 9]), Some(1));
+        assert_eq!(lru_victim(&[]), None);
+    }
 }
 
 #[cfg(test)]

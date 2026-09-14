@@ -204,27 +204,37 @@ mod flash_verdict_tests {
     }
 
     #[test]
-    fn llama_cpp_saying_it_is_on_is_believed() {
+    fn llama_cpps_verdict_is_read_rather_than_guessed_at() {
+        // One test, not four: the verdict is process-global, so separate
+        // tests would each be clearing the state the others are reading.
+        // Under `cargo test --workspace` that failed about one run in three.
         assert_eq!(read("resolve_fused_ops: Flash Attention enabled\n"), Some(true));
-    }
 
-    #[test]
-    fn llama_cpp_saying_it_is_off_is_believed() {
         // The line that used to be discarded, leaving the cache policy to
         // find out by having a context refused.
         assert_eq!(
             read("resolve_fused_ops: Flash Attention not supported, set to disabled\n"),
             Some(false)
         );
-    }
 
-    #[test]
-    fn an_unresolved_process_says_it_does_not_know() {
+        // Nothing said yet is not the same as "off".
         assert_eq!(read("llama_model_loader: loaded meta data\n"), None);
+
+        // And a line that merely mentions the feature decides nothing.
+        assert_eq!(read("Flash Attention is a thing that exists\n"), None);
     }
 
     #[test]
-    fn a_line_that_only_mentions_the_feature_does_not_decide_it() {
-        assert_eq!(read("Flash Attention is a thing that exists\n"), None);
+    fn compute_buffer_lines_are_added_up() {
+        // Read at info level, which the sink keeps for this one purpose: the
+        // figure ozgent used to model from first principles and get wrong by
+        // a factor of eight.
+        if let Ok(mut b) = COMPUTE_BYTES.lock() {
+            *b = 0;
+        }
+        note_buffer("llama_context:      CUDA0 compute buffer size =   548.01 MiB\n");
+        note_buffer("llama_context:  CUDA_Host compute buffer size =    20.01 MiB\n");
+        let total = compute_buffers();
+        assert!(total > 560 * 1024 * 1024 && total < 572 * 1024 * 1024, "{total}");
     }
 }
