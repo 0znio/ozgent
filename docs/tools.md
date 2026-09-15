@@ -337,3 +337,34 @@ The same reasoning explains something that looks like a bug and is not: an
 [agent](agents.md) with a narrower tool list pays a full prefill when it takes
 over. Its prefix genuinely is different — different tools, different system
 prompt — and there is nothing to reuse.
+
+### What changes with twenty-five tools, or fifty
+
+The cost of the schemas grows with the count, but the part that grows is the
+*cold* one. Measured, synthetic sets padded to size with MCP-shaped tools:
+
+| tools | first turn | second turn | served from cache |
+|---|---|---|---|
+| 8 | 408 ms | **77 ms** | 794 of 813 |
+| 25 | 1227 ms | **79 ms** | 2306 of 2325 |
+| 50 | 2365 ms | **86 ms** | 4531 of 4550 |
+
+Steady state is flat. Fifty schemas cost nine milliseconds more per turn than
+eight, because the cache does not care how long the prefix is once it holds it.
+That is the argument against per-turn selection getting *stronger* with scale,
+not weaker: narrowing the list at fifty tools would trade a flat 86 ms for
+2365 ms, every turn.
+
+Two real problems do appear at that size, and neither is solved by changing the
+list per turn:
+
+- **The first turn of every conversation** pays the whole thing. Two and a half
+  seconds before the first token is a different experience from four hundred
+  milliseconds.
+- **4536 tokens is fourteen percent of a 32k window** spent before anyone has
+  said anything.
+
+The answer to both is a subset chosen **once per conversation** and held
+stable — which keeps every property the cache depends on while cutting what is
+carried. A conversation about files does not need the market tools, and it does
+not need to re-decide that on every turn.

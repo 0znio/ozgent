@@ -22,7 +22,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if magnitude == 0.0 {
         println!("VERDICT: a row came back but it is all zeros — the head did not run.");
     } else {
-        println!("VERDICT: the head ran and produced a real hidden state. Drafting is viable.");
+        println!("VERDICT: the head ran and produced a real hidden state.");
+    }
+    if width == 0 {
+        return Ok(());
+    }
+
+    println!();
+    match session.probe_mtp_draft(&prompt, 6) {
+        Ok((next, drafted)) => {
+            println!("prompt:          {prompt:?}");
+            println!("target says:     {next:?}");
+            println!("head drafts:     {drafted:?}");
+            println!();
+            println!("continuation:    {next}{}", drafted.join(""));
+        }
+        Err(e) => println!("drafting failed: {e}"),
     }
     Ok(())
 }

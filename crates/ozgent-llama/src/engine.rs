@@ -1505,6 +1505,90 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// What does the NextN head actually propose?
+    ///
+    /// The second feasibility gate, after [`Session::probe_nextn`] showed the
+    /// head runs at all. A head that runs and proposes nonsense is worse than
+    /// no head: every draft would be rejected and every rejection costs a
+    /// rollback. So this prints what it says before anything is built on it.
+    ///
+    /// Returns the token the *target* would have chosen, and what the head
+    /// proposed to follow it.
+    pub fn probe_mtp_draft(
+        &mut self,
+        prompt: &str,
+        want: usize,
+    ) -> Result<(String, Vec<String>), EngineError> {
+        let n_batch = (self.context.n_batch() as usize).max(1);
+        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        self.reset();
+
+        let n_embd = self.model.n_embd() as usize;
+        let ptr = self.context.as_ptr();
+        // Unmasked: the target has to emit a hidden state for the position the
+        // draft will continue from.
+        unsafe { crate::nextn::set_enabled(ptr, true, false) };
+
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        self.prefill(&tokens, &mut batch, n_batch, true)?;
+
+        // What the target itself would say next, for comparison.
+        let target_next = self.greedy_from_logits()?;
+        // The *last* row, not the first. Unmasked, the target emits a hidden
+        // state for every position in the batch, so row zero belongs to the
+        // first prompt token. Drafting from it produced fluent nonsense —
+        // "Paris-Belstein's 2" after "The capital of France is" — which is
+        // exactly what continuing from the wrong position looks like.
+        let last = tokens.len().saturating_sub(1) as i32;
+        let hidden = unsafe { crate::nextn::embedding(ptr, last, n_embd) }
+            .ok_or_else(|| EngineError::Context("no nextn row after prefill".into()))?;
+
+        let backend = backend()?;
+        let mut drafter = crate::mtp::MtpDrafter::new(
+            self.model,
+            backend,
+            &self.context,
+            self.context.n_ctx(),
+        )?
+        .ok_or_else(|| EngineError::Context("this model has no nextn head".into()))?;
+
+        let drafted = drafter.propose(target_next, &hidden, self.n_past, want)?;
+        unsafe { crate::nextn::set_enabled(ptr, false, false) };
+
+        let render = |t: LlamaToken| {
+            self.model.token_to_str(t, Special::Tokenize).unwrap_or_else(|_| "<?>".into())
+        };
+        Ok((render(target_next), drafted.into_iter().map(render).collect()))
+    }
+
+    /// The most likely token from the last decode on this session.
+    ///
+    /// Read at `-1`, which llama.cpp resolves to the last output row. The safe
+    /// wrapper wants the batch index instead, and a prefill requests logits on
+    /// the final prompt token — index 4 of a five-token prompt, not zero —
+    /// so asking it for row zero panics with "logit 0 is not initialized".
+    fn greedy_from_logits(&self) -> Result<LlamaToken, EngineError> {
+        // SAFETY: a decode that requested logits has just completed.
+        let raw = unsafe {
+            ozgent_mtmd_sys::llama_cpp_sys_2::llama_get_logits_ith(self.context.as_ptr(), -1)
+        };
+        if raw.is_null() {
+            return Err(EngineError::Decode("no logits".into()));
+        }
+        let n_vocab = self.model.n_vocab() as usize;
+        let logits = unsafe { std::slice::from_raw_parts(raw, n_vocab) };
+        let best = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .ok_or_else(|| EngineError::Decode("no logits".into()))?;
+        Ok(LlamaToken(best as i32))
+    }
+
     /// Check that a snapshot really can rewind this model mid-generation.
     ///
     /// Generates `k` tokens, rewinds, and generates `k` again. The two runs
