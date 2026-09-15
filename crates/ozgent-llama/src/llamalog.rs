@@ -52,6 +52,7 @@ pub fn flash_attention() -> Option<bool> {
 /// than deriving it: it needs no assumption about which buffers exist, it
 /// follows llama.cpp's own changes, and it is exact.
 static COMPUTE_BYTES: Mutex<u64> = Mutex::new(0);
+static RS_BYTES: Mutex<u64> = Mutex::new(0);
 
 /// Total compute buffer bytes since the last [`clear`].
 pub fn compute_buffers() -> u64 {
@@ -80,6 +81,14 @@ pub fn note_line(line: &str) {
 
 /// Add up a "compute buffer size = N MiB" line, whichever device it names.
 fn note_buffer(line: &str) {
+    if let Some(rest) = line.split_once("RS buffer size =").map(|(_, r)| r) {
+        if let Some(mib) = rest.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()) {
+            if let Ok(mut total) = RS_BYTES.lock() {
+                *total += (mib * 1024.0 * 1024.0) as u64;
+            }
+        }
+        return;
+    }
     let Some(rest) = line.split_once("compute buffer size =").map(|(_, r)| r) else { return };
     let Some(mib) = rest.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()) else {
         return;
@@ -87,6 +96,13 @@ fn note_buffer(line: &str) {
     if let Ok(mut total) = COMPUTE_BYTES.lock() {
         *total += (mib * 1024.0 * 1024.0) as u64;
     }
+}
+
+/// What the recurrent-state cache cost, as llama.cpp reported it.
+///
+/// Scales with `1 + n_rs_seq`, so one observation prices a rollback snapshot.
+pub fn rs_buffers() -> u64 {
+    RS_BYTES.lock().map(|b| *b).unwrap_or(0)
 }
 
 /// Route llama.cpp's output into the ring rather than onto stderr.
@@ -105,6 +121,9 @@ pub fn clear() {
     }
     IN_ERROR.store(false, Ordering::Relaxed);
     if let Ok(mut b) = COMPUTE_BYTES.lock() {
+        *b = 0;
+    }
+    if let Ok(mut b) = RS_BYTES.lock() {
         *b = 0;
     }
 }

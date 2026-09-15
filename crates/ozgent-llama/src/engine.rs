@@ -676,6 +676,17 @@ impl Engine {
         mut split: ozgent_core::accel::KvSplit,
         shape: ozgent_core::reserve::Shape,
     ) -> Result<LlamaContext<'_>, EngineError> {
+        // Recurrent rollback snapshots are an optimisation; the window is what
+        // the person configured. So when both cannot fit, the snapshots go.
+        //
+        // They are not cheap on every model: each one is another copy of the
+        // recurrent state for every sequence, and on a hybrid 4B asking for
+        // sixteen of them across four slots cost more memory than the whole
+        // KV cache — it shrank a 107,008-token window to 70,224 and then died
+        // in CUDA. Nothing here knows that in advance, and nothing needs to:
+        // if the window comes back short, the snapshots are dropped and it is
+        // tried again at full size.
+        let mut rollback = params.n_rs_seq();
         let mut window = requested;
         // The retreat bisects rather than stepping by a fixed ratio.
         //
@@ -706,6 +717,24 @@ impl Engine {
             let before = crate::backend::best_gpu().map(|d| d.memory_free as u64);
             match self.model.new_context(backend, attempt) {
                 Ok(context) => {
+                    // A short window with snapshots in hand is the wrong
+                    // trade: drop them and take the full window instead.
+                    if rollback > 0 && window < requested {
+                        let each = crate::llamalog::rs_buffers() / (rollback as u64 + 1);
+                        let fewer = rollback / 2;
+                        tracing::info!(
+                            "{rollback} recurrent rollback snapshots cost {} MiB and \
+                             shortened the window to {window}; trying {fewer} instead",
+                            (crate::llamalog::rs_buffers().saturating_sub(each)) / (1024 * 1024),
+                        );
+                        drop(context);
+                        rollback = fewer;
+                        params = params.with_n_rs_seq(fewer);
+                        window = requested;
+                        good = 0;
+                        bad = requested.saturating_add(1);
+                        continue;
+                    }
                     // A success narrows the search from below. If there is
                     // still a meaningful gap to the smallest known failure,
                     // the context is dropped and a larger one tried: keeping
@@ -784,6 +813,24 @@ impl Engine {
                     // Shrinking the window does not help; the type is the
                     // problem. Fall back once, at the full window, and let the
                     // loop below shrink it if the bigger cache no longer fits.
+                    // Out of memory with snapshots in hand: give them up
+                    // before shrinking anybody's context.
+                    if rollback > 0 {
+                        // Halved rather than abandoned: a shorter rollback
+                        // still allows a shorter draft, and a draft of four is
+                        // worth a great deal more than none.
+                        let fewer = rollback / 2;
+                        tracing::info!(
+                            "{rollback} recurrent rollback snapshots do not fit; \
+                             trying {fewer} to keep the context at {requested}"
+                        );
+                        rollback = fewer;
+                        params = params.with_n_rs_seq(fewer);
+                        window = requested;
+                        good = 0;
+                        bad = requested.saturating_add(1);
+                        continue;
+                    }
                     if !plain_cache && needs_flash_attention(&reason) {
                         tracing::info!(
                             "this model has no flash attention, so the value cache cannot \
@@ -1014,6 +1061,25 @@ impl Engine {
             .with_n_batch(opts.batch_size)
             .with_n_seq_max(slots)
             .with_kv_unified(unified)
+            // Ask for enough per-token recurrent snapshots to undo a whole
+            // rejected draft.
+            //
+            // This is what makes a hybrid model's cache trimmable. Its
+            // attention layers can always drop a range; its recurrent layers
+            // could not, so `seq_rm` refused and a rejected draft had to be
+            // undone by snapshotting the entire sequence state — which is the
+            // thing that cannot be done on a shared context. llama.cpp keeps a
+            // small ring of recurrent states per sequence when asked, and then
+            // a partial `seq_rm` succeeds.
+            //
+            // Asked for unconditionally: llama.cpp clamps it to zero for any
+            // architecture that cannot do this, so there is no list of models
+            // here to fall out of date.
+            .with_n_rs_seq(if opts.speculative == Speculative::Off {
+                0
+            } else {
+                opts.speculative_tuning.draft_tokens
+            })
             .with_flash_attention_policy(flash)
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
@@ -1076,6 +1142,18 @@ impl Engine {
     pub fn sessions(&self, opts: &Resolved, want: Slots) -> Result<Vec<Session<'_>>, EngineError> {
         let (hub, window) = self.hub(opts, want)?;
         let slots = hub.slots();
+        let granted =
+            unsafe { ozgent_mtmd_sys::llama_cpp_sys_2::llama_n_rs_seq(hub.raw()) };
+        tracing::info!(
+            "rollback: {}",
+            if self.rollback_safe {
+                "the cache trims, so a rejected draft costs nothing".to_string()
+            } else if granted > 0 {
+                format!("{granted} recurrent snapshots, so drafts of up to {granted} can be undone")
+            } else {
+                "no recurrent snapshots; a rejected draft needs a context of its own".to_string()
+            }
+        );
         Ok((0..slots).map(|seq| self.attach(&hub, seq as i32, window, opts)).collect())
     }
 
@@ -1099,6 +1177,9 @@ impl Engine {
             grammar_active: false,
             can_trim: true,
             rollback_safe: self.rollback_safe,
+            rs_rollback: unsafe {
+                ozgent_mtmd_sys::llama_cpp_sys_2::llama_n_rs_seq(hub.raw())
+            },
             gen_prompt_tokens: self.gen_prompt_tokens,
             media_dirty: false,
             cpu_moe_layers: self.cpu_moe_layers,
@@ -1452,6 +1533,11 @@ pub struct Session<'a> {
     /// Mirrors [`Engine`]'s flag: false when the model keeps state that draft
     /// rejection cannot roll back, making speculation unsafe.
     rollback_safe: bool,
+    /// How many tokens of recurrent state this context can roll back, which is
+    /// what llama.cpp granted for `n_rs_seq`. Zero means it cannot, either
+    /// because nothing asked or because this architecture has no such
+    /// mechanism.
+    rs_rollback: u32,
     /// Set after a turn that evaluated images: the cache then holds embeddings
     /// no token sequence describes, so it must be rebuilt before the next turn.
     media_dirty: bool,
@@ -2198,7 +2284,10 @@ impl<'a> Session<'a> {
             return Ok(());
         }
 
-        tracing::debug!("this cache cannot trim; rebuilding it without speculation");
+        // Worth saying out loud: this is the expensive path. The cache is
+        // thrown away and rebuilt from the tokens known to be good, and
+        // speculation is abandoned for the rest of the session.
+        tracing::info!("this cache refused to trim a rejected draft; rebuilding it and stopping speculation");
         self.can_trim = false;
         self.slot.clear();
         self.n_past = 0;
@@ -2522,7 +2611,10 @@ impl<'a> Session<'a> {
         // whole sequence state is snapshotted and put back — measured at
         // 0.71 ms on device against a ~17.8 ms token budget, and exact on
         // Qwen3.5, whose cache refuses a partial trim outright.
-        let by_trim = self.rollback_safe && self.can_trim;
+        // A hybrid model counts as rollback-safe once its context holds
+        // enough recurrent snapshots to undo a draft, because then a partial
+        // `seq_rm` succeeds on both halves of its cache.
+        let by_trim = (self.rollback_safe || self.rs_rollback > 0) && self.can_trim;
         // The model's own NextN head, when it has one and was asked for.
         //
         // Opt-in rather than part of `auto` for now. It drafts where n-grams
@@ -2626,7 +2718,15 @@ impl<'a> Session<'a> {
         } else {
             ToolGate::new(self.tool_grammars.clone())
         };
-        let tuning = self.opts.speculative_tuning.clone();
+        let mut tuning = self.opts.speculative_tuning.clone();
+        // A draft longer than the rollback can undo would fail `seq_rm` and
+        // send the whole cache back through a rebuild, which costs far more
+        // than the draft could ever save. The context may have been granted
+        // fewer snapshots than were asked for — it gives them up before it
+        // gives up anybody's window — so the draft follows what it got.
+        if !self.rollback_safe && self.rs_rollback > 0 {
+            tuning.draft_tokens = tuning.draft_tokens.min(self.rs_rollback);
+        }
         // Seeded lazily from `self.cached` on the first pass through the
         // generation loop, which is authoritative and avoids copying the
         // prompt twice.
