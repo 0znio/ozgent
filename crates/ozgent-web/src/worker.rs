@@ -600,133 +600,216 @@ fn serve_model(
     // that is what the first version of this did, and it hung on the 9B.
     drop(admitted);
 
-    let mut session = engine.session(&resolved)?;
+    // One session per slot, sharing a context and its forward passes.
+    //
+    // How many is decided by what the memory holds at the asked-for window,
+    // not by the number in the config: `UpTo` opens a second slot only when a
+    // second full-length cache fits beside the first. Concurrency that
+    // silently halves somebody's context is not worth having.
+    let cap = snapshot(shared).web.parallel();
+    let sessions = engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap))?;
+    let slots = sessions.len();
+    tracing::info!(
+        "{}: {slots} conversation{} at a time, {} tokens each",
+        found.model,
+        if slots == 1 { "" } else { "s" },
+        sessions.first().map(|s| s.n_ctx()).unwrap_or(0),
+    );
     // Registered busy so nothing evicts it mid-load; it is loaded now, and the
     // turn loop below takes the flag again for each answer. Without this a
     // model would stay marked busy for ever and never become evictable.
     member.working(false);
-    // Loaded on the first turn that needs it and kept: it costs VRAM, but a
-    // conversation with one image usually has more.
-    let mut projector: Option<crate::worker::LoadedProjector<'_>> = None;
     let mmproj = found.manifest.projector_path(&found.dir);
 
-    let mut request = first;
-    loop {
-        // Each request brings its own sampling. Re-resolving per turn is what
-        // keeps two clients on one model from inheriting each other's
-        // temperature, seed and reasoning budget.
-        let live = snapshot(shared);
-        let base = live
-            .options_for(&found.model.to_string())
-            .merge(&found.manifest.defaults)
-            .merge(cli);
-        let per_turn = base
-            .clone()
-            .merge(request.overrides.as_ref().unwrap_or(&Default::default()))
-            .resolve();
+    // Requests the dispatcher has accepted and a slot has not yet taken.
+    // Whichever slot is free takes the next one; a slot blocked inside `recv`
+    // holds the lock only until something arrives, so the handoff is ordered
+    // without anybody polling.
+    let (work_tx, work_rx) = channel::<Box<Request>>();
+    let work_rx = std::sync::Mutex::new(work_rx);
+    // How many slots are mid-answer. The pool's busy flag is one bit for the
+    // whole model, so it is set when the first slot starts and cleared when
+    // the last finishes — clearing it per slot would offer the model up for
+    // eviction while another slot was still writing.
+    let busy = std::sync::atomic::AtomicUsize::new(0);
+    // A request that cannot be served by this load, handed back to be served
+    // against the next one.
+    let handback = std::sync::Mutex::new(None::<Box<Request>>);
+    let stopping = std::sync::atomic::AtomicBool::new(false);
 
-        // Context length, layer placement and the rest are fixed when the
-        // weights load. Returning the request sends it back to be served
-        // against a freshly loaded model, which is what "applies on your next
-        // message" has to mean if it is to be true.
-        if resolved.needs_reload(&per_turn) {
-            tracing::info!("a load-time setting changed; reloading {}", found.model);
-            return Ok(Some(request));
-        }
-        session.set_options(&per_turn);
-        let thinking = request.thinking.unwrap_or(per_turn.thinking);
-        let _ = request.out.send(Event::Ready {
-            model: found.model.to_string(),
-            context: session.n_ctx(),
-        });
+    std::thread::scope(|scope| {
+        for (i, mut session) in sessions.into_iter().enumerate() {
+            let (work_rx, busy, handback, stopping) = (&work_rx, &busy, &handback, &stopping);
+            let (engine, resolved, found, mmproj) = (&engine, &resolved, &found, &mmproj);
+            std::thread::Builder::new()
+                .name(format!("ozgent-slot-{i}"))
+                .spawn_scoped(scope, move || {
+                    // Loaded on the first turn that needs it and kept: it costs
+                    // VRAM, but a conversation with one image usually has more.
+                    // One per slot, because a projector writes embeddings into
+                    // the cache of whichever session is using it.
+                    let mut projector: Option<crate::worker::LoadedProjector<'_>> = None;
+                    loop {
+                        let next = work_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(request) = next else { return };
 
-        if !request.images.is_empty() && projector.is_none() {
-            match &mmproj {
-                Some(path) => match engine.projector(path, &resolved) {
-                    Ok(p) => projector = Some(p),
-                    Err(e) => {
-                        let _ = request.out.send(Event::Error {
-                            message: format!("loading the vision projector: {e}"),
+                        // Each request brings its own sampling. Re-resolving per
+                        // turn is what keeps two clients on one model from
+                        // inheriting each other's temperature, seed and
+                        // reasoning budget.
+                        let live = snapshot(shared);
+                        let base = live
+                            .options_for(&found.model.to_string())
+                            .merge(&found.manifest.defaults)
+                            .merge(cli);
+                        let per_turn = base
+                            .merge(request.overrides.as_ref().unwrap_or(&Default::default()))
+                            .resolve();
+
+                        // Context length, layer placement and the rest are fixed
+                        // when the weights load. Handing the request back sends
+                        // it to a freshly loaded model, which is what "applies on
+                        // your next message" has to mean if it is to be true.
+                        if resolved.needs_reload(&per_turn) {
+                            tracing::info!(
+                                "a load-time setting changed; reloading {}",
+                                found.model
+                            );
+                            *handback.lock().unwrap_or_else(|e| e.into_inner()) = Some(request);
+                            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return;
+                        }
+                        session.set_options(&per_turn);
+                        let thinking = request.thinking.unwrap_or(per_turn.thinking);
+                        let _ = request.out.send(Event::Ready {
+                            model: found.model.to_string(),
+                            context: session.n_ctx(),
                         });
+
+                        if !request.images.is_empty() && projector.is_none() {
+                            match mmproj {
+                                Some(path) => match engine.projector(path, resolved) {
+                                    Ok(p) => projector = Some(p),
+                                    Err(e) => {
+                                        let _ = request.out.send(Event::Error {
+                                            message: format!(
+                                                "loading the vision projector: {e}"
+                                            ),
+                                        });
+                                    }
+                                },
+                                None => {
+                                    let _ = request.out.send(Event::Error {
+                                        message: format!(
+                                            "{} cannot see images: no vision projector installed",
+                                            found.model
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+
+                        // Held across the turn so this model cannot be chosen as
+                        // the one to evict while somebody is reading its answer.
+                        if busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            member.working(true);
+                        }
+                        let outcome = turn(
+                            engine,
+                            &mut session,
+                            &per_turn,
+                            thinking,
+                            tools,
+                            permissions,
+                            projector.as_ref(),
+                            &request,
+                        );
+                        if busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                            member.working(false);
+                        }
+                        // Generation parks the slot on its way out, but a turn
+                        // that ended through an error may not have reached
+                        // that. An unparked slot is one the others wait for.
+                        session.park();
+                        if let Err(e) = outcome {
+                            let _ = request.out.send(Event::Error { message: e.to_string() });
+                        }
+                        // A turn that ended while a question was outstanding
+                        // leaves nobody to answer it; the card is gone from the
+                        // page with the stream.
+                        permissions.pending.abandon_all();
+                        // Dropping the sender ends the SSE stream.
+                        drop(request);
                     }
-                },
-                None => {
-                    let _ = request.out.send(Event::Error {
-                        message: format!("{} cannot see images: no vision projector installed", found.model),
-                    });
+                })
+                .expect("spawning a slot");
+        }
+
+        // The dispatcher. It never generates, so embedding requests and the
+        // idle clock are answered while every slot is busy.
+        let mut queued = Some(first);
+        loop {
+            if let Some(request) = queued.take() {
+                if work_tx.send(request).is_err() {
+                    break;
                 }
             }
-        }
-
-        // Held across the turn so this model cannot be chosen as the one to
-        // evict while somebody is reading its answer. Cleared afterwards,
-        // which also stamps it as recently used for the eviction order.
-        member.working(true);
-        let outcome = turn(
-            &engine,
-            &mut session,
-            &per_turn,
-            thinking,
-            tools,
-            permissions,
-            projector.as_ref(),
-            &request,
-        );
-        member.working(false);
-        if let Err(e) = outcome {
-            let _ = request.out.send(Event::Error { message: e.to_string() });
-        }
-        // A turn that ended while a question was outstanding leaves nobody to
-        // answer it; the card is gone from the page with the stream.
-        permissions.pending.abandon_all();
-        // Dropping the sender ends the SSE stream for this request.
-        drop(request);
-
-        // Keep waiting until something to generate arrives: an embedding
-        // request is answered here and does not end the turn loop.
-        // Held only while someone is using it. Returning drops the engine with
-        // this scope, which is the same path `Unload` takes — a server left
-        // running overnight should not be holding several gigabytes of VRAM
-        // for a conversation that ended at six.
-        let idle_for = snapshot(shared).web.idle_unload();
-        request = loop {
+            if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let idle_for = snapshot(shared).web.idle_unload();
             let job = match idle_for {
                 Some(limit) => match rx.recv_timeout(limit) {
                     Ok(job) => job,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Idle means nobody is being answered, not merely that
+                        // nothing new arrived. A long turn must not unload the
+                        // model out from under itself.
+                        if busy.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                            continue;
+                        }
                         tracing::info!(
                             "idle for {} minutes; unloading {wanted}",
                             limit.as_secs() / 60
                         );
-                        return Ok(None);
+                        break;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 },
                 None => match rx.recv() {
                     Ok(job) => job,
-                    Err(_) => return Ok(None),
+                    Err(_) => break,
                 },
             };
             match job {
-                Job::Generate(r) => break r,
+                Job::Generate(request) => {
+                    // The pool routes by resolved reference, so this should
+                    // never differ. Checked anyway, and compared the way the
+                    // pool compares: a request that did somehow reach the wrong
+                    // model must not be answered by it.
+                    let same = request.model == wanted
+                        || ozgent_core::resolve(paths, &request.model)
+                            .map(|f| f.model.to_string() == found.model.to_string())
+                            .unwrap_or(false);
+                    if !same {
+                        *handback.lock().unwrap_or_else(|e| e.into_inner()) = Some(request);
+                        break;
+                    }
+                    queued = Some(request);
+                }
                 Job::Embed { texts, reply } => {
                     let _ = reply.send(serve_embeddings(paths, &snapshot(shared), embedder, texts));
                 }
-                // Unloading means returning so the engine is dropped with the scope.
-                Job::Unload => return Ok(None),
+                // Unloading means returning so the engine is dropped with the
+                // scope.
+                Job::Unload => break,
             }
-        };
-        // The pool routes by resolved reference, so this should never differ.
-        // Checked anyway, and compared the way the pool compares: a request
-        // that did somehow reach the wrong model must not be answered by it.
-        let same = request.model == wanted
-            || ozgent_core::resolve(paths, &request.model)
-                .map(|f| f.model.to_string() == found.model.to_string())
-                .unwrap_or(false);
-        if !same {
-            return Ok(Some(request));
         }
-    }
+        // Ends every slot's `recv`, so the scope can join them.
+        drop(work_tx);
+    });
+
+    Ok(handback.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Why an embedding request cannot be served.

@@ -166,6 +166,14 @@ fn push(line: String) {
     if line.is_empty() {
         return;
     }
+    // Also logged, not only kept.
+    //
+    // These are retained so a null context can be explained afterwards, but
+    // some of them precede a `GGML_ABORT` — and then there is no afterwards.
+    // A crash whose one explanatory line was held in a buffer nobody lived to
+    // read is the worst version of this: the log showed the abort and not the
+    // reason for it.
+    tracing::error!(target: "llama", "{line}");
     let Ok(mut errors) = ERRORS.lock() else { return };
     // Keep the first lines, not the last: llama.cpp names the cause where it
     // throws and only summarises on the way back out.

@@ -368,7 +368,7 @@ impl<'a> Hub<'a> {
             return q;
         }
         let deadline = Instant::now() + self.window(&q);
-        while q.waiting.len() < q.running {
+        while field_incomplete(q.waiting.len(), q.running) {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -461,6 +461,19 @@ impl<'a> Hub<'a> {
     }
 }
 
+/// Whether the driver should keep holding a pass open for slots that have not
+/// asked yet.
+///
+/// The whole correctness of the gather window rests on `running` counting only
+/// slots that are actually coming back. A slot that finished its turn and did
+/// not park is still counted, so the driver waits the full window for it on
+/// every pass — measured at 33.4 tok/s against 45.3 for a lone caller on a
+/// four-slot context, because three slots that had finished long before were
+/// still being waited for.
+fn field_incomplete(waiting: usize, running: usize) -> bool {
+    waiting < running
+}
+
 /// Take as many waiting requests as one batch can carry, oldest first.
 ///
 /// Oldest first because a request that keeps losing to newer arrivals never
@@ -548,6 +561,28 @@ impl<'a> Slot<'a> {
         self.hub.with_context(f)
     }
 
+    /// Whether this slot may take device-resident snapshots of its sequence.
+    ///
+    /// llama.cpp caches one buffer per *context* for these, and reuses it
+    /// whenever the next state happens to be the same total size. Two
+    /// sequences taking snapshots in turn therefore hand each other a buffer
+    /// laid out for the other's cells, and llama.cpp answers that by aborting
+    /// the process — which is what four concurrent drafting turns did, inside
+    /// ggml's allocator, on the first round.
+    ///
+    /// Granting the right to exactly one slot is not enough, which was worth
+    /// finding out: with only sequence 0 snapshotting and the other three
+    /// merely decoding, four concurrent turns still aborted. Other sequences
+    /// writing to the same cache is what invalidates the views, not only
+    /// other sequences snapshotting.
+    ///
+    /// So the right belongs to a slot with the context to itself. A model
+    /// whose cache *can* trim a rejected draft never needs this and
+    /// speculates freely however many slots there are.
+    pub fn may_snapshot(&self) -> bool {
+        self.hub.solo()
+    }
+
     /// Drop positions `from..` from this slot's sequence. False means this
     /// cache cannot drop a partial range, which sliding-window and recurrent
     /// caches cannot.
@@ -586,6 +621,21 @@ mod tests {
                 logits: Logits::Last,
             },
         }
+    }
+
+    #[test]
+    fn the_driver_waits_only_while_somebody_is_still_coming() {
+        // Two slots generating, one has asked: wait for the other.
+        assert!(field_incomplete(1, 2));
+        // Both have asked: nothing left to wait for.
+        assert!(!field_incomplete(2, 2));
+        // The bug this guards: a slot that finished its turn without parking
+        // is still counted as running, so the driver waits a window per pass
+        // for a caller that will never arrive.
+        assert!(!field_incomplete(1, 1), "a parked slot must not be waited for");
+        // More waiting than running is possible when a slot queues again
+        // before another has parked; it must not wait.
+        assert!(!field_incomplete(3, 2));
     }
 
     #[test]

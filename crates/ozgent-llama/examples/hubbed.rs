@@ -38,7 +38,15 @@ fn run<'a>(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut slot = hub.slot(seq);
     slot.clear();
-    let tokens = model.str_to_token(prompt, AddBos::Always)?;
+    // A real turn's prompt is a system prompt plus tool schemas plus history,
+    // which is chunked prefill rather than a handful of tokens.
+    let pad: usize = std::env::var("HUB_PAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let prompt = if pad > 0 {
+        format!("{}{prompt}", "The following is background material. ".repeat(pad))
+    } else {
+        prompt.to_string()
+    };
+    let tokens = model.str_to_token(&prompt, AddBos::Always)?;
     let mut sampler = LlamaSampler::greedy();
     let mut pos = 0i32;
     let mut out = String::new();
@@ -112,7 +120,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = ozgent_llama::engine::Engine::load(std::path::Path::new(&path), &opts)?;
     // Zero means leave the window adaptive, which is the real behaviour.
     let hold: u64 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let (hub, window) = engine.hub(&opts, callers as u32)?;
+    // `UpTo` is the shared-pool path the daemon takes; `Exact` divides the
+    // window between slots instead.
+    let want = if std::env::var("HUB_UNIFIED").is_ok() {
+        ozgent_llama::engine::Slots::UpTo(callers as u32)
+    } else {
+        ozgent_llama::engine::Slots::Exact(callers as u32)
+    };
+    let (hub, window) = engine.hub(&opts, want)?;
     let hub = if hold > 0 {
         std::sync::Arc::new(
             std::sync::Arc::try_unwrap(hub)

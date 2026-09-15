@@ -26,6 +26,16 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+/// How many conversations a context should carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slots {
+    /// Exactly this many, whatever it costs in window length.
+    Exact(u32),
+    /// As many as fit beside each other at the asked-for window, and no
+    /// fewer than one.
+    UpTo(u32),
+}
+
 /// llama.cpp's backend may only be initialised once per process.
 pub(crate) fn backend_handle() -> Result<&'static LlamaBackend, EngineError> {
     backend()
@@ -804,22 +814,43 @@ impl Engine {
 
     /// Open a context for this model with `opts` applied.
     ///
-    /// `slots` is how many conversations will share it. llama.cpp's unified
-    /// cache holds `n_ctx` cells in total and hands them out across
-    /// sequences, so serving four callers at the asked-for window needs four
-    /// times the cache — the window is multiplied here and divided again by
-    /// whoever uses it, rather than silently giving each caller a quarter of
-    /// what they asked for.
+    /// `want` is how many conversations will share it, and how that is paid
+    /// for depends on which kind of cache llama.cpp is asked for.
+    ///
+    /// By default it divides `n_ctx` by the sequence count and gives each
+    /// sequence a fixed slice, so four conversations at the asked-for window
+    /// need four times the cache — and on a card with room for one, four
+    /// callers would each get a quarter of the context they asked for.
+    /// Measured on this machine, a 107,008-token window left room for exactly
+    /// one conversation, which is concurrency nobody gets.
+    ///
+    /// `kv_unified` is the way out: one pool of cells that every sequence
+    /// draws from, so a conversation occupies what it is actually holding and
+    /// the rest stays available. Four idle-to-moderate conversations then cost
+    /// about what one long one does, and a lone caller still gets the whole
+    /// window. The trade is that four callers who *all* run to the end of the
+    /// context will exhaust the pool between them; llama.cpp reports that as a
+    /// failed decode rather than silently truncating, so it surfaces as an
+    /// error on the turn that hits it.
+    ///
+    /// Left off for a single slot, where it would change nothing but the code
+    /// path taken.
+    ///
+    /// Returns the context, the window each slot may use, and the slot count.
     fn open(
         &self,
         opts: &Resolved,
-        slots: u32,
-    ) -> Result<(LlamaContext<'_>, u32), EngineError> {
+        want: Slots,
+    ) -> Result<(LlamaContext<'_>, u32, u32), EngineError> {
+        let mut slots = match want {
+            Slots::Exact(n) => n.max(1),
+            Slots::UpTo(n) => n.max(1),
+        };
         let backend = backend()?;
 
         // Asking for more context than the model was trained on produces
         // gibberish rather than an error, so it is clamped with a warning.
-        let requested = opts.context_length.min(self.n_ctx_train.max(512));
+        let mut requested = opts.context_length.min(self.n_ctx_train.max(512));
         if opts.context_length > self.n_ctx_train && self.n_ctx_train > 0 {
             tracing::warn!(
                 "context {} exceeds this model's trained {}; clamping",
@@ -827,11 +858,6 @@ impl Engine {
                 self.n_ctx_train
             );
         }
-
-        // Every slot needs cells of its own out of one shared cache, so the
-        // window that has to be allocated is the per-slot window times the
-        // number of slots. Everything below sizes the *total*.
-        let requested = requested.saturating_mul(slots);
 
         // `auto` is resolved here rather than at parse time because it needs
         // the VRAM left *after* the weights are resident, which is only known
@@ -899,6 +925,23 @@ impl Engine {
         };
         let (type_k, type_v) = (split.k, split.v);
 
+        // `UpTo` is a cap on callers, not on cells: with a shared pool a
+        // second slot costs nothing until somebody actually uses it, so there
+        // is nothing here to fit. `Exact` still divides the window, which is
+        // what a caller asking for a fixed partition means.
+        let unified = slots > 1 && matches!(want, Slots::UpTo(_));
+        if !unified {
+            // Each sequence gets a fixed slice, so the pool has to be that
+            // many times larger.
+            requested = requested.saturating_mul(slots);
+        }
+        let shape = crate::backend::reserve_shape(
+            opts.ubatch.unwrap_or(512),
+            self.model.n_embd() as u32,
+            requested,
+            opts.batch_size,
+        );
+
         // Training context is a claim about which positions the model
         // understands, not a promise that the cache for them fits in memory.
         // At the million-token windows recent models advertise, the cache runs
@@ -915,7 +958,7 @@ impl Engine {
         // `budget` was computed above, against a measured reserve rather than
         // a share of the card: the share allowed 3514 MiB of 5020 free, so a
         // cache that would have fitted at f16 was quantised for nothing.
-        let requested =
+        let mut requested =
             ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
         let asked = opts.context_length.min(self.n_ctx_train.max(512)).saturating_mul(slots);
         if requested < asked {
@@ -970,6 +1013,7 @@ impl Engine {
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(opts.batch_size)
             .with_n_seq_max(slots)
+            .with_kv_unified(unified)
             .with_flash_attention_policy(flash)
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
@@ -1011,21 +1055,27 @@ impl Engine {
             }
         }
 
-        Ok((context, requested))
+        // What one slot may use: the whole pool when it is shared, its own
+        // slice when it is not.
+        let each = if unified { requested } else { (requested / slots).max(1) };
+        Ok((context, each, slots))
     }
 
     /// One conversation with a cache of its own.
     pub fn session(&self, opts: &Resolved) -> Result<Session<'_>, EngineError> {
-        Ok(self.sessions(opts, 1)?.pop().expect("one slot is one session"))
+        Ok(self
+            .sessions(opts, Slots::Exact(1))?
+            .pop()
+            .expect("one slot is one session"))
     }
 
     /// `slots` conversations sharing one context, and one forward pass
     /// whenever more than one of them wants a token at the same moment.
     ///
     /// The window is divided between them: see [`Engine::open`].
-    pub fn sessions(&self, opts: &Resolved, slots: u32) -> Result<Vec<Session<'_>>, EngineError> {
-        let slots = slots.max(1);
-        let (hub, window) = self.hub(opts, slots)?;
+    pub fn sessions(&self, opts: &Resolved, want: Slots) -> Result<Vec<Session<'_>>, EngineError> {
+        let (hub, window) = self.hub(opts, want)?;
+        let slots = hub.slots();
         Ok((0..slots).map(|seq| self.attach(&hub, seq as i32, window, opts)).collect())
     }
 
@@ -1067,11 +1117,9 @@ impl Engine {
     pub fn hub(
         &self,
         opts: &Resolved,
-        slots: u32,
+        want: Slots,
     ) -> Result<(std::sync::Arc<crate::hub::Hub<'_>>, u32), EngineError> {
-        let slots = slots.max(1);
-        let (context, total) = self.open(opts, slots)?;
-        let each = (total / slots).max(1);
+        let (context, each, slots) = self.open(opts, want)?;
         Ok((
             std::sync::Arc::new(crate::hub::Hub::new(
                 context,
@@ -1424,14 +1472,45 @@ pub struct Session<'a> {
     opts: Resolved,
 }
 
+// A session may be moved to the thread that will answer with it, which is how
+// several of them share one context: each slot gets its own thread and its own
+// session, and the hub serialises the one thing they share.
+//
+// What this asserts is that nothing a session owns is tied to the thread that
+// made it. The model behind `&LlamaModel` is already `Sync`; the context is
+// behind the hub's lock and is never handed out; the sampler and the saved
+// sequence states are raw llama.cpp pointers with no thread affinity, owned by
+// exactly one session and used from one thread at a time. What is *not*
+// asserted is that two threads may touch one session — `Sync` is deliberately
+// not implemented, so the compiler still requires `&mut` to generate.
+unsafe impl Send for Session<'_> {}
+
 impl<'a> Session<'a> {
     pub fn n_ctx(&self) -> u32 {
         self.n_ctx
     }
 
+    /// Say that this session has stopped asking for tokens, so the others
+    /// sharing its context do not wait for it.
+    ///
+    /// The hub holds each pass open briefly for slots that are about to ask
+    /// for their next token, and a slot that has walked away without saying so
+    /// costs everybody that wait on every pass. Not a small effect: leaving it
+    /// out cost a lone caller 46.6 tok/s against 33.4, because three slots
+    /// that had finished long ago were still being waited for.
+    pub fn park(&mut self) {
+        self.slot.park();
+    }
+
     /// Whether this session has the context to itself.
     pub fn solo(&self) -> bool {
         self.slot.hub().solo()
+    }
+
+    /// Whether this session may roll a rejected draft back by snapshotting
+    /// its sequence state. See [`crate::hub::Slot::may_snapshot`].
+    fn may_snapshot(&self) -> bool {
+        self.slot.may_snapshot()
     }
 
     /// Capture the sequence state so it can be put back later.
@@ -1846,6 +1925,11 @@ impl<'a> Session<'a> {
             self.cached.extend_from_slice(&fresh);
         }
 
+        if !self.may_snapshot() {
+            // See `generate_drafted`: a device-held state is captured through
+            // a buffer the whole context shares, and only one slot may use it.
+            return Ok(Vec::new());
+        }
         let mark = self.n_past;
         let cached_len = self.cached.len();
         let state = self.snapshot(false, true)?;
@@ -1879,6 +1963,7 @@ impl<'a> Session<'a> {
         prompt: &str,
         iterations: u32,
         on_device: bool,
+        partial: bool,
     ) -> Result<(f64, f64, usize), EngineError> {
         let n_batch = (self.n_batch as usize).max(1);
 
@@ -1891,13 +1976,13 @@ impl<'a> Session<'a> {
 
         // One outside the loop, so allocation and any first-call setup are not
         // charged to the average.
-        let warm = self.snapshot(false, on_device)?;
+        let warm = self.snapshot(partial, on_device)?;
         self.restore(&warm)?;
 
         let start = Instant::now();
         let mut states = Vec::with_capacity(iterations as usize);
         for _ in 0..iterations {
-            states.push(self.snapshot(false, on_device)?);
+            states.push(self.snapshot(partial, on_device)?);
         }
         let snap_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
 
@@ -2447,7 +2532,13 @@ impl<'a> Session<'a> {
         // using, and the failure mode of getting that wrong is wrong output
         // rather than an error. It earns `auto` by being measured, not by
         // being plausible.
-        let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp) && !self.grammar_active {
+        // Drafting from the model's own head opens a second context over this
+        // one's memory and edits sequence 0 directly, which is only this
+        // session's sequence when this session is the only one.
+        let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp)
+            && !self.grammar_active
+            && self.solo()
+        {
             match self
                 .slot
                 .with_context(|c| crate::mtp::MtpDrafter::new(self.model, backend()?, c, self.n_ctx))
@@ -2479,7 +2570,25 @@ impl<'a> Session<'a> {
             && (drafter.is_some()
                 || mtp.is_some()
                 || matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto));
-        let mut use_snapshot = spec_on && !by_trim;
+        // A device-resident snapshot is a list of views into the cache as it
+        // stood, and llama.cpp keeps one cached buffer per *context* to hold
+        // them. Two conversations sharing a context therefore snapshot through
+        // the same buffer with different layouts, and llama.cpp answers that
+        // by aborting the process — not theorised: four concurrent turns on
+        // one context died in ggml's allocator on the first drafting round,
+        // and vanished the moment speculation was switched off.
+        //
+        // So the snapshot path belongs to a session that has the context to
+        // itself. A shared session can still speculate if its cache can trim,
+        // which is per-sequence and safe; one that cannot simply does not.
+        let mut use_snapshot = spec_on && !by_trim && self.may_snapshot();
+        if spec_on && !by_trim && !self.may_snapshot() {
+            tracing::debug!(
+                "this cache cannot trim a rejected draft, and the rollback that \
+                 replaces trimming needs a context of its own; not speculating"
+            );
+            spec_on = false;
+        }
         if use_snapshot && self.snapshot(false, true).is_err() {
             // The device-resident path is what makes this affordable; without
             // it, speculating would cost more than it saves.
@@ -2784,6 +2893,10 @@ impl<'a> Session<'a> {
         }
         stats.generation_ms = gen_started.elapsed().as_millis();
         stats.callback_ms = callback_ns / 1_000_000;
+        // Whatever comes next — a tool call, another round, the end of the
+        // turn — this session is not about to ask for a token, so nobody
+        // should hold a pass open for it.
+        self.slot.park();
         Ok((stats, reason))
     }
 }

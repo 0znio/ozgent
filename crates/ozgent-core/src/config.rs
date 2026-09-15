@@ -71,6 +71,18 @@ pub struct WebConfig {
     /// which is the same wait the first question of the day pays anyway.
     #[serde(default = "default_idle_unload")]
     pub idle_unload_minutes: u64,
+    /// How many conversations one model may answer at once.
+    ///
+    /// An upper bound, not a promise: slots are only opened while the memory
+    /// holds them at the asked-for context length, so a card with room for
+    /// one conversation answers one however high this is set. Raising it
+    /// never shortens anybody's window.
+    #[serde(default = "default_parallel")]
+    pub parallel: u32,
+}
+
+fn default_parallel() -> u32 {
+    4
 }
 
 fn default_idle_unload() -> u64 {
@@ -79,7 +91,11 @@ fn default_idle_unload() -> u64 {
 
 impl Default for WebConfig {
     fn default() -> Self {
-        Self { admin_password_hash: None, idle_unload_minutes: default_idle_unload() }
+        Self {
+            admin_password_hash: None,
+            idle_unload_minutes: default_idle_unload(),
+            parallel: default_parallel(),
+        }
     }
 }
 
@@ -87,6 +103,11 @@ impl WebConfig {
     /// The stored admin password hash, if one is set and is not blank.
     pub fn admin_hash(&self) -> Option<&str> {
         self.admin_password_hash.as_deref().map(str::trim).filter(|p| !p.is_empty())
+    }
+
+    /// The most conversations one model may answer at once, never zero.
+    pub fn parallel(&self) -> u32 {
+        self.parallel.max(1)
     }
 
     /// How long to hold an idle model, or `None` to hold it indefinitely.

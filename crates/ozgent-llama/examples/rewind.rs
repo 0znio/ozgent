@@ -47,8 +47,17 @@ fn main() {
     // Size is only half the question: a snapshot on every draft step has to fit
     // inside the per-token budget, which at ~56 tok/s is about 17.8 ms.
     println!();
-    for (on_device, label) in [(false, "host  "), (true, "device")] {
-        match session.probe_snapshot_cost(prompt, 20, on_device) {
+    // Partial states hold only what a trim cannot reach — the recurrent or
+    // sliding-window part — so on a hybrid model they should be a fraction of
+    // the size, and unlike a device-held state they are plain host bytes with
+    // no layout to go stale. If one is cheap enough, a shared context can
+    // speculate after all.
+    for (on_device, partial, label) in [
+        (false, false, "host full   "),
+        (true, false, "device full "),
+        (false, true, "host partial"),
+    ] {
+        match session.probe_snapshot_cost(prompt, 20, on_device, partial) {
             Ok((snap, restore, bytes)) => println!(
                 "{label}  snapshot {snap:6.2} ms   restore {restore:6.2} ms   host bytes {:>9}",
                 bytes
