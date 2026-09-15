@@ -1016,10 +1016,31 @@ impl Engine {
 
     /// One conversation with a cache of its own.
     pub fn session(&self, opts: &Resolved) -> Result<Session<'_>, EngineError> {
-        let (context, _) = self.open(opts, 1)?;
-        Ok(Session {
+        Ok(self.sessions(opts, 1)?.pop().expect("one slot is one session"))
+    }
+
+    /// `slots` conversations sharing one context, and one forward pass
+    /// whenever more than one of them wants a token at the same moment.
+    ///
+    /// The window is divided between them: see [`Engine::open`].
+    pub fn sessions(&self, opts: &Resolved, slots: u32) -> Result<Vec<Session<'_>>, EngineError> {
+        let slots = slots.max(1);
+        let (hub, window) = self.hub(opts, slots)?;
+        Ok((0..slots).map(|seq| self.attach(&hub, seq as i32, window, opts)).collect())
+    }
+
+    fn attach<'e>(
+        &'e self,
+        hub: &std::sync::Arc<crate::hub::Hub<'e>>,
+        seq: i32,
+        window: u32,
+        opts: &Resolved,
+    ) -> Session<'e> {
+        Session {
             model: &self.model,
-            context,
+            n_ctx: window,
+            n_batch: hub.n_batch() as u32,
+            slot: hub.slot(seq),
             sampler: build_sampler(opts),
             n_past: 0,
             cached: Vec::new(),
@@ -1036,18 +1057,29 @@ impl Engine {
             tool_grammars: Vec::new(),
             gate_applied: false,
             opts: opts.clone(),
-        })
+        }
     }
 
     /// A context several conversations share, decoding through it together.
     ///
     /// Returns the hub and the window each slot may use. See [`crate::hub`]
     /// for what sharing a pass does and does not change.
-    pub fn hub(&self, opts: &Resolved, slots: u32) -> Result<(crate::hub::Hub<'_>, u32), EngineError> {
+    pub fn hub(
+        &self,
+        opts: &Resolved,
+        slots: u32,
+    ) -> Result<(std::sync::Arc<crate::hub::Hub<'_>>, u32), EngineError> {
         let slots = slots.max(1);
         let (context, total) = self.open(opts, slots)?;
         let each = (total / slots).max(1);
-        Ok((crate::hub::Hub::new(context, self.model.n_vocab() as usize), each))
+        Ok((
+            std::sync::Arc::new(crate::hub::Hub::new(
+                context,
+                self.model.n_vocab() as usize,
+                slots,
+            )),
+            each,
+        ))
     }
 
     pub fn model(&self) -> &LlamaModel {
@@ -1151,18 +1183,6 @@ fn build_sampler_old(opts: &Resolved) -> LlamaSampler {
 }
 
 /// Length of the longest shared prefix of two token sequences.
-/// Slots to allocate for the batch that is reused throughout a generation.
-///
-/// It has to hold the largest thing ever put in it, which is whichever is
-/// bigger: a full prefill chunk (`n_batch`), or the confirmed token plus a
-/// full draft. Sizing it to the *current* prompt instead was a real bug: a
-/// mid-generation cache rebuild re-prefills far more tokens than the original
-/// prompt held, and overflowed the buffer.
-fn batch_capacity(n_batch: usize, opts: &Resolved) -> usize {
-    let draft = opts.speculative_tuning.draft_tokens as usize;
-    n_batch.max(1 + draft).max(1)
-}
-
 /// Split a prompt of `len` tokens into batches of at most `n_batch`.
 ///
 /// Extracted so the arithmetic can be checked without a model: an off-by-one
@@ -1358,7 +1378,13 @@ pub struct Session<'a> {
     /// engine so the checkpoint budget can stand aside for them.
     cpu_moe_layers: u32,
     model: &'a LlamaModel,
-    context: LlamaContext<'a>,
+    /// This conversation's claim on a context that may be shared with others.
+    /// A session built by [`Engine::session`] has the context to itself; one
+    /// built by [`Engine::sessions`] shares its forward passes.
+    slot: crate::hub::Slot<'a>,
+    /// Cached from the context, which is now behind a lock.
+    n_ctx: u32,
+    n_batch: u32,
     sampler: LlamaSampler,
     n_past: i32,
     /// Tokens currently resident in the KV cache, so the next prompt can
@@ -1400,7 +1426,12 @@ pub struct Session<'a> {
 
 impl<'a> Session<'a> {
     pub fn n_ctx(&self) -> u32 {
-        self.context.n_ctx()
+        self.n_ctx
+    }
+
+    /// Whether this session has the context to itself.
+    pub fn solo(&self) -> bool {
+        self.slot.hub().solo()
     }
 
     /// Capture the sequence state so it can be put back later.
@@ -1416,14 +1447,16 @@ impl<'a> Session<'a> {
         if on_device {
             bits |= LlamaStateSeqFlags::ON_DEVICE.bits();
         }
-        self.context
-            .state_seq_get(0, LlamaStateSeqFlags::from_bits(bits))
+        let seq = self.slot.seq();
+        self.slot
+            .with_context(|c| c.state_seq_get(seq, LlamaStateSeqFlags::from_bits(bits)))
             .map_err(|e| EngineError::State(e.to_string()))
     }
 
     fn restore(&mut self, state: &SeqState) -> Result<(), EngineError> {
-        self.context
-            .state_seq_set(state, 0)
+        let seq = self.slot.seq();
+        self.slot
+            .with_context(|c| c.state_seq_set(state, seq))
             .map_err(|e| EngineError::State(e.to_string()))
     }
 
@@ -1568,7 +1601,7 @@ impl<'a> Session<'a> {
             // The cache is now of unknown shape; force a clean prefill. The
             // state itself is not at fault, so it is kept.
             self.checkpoints.push(checkpoint);
-            self.context.clear_kv_cache();
+            self.slot.clear();
             self.cached.clear();
             self.n_past = 0;
             return None;
@@ -1598,12 +1631,11 @@ impl<'a> Session<'a> {
     /// a row of zeros links and reads perfectly well while meaning the head
     /// never ran.
     pub fn probe_nextn(&mut self, prompt: &str) -> Result<(usize, f32), EngineError> {
-        let n_batch = (self.context.n_batch() as usize).max(1);
-        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        let n_batch = (self.n_batch as usize).max(1);
         self.reset();
 
         let n_embd = self.model.n_embd() as usize;
-        let ptr = self.context.as_ptr();
+        let ptr = self.slot.hub().raw();
         // Unmasked. llama.cpp's own driver sets the *target* context this way
         // and reserves `masked` for the draft context: the target has to emit
         // a hidden state for every prompt position, because those rows are
@@ -1616,7 +1648,7 @@ impl<'a> Session<'a> {
             .model
             .str_to_token(prompt, AddBos::Always)
             .map_err(|e| EngineError::Tokenize(e.to_string()))?;
-        self.prefill(&tokens, &mut batch, n_batch, true)?;
+        self.prefill(&tokens, true)?;
 
         let row = unsafe { crate::nextn::embedding(ptr, 0, n_embd) };
         unsafe { crate::nextn::set_enabled(ptr, false, false) };
@@ -1645,12 +1677,11 @@ impl<'a> Session<'a> {
         prompt: &str,
         want: usize,
     ) -> Result<(String, Vec<String>), EngineError> {
-        let n_batch = (self.context.n_batch() as usize).max(1);
-        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        let n_batch = (self.n_batch as usize).max(1);
         self.reset();
 
         let n_embd = self.model.n_embd() as usize;
-        let ptr = self.context.as_ptr();
+        let ptr = self.slot.hub().raw();
         // Unmasked: the target has to emit a hidden state for the position the
         // draft will continue from.
         unsafe { crate::nextn::set_enabled(ptr, true, false) };
@@ -1659,7 +1690,7 @@ impl<'a> Session<'a> {
             .model
             .str_to_token(prompt, AddBos::Always)
             .map_err(|e| EngineError::Tokenize(e.to_string()))?;
-        self.prefill(&tokens, &mut batch, n_batch, true)?;
+        self.prefill(&tokens, true)?;
 
         // What the target itself would say next, for comparison.
         let target_next = self.greedy_from_logits()?;
@@ -1673,12 +1704,9 @@ impl<'a> Session<'a> {
             .ok_or_else(|| EngineError::Context("no nextn row after prefill".into()))?;
 
         let backend = backend()?;
-        let mut drafter = crate::mtp::MtpDrafter::new(
-            self.model,
-            backend,
-            &self.context,
-            self.context.n_ctx(),
-        )?
+        let mut drafter = self
+            .slot
+            .with_context(|c| crate::mtp::MtpDrafter::new(self.model, backend, c, self.n_ctx))?
         .ok_or_else(|| EngineError::Context("this model has no nextn head".into()))?;
 
         let drafted = drafter.propose(target_next, &hidden, self.n_past, want)?;
@@ -1701,7 +1729,7 @@ impl<'a> Session<'a> {
     fn greedy_from_logits(&self) -> Result<LlamaToken, EngineError> {
         // SAFETY: a decode that requested logits has just completed.
         let raw = unsafe {
-            ozgent_mtmd_sys::llama_cpp_sys_2::llama_get_logits_ith(self.context.as_ptr(), -1)
+            ozgent_mtmd_sys::llama_cpp_sys_2::llama_get_logits_ith(self.slot.hub().raw(), -1)
         };
         if raw.is_null() {
             return Err(EngineError::Decode("no logits".into()));
@@ -1725,7 +1753,7 @@ impl<'a> Session<'a> {
     /// — so it is measurable on its own, separately from any drafting.
     pub fn set_nextn_output(&mut self, on: bool) {
         // SAFETY: the context is live for the life of the session.
-        unsafe { crate::nextn::set_enabled(self.context.as_ptr(), on, !on) };
+        unsafe { crate::nextn::set_enabled(self.slot.hub().raw(), on, !on) };
     }
 
     /// Check that a snapshot really can rewind this model mid-generation.
@@ -1743,8 +1771,7 @@ impl<'a> Session<'a> {
         partial: bool,
         on_device: bool,
     ) -> Result<(String, String, usize), EngineError> {
-        let n_batch = (self.context.n_batch() as usize).max(1);
-        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        let n_batch = (self.n_batch as usize).max(1);
 
         self.reset();
         let tokens = self
@@ -1752,7 +1779,7 @@ impl<'a> Session<'a> {
             .str_to_token(prompt, AddBos::Always)
             .map_err(|e| EngineError::Tokenize(e.to_string()))?;
         let (head, tail) = tokens.split_at(tokens.len().saturating_sub(1));
-        self.prefill(head, &mut batch, n_batch, false)?;
+        self.prefill(head, false)?;
 
         // The snapshot is taken *before* the final prompt token, so each run
         // can decode it again and regenerate its logits. Restoring state does
@@ -1763,14 +1790,14 @@ impl<'a> Session<'a> {
         let state = self.snapshot(partial, on_device)?;
         let size = state.byte_len();
 
-        self.prefill(tail, &mut batch, n_batch, true)?;
-        let first = self.run_greedy(k, &mut batch, n_batch)?;
+        let row = self.prefill(tail, true)?;
+        let first = self.run_greedy(k, row)?;
 
         self.restore(&state)?;
         self.n_past = mark;
         self.sampler.reset();
-        self.prefill(tail, &mut batch, n_batch, true)?;
-        let second = self.run_greedy(k, &mut batch, n_batch)?;
+        let row = self.prefill(tail, true)?;
+        let second = self.run_greedy(k, row)?;
 
         Ok((first, second, size))
     }
@@ -1795,12 +1822,11 @@ impl<'a> Session<'a> {
         if n == 0 || context.is_empty() {
             return Ok(Vec::new());
         }
-        let n_ctx = self.context.n_ctx() as i32;
+        let n_ctx = self.n_ctx as i32;
         if context.len() as i32 + n as i32 >= n_ctx {
             return Ok(Vec::new());
         }
-        let n_batch = (self.context.n_batch() as usize).max(1);
-        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        let n_batch = (self.n_batch as usize).max(1);
 
         // Anything the drafter has not absorbed yet. A divergence means the
         // target went somewhere this session never saw, so start over rather
@@ -1809,9 +1835,14 @@ impl<'a> Session<'a> {
         if shared < self.cached.len() {
             self.reset();
         }
+        // The logits to draft from come out of this prefill. If there is
+        // nothing fresh to feed there are none — the previous round's belong
+        // to a pass that has since been overwritten — so the round simply
+        // proposes nothing, which costs the target one ordinary token.
+        let mut row: Option<Vec<f32>> = None;
         let fresh: Vec<LlamaToken> = context[self.cached.len()..].to_vec();
         if !fresh.is_empty() {
-            self.prefill(&fresh, &mut batch, n_batch, true)?;
+            row = self.prefill(&fresh, true)?;
             self.cached.extend_from_slice(&fresh);
         }
 
@@ -1821,19 +1852,13 @@ impl<'a> Session<'a> {
 
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            let token = self.sampler.sample(&self.context, -1);
+            let Some(logits) = row.take() else { break };
+            let token = self.pick(&logits);
             if self.model.is_eog_token(token) {
                 break;
             }
             out.push(token);
-            batch.clear();
-            batch
-                .add(token, self.n_past, &[0], true)
-                .map_err(|e| EngineError::Batch(e.to_string()))?;
-            self.context
-                .decode(&mut batch)
-                .map_err(|e| EngineError::Decode(e.to_string()))?;
-            self.n_past += 1;
+            row = self.feed(vec![token], self.n_past, crate::hub::Logits::Last)?.into_last();
         }
 
         // Put the drafter back where it started, so the next call resumes from
@@ -1855,15 +1880,14 @@ impl<'a> Session<'a> {
         iterations: u32,
         on_device: bool,
     ) -> Result<(f64, f64, usize), EngineError> {
-        let n_batch = (self.context.n_batch() as usize).max(1);
-        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        let n_batch = (self.n_batch as usize).max(1);
 
         self.reset();
         let tokens = self
             .model
             .str_to_token(prompt, AddBos::Always)
             .map_err(|e| EngineError::Tokenize(e.to_string()))?;
-        self.prefill(&tokens, &mut batch, n_batch, true)?;
+        self.prefill(&tokens, true)?;
 
         // One outside the loop, so allocation and any first-call setup are not
         // charged to the average.
@@ -1890,16 +1914,13 @@ impl<'a> Session<'a> {
     }
 
     /// Greedily decode `k` tokens from the current position, returning the text.
-    fn run_greedy(
-        &mut self,
-        k: u32,
-        batch: &mut LlamaBatch,
-        _n_batch: usize,
-    ) -> Result<String, EngineError> {
+    fn run_greedy(&mut self, k: u32, from: Option<Vec<f32>>) -> Result<String, EngineError> {
         let mut out = String::new();
         let mut decoder = Utf8Buffer::new();
+        let mut row = from;
         for _ in 0..k {
-            let token = self.sampler.sample(&self.context, -1);
+            let Some(logits) = row.take() else { break };
+            let token = self.pick(&logits);
             if self.model.is_eog_token(token) {
                 break;
             }
@@ -1909,14 +1930,7 @@ impl<'a> Session<'a> {
                 .map_err(|e| EngineError::Detokenize(e.to_string()))?;
             out.push_str(&decoder.push(&bytes));
 
-            batch.clear();
-            batch
-                .add(token, self.n_past, &[0], true)
-                .map_err(|e| EngineError::Batch(e.to_string()))?;
-            self.context
-                .decode(batch)
-                .map_err(|e| EngineError::Decode(e.to_string()))?;
-            self.n_past += 1;
+            row = self.feed(vec![token], self.n_past, crate::hub::Logits::Last)?.into_last();
         }
         out.push_str(&decoder.finish());
         Ok(out)
@@ -1945,10 +1959,51 @@ impl<'a> Session<'a> {
         if on_device {
             bits |= llama_cpp_2::context::session::LlamaStateSeqFlags::ON_DEVICE.bits();
         }
-        self.context.state_seq_get_size_ext(
-            0,
-            llama_cpp_2::context::session::LlamaStateSeqFlags::from_bits(bits),
-        )
+        let seq = self.slot.seq();
+        self.slot.with_context(|c| {
+            c.state_seq_get_size_ext(
+                seq,
+                llama_cpp_2::context::session::LlamaStateSeqFlags::from_bits(bits),
+            )
+        })
+    }
+
+    /// Choose a token from one row of logits.
+    ///
+    /// Exactly what `llama_sampler_sample` does — apply the chain, take what
+    /// it selected, accept it — but from a row the hub copied out rather than
+    /// from the context, which by now belongs to somebody else's pass. The
+    /// accept is not optional: `sample` performs it internally, and stateful
+    /// samplers (repetition penalties, grammars) go wrong without it.
+    fn pick(&mut self, row: &[f32]) -> LlamaToken {
+        let mut candidates = llama_cpp_2::token::data_array::LlamaTokenDataArray::from_iter(
+            row.iter().enumerate().map(|(i, &logit)| {
+                llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i as i32), logit, 0.0)
+            }),
+            false,
+        );
+        candidates.apply_sampler(&self.sampler);
+        let token = candidates
+            .selected_token()
+            .expect("a sampler chain always selects a token");
+        self.sampler.accept(token);
+        token
+    }
+
+    /// Decode `tokens` at the current position through the hub, advancing it.
+    fn feed(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: crate::hub::Logits,
+    ) -> Result<crate::hub::Outcome, EngineError> {
+        let n = tokens.len() as i32;
+        let out = self
+            .slot
+            .run(tokens, pos, logits)
+            .map_err(|e| EngineError::Decode(e.to_string()))?;
+        self.n_past = pos + n;
+        Ok(out)
     }
 
     /// Tokens currently held in the KV cache.
@@ -1964,35 +2019,27 @@ impl<'a> Session<'a> {
     fn prefill(
         &mut self,
         tokens: &[LlamaToken],
-        batch: &mut LlamaBatch,
-        n_batch: usize,
         want_logits: bool,
-    ) -> Result<(), EngineError> {
-        let last = tokens.len().saturating_sub(1);
-        let mut offset = 0usize;
-        while offset < tokens.len() {
-            let end = (offset + n_batch).min(tokens.len());
-            batch.clear();
-            for (i, token) in tokens[offset..end].iter().enumerate() {
-                let index = offset + i;
-                batch
-                    .add(
-                        *token,
-                        self.n_past + index as i32,
-                        &[0],
-                        // Logits are needed only for the final token of the
-                        // whole sequence, not of each chunk.
-                        want_logits && index == last,
-                    )
-                    .map_err(|e| EngineError::Batch(e.to_string()))?;
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let n_batch = (self.n_batch as usize).max(1);
+        let start = self.n_past;
+        let mut row = None;
+        for (offset, end) in prefill_chunks(tokens.len(), n_batch) {
+            let final_chunk = end == tokens.len();
+            // Logits are needed only for the final token of the whole
+            // sequence, not of each chunk.
+            let logits = if want_logits && final_chunk {
+                crate::hub::Logits::Last
+            } else {
+                crate::hub::Logits::None
+            };
+            let out = self.feed(tokens[offset..end].to_vec(), start + offset as i32, logits)?;
+            if final_chunk {
+                row = out.into_last();
             }
-            self.context
-                .decode(batch)
-                .map_err(|e| EngineError::Decode(e.to_string()))?;
-            offset = end;
         }
-        self.n_past += tokens.len() as i32;
-        Ok(())
+        self.n_past = start + tokens.len() as i32;
+        Ok(row)
     }
 
     /// Drop the cache and start a fresh conversation on this context.
@@ -2000,7 +2047,7 @@ impl<'a> Session<'a> {
     /// Reusing the context avoids re-allocating the KV cache, which for a
     /// large context is the slow part of opening a session.
     pub fn reset(&mut self) {
-        self.context.clear_kv_cache();
+        self.slot.clear();
         self.sampler.reset();
         self.n_past = 0;
         self.cached.clear();
@@ -2028,8 +2075,6 @@ impl<'a> Session<'a> {
         pending: LlamaToken,
         draft: &[LlamaToken],
         accepted: usize,
-        batch: &mut LlamaBatch,
-        n_batch: usize,
     ) -> Result<(), EngineError> {
         match snapshot {
             // Everything was accepted: the state already reflects it.
@@ -2040,9 +2085,9 @@ impl<'a> Session<'a> {
                 let mut confirmed = Vec::with_capacity(1 + accepted);
                 confirmed.push(pending);
                 confirmed.extend_from_slice(&draft[..accepted]);
-                self.prefill(&confirmed, batch, n_batch, false)
+                self.prefill(&confirmed, false).map(|_| ())
             }
-            None => self.trim_after_draft(start, accepted, batch, n_batch),
+            None => self.trim_after_draft(start, accepted),
         }
     }
 
@@ -2058,25 +2103,19 @@ impl<'a> Session<'a> {
         &mut self,
         start: i32,
         accepted: usize,
-        batch: &mut LlamaBatch,
-        n_batch: usize,
     ) -> Result<(), EngineError> {
         let valid = start + 1 + accepted as i32;
         if valid >= self.n_past {
             return Ok(());
         }
-        if self
-            .context
-            .kv_cache_seq_rm(0, Some(valid as u32), None)
-            .is_ok()
-        {
+        if self.slot.trim(valid).unwrap_or(false) {
             self.n_past = valid;
             return Ok(());
         }
 
         tracing::debug!("this cache cannot trim; rebuilding it without speculation");
         self.can_trim = false;
-        self.context.clear_kv_cache();
+        self.slot.clear();
         self.n_past = 0;
 
         let good: Vec<LlamaToken> = self
@@ -2085,7 +2124,7 @@ impl<'a> Session<'a> {
             .copied()
             .take(valid.max(0) as usize)
             .collect();
-        self.prefill(&good, batch, n_batch, true)?;
+        self.prefill(&good, true)?;
         self.cached = good;
         Ok(())
     }
@@ -2208,18 +2247,21 @@ impl<'a> Session<'a> {
             self.set_grammar(None)?;
             self.gate_applied = false;
         }
-        let n_ctx = self.context.n_ctx() as i32;
+        let n_ctx = self.n_ctx as i32;
         let mut stats = Stats::default();
         let started = Instant::now();
-        let n_batch = (self.context.n_batch() as usize).max(1);
-        let mut batch = LlamaBatch::new(batch_capacity(n_batch, &self.opts), 1);
+        let n_batch = (self.n_batch as usize).max(1);
+        // The logits the prompt ends on, which is where generation starts.
+        // Carried out of the prefill rather than read back from the context,
+        // which by then may be running somebody else's pass.
+        let mut prefill_row: Option<Vec<f32>> = None;
 
         // An image becomes embeddings, not token ids. Once mtmd has written
         // them into the cache there is no token sequence that describes what is
         // resident, so the prefix-reuse bookkeeping cannot be trusted and the
         // next turn has to start from a clean cache.
         if self.media_dirty {
-            self.context.clear_kv_cache();
+            self.slot.clear();
             self.cached.clear();
             self.n_past = 0;
             self.media_dirty = false;
@@ -2227,12 +2269,16 @@ impl<'a> Session<'a> {
 
         match media {
             Some((projector, images, sources)) if !images.is_empty() => {
-                self.context.clear_kv_cache();
+                self.slot.clear();
                 self.cached.clear();
                 self.n_past = 0;
 
-                let new_past = projector
-                    .eval(&mut self.context, prompt, images, sources, 0, n_batch as i32, true)
+                let seq = self.slot.seq();
+                let new_past = self
+                    .slot
+                    .with_context(|c| {
+                        projector.eval(c, prompt, images, sources, seq, n_batch as i32, true)
+                    })
                     .map_err(|e| EngineError::Decode(e.to_string()))?;
                 if new_past >= n_ctx {
                     return Err(EngineError::PromptTooLong {
@@ -2297,12 +2343,7 @@ impl<'a> Session<'a> {
                 if !restored && reuse < self.cached.len() {
                     // Drop everything after the shared prefix; those positions
                     // are about to be occupied by different tokens.
-                    if self.can_trim
-                        && self
-                            .context
-                            .kv_cache_seq_rm(0, Some(reuse as u32), None)
-                            .is_err()
-                    {
+                    if self.can_trim && !self.slot.trim(reuse as i32).unwrap_or(false) {
                         // Sliding-window and recurrent caches refuse a partial
                         // removal. That is a limitation, not an error: drop the
                         // whole cache and prefill from scratch, and stop relying
@@ -2321,7 +2362,7 @@ impl<'a> Session<'a> {
                                 restored = true;
                             }
                             None => {
-                                self.context.clear_kv_cache();
+                                self.slot.clear();
                                 self.cached.clear();
                                 reuse = 0;
                             }
@@ -2342,11 +2383,12 @@ impl<'a> Session<'a> {
                 // it is replaced by the reply the model is about to write.
                 let boundary = tokens.len().saturating_sub(self.gen_prompt_tokens).max(reuse);
                 if boundary > reuse {
-                    self.prefill(&tokens[reuse..boundary], &mut batch, n_batch, false)?;
+                    self.prefill(&tokens[reuse..boundary], false)?;
                     self.cached = tokens[..boundary].to_vec();
                     self.save_checkpoint(&tokens[..boundary]);
                 }
-                self.prefill(&tokens[boundary..], &mut batch, n_batch, true)?;
+                prefill_row = self.prefill(&tokens[boundary..], true)?;
+                debug_assert!(prefill_row.is_some());
                 self.cached = tokens.clone();
                 stats.prompt_tokens = tokens.len() - reuse;
                 stats.reused_tokens = reuse;
@@ -2406,16 +2448,14 @@ impl<'a> Session<'a> {
         // rather than an error. It earns `auto` by being measured, not by
         // being plausible.
         let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp) && !self.grammar_active {
-            match crate::mtp::MtpDrafter::new(
-                self.model,
-                backend()?,
-                &self.context,
-                self.context.n_ctx(),
-            ) {
+            match self
+                .slot
+                .with_context(|c| crate::mtp::MtpDrafter::new(self.model, backend()?, c, self.n_ctx))
+            {
                 Ok(Some(d)) => {
                     // Unmasked, so a hidden state comes back for every position
                     // the target decodes — including each verified draft.
-                    unsafe { crate::nextn::set_enabled(self.context.as_ptr(), true, false) };
+                    unsafe { crate::nextn::set_enabled(self.slot.hub().raw(), true, false) };
                     Some(d)
                 }
                 Ok(None) => {
@@ -2507,7 +2547,12 @@ impl<'a> Session<'a> {
         };
 
         // The token to decode next, sampled from the prefill's final logits.
-        let mut pending = self.sampler.sample(&self.context, -1);
+        let Some(row) = prefill_row.take() else {
+            return Err(EngineError::Decode(
+                "the prompt produced no logits to generate from".into(),
+            ));
+        };
+        let mut pending = self.pick(&row);
 
         'outer: loop {
             if self.model.is_eog_token(pending) {
@@ -2559,19 +2604,10 @@ impl<'a> Session<'a> {
             // would leave an unterminated block and waste what it already
             // spent. Drafting is skipped this round; there is nothing to guess.
             if think.exhausted() && !closing.is_empty() {
-                batch.clear();
-                batch
-                    .add(pending, self.n_past, &[0], false)
-                    .map_err(|e| EngineError::Batch(e.to_string()))?;
-                for (i, token) in closing.iter().enumerate() {
-                    batch
-                        .add(*token, self.n_past + 1 + i as i32, &[0], i + 1 == closing.len())
-                        .map_err(|e| EngineError::Batch(e.to_string()))?;
-                }
-                self.context
-                    .decode(&mut batch)
-                    .map_err(|e| EngineError::Decode(e.to_string()))?;
-                self.n_past += 1 + closing.len() as i32;
+                let mut run = Vec::with_capacity(1 + closing.len());
+                run.push(pending);
+                run.extend_from_slice(&closing);
+                let closed = self.feed(run, self.n_past, crate::hub::Logits::Last)?;
 
                 for token in &closing {
                     if !emit(*token, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?.0 {
@@ -2582,7 +2618,11 @@ impl<'a> Session<'a> {
                 }
                 think.closed();
                 tracing::info!("reasoning budget of {think_budget} spent; closed the block");
-                pending = self.sampler.sample(&self.context, -1);
+                let Some(row) = closed.into_last() else {
+                    reason = StopReason::ContextFull;
+                    break;
+                };
+                pending = self.pick(&row);
                 continue;
             }
 
@@ -2663,24 +2703,17 @@ impl<'a> Session<'a> {
                 (true, false) => Some(self.snapshot(false, true)?),
                 _ => None,
             };
-            batch.clear();
-            batch
-                .add(pending, start, &[0], true)
-                .map_err(|e| EngineError::Batch(e.to_string()))?;
-            for (i, d) in draft.iter().enumerate() {
-                batch
-                    .add(*d, start + 1 + i as i32, &[0], true)
-                    .map_err(|e| EngineError::Batch(e.to_string()))?;
-            }
-            self.context
-                .decode(&mut batch)
-                .map_err(|e| EngineError::Decode(e.to_string()))?;
-            self.n_past = start + 1 + draft.len() as i32;
+            let mut run = Vec::with_capacity(1 + draft.len());
+            run.push(pending);
+            run.extend_from_slice(&draft);
+            // Every position asks for logits, so each draft can be verified.
+            let verified = self.feed(run, start, crate::hub::Logits::All)?.rows;
+            debug_assert_eq!(verified.len(), 1 + draft.len());
 
             // Verify. Row i predicts the token after batch entry i, so a
             // drafted token is accepted only when it equals what the model
             // itself would have sampled — which is why output never changes.
-            let mut chosen = self.sampler.sample(&self.context, 0);
+            let mut chosen = self.pick(&verified[0]);
             let mut accepted = 0usize;
 
             for (i, d) in draft.iter().enumerate() {
@@ -2697,9 +2730,7 @@ impl<'a> Session<'a> {
                     reason = StopReason::Cancelled;
                     accepted = i + 1;
                     self.cached.push(chosen);
-                    self.settle_draft(
-                        snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
-                    )?;
+                    self.settle_draft(snapshot.as_ref(), start, pending, &draft, accepted)?;
                     break 'outer;
                 }
                 produced += 1;
@@ -2707,7 +2738,7 @@ impl<'a> Session<'a> {
                 stats.drafted_tokens += 1;
                 self.cached.push(chosen);
                 accepted = i + 1;
-                chosen = self.sampler.sample(&self.context, (i + 1) as i32);
+                chosen = self.pick(&verified[i + 1]);
             }
 
             if !draft.is_empty() {
@@ -2726,18 +2757,16 @@ impl<'a> Session<'a> {
             if mtp.is_some() {
                 let n_embd = self.model.n_embd() as usize;
                 mtp_hidden =
-                    unsafe { crate::nextn::embedding(self.context.as_ptr(), accepted as i32, n_embd) };
+                    unsafe { crate::nextn::embedding(self.slot.hub().raw(), accepted as i32, n_embd) };
             }
 
-            self.settle_draft(
-                snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
-            )?;
+            self.settle_draft(snapshot.as_ref(), start, pending, &draft, accepted)?;
             pending = chosen;
         }
         if mtp.is_some() {
             // Left on, the next turn's prefill would emit a hidden state per
             // prompt token for nobody.
-            unsafe { crate::nextn::set_enabled(self.context.as_ptr(), false, false) };
+            unsafe { crate::nextn::set_enabled(self.slot.hub().raw(), false, false) };
         }
 
         if think.spent() > 0 {
@@ -2806,26 +2835,15 @@ mod tests {
     }
 
     #[test]
-    fn the_batch_is_sized_for_the_largest_thing_put_in_it() {
-        let opts = Options::default().resolve();
-        // A prefill chunk is the usual maximum.
-        assert!(batch_capacity(512, &opts) >= 512);
-        // But a draft must fit even when n_batch is tiny.
-        let cap = batch_capacity(4, &opts);
-        assert!(
-            cap >= 1 + opts.speculative_tuning.draft_tokens as usize,
-            "capacity {cap} cannot hold a full draft"
-        );
-        assert!(batch_capacity(0, &opts) >= 1, "must never be zero");
-    }
-
-    #[test]
-    fn capacity_does_not_depend_on_the_current_prompt() {
-        // The bug this guards: sizing by the prompt meant a later, longer
-        // re-prefill overflowed the batch.
-        let opts = Options::default().resolve();
-        assert_eq!(batch_capacity(512, &opts), batch_capacity(512, &opts));
-        assert!(batch_capacity(512, &opts) >= 512, "always at least n_batch");
+    fn a_verification_batch_always_fits_one_pass() {
+        // Batches are now built by the hub, which refuses anything wider than
+        // `n_batch`. The confirmed token plus a full draft must stay inside
+        // that, which is what the draft cap is for.
+        for n_batch in [4usize, 32, 512] {
+            let draft = Options::default().resolve().speculative_tuning.draft_tokens as usize;
+            let capped = draft.min(n_batch.saturating_sub(1));
+            assert!(1 + capped <= n_batch, "{n_batch} cannot carry its own draft");
+        }
     }
 
     #[test]

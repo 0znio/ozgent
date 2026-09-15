@@ -37,7 +37,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::token::LlamaToken;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// A caller's request for one forward pass over some tokens.
@@ -48,15 +48,37 @@ pub struct Work {
     pub tokens: Vec<LlamaToken>,
     /// Position of `tokens[0]` in that sequence.
     pub pos: i32,
-    /// Whether the caller needs the logits of the final token. A prefill
-    /// chunk that is not the last one does not.
-    pub logits: bool,
+    /// Which rows of logits the caller needs back.
+    pub logits: Logits,
+}
+
+/// Which logits a request wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Logits {
+    /// None at all — a prefill chunk that is not the last one.
+    None,
+    /// The final token's, which is what generation needs.
+    Last,
+    /// Every token's, which is what verifying a draft needs.
+    All,
 }
 
 /// What came back.
+#[derive(Default)]
 pub struct Outcome {
-    /// Logits of the last token, when [`Work::logits`] asked for them.
-    pub logits: Option<Vec<f32>>,
+    /// One row per token whose logits were asked for, in token order.
+    pub rows: Vec<Vec<f32>>,
+}
+
+impl Outcome {
+    /// The last row, which is what a caller asking for [`Logits::Last`] wants.
+    pub fn last(&self) -> Option<&[f32]> {
+        self.rows.last().map(|r| r.as_slice())
+    }
+
+    pub fn into_last(mut self) -> Option<Vec<f32>> {
+        self.rows.pop()
+    }
 }
 
 #[derive(Debug)]
@@ -119,6 +141,7 @@ pub struct Hub<'a> {
     woke: Condvar,
     n_batch: usize,
     n_vocab: usize,
+    slots: u32,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
 }
@@ -130,7 +153,7 @@ unsafe impl Send for Hub<'_> {}
 unsafe impl Sync for Hub<'_> {}
 
 impl<'a> Hub<'a> {
-    pub fn new(context: LlamaContext<'a>, n_vocab: usize) -> Self {
+    pub fn new(context: LlamaContext<'a>, n_vocab: usize, slots: u32) -> Self {
         let n_batch = (context.n_batch() as usize).max(1);
         Self {
             context: Mutex::new(context),
@@ -138,6 +161,7 @@ impl<'a> Hub<'a> {
             woke: Condvar::new(),
             n_batch,
             n_vocab,
+            slots: slots.max(1),
             fixed_window: None,
         }
     }
@@ -150,12 +174,42 @@ impl<'a> Hub<'a> {
     }
 
     /// Claim `seq` as a slot of this hub, for as long as the handle lives.
-    pub fn slot<'h>(&'h self, seq: i32) -> Slot<'h, 'a> {
-        Slot { hub: self, seq, running: false }
+    ///
+    /// Taken by `Arc` rather than by reference so a slot can be owned by the
+    /// conversation using it — a [`crate::engine::Session`] holds its slot,
+    /// and a session that borrowed the hub could not.
+    pub fn slot(self: &Arc<Self>, seq: i32) -> Slot<'a> {
+        Slot { hub: Arc::clone(self), seq, running: false }
     }
 
     pub fn n_batch(&self) -> usize {
         self.n_batch
+    }
+
+    /// How many conversations this hub was built to carry.
+    pub fn slots(&self) -> u32 {
+        self.slots
+    }
+
+    /// True when this hub carries one conversation, so its context is not
+    /// shared with anybody.
+    ///
+    /// The paths that reach past the hub for a raw context pointer — drafting
+    /// from a NextN head, which opens a second context over the same memory —
+    /// are only sound then.
+    pub fn solo(&self) -> bool {
+        self.slots <= 1
+    }
+
+    /// The raw context, for the few things llama.cpp only exposes that way.
+    ///
+    /// Sound only while nothing else is using the context: check [`solo`]
+    /// first, or hold the lock through [`with_context`].
+    ///
+    /// [`solo`]: Hub::solo
+    /// [`with_context`]: Hub::with_context
+    pub fn raw(&self) -> *mut ozgent_mtmd_sys::llama_cpp_sys_2::llama_context {
+        self.context.lock().unwrap().as_ptr()
     }
 
     /// Passes run and requests carried, since the hub was made.
@@ -352,20 +406,26 @@ impl<'a> Hub<'a> {
         let mut llama = LlamaBatch::new(total.max(1), 1);
         // Where each request's final token landed, so its logits can be found
         // again once the pass is done.
-        let mut rows: Vec<i32> = Vec::with_capacity(batch.len());
+        let mut rows: Vec<Vec<i32>> = Vec::with_capacity(batch.len());
         let mut filled = 0i32;
 
         for p in batch {
             let last = p.work.tokens.len().saturating_sub(1);
+            let mut mine = Vec::new();
             for (i, token) in p.work.tokens.iter().enumerate() {
-                let wants = p.work.logits && i == last;
-                if let Err(e) =
-                    llama.add(*token, p.work.pos + i as i32, &[p.work.seq], wants)
-                {
+                let wants = match p.work.logits {
+                    Logits::None => false,
+                    Logits::Last => i == last,
+                    Logits::All => true,
+                };
+                if let Err(e) = llama.add(*token, p.work.pos + i as i32, &[p.work.seq], wants) {
                     return batch.iter().map(|_| Err(format!("batch failed: {e}"))).collect();
                 }
+                if wants {
+                    mine.push(filled + i as i32);
+                }
             }
-            rows.push(if p.work.logits { filled + last as i32 } else { -1 });
+            rows.push(mine);
             filled += p.work.tokens.len() as i32;
         }
 
@@ -385,12 +445,15 @@ impl<'a> Hub<'a> {
         // there. Anything timing `decode` alone is timing submission.
         let out = rows
             .iter()
-            .map(|&row| {
-                if row < 0 {
-                    return Ok(Outcome { logits: None });
-                }
-                let slice = ctx.get_logits_ith(row);
-                Ok(Outcome { logits: Some(slice[..self.n_vocab.min(slice.len())].to_vec()) })
+            .map(|mine| {
+                let rows = mine
+                    .iter()
+                    .map(|&row| {
+                        let slice = ctx.get_logits_ith(row);
+                        slice[..self.n_vocab.min(slice.len())].to_vec()
+                    })
+                    .collect();
+                Ok(Outcome { rows })
             })
             .collect();
         PASS_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -435,19 +498,19 @@ const MAX_WINDOW: Duration = Duration::from_millis(20);
 /// Counted as running while it is generating, so the driver knows to wait for
 /// it, and parked while it is doing anything else — running a tool, waiting on
 /// a user — so it does not hold everyone else up.
-pub struct Slot<'h, 'm> {
-    hub: &'h Hub<'m>,
+pub struct Slot<'a> {
+    hub: Arc<Hub<'a>>,
     seq: i32,
     running: bool,
 }
 
-impl<'h, 'm> Slot<'h, 'm> {
+impl<'a> Slot<'a> {
     pub fn seq(&self) -> i32 {
         self.seq
     }
 
-    pub fn hub(&self) -> &'h Hub<'m> {
-        self.hub
+    pub fn hub(&self) -> &Hub<'a> {
+        &self.hub
     }
 
     /// Say that this slot is generating and will keep asking for tokens.
@@ -470,9 +533,29 @@ impl<'h, 'm> Slot<'h, 'm> {
     }
 
     /// Decode `tokens` at `pos` on this slot's sequence.
-    pub fn run(&mut self, tokens: Vec<LlamaToken>, pos: i32, logits: bool) -> Result<Outcome, HubError> {
+    pub fn run(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: Logits,
+    ) -> Result<Outcome, HubError> {
         self.resume();
         self.hub.run(Work { seq: self.seq, tokens, pos, logits })
+    }
+
+    /// Reach the context for the operations that are not decodes.
+    pub fn with_context<T>(&self, f: impl FnOnce(&mut LlamaContext<'a>) -> T) -> T {
+        self.hub.with_context(f)
+    }
+
+    /// Drop positions `from..` from this slot's sequence. False means this
+    /// cache cannot drop a partial range, which sliding-window and recurrent
+    /// caches cannot.
+    pub fn trim(&self, from: i32) -> Result<bool, String> {
+        self.with_context(|c| {
+            c.clear_kv_cache_seq(Some(self.seq as u32), Some(from as u32), None)
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Forget everything cached for this slot, leaving the others alone.
@@ -483,7 +566,7 @@ impl<'h, 'm> Slot<'h, 'm> {
     }
 }
 
-impl Drop for Slot<'_, '_> {
+impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.park();
     }
@@ -500,7 +583,7 @@ mod tests {
                 seq: 0,
                 tokens: vec![LlamaToken(1); tokens],
                 pos: 0,
-                logits: true,
+                logits: Logits::Last,
             },
         }
     }

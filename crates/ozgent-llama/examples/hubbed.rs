@@ -29,8 +29,8 @@ const PROMPTS: [&str; 8] = [
 ];
 
 /// Generate `n` tokens greedily on `seq`, decoding through the hub.
-fn run(
-    hub: &Hub<'_>,
+fn run<'a>(
+    hub: &std::sync::Arc<Hub<'a>>,
     model: &llama_cpp_2::model::LlamaModel,
     seq: i32,
     prompt: &str,
@@ -49,10 +49,14 @@ fn run(
     let mut logits = None;
     for part in tokens.chunks(chunk) {
         let last = pos as usize + part.len() == tokens.len();
-        let got = slot.run(part.to_vec(), pos, last)?;
+        let got = slot.run(
+            part.to_vec(),
+            pos,
+            if last { ozgent_llama::hub::Logits::Last } else { ozgent_llama::hub::Logits::None },
+        )?;
         pos += part.len() as i32;
         if last {
-            logits = got.logits;
+            logits = got.into_last();
         }
     }
 
@@ -74,9 +78,9 @@ fn run(
             break;
         }
         out.push_str(&model.token_to_str(token, llama_cpp_2::model::Special::Tokenize)?);
-        let got = slot.run(vec![token], pos, true)?;
+        let got = slot.run(vec![token], pos, ozgent_llama::hub::Logits::Last)?;
         pos += 1;
-        logits = got.logits;
+        logits = got.into_last();
     }
     Ok(out)
 }
@@ -110,7 +114,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hold: u64 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
     let (hub, window) = engine.hub(&opts, callers as u32)?;
     let hub = if hold > 0 {
-        hub.with_window(std::time::Duration::from_micros(hold))
+        std::sync::Arc::new(
+            std::sync::Arc::try_unwrap(hub)
+                .unwrap_or_else(|_| unreachable!())
+                .with_window(std::time::Duration::from_micros(hold)),
+        )
     } else {
         hub
     };
