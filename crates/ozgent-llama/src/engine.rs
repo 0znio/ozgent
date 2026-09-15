@@ -110,6 +110,14 @@ impl Engine {
     /// GPU the ratio collapses to 1.0 and batching is not worth restructuring
     /// the daemon for.
     ///
+    /// Both sides read the logits back. `decode` queues work on the GPU and
+    /// returns; `llama_get_logits_ith` is what synchronises, so without the
+    /// read this times how fast batches can be submitted rather than how long
+    /// they take. It turns out to make little difference here — 2.42x against
+    /// 2.47x at four sequences — because over forty rounds the queue
+    /// saturates anyway, but a probe whose answer decides an architecture
+    /// should not depend on that.
+    ///
     /// Returns milliseconds for the batched decode and for the separate ones.
     pub fn probe_batched_decode(
         &self,
@@ -156,6 +164,7 @@ impl Engine {
                     .map_err(|e| EngineError::Batch(e.to_string()))?;
             }
             context.decode(&mut batch).map_err(|e| EngineError::Decode(e.to_string()))?;
+            let _ = context.get_logits_ith(0);
         }
         let together = together.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
 
@@ -168,6 +177,7 @@ impl Engine {
                     .add(seed[0], base + rounds as i32 + round as i32, &[seq as i32], true)
                     .map_err(|e| EngineError::Batch(e.to_string()))?;
                 context.decode(&mut batch).map_err(|e| EngineError::Decode(e.to_string()))?;
+                let _ = context.get_logits_ith(0);
             }
         }
         let apart = apart.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
@@ -792,7 +802,19 @@ impl Engine {
         }
     }
 
-    pub fn session(&self, opts: &Resolved) -> Result<Session<'_>, EngineError> {
+    /// Open a context for this model with `opts` applied.
+    ///
+    /// `slots` is how many conversations will share it. llama.cpp's unified
+    /// cache holds `n_ctx` cells in total and hands them out across
+    /// sequences, so serving four callers at the asked-for window needs four
+    /// times the cache — the window is multiplied here and divided again by
+    /// whoever uses it, rather than silently giving each caller a quarter of
+    /// what they asked for.
+    fn open(
+        &self,
+        opts: &Resolved,
+        slots: u32,
+    ) -> Result<(LlamaContext<'_>, u32), EngineError> {
         let backend = backend()?;
 
         // Asking for more context than the model was trained on produces
@@ -805,6 +827,11 @@ impl Engine {
                 self.n_ctx_train
             );
         }
+
+        // Every slot needs cells of its own out of one shared cache, so the
+        // window that has to be allocated is the per-slot window times the
+        // number of slots. Everything below sizes the *total*.
+        let requested = requested.saturating_mul(slots);
 
         // `auto` is resolved here rather than at parse time because it needs
         // the VRAM left *after* the weights are resident, which is only known
@@ -890,11 +917,9 @@ impl Engine {
         // cache that would have fitted at f16 was quantised for nothing.
         let requested =
             ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
-        if requested < opts.context_length.min(self.n_ctx_train.max(512)) {
-            let wanted = self
-                .kv_shape
-                .bytes(opts.context_length.min(self.n_ctx_train.max(512)), split)
-                / (1024 * 1024);
+        let asked = opts.context_length.min(self.n_ctx_train.max(512)).saturating_mul(slots);
+        if requested < asked {
+            let wanted = self.kv_shape.bytes(asked, split) / (1024 * 1024);
             let where_ = if opts.kv_offload { "vram" } else { "system ram" };
             tracing::warn!(
                 "context {} needs {wanted} MiB of {k:?} K / {v:?} V kv cache; only {} MiB \
@@ -910,7 +935,7 @@ impl Engine {
             if opts.kv_offload
                 && ozgent_core::accel::fit_context_split(
                     self.kv_shape,
-                    opts.context_length,
+                    asked,
                     split,
                     ozgent_core::accel::kv_budget(0, host, 0, self.n_layer),
                 ) > requested
@@ -944,6 +969,7 @@ impl Engine {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(opts.batch_size)
+            .with_n_seq_max(slots)
             .with_flash_attention_policy(flash)
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
@@ -985,6 +1011,12 @@ impl Engine {
             }
         }
 
+        Ok((context, requested))
+    }
+
+    /// One conversation with a cache of its own.
+    pub fn session(&self, opts: &Resolved) -> Result<Session<'_>, EngineError> {
+        let (context, _) = self.open(opts, 1)?;
         Ok(Session {
             model: &self.model,
             context,
@@ -1005,6 +1037,21 @@ impl Engine {
             gate_applied: false,
             opts: opts.clone(),
         })
+    }
+
+    /// A context several conversations share, decoding through it together.
+    ///
+    /// Returns the hub and the window each slot may use. See [`crate::hub`]
+    /// for what sharing a pass does and does not change.
+    pub fn hub(&self, opts: &Resolved, slots: u32) -> Result<(crate::hub::Hub<'_>, u32), EngineError> {
+        let slots = slots.max(1);
+        let (context, total) = self.open(opts, slots)?;
+        let each = (total / slots).max(1);
+        Ok((crate::hub::Hub::new(context, self.model.n_vocab() as usize), each))
+    }
+
+    pub fn model(&self) -> &LlamaModel {
+        &self.model
     }
 }
 

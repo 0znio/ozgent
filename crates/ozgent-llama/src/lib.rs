@@ -9,6 +9,8 @@ pub mod effort;
 pub mod engine;
 pub mod grammar;
 #[cfg(feature = "llama")]
+pub mod hub;
+#[cfg(feature = "llama")]
 pub mod layout;
 #[cfg(feature = "llama")]
 pub mod llamalog;

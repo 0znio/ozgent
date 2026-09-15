@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = base.resolve();
     let engine = ozgent_llama::engine::Engine::load(std::path::Path::new(&path), &opts)?;
 
+    println!("{} of {} layers on the gpu", engine.gpu_layers_used(), engine.n_layer());
     println!("sequences   one batch    separate batches   ratio");
     for n in [1usize, 2, 4, 8] {
         let (together, apart) = engine.probe_batched_decode(n, widest, 40)?;
