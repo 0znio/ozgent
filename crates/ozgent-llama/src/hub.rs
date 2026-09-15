@@ -109,8 +109,12 @@ impl std::fmt::Display for HubError {
 
 impl std::error::Error for HubError {}
 
-/// Microseconds spent inside a pass, process-wide, for diagnostics.
+/// Microseconds spent inside a pass, and how many there were, process-wide.
 pub static PASS_MICROS: AtomicU64 = AtomicU64::new(0);
+pub static PASS_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Tokens those passes carried, so a verification batch can be told from a
+/// plain decode.
+pub static PASS_TOKENS: AtomicU64 = AtomicU64::new(0);
 
 struct Pending {
     id: u64,
@@ -637,6 +641,8 @@ impl<'a> Hub<'a> {
             })
             .collect();
         PASS_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PASS_COUNT.fetch_add(1, Ordering::Relaxed);
+        PASS_TOKENS.fetch_add(total as u64, Ordering::Relaxed);
         out
     }
 }

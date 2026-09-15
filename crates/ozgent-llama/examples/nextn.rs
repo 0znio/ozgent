@@ -32,7 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    use std::sync::atomic::Ordering::Relaxed;
     let mut run = |spec, label: &str| -> Result<(String, f64), Box<dyn std::error::Error>> {
+        ozgent_llama::hub::PASS_MICROS.store(0, Relaxed);
+        ozgent_llama::hub::PASS_COUNT.store(0, Relaxed);
+        ozgent_llama::mtp::STEP_MICROS.store(0, Relaxed);
+        ozgent_llama::mtp::STEPS.store(0, Relaxed);
+        ozgent_llama::mtp::PROPOSE_MICROS.store(0, Relaxed);
+        let wall = std::time::Instant::now();
         let mut o = base.clone();
         o.speculative = Some(spec);
         let resolved = o.resolve();
@@ -42,11 +49,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             text.push_str(t);
             true
         })?;
+        let wall = wall.elapsed().as_secs_f64() * 1000.0;
+        let pm = ozgent_llama::hub::PASS_MICROS.load(Relaxed) as f64 / 1000.0;
+        let pc = ozgent_llama::hub::PASS_COUNT.load(Relaxed);
+        let dm = ozgent_llama::mtp::PROPOSE_MICROS.load(Relaxed) as f64 / 1000.0;
+        let ds = ozgent_llama::mtp::STEPS.load(Relaxed);
         println!(
             "{label:12} {:5.1} tok/s   proposed {:3}  accepted {:3}",
             stats.tokens_per_second(),
             stats.proposed_drafts,
             stats.accepted_drafts
+        );
+        println!(
+            "             {wall:6.0} ms wall = {pm:6.0} ms in {pc} target passes              + {dm:5.0} ms in {ds} draft steps + {:.0} ms elsewhere",
+            wall - pm - dm
         );
         Ok((text, stats.tokens_per_second()))
     };
@@ -55,6 +71,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (off, rate_off) = run(ozgent_core::accel::Speculative::Off, "no drafting")?;
     let (mtp, rate_mtp) = run(ozgent_core::accel::Speculative::Mtp, "nextn head")?;
     let (ngram, _) = run(ozgent_core::accel::Speculative::Ngram, "n-grams")?;
+
+    let (pm, pc, pt) = (
+        ozgent_llama::hub::PASS_MICROS.swap(0, Relaxed),
+        ozgent_llama::hub::PASS_COUNT.swap(0, Relaxed),
+        ozgent_llama::hub::PASS_TOKENS.swap(0, Relaxed),
+    );
+    if pc > 0 {
+        println!(
+            "\ntarget passes: {pc}, {:.2} ms each, {:.1} tokens each, {:.0} ms total",
+            pm as f64 / 1000.0 / pc as f64,
+            pt as f64 / pc as f64,
+            pm as f64 / 1000.0
+        );
+    }
+    let steps = ozgent_llama::mtp::STEPS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let micros = ozgent_llama::mtp::STEP_MICROS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if steps > 0 {
+        println!(
+            "\ndraft step: {:.2} ms each over {steps} steps",
+            micros as f64 / 1000.0 / steps as f64
+        );
+    }
 
     println!();
     let same = |a: &str, b: &str| if a == b { "identical" } else { "DIFFERENT" };

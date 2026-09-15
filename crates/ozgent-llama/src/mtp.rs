@@ -28,6 +28,40 @@ use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
 
 use crate::engine::EngineError;
 
+/// Why this does not pay on Qwen3.5, whatever the threshold.
+///
+/// Speculation rests on one assumption: that verifying `k` drafted tokens in a
+/// single pass costs about what decoding one token costs. Where that holds,
+/// every accepted draft is very nearly free. On this model it does not hold,
+/// and the measurement is unambiguous — drafting cuts the number of target
+/// passes almost in half and the time spent in them does not move:
+///
+/// ```text
+/// threshold   passes   ms in passes   ms per pass
+///   none        122        2571          21.1
+///   0.95         76        2600          34.2
+///   0.70         69        2460          35.7
+///   0.50         72        2617          36.3
+/// ```
+///
+/// A pass carrying two tokens costs 34 ms where a pass carrying one costs 21.
+/// The draft steps themselves are cheap and behave exactly as designed — 2.9
+/// ms each against a 21 ms pass, and the acceptance rate is what the threshold
+/// was swept for — but there is nothing for them to win. Every accepted token
+/// has to be paid for in the verification pass at close to full price.
+///
+/// The reason is the architecture. Most of this model's layers are recurrent:
+/// they walk a sequence one position at a time rather than attending over it
+/// at once, so `k` tokens of one sequence is `k` steps of work. Batching
+/// across *different* conversations is a different matter and does pay — those
+/// are one step each, taken together, which is the 2.2x the hub measures.
+/// Within one sequence there is no such saving to find.
+///
+/// So this is not a tuning problem and no threshold fixes it. It stays behind
+/// `--spec mtp` rather than joining `auto`, and on a model whose layers are
+/// ordinary attention it would be worth revisiting — the drafting machinery is
+/// correct, the model simply gives it nothing to earn.
+///
 /// How sure the head must be to justify another forward pass.
 ///
 /// Every proposal costs a decode of the NextN block, so a draft unlikely to be
@@ -51,6 +85,19 @@ use crate::engine::EngineError;
 /// passes were spent failing to. Ungated drafting was *slower* than no
 /// drafting at all.
 const MIN_CONFIDENCE: f32 = 0.95;
+
+/// Microseconds spent inside draft decodes, and how many there were. The
+/// whole economics of drafting from the head rests on a step being cheap, so
+/// it is counted rather than assumed.
+pub static STEP_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Microseconds spent inside `propose` as a whole, which is the decodes plus
+/// everything drafting does around them.
+pub static PROPOSE_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
 
 /// The threshold in force, overridable while it is being tuned.
 fn min_confidence() -> f32 {
@@ -166,13 +213,13 @@ impl<'a> MtpDrafter<'a> {
             // and then requires it to cover `n_seq_max`, so a batch of one on
             // a context that knows about five conversations trips an assert
             // before anything is decoded.
-            .with_n_batch(n_seq_max.max(1))
+            .with_n_batch(env_u32("OZGENT_MTP_NBATCH").unwrap_or(n_seq_max.max(1)))
             // The draft context shares the target's memory, so it has to agree
             // with the target about how many sequences that memory holds and
             // how they are laid out. Left at the default it would refuse the
             // sequence id of every conversation but the first.
-            .with_n_seq_max(n_seq_max)
-            .with_kv_unified(unified)
+            .with_n_seq_max(env_u32("OZGENT_MTP_NSEQ").unwrap_or(n_seq_max))
+            .with_kv_unified(env_u32("OZGENT_MTP_UNIFIED").map_or(unified, |v| v != 0))
             .with_embeddings(false);
         let context = model
             .new_context_with_ctx_other(backend, params, target)
@@ -207,6 +254,7 @@ impl<'a> MtpDrafter<'a> {
         pos: i32,
         want: usize,
     ) -> Result<Vec<LlamaToken>, EngineError> {
+        let whole = std::time::Instant::now();
         let mut drafted = Vec::with_capacity(want);
         let mut token = token;
         let mut hidden = hidden.to_vec();
@@ -214,7 +262,18 @@ impl<'a> MtpDrafter<'a> {
         for step in 0..want {
             self.batch.set(token, &hidden, pos + step as i32, self.seq);
             // SAFETY: the batch and context are both live.
+            let started = std::time::Instant::now();
             let rc = unsafe { sys::llama_decode(self.context.as_ptr(), self.batch.raw) };
+            // Read here so the timing covers the wait as well as the launch:
+            // `llama_decode` queues and returns, and reading a row is what
+            // synchronises.
+            let logits = unsafe { sys::llama_get_logits_ith(self.context.as_ptr(), 0) };
+            STEP_MICROS.fetch_add(
+                started.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = logits;
             if rc != 0 {
                 // Not an error worth failing the turn over: a draft that could
                 // not be produced is a turn that decodes normally.
@@ -261,6 +320,10 @@ impl<'a> MtpDrafter<'a> {
                 sys::llama_memory_seq_rm(mem, self.seq, pos, -1);
             }
         }
+        PROPOSE_MICROS.fetch_add(
+            whole.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(drafted)
     }
 
