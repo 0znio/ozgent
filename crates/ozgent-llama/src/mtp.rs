@@ -180,6 +180,23 @@ impl<'a> MtpDrafter<'a> {
             }
             token = next;
         }
+        // Take the draft back out of the cache.
+        //
+        // The draft context shares the target's memory — that is what makes it
+        // cheap — which means every speculative decode writes into the cache
+        // the target is about to use. Leaving those cells behind corrupts the
+        // target's idea of what is resident: the next generation came back
+        // "Decode Error -1: n_tokens == 0", because the position bookkeeping
+        // on either side no longer agreed. The draft region is everything from
+        // where this started, so that is what goes.
+        //
+        // SAFETY: the memory handle belongs to the live draft context.
+        unsafe {
+            let mem = sys::llama_get_memory(self.context.as_ptr());
+            if !mem.is_null() {
+                sys::llama_memory_seq_rm(mem, 0, pos, -1);
+            }
+        }
         Ok(drafted)
     }
 

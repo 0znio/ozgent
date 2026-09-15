@@ -1498,6 +1498,10 @@ impl<'a> Session<'a> {
 
         let row = unsafe { crate::nextn::embedding(ptr, 0, n_embd) };
         unsafe { crate::nextn::set_enabled(ptr, false, false) };
+        // The cache now holds these tokens and the session has to agree, or
+        // the next generation reasons about a prefix that is not there and
+        // decodes an empty batch: "Decode Error -1: n_tokens == 0".
+        self.cached = tokens;
 
         match row {
             Some(v) => Ok((v.len(), v.iter().map(|x| x.abs()).sum())),
@@ -1557,6 +1561,8 @@ impl<'a> Session<'a> {
 
         let drafted = drafter.propose(target_next, &hidden, self.n_past, want)?;
         unsafe { crate::nextn::set_enabled(ptr, false, false) };
+        drop(drafter);
+        self.cached = tokens;
 
         let render = |t: LlamaToken| {
             self.model.token_to_str(t, Special::Tokenize).unwrap_or_else(|_| "<?>".into())
@@ -1587,6 +1593,17 @@ impl<'a> Session<'a> {
             .map(|(i, _)| i)
             .ok_or_else(|| EngineError::Decode("no logits".into()))?;
         Ok(LlamaToken(best as i32))
+    }
+
+    /// Turn the NextN head's output on or off for this session.
+    ///
+    /// Drafting from the head needs the target unmasked, which makes it emit a
+    /// hidden state for every position it decodes. That is not free, and the
+    /// drafter has to win back whatever it costs before it is worth wiring in
+    /// — so it is measurable on its own, separately from any drafting.
+    pub fn set_nextn_output(&mut self, on: bool) {
+        // SAFETY: the context is live for the life of the session.
+        unsafe { crate::nextn::set_enabled(self.context.as_ptr(), on, !on) };
     }
 
     /// Check that a snapshot really can rewind this model mid-generation.

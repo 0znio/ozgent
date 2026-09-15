@@ -28,13 +28,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // What does asking for the hidden states cost, before any drafting?
+    // The drafter has to win this back before it is worth having.
+    let long = "Write several paragraphs about the history of the sea.";
+    // A clean cache either way: the draft probe above left its own state.
+    for (label, on) in [("nextn off", false), ("nextn on ", true)] {
+        let mut rates = Vec::new();
+        for _ in 0..3 {
+            session.set_nextn_output(on);
+            let mut seen = 0usize;
+            let (stats, _) = session.generate(long, 120, |_| {
+                seen += 1;
+                true
+            })?;
+            rates.push(stats.tokens_per_second());
+            let _ = seen;
+        }
+        rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("{label}   {:.1} tok/s (median of 3)", rates[1]);
+    }
+    session.set_nextn_output(false);
+
     println!();
     match session.probe_mtp_draft(&prompt, 6) {
         Ok((next, drafted)) => {
-            println!("prompt:          {prompt:?}");
             println!("target says:     {next:?}");
             println!("head drafts:     {drafted:?}");
-            println!();
             println!("continuation:    {next}{}", drafted.join(""));
         }
         Err(e) => println!("drafting failed: {e}"),
