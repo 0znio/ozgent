@@ -133,6 +133,35 @@ struct Queue {
     running: usize,
 }
 
+/// The prefix every conversation on this hub begins with, held once.
+///
+/// A system prompt and a set of tool schemas are the same thousand-odd tokens
+/// at the front of every turn, and each conversation was prefilling them from
+/// cold. They only have to exist in the cache once: a sequence of their own
+/// holds them, and a new conversation takes a copy by `seq_cp`, which for the
+/// attention cells is a change of ownership rather than any recomputation.
+///
+/// Why a sequence of its own, rather than copying a prefix out of whichever
+/// conversation happens to have one. llama.cpp's recurrent `seq_cp` ignores
+/// the position range and copies the state as it stands *now* — there is only
+/// one, at the end of the sequence. Copying the first four hundred tokens of a
+/// conversation that has since run to four thousand would hand over a
+/// recurrent state belonging to position four thousand, and the model would
+/// continue from a place it had never been. Taking a whole sequence that holds
+/// nothing but the shared prefix is the version of this that is true for every
+/// architecture.
+#[derive(Default)]
+struct Commons {
+    /// Exactly what the commons sequence holds, or empty.
+    tokens: Vec<LlamaToken>,
+    /// The previous prompt seen, so a shared prefix can be noticed without
+    /// anybody declaring one.
+    previous: Vec<LlamaToken>,
+    /// Set while a slot is filling the commons, so the others do not all
+    /// decide to do it at once.
+    filling: bool,
+}
+
 /// A shared context several callers decode through.
 pub struct Hub<'a> {
     /// Held only while a pass is actually running, by the driver alone.
@@ -142,6 +171,7 @@ pub struct Hub<'a> {
     n_batch: usize,
     n_vocab: usize,
     slots: u32,
+    commons: Mutex<Commons>,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
 }
@@ -162,6 +192,7 @@ impl<'a> Hub<'a> {
             n_batch,
             n_vocab,
             slots: slots.max(1),
+            commons: Mutex::new(Commons::default()),
             fixed_window: None,
         }
     }
@@ -189,6 +220,92 @@ impl<'a> Hub<'a> {
     /// How many conversations this hub was built to carry.
     pub fn slots(&self) -> u32 {
         self.slots
+    }
+
+    /// The sequence that holds the shared prefix, which is the one past the
+    /// conversations.
+    pub fn commons_seq(&self) -> i32 {
+        self.slots as i32
+    }
+
+    /// What the shared prefix currently holds.
+    pub fn commons(&self) -> Vec<LlamaToken> {
+        self.commons.lock().unwrap().tokens.clone()
+    }
+
+    /// Note a prompt, and say what to do about the shared prefix.
+    ///
+    /// Returns the tokens a caller should put into the commons sequence, when
+    /// this prompt reveals that the current one is missing something every
+    /// conversation shares. Nobody declares the shared prefix: it is whatever
+    /// two consecutive prompts turn out to begin with.
+    pub fn consider(&self, prompt: &[LlamaToken]) -> Option<Vec<LlamaToken>> {
+        let mut c = self.commons.lock().unwrap();
+        let shared = shared_head(&c.previous, prompt);
+        c.previous = prompt.to_vec();
+        if c.filling || shared < MIN_COMMONS {
+            return None;
+        }
+        // Only grown, and only by enough to be worth a rebuild: a commons that
+        // chased every prompt would be refilled constantly and save nothing.
+        if shared <= c.tokens.len() + c.tokens.len() / 4 && !c.tokens.is_empty() {
+            return None;
+        }
+        // It must stay a prefix of what it already was, or conversations
+        // holding a copy of the old one are describing a cache that no longer
+        // matches.
+        c.filling = true;
+        Some(prompt[..shared].to_vec())
+    }
+
+    /// Publish what the commons sequence now holds, or give up on filling it.
+    pub fn filled(&self, tokens: Vec<LlamaToken>) {
+        let mut c = self.commons.lock().unwrap();
+        c.tokens = tokens;
+        c.filling = false;
+    }
+
+    /// Put `tokens` into the commons sequence and publish them.
+    ///
+    /// Costs one prefill of the same tokens the calling turn was about to
+    /// prefill anyway — it then borrows them straight back — so the first
+    /// conversation to notice a shared prefix pays nothing for it and every
+    /// later one starts from it for free.
+    pub fn fill_commons(&self, tokens: &[LlamaToken]) -> Result<(), HubError> {
+        let seq = self.commons_seq();
+        self.with_context(|c| {
+            let _ = c.clear_kv_cache_seq(Some(seq as u32), None, None);
+        });
+        let mut pos = 0i32;
+        for chunk in tokens.chunks(self.n_batch) {
+            let last = pos as usize + chunk.len() == tokens.len();
+            // The final row is asked for so the pass always has an output;
+            // nothing reads it.
+            let want = if last { Logits::Last } else { Logits::None };
+            if let Err(e) = self.run(Work { seq, tokens: chunk.to_vec(), pos, logits: want }) {
+                self.filled(Vec::new());
+                return Err(e);
+            }
+            pos += chunk.len() as i32;
+        }
+        self.filled(tokens.to_vec());
+        Ok(())
+    }
+
+    /// Hand a copy of the shared prefix to `seq`, which must hold nothing.
+    pub fn lend(&self, seq: i32) -> Result<usize, HubError> {
+        let c = self.commons.lock().unwrap();
+        if c.tokens.is_empty() {
+            return Ok(0);
+        }
+        let n = c.tokens.len();
+        let from = self.commons_seq();
+        self.with_context(|ctx| {
+            let _ = ctx.clear_kv_cache_seq(Some(seq as u32), None, None);
+            ctx.kv_cache_seq_cp(from, seq, None, None)
+                .map_err(|e| HubError::Decode(e.to_string()))
+        })?;
+        Ok(n)
     }
 
     /// True when this hub carries one conversation, so its context is not
@@ -461,6 +578,16 @@ impl<'a> Hub<'a> {
     }
 }
 
+/// The shortest prefix worth holding in a sequence of its own.
+///
+/// Below this the copy costs more bookkeeping than the prefill it saves.
+const MIN_COMMONS: usize = 128;
+
+/// How far two token sequences agree from the start.
+fn shared_head(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
 /// Whether the driver should keep holding a pass open for slots that have not
 /// asked yet.
 ///
@@ -621,6 +748,16 @@ mod tests {
                 logits: Logits::Last,
             },
         }
+    }
+
+    #[test]
+    fn a_shared_head_stops_at_the_first_difference() {
+        let a: Vec<LlamaToken> = [1, 2, 3, 4].iter().map(|i| LlamaToken(*i)).collect();
+        let b: Vec<LlamaToken> = [1, 2, 9, 4].iter().map(|i| LlamaToken(*i)).collect();
+        assert_eq!(shared_head(&a, &b), 2);
+        assert_eq!(shared_head(&a, &a), 4);
+        assert_eq!(shared_head(&a, &[]), 0);
+        assert_eq!(shared_head(&a[..2], &a), 2, "a shorter sequence bounds it");
     }
 
     #[test]

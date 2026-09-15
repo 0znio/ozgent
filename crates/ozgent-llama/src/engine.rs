@@ -979,8 +979,8 @@ impl Engine {
         let unified = slots > 1 && matches!(want, Slots::UpTo(_));
         if !unified {
             // Each sequence gets a fixed slice, so the pool has to be that
-            // many times larger.
-            requested = requested.saturating_mul(slots);
+            // many times larger — including the one holding the shared prefix.
+            requested = requested.saturating_mul(slots + 1);
         }
         let shape = crate::backend::reserve_shape(
             opts.ubatch.unwrap_or(512),
@@ -1059,7 +1059,9 @@ impl Engine {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(opts.batch_size)
-            .with_n_seq_max(slots)
+            // One more than the conversations: the last sequence holds the
+            // prefix they share. See `Commons`.
+            .with_n_seq_max(slots + 1)
             .with_kv_unified(unified)
             // Ask for enough per-token recurrent snapshots to undo a whole
             // rejected draft.
@@ -1075,11 +1077,22 @@ impl Engine {
             // Asked for unconditionally: llama.cpp clamps it to zero for any
             // architecture that cannot do this, so there is no list of models
             // here to fall out of date.
-            .with_n_rs_seq(if opts.speculative == Speculative::Off {
-                0
-            } else {
-                opts.speculative_tuning.draft_tokens
-            })
+            //
+            // Not asked for while prefixes are being shared, because the two
+            // cannot coexist: copying a sequence into another one while the
+            // rollback ring is live fails inside CUDA, reproducibly, and
+            // without it the same run is clean. Of the two, sharing is worth
+            // far more — a borrowed prefix saves 1.4 seconds of prefill where
+            // a rejected draft saves milliseconds, and on this model drafting
+            // measured no gain at all. Turning prefix reuse off gets the ring
+            // back.
+            .with_n_rs_seq(
+                if opts.speculative == Speculative::Off || opts.prefix_reuse != PrefixReuse::Off {
+                    0
+                } else {
+                    opts.speculative_tuning.draft_tokens
+                },
+            )
             .with_flash_attention_policy(flash)
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
@@ -1123,7 +1136,7 @@ impl Engine {
 
         // What one slot may use: the whole pool when it is shared, its own
         // slice when it is not.
-        let each = if unified { requested } else { (requested / slots).max(1) };
+        let each = if unified { requested } else { (requested / (slots + 1)).max(1) };
         Ok((context, each, slots))
     }
 
@@ -2543,6 +2556,57 @@ impl<'a> Session<'a> {
                         }
                     }
                 }
+                // The prefix every conversation here begins with — a system
+                // prompt, a set of tool schemas — is held once, in a sequence
+                // of its own. Borrowing it is a change of ownership in the
+                // cache rather than a prefill, so a conversation that has
+                // never been seen before starts a thousand tokens in.
+                //
+                // Filled here, by whichever turn first reveals that two
+                // prompts share a head. That turn was about to prefill those
+                // tokens itself and borrows them straight back, so it pays
+                // nothing and every later conversation starts from them free.
+                // Placed after the trim rather than before it, because what
+                // matters is the reuse that *survived*. A cache that cannot
+                // trim loses everything past the point of divergence, so a
+                // hopeful reuse of two thousand tokens becomes zero — and
+                // comparing the shared prefix against the hopeful figure meant
+                // it was never worth borrowing, on exactly the turns it would
+                // have saved the most.
+                if self.reuse != PrefixReuse::Off {
+                    if let Some(target) = self.slot.hub().consider(&tokens) {
+                        tracing::info!(
+                            "holding the {} tokens every conversation starts with",
+                            target.len()
+                        );
+                        if let Err(e) = self.slot.hub().fill_commons(&target) {
+                            tracing::warn!("the shared prefix could not be held: {e}");
+                        }
+                    }
+                    let commons = self.slot.hub().commons();
+                    // All of it or none: a partial copy would hand over a
+                    // recurrent state belonging to a position this
+                    // conversation has never reached.
+                    let usable = !commons.is_empty()
+                        && commons.len() < tokens.len()
+                        && common_prefix(&commons, &tokens) == commons.len()
+                        && commons.len() > reuse + CHECKPOINT_MIN_TOKENS;
+                    let _ = restored;
+                    if usable {
+                        match self.slot.hub().lend(self.slot.seq()) {
+                            Ok(n) if n > 0 => {
+                                reuse = n;
+                                self.n_past = n as i32;
+                                self.cached = commons;
+                                self.checkpoints.clear();
+                                restored = true;
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("the shared prefix could not be lent: {e}"),
+                        }
+                    }
+                }
+
                 tracing::debug!(
                     "prefix reuse: {reuse} of {} prompt tokens{}",
                     tokens.len(),
