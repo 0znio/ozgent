@@ -183,6 +183,12 @@ pub struct Hub<'a> {
     n_embd: usize,
     slots: u32,
     unified: bool,
+    /// Whether a sequence past the conversations holds a shared prefix.
+    has_commons: bool,
+    /// Free VRAM right after the context opened, so the first decode's lazy
+    /// allocations can be measured against it.
+    free_at_open: Option<u64>,
+    decode_measured: std::sync::atomic::AtomicBool,
     /// How many slots currently want NextN hidden states. The flag that
     /// produces them belongs to the context, not to a sequence, so it is on
     /// while anybody wants it and off when the last one is done.
@@ -205,6 +211,7 @@ impl<'a> Hub<'a> {
         n_embd: usize,
         slots: u32,
         unified: bool,
+        has_commons: bool,
     ) -> Self {
         let n_batch = (context.n_batch() as usize).max(1);
         Self {
@@ -216,6 +223,9 @@ impl<'a> Hub<'a> {
             n_embd,
             slots: slots.max(1),
             unified,
+            has_commons,
+            free_at_open: crate::backend::best_gpu().map(|d| d.memory_free as u64),
+            decode_measured: std::sync::atomic::AtomicBool::new(false),
             nextn: Mutex::new(0),
             commons: Mutex::new(Commons::default()),
             fixed_window: None,
@@ -247,9 +257,23 @@ impl<'a> Hub<'a> {
         self.slots
     }
 
+    /// Record, once, what the first decode on this context took beyond its
+    /// buffers. See `reserve::PRIOR_DECODE_BYTES`.
+    pub fn note_decoded(&self) {
+        if self.decode_measured.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (Some(before), Some(now)) =
+            (self.free_at_open, crate::backend::best_gpu().map(|d| d.memory_free as u64))
+        else {
+            return;
+        };
+        crate::backend::record_decode(before.saturating_sub(now));
+    }
+
     /// Sequences this context can carry, conversations plus the commons.
     pub fn n_seq_max(&self) -> u32 {
-        self.slots + 1
+        self.slots + self.has_commons as u32
     }
 
     pub fn unified(&self) -> bool {
@@ -288,6 +312,9 @@ impl<'a> Hub<'a> {
     /// conversation shares. Nobody declares the shared prefix: it is whatever
     /// two consecutive prompts turn out to begin with.
     pub fn consider(&self, prompt: &[LlamaToken]) -> Option<Vec<LlamaToken>> {
+        if !self.has_commons {
+            return None;
+        }
         let mut c = self.commons.lock().unwrap();
         let shared = shared_head(&c.previous, prompt);
         c.previous = prompt.to_vec();

@@ -46,6 +46,18 @@ pub struct Layout {
     /// when the file does not say. Asking for more than this is not a longer
     /// memory, it is a model reading positions it has never seen.
     pub context_train: u32,
+    /// The first block that has routed experts. Many mixture-of-experts
+    /// models open with dense blocks, and an eviction pattern that counts
+    /// from block zero frees nothing for those.
+    pub first_moe_layer: u32,
+    /// The routed-expert bytes of the heaviest single block. During prefill
+    /// llama.cpp uploads one block's evicted experts to the GPU at a time, so
+    /// this much has to stay free beside everything else.
+    pub max_layer_expert_bytes: u64,
+    /// Tensors outside the blocks that llama.cpp keeps on the GPU — the output
+    /// head and its norm. The input embedding stays in host memory and is not
+    /// counted.
+    pub fixed_gpu_bytes: u64,
 }
 
 /// The routed-expert tensors, in the order eviction spends them.
@@ -127,6 +139,8 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
     let mut expert_bytes = 0u64;
     let mut kind_bytes = [0u64; 3];
     let mut highest_block: i64 = -1;
+    let mut per_block_experts: std::collections::BTreeMap<i64, u64> = Default::default();
+    let mut fixed_gpu_bytes = 0u64;
 
     for i in 0..count {
         let name = unsafe { CStr::from_ptr(sys::gguf_get_tensor_name(gguf, i)) }
@@ -134,9 +148,17 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
             .into_owned();
         let size = unsafe { sys::gguf_get_tensor_size(gguf, i) } as u64;
 
-        // Only per-block tensors scale with layer count; embeddings and the
-        // output head are paid once and belong to neither figure.
-        let Some(rest) = name.strip_prefix("blk.") else { continue };
+        // Only per-block tensors scale with layer count. The rest are paid
+        // once — but the output head and its norm still sit on the GPU, and
+        // leaving them out of every figure was 262 MB of GLM-4.7-Flash that the
+        // planner placed experts into. The input embedding is looked up on the
+        // host, so it alone is left out.
+        let Some(rest) = name.strip_prefix("blk.") else {
+            if !name.starts_with("token_embd") {
+                fixed_gpu_bytes += size;
+            }
+            continue;
+        };
         let Some((index, tail)) = rest.split_once('.') else { continue };
         let Ok(index) = index.parse::<i64>() else { continue };
         highest_block = highest_block.max(index);
@@ -147,6 +169,7 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         // every token uses and which therefore must stay resident.
         if is_routed_expert(tail) {
             expert_bytes += size;
+            *per_block_experts.entry(index).or_default() += size;
             if let Some(k) = EXPERT_KINDS.iter().position(|k| tail.starts_with(&format!("ffn_{k}_"))) {
                 kind_bytes[k] += size;
             }
@@ -157,10 +180,18 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
     if layers == 0 {
         return None;
     }
+    // Averaged over the blocks that have experts, not over every block. A
+    // dense leading block diluted the average and, worse, was the first block
+    // the eviction pattern named — credited with a full block of experts that
+    // did not exist.
+    let moe_layers = per_block_experts.len().max(1) as u64;
     Some(Layout {
         bytes_per_layer: block_bytes / layers as u64,
-        expert_bytes_per_layer: expert_bytes / layers as u64,
-        expert_kind_bytes: kind_bytes.map(|b| b / layers as u64),
+        expert_bytes_per_layer: expert_bytes / moe_layers,
+        expert_kind_bytes: kind_bytes.map(|b| b / moe_layers),
+        first_moe_layer: per_block_experts.keys().next().map_or(0, |&i| i as u32),
+        max_layer_expert_bytes: per_block_experts.values().copied().max().unwrap_or(0),
+        fixed_gpu_bytes,
         layers,
         kv_elements_per_token: 0,
         caching_layers: layers,
@@ -192,11 +223,24 @@ fn kv_elements(gguf: *mut sys::gguf_context, layers: u32) -> u64 {
     let fallback = if heads > 0 { embd / heads } else { 0 };
     let k = u32_key(gguf, &format!("{arch}.attention.key_length")).unwrap_or(fallback);
     let v = u32_key(gguf, &format!("{arch}.attention.value_length")).unwrap_or(fallback);
+    // Multi-head latent attention caches one compressed latent per layer and
+    // no values at all: llama.cpp allocates no V tensor when a model declares
+    // its MLA widths. Pricing a V half anyway doubled the estimate for
+    // GLM-4.7-Flash — 848 MiB predicted where llama.cpp allocated 449 — and
+    // that half a gigabyte came straight off the budget experts are placed in.
+    let v = if is_mla(gguf, &arch) { 0 } else { v };
     // Only the layers that actually keep a cache are priced. See
     // [`caching_layers`] — on a model that interleaves linear attention this
     // is a quarter of them, and pricing all of them over-reserves by 4x.
     let caching = caching_layers(gguf, &arch, layers);
     fold_kv(caching, &heads_kv, k, v)
+}
+
+/// Whether this model uses multi-head latent attention, by llama.cpp's own
+/// test: both MLA widths declared.
+pub fn is_mla(gguf: *mut sys::gguf_context, arch: &str) -> bool {
+    u32_key(gguf, &format!("{arch}.attention.key_length_mla")).is_some_and(|n| n > 0)
+        && u32_key(gguf, &format!("{arch}.attention.value_length_mla")).is_some_and(|n| n > 0)
 }
 
 /// How many blocks keep a cache that grows with the context.
@@ -416,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_dense_layout_reports_no_experts() {
-        let l = Layout { bytes_per_layer: 1000, expert_bytes_per_layer: 0, expert_kind_bytes: [0; 3], layers: 32, kv_elements_per_token: 0, caching_layers: 32, n_embd: 0, context_train: 0 };
+        let l = Layout { bytes_per_layer: 1000, layers: 32, caching_layers: 32, ..Default::default() };
         assert!(!l.is_moe());
     }
 

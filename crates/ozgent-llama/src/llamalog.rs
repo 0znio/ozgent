@@ -153,6 +153,9 @@ unsafe extern "C" fn sink(
     }
     // SAFETY: llama.cpp always passes a NUL-terminated string.
     let chunk = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    if std::env::var_os("OZ_LLAMA_LOG").is_some() {
+        eprint!("{chunk}");
+    }
     // Read at every level, because the answer arrives at info or warn — this
     // is the one non-error line worth keeping.
     note_line(&chunk);

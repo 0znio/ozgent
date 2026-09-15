@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ozgent_llama::mtp::STEP_MICROS.store(0, Relaxed);
         ozgent_llama::mtp::STEPS.store(0, Relaxed);
         ozgent_llama::mtp::PROPOSE_MICROS.store(0, Relaxed);
+        ozgent_llama::engine::PICK_MICROS.store(0, Relaxed);
         let wall = std::time::Instant::now();
         let mut o = base.clone();
         o.speculative = Some(spec);
@@ -63,6 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "             {wall:6.0} ms wall = {pm:6.0} ms in {pc} target passes              + {dm:5.0} ms in {ds} draft steps + {:.0} ms elsewhere",
             wall - pm - dm
+        );
+        println!(
+            "             of which choosing tokens: {:.0} ms",
+            ozgent_llama::engine::PICK_MICROS.load(Relaxed) as f64 / 1000.0
         );
         Ok((text, stats.tokens_per_second()))
     };

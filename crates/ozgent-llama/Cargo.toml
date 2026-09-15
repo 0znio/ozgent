@@ -25,3 +25,6 @@ minijinja.workspace = true
 minijinja-contrib.workspace = true
 llama-cpp-2 = { version = "0.1.154", optional = true }
 ozgent-mtmd-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

@@ -50,6 +50,21 @@ const PRIOR_PROCESS_BYTES: u64 = 400 * 1024 * 1024;
 /// term that dominates is the one that scales with the window.
 const PRIOR_RATE: f64 = 20.0;
 
+/// Working memory the backend takes during a context's first decode, before
+/// it has seen one.
+///
+/// llama.cpp reports its compute buffers when a context opens, but cuBLAS
+/// creates its handle and ggml grows its CUDA pool lazily, on the first matrix
+/// multiply — after every figure the planner can read. Measured at 78 MiB on
+/// Qwen3.5-4B and 86–90 MiB on GLM-4.7-Flash, whatever the prompt length. A
+/// plan that left 64 MiB aborted inside `cublasCreate`, which is not an error
+/// anything can recover from, so this errs large.
+const PRIOR_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn prior_decode_bytes() -> u64 {
+    PRIOR_DECODE_BYTES
+}
+
 /// How much to inflate the estimate while it is still young.
 ///
 /// A prediction from two observations should not be trusted like one from
@@ -69,11 +84,20 @@ pub struct Reserve {
     pub rate: f64,
     /// Observations behind those two figures.
     pub samples: u32,
+    /// Memory taken lazily during a context's first decode. See
+    /// [`PRIOR_DECODE_BYTES`].
+    #[serde(default = "prior_decode_bytes")]
+    pub decode_bytes: u64,
 }
 
 impl Default for Reserve {
     fn default() -> Self {
-        Self { process_bytes: PRIOR_PROCESS_BYTES, rate: PRIOR_RATE, samples: 0 }
+        Self {
+            process_bytes: PRIOR_PROCESS_BYTES,
+            rate: PRIOR_RATE,
+            samples: 0,
+            decode_bytes: PRIOR_DECODE_BYTES,
+        }
     }
 }
 
@@ -107,7 +131,20 @@ impl Reserve {
     pub fn predict(&self, shape: Shape) -> u64 {
         let scaling = self.rate * Self::work(shape);
         let once = if shape.first_in_process { self.process_bytes as f64 } else { 0.0 };
-        ((once + scaling) * margin(self.samples)) as u64
+        ((once + scaling) * margin(self.samples)) as u64 + self.decode_bytes
+    }
+
+    /// Fold in what a first decode took beyond the context's reported buffers.
+    ///
+    /// Rises at once and falls slowly. Under-reserving this does not shorten
+    /// a window, it aborts the process mid-decode, so a larger observation is
+    /// believed immediately and a smaller one only nudges the figure down.
+    pub fn observe_decode(&mut self, bytes: u64) {
+        self.decode_bytes = if bytes > self.decode_bytes {
+            bytes
+        } else {
+            (self.decode_bytes as f64 * 0.9 + bytes as f64 * 0.1) as u64
+        };
     }
 
     /// Fold in what a load actually cost.
@@ -286,4 +323,31 @@ mod tests {
         assert!((back.rate - r.rate).abs() < 1e-6, "{} vs {}", back.rate, r.rate);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn decode_memory_is_believed_at_once_upward_and_slowly_downward() {
+        let mut r = Reserve::default();
+        let start = r.decode_bytes;
+        // Under-reserving this aborts the process, so a larger reading wins
+        // outright.
+        r.observe_decode(start * 2);
+        assert_eq!(r.decode_bytes, start * 2);
+        // A smaller one only nudges it.
+        r.observe_decode(0);
+        assert!(r.decode_bytes > start, "one small reading must not undo a large one");
+    }
+
+    #[test]
+    fn every_prediction_carries_the_decode_memory() {
+        let r = Reserve { samples: 100, rate: 0.0, process_bytes: 0, ..Default::default() };
+        assert_eq!(r.predict(LATER), r.decode_bytes);
+    }
+
+    #[test]
+    fn a_reserve_saved_before_decode_memory_existed_still_loads() {
+        let old = r#"{"process_bytes":1,"rate":20.0,"samples":3}"#;
+        let r: Reserve = serde_json::from_str(old).unwrap();
+        assert_eq!(r.decode_bytes, PRIOR_DECODE_BYTES);
+    }
+
 }

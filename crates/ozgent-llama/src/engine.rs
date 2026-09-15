@@ -26,6 +26,23 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+/// Sequences a context carries for `slots` conversations.
+///
+/// One more on the daemon's shared contexts, where the prefix every
+/// conversation starts with is held once; see `hub::Commons`. Not on a
+/// session opened for one caller, where there is nobody to share it with and
+/// the extra sequence only doubled the cache — `2/2 seqs` in llama.cpp's own
+/// log, for a CLI session that could never use the second.
+fn sequences_for(slots: u32, want: Slots) -> u32 {
+    match want {
+        Slots::UpTo(_) => slots + 1,
+        Slots::Exact(_) => slots,
+    }
+}
+
+/// Microseconds spent choosing tokens from logits, process-wide.
+pub static PICK_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How many conversations a context should carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slots {
@@ -238,6 +255,9 @@ impl Engine {
             .with_use_mmap(opts.use_mmap)
             .with_use_mlock(opts.use_mlock)
             .with_main_gpu(opts.main_gpu as i32)
+            // Experiment hooks while offloaded-expert placement is measured.
+            .with_use_extra_bufts(std::env::var("OZ_NO_REPACK").is_err())
+            .with_no_host(std::env::var("OZ_NO_HOST").is_ok())
             .with_progress_callback(move |p| {
                 progress(p.clamp(0.0, 1.0));
                 true
@@ -356,6 +376,10 @@ impl Engine {
         let head_dim = (model.n_embd() as u32) / model.n_head().max(1);
         let k_len = meta_u32(&model, &format!("{arch}.attention.key_length")).unwrap_or(head_dim);
         let v_len = meta_u32(&model, &format!("{arch}.attention.value_length")).unwrap_or(head_dim);
+        // No value cache under multi-head latent attention; see `layout::is_mla`.
+        let mla = meta_u32(&model, &format!("{arch}.attention.key_length_mla")).is_some_and(|n| n > 0)
+            && meta_u32(&model, &format!("{arch}.attention.value_length_mla")).is_some_and(|n| n > 0);
+        let v_len = if mla { 0 } else { v_len };
         // Counted from the file, not from `n_layer`, because a hybrid model
         // caches on only some of its layers. Qwen3.5 runs linear attention on
         // three of every four and holds a fixed-size recurrent state there —
@@ -706,6 +730,27 @@ impl Engine {
             let before = crate::backend::best_gpu().map(|d| d.memory_free as u64);
             match self.model.new_context(backend, attempt) {
                 Ok(context) => {
+                    // A context that opened but left too little for its first
+                    // decode is not a success. cuBLAS and ggml's CUDA pool
+                    // allocate lazily on the first matrix multiply, after
+                    // everything above has been measured, and running out
+                    // there aborts the process rather than returning an
+                    // error. So it is treated as a failure while there is still
+                    // a smaller window to try.
+                    let starved = crate::backend::best_gpu()
+                        .is_some_and(|d| (d.memory_free as u64) < crate::backend::decode_reserve());
+                    if starved && window > ozgent_core::accel::MIN_CONTEXT {
+                        tracing::debug!(
+                            "a context of {window} leaves too little VRAM to decode in; trying smaller"
+                        );
+                        drop(context);
+                        first_reason
+                            .get_or_insert_with(|| "too little VRAM left to decode in".to_string());
+                        bad = window;
+                        let midpoint = good + (bad - good) / 2;
+                        window = midpoint.max(ozgent_core::accel::MIN_CONTEXT).min(window - 1);
+                        continue;
+                    }
                     // A success narrows the search from below. If there is
                     // still a meaningful gap to the smallest known failure,
                     // the context is dropped and a larger one tried: keeping
@@ -935,11 +980,12 @@ impl Engine {
         // slice *and* splits every batch per stream, which a lone caller pays
         // for while using none of it: 44.5 tok/s against 46.8, and worse under
         // drafting, where every draft step pays it again.
-        let unified = matches!(want, Slots::UpTo(_));
+        let sequences = sequences_for(slots, want);
+        let unified = matches!(want, Slots::UpTo(_)) && sequences > 1;
         if !unified {
             // Each sequence gets a fixed slice, so the pool has to be that
-            // many times larger — including the one holding the shared prefix.
-            requested = requested.saturating_mul(slots + 1);
+            // many times larger — including one holding a shared prefix.
+            requested = requested.saturating_mul(sequences);
         }
         let shape = crate::backend::reserve_shape(
             opts.ubatch.unwrap_or(512),
@@ -1020,7 +1066,7 @@ impl Engine {
             .with_n_batch(opts.batch_size)
             // One more than the conversations: the last sequence holds the
             // prefix they share. See `Commons`.
-            .with_n_seq_max(slots + 1)
+            .with_n_seq_max(sequences)
             .with_kv_unified(unified)
             // `n_rs_seq` — llama.cpp's ring of per-token recurrent snapshots,
             // which makes a hybrid model's cache trimmable and so lets it undo
@@ -1038,6 +1084,7 @@ impl Engine {
             //   tokens costs k passes — see `crate::mtp` for the measurement.
             //   The one thing it enables is the one thing that cannot pay.
             .with_flash_attention_policy(flash)
+            .with_op_offload(std::env::var("OZ_NO_OP_OFFLOAD").is_err())
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
             .with_type_v(ggml_type(type_v));
@@ -1080,7 +1127,7 @@ impl Engine {
 
         // What one slot may use: the whole pool when it is shared, its own
         // slice when it is not.
-        let each = if unified { requested } else { (requested / (slots + 1)).max(1) };
+        let each = if unified { requested } else { (requested / sequences).max(1) };
         Ok((context, each, slots))
     }
 
@@ -1130,6 +1177,7 @@ impl Engine {
             tool_grammars: Vec::new(),
             gate_applied: false,
             opts: opts.clone(),
+            candidates: Vec::new(),
         }
     }
 
@@ -1143,7 +1191,8 @@ impl Engine {
         want: Slots,
     ) -> Result<(std::sync::Arc<crate::hub::Hub<'_>>, u32), EngineError> {
         let (context, each, slots) = self.open(opts, want)?;
-        let unified_pool = matches!(want, Slots::UpTo(_));
+        let unified_pool = matches!(want, Slots::UpTo(_)) && sequences_for(slots, want) > 1;
+        let commons = matches!(want, Slots::UpTo(_));
         Ok((
             std::sync::Arc::new(crate::hub::Hub::new(
                 context,
@@ -1151,6 +1200,7 @@ impl Engine {
                 self.model.n_embd() as usize,
                 slots,
                 unified_pool,
+                commons,
             )),
             each,
         ))
@@ -1496,6 +1546,8 @@ pub struct Session<'a> {
     gate_applied: bool,
     /// Kept so the sampler can be rebuilt when a grammar is set or cleared.
     opts: Resolved,
+    /// The candidate array token selection fills, kept rather than rebuilt.
+    candidates: Vec<llama_cpp_2::token::data::LlamaTokenData>,
 }
 
 // A session may be moved to the thread that will answer with it, which is how
@@ -2089,16 +2141,33 @@ impl<'a> Session<'a> {
     /// accept is not optional: `sample` performs it internally, and stateful
     /// samplers (repetition penalties, grammars) go wrong without it.
     fn pick(&mut self, row: &[f32]) -> LlamaToken {
-        let mut candidates = llama_cpp_2::token::data_array::LlamaTokenDataArray::from_iter(
-            row.iter().enumerate().map(|(i, &logit)| {
-                llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i as i32), logit, 0.0)
-            }),
-            false,
-        );
+        let started = Instant::now();
+        let token = self.pick_inner(row);
+        PICK_MICROS.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        token
+    }
+
+    fn pick_inner(&mut self, row: &[f32]) -> LlamaToken {
+        // One buffer for the life of the session, refilled in place.
+        //
+        // The candidate array is a whole vocabulary of entries — 151,936 of
+        // them, 1.8 MB — and building a fresh one every token cost 2.0 ms of a
+        // 21 ms pass: the six percent this session had quietly lost on plain
+        // decoding, measured at 45.0 tok/s against 47.7 before the hub
+        // existed. llama.cpp's own sampler never paid it because it keeps its
+        // buffer; this now does too.
+        let mut data = std::mem::take(&mut self.candidates);
+        data.clear();
+        data.extend(row.iter().enumerate().map(|(i, &logit)| {
+            llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i as i32), logit, 0.0)
+        }));
+        let mut candidates =
+            llama_cpp_2::token::data_array::LlamaTokenDataArray::new(data, false);
         candidates.apply_sampler(&self.sampler);
         let token = candidates
             .selected_token()
             .expect("a sampler chain always selects a token");
+        self.candidates = candidates.data;
         self.sampler.accept(token);
         token
     }
@@ -2515,7 +2584,9 @@ impl<'a> Session<'a> {
                 // it was never worth borrowing, on exactly the turns it would
                 // have saved the most.
                 if self.reuse != PrefixReuse::Off {
-                    if let Some(target) = self.slot.hub().consider(&tokens) {
+                    if let Some(target) =
+                        self.slot.hub().consider(&tokens)
+                    {
                         tracing::info!(
                             "holding the {} tokens every conversation starts with",
                             target.len()
@@ -3020,6 +3091,7 @@ impl<'a> Session<'a> {
         }
         stats.generation_ms = gen_started.elapsed().as_millis();
         stats.callback_ms = callback_ns / 1_000_000;
+        self.slot.hub().note_decoded();
         // Whatever comes next — a tool call, another round, the end of the
         // turn — this session is not about to ask for a token, so nobody
         // should hold a pass open for it.

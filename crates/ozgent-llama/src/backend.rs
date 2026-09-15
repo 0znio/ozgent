@@ -520,6 +520,21 @@ pub fn reserve_for(shape: ozgent_core::reserve::Shape) -> u64 {
     learned().lock().map(|r| r.predict(shape)).unwrap_or(512 * 1024 * 1024)
 }
 
+/// What a context's first decode is expected to take beyond its buffers.
+pub fn decode_reserve() -> u64 {
+    learned().lock().map(|r| r.decode_bytes).unwrap_or(128 * 1024 * 1024)
+}
+
+/// Fold in what a first decode actually took, and remember it.
+pub fn record_decode(bytes: u64) {
+    let Ok(mut learned) = learned().lock() else { return };
+    learned.observe_decode(bytes);
+    if let Ok(paths) = ozgent_core::Paths::discover() {
+        learned.save(&paths);
+    }
+    tracing::debug!("decode working memory: {} MiB", learned.decode_bytes / (1024 * 1024));
+}
+
 /// Fold in what a load actually cost, and remember it for next time.
 ///
 /// `overhead` is what disappeared beyond the weights and the cache. This is
@@ -636,17 +651,35 @@ impl Plan {
         // with the model rather than with the hardware.
         let shape = reserve_shape(opts.ubatch.unwrap_or(512), layout.n_embd, window, opts.batch_size);
         let overhead = ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
-            + reserve_for(shape);
-        let (layers, experts, expert_tensors) = resolve_auto(
-            opts.gpu_layers,
-            opts.cpu_moe,
-            Some(&device),
-            layout.layers,
-            layout.bytes_per_layer,
-            layout.expert_bytes_per_layer,
-            layout.expert_kind_bytes,
-            overhead,
-        );
+            + reserve_for(shape)
+            + layout.fixed_gpu_bytes;
+        let place = |overhead: u64| {
+            resolve_auto(
+                opts.gpu_layers,
+                opts.cpu_moe,
+                Some(&device),
+                layout.layers,
+                layout.bytes_per_layer,
+                layout.expert_bytes_per_layer,
+                layout.expert_kind_bytes,
+                overhead,
+            )
+        };
+        let (mut layers, mut experts, mut expert_tensors) = place(overhead);
+        // Evicting any experts brings a cost the first pass could not see:
+        // prefill uploads one block's experts to the GPU at a time, into a
+        // buffer llama.cpp sizes for the heaviest block. Measured at 331 MiB
+        // on a model whose blocks carry 294 MB of experts. So once eviction is
+        // on the table, place again with that much held back.
+        if experts > 0 || expert_tensors > 0 {
+            (layers, experts, expert_tensors) = place(overhead + layout.max_layer_expert_bytes);
+        }
+        // `fit_to_vram` counts blocks that have experts. The pattern counts
+        // blocks from zero, the way llama.cpp's own `--n-cpu-moe` does, so the
+        // dense blocks in front are added back in.
+        if experts > 0 || expert_tensors > 0 {
+            experts = (experts + layout.first_moe_layer).min(layout.layers);
+        }
         Self { layers, experts, expert_tensors, total_layers: layout.layers, free_bytes: free }
     }
 
