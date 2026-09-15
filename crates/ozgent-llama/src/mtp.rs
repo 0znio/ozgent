@@ -8,12 +8,11 @@
 //! ordinary prose produces exactly zero n-gram drafts, because there is no
 //! repetition to find. This is the case that fills.
 //!
-//! **Only one sequence.** llama.cpp's own driver tracks a draft state per
-//! sequence, with per-sequence batch bounds, pending hidden states and KV
-//! region resets. ozgent decodes one sequence at a time, and carrying that
-//! machinery for a case that does not arise would be several hundred lines of
-//! bookkeeping whose failure mode is silently wrong output. If batching ever
-//! lands, this grows with it.
+//! **One drafter per conversation.** A drafter belongs to the sequence it
+//! drafts for: it writes into that sequence's cells and takes them back out
+//! again, and llama.cpp scopes both to the sequence id it is given. Nothing
+//! here is shared between conversations except the weights and the memory
+//! they all already share, so several may draft at once.
 //!
 //! **The draft context shares the target's memory.** Created with `ctx_other`
 //! pointing at the target, which is what lets llama.cpp skip the "catch-up
@@ -89,7 +88,7 @@ impl EmbdBatch {
 
     /// Put one position in the batch: its token, its hidden state, its
     /// position, and a request for logits.
-    fn set(&mut self, token: LlamaToken, hidden: &[f32], pos: i32) {
+    fn set(&mut self, token: LlamaToken, hidden: &[f32], pos: i32, seq: i32) {
         assert!(hidden.len() == self.n_embd, "hidden state is the wrong width");
         assert!(self.capacity >= 1);
         // SAFETY: every array was allocated with `capacity` entries and index
@@ -99,7 +98,7 @@ impl EmbdBatch {
             std::ptr::copy_nonoverlapping(hidden.as_ptr(), self.raw.embd, self.n_embd);
             *self.raw.pos.add(0) = pos;
             *self.raw.n_seq_id.add(0) = 1;
-            *(*self.raw.seq_id.add(0)).add(0) = 0;
+            *(*self.raw.seq_id.add(0)).add(0) = seq;
             *self.raw.logits.add(0) = 1;
         }
         self.raw.n_tokens = 1;
@@ -132,6 +131,9 @@ pub struct MtpDrafter<'a> {
     min_confidence: f32,
     context: LlamaContext<'a>,
     batch: EmbdBatch,
+    /// The conversation this drafter belongs to. Every cell it writes and
+    /// every cell it takes back out is scoped to this sequence.
+    seq: i32,
     n_embd: usize,
     n_vocab: i32,
 }
@@ -146,6 +148,9 @@ impl<'a> MtpDrafter<'a> {
         backend: &'static LlamaBackend,
         target: &LlamaContext<'_>,
         n_ctx: u32,
+        seq: i32,
+        n_seq_max: u32,
+        unified: bool,
     ) -> Result<Option<Self>, EngineError> {
         // SAFETY: the model outlives this call.
         let heads = unsafe { sys::llama_model_n_layer_nextn(model.as_ptr()) };
@@ -156,7 +161,18 @@ impl<'a> MtpDrafter<'a> {
         let params = LlamaContextParams::default()
             .with_context_type(LlamaContextType::Mtp)
             .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            .with_n_batch(1)
+            // One token at a time, but never narrower than the number of
+            // sequences: llama.cpp sizes its output allowance from `n_batch`
+            // and then requires it to cover `n_seq_max`, so a batch of one on
+            // a context that knows about five conversations trips an assert
+            // before anything is decoded.
+            .with_n_batch(n_seq_max.max(1))
+            // The draft context shares the target's memory, so it has to agree
+            // with the target about how many sequences that memory holds and
+            // how they are laid out. Left at the default it would refuse the
+            // sequence id of every conversation but the first.
+            .with_n_seq_max(n_seq_max)
+            .with_kv_unified(unified)
             .with_embeddings(false);
         let context = model
             .new_context_with_ctx_other(backend, params, target)
@@ -171,6 +187,7 @@ impl<'a> MtpDrafter<'a> {
             min_confidence: min_confidence(),
             batch: EmbdBatch::new(1, n_embd),
             context,
+            seq,
             n_embd,
             n_vocab: model.n_vocab(),
         }))
@@ -195,7 +212,7 @@ impl<'a> MtpDrafter<'a> {
         let mut hidden = hidden.to_vec();
 
         for step in 0..want {
-            self.batch.set(token, &hidden, pos + step as i32);
+            self.batch.set(token, &hidden, pos + step as i32, self.seq);
             // SAFETY: the batch and context are both live.
             let rc = unsafe { sys::llama_decode(self.context.as_ptr(), self.batch.raw) };
             if rc != 0 {
@@ -241,7 +258,7 @@ impl<'a> MtpDrafter<'a> {
         unsafe {
             let mem = sys::llama_get_memory(self.context.as_ptr());
             if !mem.is_null() {
-                sys::llama_memory_seq_rm(mem, 0, pos, -1);
+                sys::llama_memory_seq_rm(mem, self.seq, pos, -1);
             }
         }
         Ok(drafted)

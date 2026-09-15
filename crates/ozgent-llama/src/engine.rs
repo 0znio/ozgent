@@ -976,7 +976,13 @@ impl Engine {
         // second slot costs nothing until somebody actually uses it, so there
         // is nothing here to fit. `Exact` still divides the window, which is
         // what a caller asking for a fixed partition means.
-        let unified = slots > 1 && matches!(want, Slots::UpTo(_));
+        // Whenever the context carries more than one sequence, and it always
+        // does — the shared prefix has one of its own — the cells are a
+        // single pool. Left divided, llama.cpp gives each sequence a fixed
+        // slice *and* splits every batch per stream, which a lone caller pays
+        // for while using none of it: 44.5 tok/s against 46.8, and worse under
+        // drafting, where every draft step pays it again.
+        let unified = matches!(want, Slots::UpTo(_));
         if !unified {
             // Each sequence gets a fixed slice, so the pool has to be that
             // many times larger — including the one holding the shared prefix.
@@ -1214,11 +1220,14 @@ impl Engine {
         want: Slots,
     ) -> Result<(std::sync::Arc<crate::hub::Hub<'_>>, u32), EngineError> {
         let (context, each, slots) = self.open(opts, want)?;
+        let unified_pool = matches!(want, Slots::UpTo(_));
         Ok((
             std::sync::Arc::new(crate::hub::Hub::new(
                 context,
                 self.model.n_vocab() as usize,
+                self.model.n_embd() as usize,
                 slots,
+                unified_pool,
             )),
             each,
         ))
@@ -1882,9 +1891,11 @@ impl<'a> Session<'a> {
             .ok_or_else(|| EngineError::Context("no nextn row after prefill".into()))?;
 
         let backend = backend()?;
-        let mut drafter = self
-            .slot
-            .with_context(|c| crate::mtp::MtpDrafter::new(self.model, backend, c, self.n_ctx))?
+        let (seq, n_seq_max, unified) =
+            (self.slot.seq(), self.slot.hub().n_seq_max(), self.slot.hub().unified());
+        let mut drafter = self.slot.with_context(|c| {
+            crate::mtp::MtpDrafter::new(self.model, backend, c, self.n_ctx, seq, n_seq_max, unified)
+        })?
         .ok_or_else(|| EngineError::Context("this model has no nextn head".into()))?;
 
         let drafted = drafter.propose(target_next, &hidden, self.n_past, want)?;
@@ -2181,10 +2192,22 @@ impl<'a> Session<'a> {
         pos: i32,
         logits: crate::hub::Logits,
     ) -> Result<crate::hub::Outcome, EngineError> {
+        self.feed_wanting(tokens, pos, logits, false)
+    }
+
+    /// As [`Session::feed`], also bringing back the NextN hidden state of each
+    /// row, which drafting from the model's own head needs.
+    fn feed_wanting(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: crate::hub::Logits,
+        hidden: bool,
+    ) -> Result<crate::hub::Outcome, EngineError> {
         let n = tokens.len() as i32;
         let out = self
             .slot
-            .run(tokens, pos, logits)
+            .run_wanting(tokens, pos, logits, hidden)
             .map_err(|e| EngineError::Decode(e.to_string()))?;
         self.n_past = pos + n;
         Ok(out)
@@ -2691,18 +2714,29 @@ impl<'a> Session<'a> {
         // Drafting from the model's own head opens a second context over this
         // one's memory and edits sequence 0 directly, which is only this
         // session's sequence when this session is the only one.
-        let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp)
-            && !self.grammar_active
-            && self.solo()
-        {
-            match self
-                .slot
-                .with_context(|c| crate::mtp::MtpDrafter::new(self.model, backend()?, c, self.n_ctx))
-            {
+        // A drafter belongs to its slot's sequence, so several conversations
+        // may draft at once. What they share is the flag that makes the target
+        // emit hidden states, which belongs to the context — hence a guard
+        // that turns it on for the first and off after the last.
+        let mut nextn_on = None;
+        let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp) && !self.grammar_active {
+            let (seq, n_seq_max, unified) =
+                (self.slot.seq(), self.slot.hub().n_seq_max(), self.slot.hub().unified());
+            match self.slot.with_context(|c| {
+                crate::mtp::MtpDrafter::new(
+                    self.model,
+                    backend()?,
+                    c,
+                    self.n_ctx,
+                    seq,
+                    n_seq_max,
+                    unified,
+                )
+            }) {
                 Ok(Some(d)) => {
                     // Unmasked, so a hidden state comes back for every position
                     // the target decodes — including each verified draft.
-                    unsafe { crate::nextn::set_enabled(self.slot.hub().raw(), true, false) };
+                    nextn_on = Some(self.slot.want_nextn());
                     Some(d)
                 }
                 Ok(None) => {
@@ -2940,7 +2974,20 @@ impl<'a> Session<'a> {
                         let want = (tuning.draft_tokens as usize)
                             .min(room)
                             .min(n_batch.saturating_sub(1));
-                        m.propose(pending, hidden, self.n_past, want)?
+                        // Drafted under the hub's lock.
+                        //
+                        // The drafter has a context of its own but shares this
+                        // one's memory — that is what makes it cheap — so its
+                        // decodes write into cells another slot's pass may be
+                        // reading, and nothing else would stop the two
+                        // overlapping. No misbehaviour was traced to it; the
+                        // answer divergence that prompted this turned out to
+                        // be the ordinary float-reduction difference of a
+                        // shared batch, identical with drafting switched off.
+                        // The lock stays because two threads inside one
+                        // cache is a race whether or not it has bitten yet.
+                        let pos = self.n_past;
+                        self.slot.with_context(|_| m.propose(pending, hidden, pos, want))?
                     }
                     _ => match drafter.as_mut() {
                     // A draft model proposes from the whole distribution rather
@@ -2980,7 +3027,9 @@ impl<'a> Session<'a> {
             run.push(pending);
             run.extend_from_slice(&draft);
             // Every position asks for logits, so each draft can be verified.
-            let verified = self.feed(run, start, crate::hub::Logits::All)?.rows;
+            let outcome = self.feed_wanting(run, start, crate::hub::Logits::All, mtp.is_some())?;
+            let hidden_rows = outcome.hidden;
+            let verified = outcome.rows;
             debug_assert_eq!(verified.len(), 1 + draft.len());
 
             // Verify. Row i predicts the token after batch entry i, so a
@@ -3029,8 +3078,15 @@ impl<'a> Session<'a> {
             // fluent nonsense rather than as an error.
             if mtp.is_some() {
                 let n_embd = self.model.n_embd() as usize;
-                mtp_hidden =
-                    unsafe { crate::nextn::embedding(self.slot.hub().raw(), accepted as i32, n_embd) };
+                // Taken from this slot's own rows of the pass. Read off the
+                // context directly it would be whichever row of the shared
+                // batch happened to sit at that index — another conversation's
+                // hidden state, and a draft continuing from a place this one
+                // has never been.
+                mtp_hidden = hidden_rows
+                    .get(accepted)
+                    .filter(|row| !row.is_empty())
+                    .cloned();
             }
 
             self.settle_draft(snapshot.as_ref(), start, pending, &draft, accepted)?;
@@ -3039,7 +3095,7 @@ impl<'a> Session<'a> {
         if mtp.is_some() {
             // Left on, the next turn's prefill would emit a hidden state per
             // prompt token for nobody.
-            unsafe { crate::nextn::set_enabled(self.slot.hub().raw(), false, false) };
+            drop(nextn_on.take());
         }
 
         if think.spent() > 0 {

@@ -50,6 +50,10 @@ pub struct Work {
     pub pos: i32,
     /// Which rows of logits the caller needs back.
     pub logits: Logits,
+    /// Whether the caller also needs the NextN hidden state of each row it
+    /// asked logits for. Drafting from the model's own head needs them, and
+    /// they can only be read out of the pass that produced them.
+    pub hidden: bool,
 }
 
 /// Which logits a request wants.
@@ -68,6 +72,8 @@ pub enum Logits {
 pub struct Outcome {
     /// One row per token whose logits were asked for, in token order.
     pub rows: Vec<Vec<f32>>,
+    /// The NextN hidden state of each of those rows, when asked for.
+    pub hidden: Vec<Vec<f32>>,
 }
 
 impl Outcome {
@@ -170,7 +176,13 @@ pub struct Hub<'a> {
     woke: Condvar,
     n_batch: usize,
     n_vocab: usize,
+    n_embd: usize,
     slots: u32,
+    unified: bool,
+    /// How many slots currently want NextN hidden states. The flag that
+    /// produces them belongs to the context, not to a sequence, so it is on
+    /// while anybody wants it and off when the last one is done.
+    nextn: Mutex<usize>,
     commons: Mutex<Commons>,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
@@ -183,7 +195,13 @@ unsafe impl Send for Hub<'_> {}
 unsafe impl Sync for Hub<'_> {}
 
 impl<'a> Hub<'a> {
-    pub fn new(context: LlamaContext<'a>, n_vocab: usize, slots: u32) -> Self {
+    pub fn new(
+        context: LlamaContext<'a>,
+        n_vocab: usize,
+        n_embd: usize,
+        slots: u32,
+        unified: bool,
+    ) -> Self {
         let n_batch = (context.n_batch() as usize).max(1);
         Self {
             context: Mutex::new(context),
@@ -191,7 +209,10 @@ impl<'a> Hub<'a> {
             woke: Condvar::new(),
             n_batch,
             n_vocab,
+            n_embd,
             slots: slots.max(1),
+            unified,
+            nextn: Mutex::new(0),
             commons: Mutex::new(Commons::default()),
             fixed_window: None,
         }
@@ -220,6 +241,29 @@ impl<'a> Hub<'a> {
     /// How many conversations this hub was built to carry.
     pub fn slots(&self) -> u32 {
         self.slots
+    }
+
+    /// Sequences this context can carry, conversations plus the commons.
+    pub fn n_seq_max(&self) -> u32 {
+        self.slots + 1
+    }
+
+    pub fn unified(&self) -> bool {
+        self.unified
+    }
+
+    /// Ask the context to emit NextN hidden states while the returned guard
+    /// lives. Counted, because the flag is the context's and several slots may
+    /// be drafting at once.
+    pub fn want_nextn(self: &Arc<Self>) -> NextnOn<'a> {
+        let mut n = self.nextn.lock().unwrap();
+        if *n == 0 {
+            // Unmasked: a hidden state for every position decoded, which is
+            // what the verification batch needs.
+            self.with_context(|c| unsafe { crate::nextn::set_enabled(c.as_ptr(), true, false) });
+        }
+        *n += 1;
+        NextnOn { hub: Arc::clone(self) }
     }
 
     /// The sequence that holds the shared prefix, which is the one past the
@@ -282,7 +326,8 @@ impl<'a> Hub<'a> {
             // The final row is asked for so the pass always has an output;
             // nothing reads it.
             let want = if last { Logits::Last } else { Logits::None };
-            if let Err(e) = self.run(Work { seq, tokens: chunk.to_vec(), pos, logits: want }) {
+            let work = Work { seq, tokens: chunk.to_vec(), pos, logits: want, hidden: false };
+            if let Err(e) = self.run(work) {
                 self.filled(Vec::new());
                 return Err(e);
             }
@@ -529,6 +574,7 @@ impl<'a> Hub<'a> {
         for p in batch {
             let last = p.work.tokens.len().saturating_sub(1);
             let mut mine = Vec::new();
+            let _ = &p.work.hidden;
             for (i, token) in p.work.tokens.iter().enumerate() {
                 let wants = match p.work.logits {
                     Logits::None => false,
@@ -562,7 +608,8 @@ impl<'a> Hub<'a> {
         // there. Anything timing `decode` alone is timing submission.
         let out = rows
             .iter()
-            .map(|mine| {
+            .zip(batch)
+            .map(|(mine, p)| {
                 let rows = mine
                     .iter()
                     .map(|&row| {
@@ -570,11 +617,43 @@ impl<'a> Hub<'a> {
                         slice[..self.n_vocab.min(slice.len())].to_vec()
                     })
                     .collect();
-                Ok(Outcome { rows })
+                // Read here, in the pass that produced them: the hidden states
+                // belong to this decode and the next one overwrites them.
+                // One entry per logits row, in the same order, even where
+                // the head produced nothing: the caller indexes these by the
+                // position it accepted, and dropping a row would shift every
+                // later one onto somebody else's hidden state.
+                let hidden = if p.work.hidden {
+                    mine.iter()
+                        .map(|&row| unsafe {
+                            crate::nextn::embedding(ctx.as_ptr(), row, self.n_embd)
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(Outcome { rows, hidden })
             })
             .collect();
         PASS_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
+    }
+}
+
+/// Keeps NextN hidden states coming while it lives.
+pub struct NextnOn<'a> {
+    hub: Arc<Hub<'a>>,
+}
+
+impl Drop for NextnOn<'_> {
+    fn drop(&mut self) {
+        let mut n = self.hub.nextn.lock().unwrap();
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.hub
+                .with_context(|c| unsafe { crate::nextn::set_enabled(c.as_ptr(), false, false) });
+        }
     }
 }
 
@@ -679,8 +758,20 @@ impl<'a> Slot<'a> {
         pos: i32,
         logits: Logits,
     ) -> Result<Outcome, HubError> {
+        self.run_wanting(tokens, pos, logits, false)
+    }
+
+    /// As [`Slot::run`], also bringing back the NextN hidden state of every
+    /// row whose logits were asked for.
+    pub fn run_wanting(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: Logits,
+        hidden: bool,
+    ) -> Result<Outcome, HubError> {
         self.resume();
-        self.hub.run(Work { seq: self.seq, tokens, pos, logits })
+        self.hub.run(Work { seq: self.seq, tokens, pos, logits, hidden })
     }
 
     /// Reach the context for the operations that are not decodes.
@@ -708,6 +799,11 @@ impl<'a> Slot<'a> {
     /// speculates freely however many slots there are.
     pub fn may_snapshot(&self) -> bool {
         self.hub.solo()
+    }
+
+    /// Ask for NextN hidden states while the guard lives.
+    pub fn want_nextn(&self) -> NextnOn<'a> {
+        self.hub.want_nextn()
     }
 
     /// Drop positions `from..` from this slot's sequence. False means this
@@ -746,6 +842,7 @@ mod tests {
                 tokens: vec![LlamaToken(1); tokens],
                 pos: 0,
                 logits: Logits::Last,
+                hidden: false,
             },
         }
     }
