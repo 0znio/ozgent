@@ -522,6 +522,39 @@ pub fn reserve_for(shape: ozgent_core::reserve::Shape) -> u64 {
     learned().lock().map(|r| r.predict(shape)).unwrap_or(512 * 1024 * 1024)
 }
 
+/// Whether flash attention on this build's GPU backend has a kernel for every
+/// quantised K/V pair, or only the handful of same-type ones.
+///
+/// Asked of the backend rather than assumed: llama.cpp's CUDA backend lists
+/// `FA_ALL_QUANTS` among its features exactly when it was compiled with every
+/// kernel. No CUDA backend registered means no such limitation to respect.
+/// See `accel::flash_has_kernel` for what getting this wrong costs.
+#[cfg(feature = "llama")]
+pub fn flash_takes_any_kv_pair() -> bool {
+    use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| unsafe {
+        let reg = sys::ggml_backend_reg_by_name(c"CUDA".as_ptr());
+        if reg.is_null() {
+            return true;
+        }
+        let proc = sys::ggml_backend_reg_get_proc_address(reg, c"ggml_backend_get_features".as_ptr());
+        if proc.is_null() {
+            return false;
+        }
+        let features: unsafe extern "C" fn(sys::ggml_backend_reg_t) -> *const sys::ggml_backend_feature =
+            std::mem::transmute(proc);
+        let mut f = features(reg);
+        while !f.is_null() && !(*f).name.is_null() {
+            if std::ffi::CStr::from_ptr((*f).name) == c"FA_ALL_QUANTS" {
+                return true;
+            }
+            f = f.add(1);
+        }
+        false
+    })
+}
+
 /// What a context's first decode is expected to take beyond its buffers.
 pub fn decode_reserve() -> u64 {
     learned().lock().map(|r| r.decode_bytes).unwrap_or(128 * 1024 * 1024)

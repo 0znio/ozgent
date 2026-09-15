@@ -984,13 +984,15 @@ impl Engine {
             free / (1024 * 1024),
             reserve / (1024 * 1024)
         );
+        let any_pair = crate::backend::flash_takes_any_kv_pair();
         let split = match (opts.cache_type_k, opts.cache_type_v) {
-            (CacheType::Auto, CacheType::Auto) => ozgent_core::accel::choose_kv_split(
+            (CacheType::Auto, CacheType::Auto) => ozgent_core::accel::choose_kv_split_for(
                 self.kv_shape,
                 requested,
                 self.weight_bytes,
                 budget,
                 opts.flash_attention,
+                any_pair,
             ),
             // One named and the other left alone is someone saying "store the
             // cache like this", not asking for a mixed one.
@@ -1001,15 +1003,21 @@ impl Engine {
         // A pair llama.cpp will refuse returns a null context with the reason
         // only in its own log, so it is caught here while there is still
         // something useful to say and a working pair to fall back to.
-        let split = if ozgent_core::accel::kv_split_allowed(split, opts.flash_attention, self.kv_shape) {
+        let split = if ozgent_core::accel::kv_split_allowed_for(
+            split,
+            opts.flash_attention,
+            self.kv_shape,
+            any_pair,
+        ) {
             split
         } else {
-            let safe = ozgent_core::accel::choose_kv_split(
+            let safe = ozgent_core::accel::choose_kv_split_for(
                 self.kv_shape,
                 requested,
                 self.weight_bytes,
                 budget,
                 opts.flash_attention,
+                any_pair,
             );
             tracing::warn!(
                 "this model cannot store its cache as {:?}/{:?}; using {:?}/{:?}",

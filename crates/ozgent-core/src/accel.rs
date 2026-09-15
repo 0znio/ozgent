@@ -275,6 +275,33 @@ const KV_BLOCK: u32 = 32;
 /// have been quantised for free — which on a 9B at 32k is over a gigabyte of
 /// VRAM handed back for nothing.
 pub fn kv_split_allowed(split: KvSplit, flash: bool, shape: KvShape) -> bool {
+    kv_split_allowed_for(split, flash, shape, true)
+}
+
+/// Whether a flash-attention kernel exists for this pair on the backend in use.
+///
+/// `any_pair` is false for CUDA built without `GGML_CUDA_FA_ALL_QUANTS`, which
+/// is the default: its kernels then cover only F16/F16, Q4_0/Q4_0 and
+/// Q8_0/Q8_0 (fattn.cu). Everything else — any Q5_1, and *any* pair whose two
+/// halves differ — has no kernel, so llama.cpp quietly runs without flash
+/// attention, refuses the quantised V it no longer supports, and falls back to
+/// f16 values and an attention path with far more scratch. Measured on
+/// GLM-4.7-Flash: a Q5_1/Q4_0 cache asked for 762 MiB of compute buffer where
+/// Q8_0 needed 354, which shrank the window and then ran prefill out of memory.
+pub fn flash_has_kernel(split: KvSplit, any_pair: bool) -> bool {
+    if any_pair {
+        return true;
+    }
+    let native = |t: CacheType| matches!(t, CacheType::F16 | CacheType::Q4_0 | CacheType::Q8_0);
+    split.k == split.v && native(split.k)
+}
+
+/// [`kv_split_allowed`] for a backend that may not have a kernel for every
+/// pair. See [`flash_has_kernel`].
+pub fn kv_split_allowed_for(split: KvSplit, flash: bool, shape: KvShape, any_pair: bool) -> bool {
+    if flash && !flash_has_kernel(split, any_pair) {
+        return false;
+    }
     // "V cache quantization requires flash_attn" — llama-context.cpp. There is
     // no matching rule for K.
     if split.v.is_quantized() && !flash {
@@ -335,9 +362,21 @@ const PLAIN_LADDER: [KvSplit; 3] = [
 
 /// The pairs worth trying on this model. Ordered best-first and smallest-last.
 pub fn kv_ladder(flash: bool, shape: KvShape) -> Vec<KvSplit> {
+    kv_ladder_for(flash, shape, true)
+}
+
+/// [`kv_ladder`] for a backend whose flash attention may not take every pair.
+///
+/// Filtering the mixed rungs out leaves Q8_0/Q8_0 then Q4_0/Q4_0 on such a
+/// backend, which is coarser than the full ladder — but a rung that silently
+/// turns flash attention off costs far more than the bits it saves.
+pub fn kv_ladder_for(flash: bool, shape: KvShape, any_pair: bool) -> Vec<KvSplit> {
     let ladder: &[KvSplit] = if flash { &FLASH_LADDER } else { &PLAIN_LADDER };
-    let usable: Vec<KvSplit> =
-        ladder.iter().copied().filter(|s| kv_split_allowed(*s, flash, shape)).collect();
+    let usable: Vec<KvSplit> = ladder
+        .iter()
+        .copied()
+        .filter(|s| kv_split_allowed_for(*s, flash, shape, any_pair))
+        .collect();
     if usable.is_empty() {
         // Every quantised form was refused for this model — a head width that
         // does not divide the block size, most likely. f16 always works, and
@@ -364,11 +403,24 @@ pub fn choose_kv_split(
     budget: u64,
     flash: bool,
 ) -> KvSplit {
+    choose_kv_split_for(shape, n_ctx, weight_bytes, budget, flash, true)
+}
+
+/// [`choose_kv_split`] for a backend whose flash attention may not take every
+/// pair. See [`flash_has_kernel`].
+pub fn choose_kv_split_for(
+    shape: KvShape,
+    n_ctx: u32,
+    weight_bytes: u64,
+    budget: u64,
+    flash: bool,
+    any_pair: bool,
+) -> KvSplit {
     let avg_f16 = kv_bytes(shape.total(), n_ctx / 2, CacheType::F16);
     let traffic_bound =
         weight_bytes > 0 && avg_f16 as f64 > weight_bytes as f64 * KV_TRAFFIC_RATIO;
 
-    let usable = kv_ladder(flash, shape);
+    let usable = kv_ladder_for(flash, shape, any_pair);
 
     for split in &usable {
         // Past the traffic threshold an f16 K is the slow choice, not the
@@ -1000,4 +1052,34 @@ mod tests {
             assert_eq!(toml::from_str::<W>(&s).unwrap().v, v, "round trip failed for {s}");
         }
     }
+
+    #[test]
+    fn a_backend_without_mixed_kernels_is_never_handed_a_mixed_pair() {
+        let shape = KvShape::new(32, 8, 128, 128);
+        for budget in [64 * 1024 * 1024, 512 * 1024 * 1024, 8 * GIB] {
+            let chosen = choose_kv_split_for(shape, 32_768, 2_740_000_000, budget, true, false);
+            assert!(flash_has_kernel(chosen, false), "{chosen:?} at {budget}");
+        }
+        let ladder = kv_ladder_for(true, shape, false);
+        assert!(ladder.iter().all(|s| s.k == s.v), "{ladder:?}");
+        assert!(ladder.contains(&KvSplit::uniform(CacheType::Q4_0)));
+    }
+
+    #[test]
+    fn a_backend_with_every_kernel_keeps_the_full_ladder() {
+        let shape = KvShape::new(32, 8, 128, 128);
+        assert_eq!(kv_ladder_for(true, shape, true), kv_ladder(true, shape));
+        assert!(kv_ladder(true, shape).iter().any(|s| s.k != s.v));
+    }
+
+    #[test]
+    fn the_native_kernels_are_exactly_the_same_type_ones() {
+        let q = |k, v| KvSplit { k, v };
+        assert!(flash_has_kernel(q(CacheType::Q8_0, CacheType::Q8_0), false));
+        assert!(flash_has_kernel(q(CacheType::Q4_0, CacheType::Q4_0), false));
+        assert!(flash_has_kernel(q(CacheType::F16, CacheType::F16), false));
+        assert!(!flash_has_kernel(q(CacheType::Q8_0, CacheType::Q4_0), false));
+        assert!(!flash_has_kernel(q(CacheType::Q5_1, CacheType::Q5_1), false));
+    }
+
 }
