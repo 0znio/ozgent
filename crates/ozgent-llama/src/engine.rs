@@ -230,6 +230,74 @@ impl Engine {
         Ok((together, apart))
     }
 
+    /// Milliseconds for one pass carrying `k` tokens of a single sequence,
+    /// for each `k` — what verifying a k-token draft costs.
+    ///
+    /// Speculation assumes that cost barely grows with `k`. On a model whose
+    /// routed experts live on the host it may not: each extra token routes to
+    /// its own experts, so the pass reads the union of all of them from system
+    /// RAM. Measured rather than argued. Each pass is rewound, so every `k`
+    /// starts from the same cache.
+    pub fn probe_verify_cost(
+        &self,
+        opts: &Resolved,
+        ks: &[usize],
+        rounds: usize,
+    ) -> Result<Vec<(usize, f64)>, EngineError> {
+        let session = self.session(opts)?;
+        let prompt = self
+            .model
+            .str_to_token(
+                &"The history of the lighthouse spans many centuries and many coasts. ".repeat(40),
+                AddBos::Always,
+            )
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        let n_batch = (session.n_batch as usize).max(1);
+        let mut pos = 0i32;
+        for chunk in prompt.chunks(n_batch) {
+            session
+                .slot
+                .hub()
+                .run(crate::hub::Work {
+                    seq: 0,
+                    tokens: chunk.to_vec(),
+                    pos,
+                    logits: crate::hub::Logits::Last,
+                    hidden: false,
+                })
+                .map_err(|e| EngineError::Decode(e.to_string()))?;
+            pos += chunk.len() as i32;
+        }
+        // Distinct tokens drawn from the prompt, so each position routes the
+        // way real text would rather than repeating one token's experts.
+        let pool: Vec<LlamaToken> = prompt.iter().copied().skip(1).collect();
+        let mut out = Vec::new();
+        for &k in ks {
+            let mut times = Vec::with_capacity(rounds);
+            for r in 0..rounds {
+                let tokens: Vec<LlamaToken> =
+                    (0..k).map(|i| pool[(r * 7 + i * 13) % pool.len()]).collect();
+                let t = Instant::now();
+                session
+                    .slot
+                    .hub()
+                    .run(crate::hub::Work {
+                        seq: 0,
+                        tokens,
+                        pos,
+                        logits: crate::hub::Logits::All,
+                        hidden: false,
+                    })
+                    .map_err(|e| EngineError::Decode(e.to_string()))?;
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                let _ = session.slot.trim(pos);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            out.push((k, times[times.len() / 2]));
+        }
+        Ok(out)
+    }
+
     /// Load a GGUF file with the given resolved settings.
     pub fn load(path: &Path, opts: &Resolved) -> Result<Self, EngineError> {
         Self::load_reporting(path, opts, |_| {})
@@ -273,9 +341,6 @@ impl Engine {
             .with_use_mmap(opts.use_mmap)
             .with_use_mlock(opts.use_mlock)
             .with_main_gpu(opts.main_gpu as i32)
-            // Experiment hooks while offloaded-expert placement is measured.
-            .with_use_extra_bufts(std::env::var("OZ_NO_REPACK").is_err())
-            .with_no_host(std::env::var("OZ_NO_HOST").is_ok())
             .with_progress_callback(move |p| {
                 progress(p.clamp(0.0, 1.0));
                 true
@@ -381,18 +446,6 @@ impl Engine {
             let reason = crate::llamalog::reason().unwrap_or_else(|| e.to_string());
             EngineError::Load { path: path.display().to_string(), reason }
         })?;
-
-        if std::env::var_os("OZ_PIN_MMAP").is_some() {
-            if let MoeOffload::Layers(n) = resolved_moe {
-                let t = std::time::Instant::now();
-                let bytes = crate::pin::pin_host_experts(path, n, resolved_tensors);
-                tracing::info!(
-                    "pinned {} MiB of host-side experts in place, in {:.1}s",
-                    bytes / (1 << 20),
-                    t.elapsed().as_secs_f64()
-                );
-            }
-        }
 
         let template = model.chat_template(None).ok();
         let n_layer = model.n_layer();
@@ -1140,7 +1193,6 @@ impl Engine {
             //   tokens costs k passes — see `crate::mtp` for the measurement.
             //   The one thing it enables is the one thing that cannot pay.
             .with_flash_attention_policy(flash)
-            .with_op_offload(std::env::var("OZ_NO_OP_OFFLOAD").is_err())
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
             .with_type_v(ggml_type(type_v));
@@ -1236,8 +1288,7 @@ impl Engine {
                         .with_n_seq_max(sequences)
                         .with_kv_unified(unified)
                         .with_flash_attention_policy(flash)
-                        .with_op_offload(std::env::var("OZ_NO_OP_OFFLOAD").is_err())
-                        .with_offload_kqv(opts.kv_offload)
+                                    .with_offload_kqv(opts.kv_offload)
                         .with_type_k(ggml_type(CacheType::Q8_0))
                         .with_type_v(ggml_type(value));
                     if let Some(n) = opts.ubatch {

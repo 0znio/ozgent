@@ -4,8 +4,9 @@
 //! bandwidth-bound and cannot.
 //!
 //! Knobs by environment: OZ_CPU_MOE (auto|all|off|N), OZ_CTX, OZ_UBATCH,
-//! OZ_BATCH, OZ_THREADS, OZ_NO_MMAP, OZ_NO_REPACK, OZ_NO_HOST, OZ_NO_OP_OFFLOAD,
-//! OZ_PROMPT_REPEAT (prompt length), OZ_TOKENS (decode length).
+//! OZ_BATCH, OZ_THREADS, OZ_NO_MMAP, OZ_NGL, OZ_ROUNDS, OZ_PROMPT_REPEAT (prompt
+//! length), OZ_TOKENS (decode length), OZ_VERIFY (verification cost by draft
+//! length instead of a generation run).
 
 fn env<T: std::str::FromStr>(k: &str) -> Option<T> {
     std::env::var(k).ok().and_then(|v| v.parse().ok())
@@ -38,6 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load = t.elapsed().as_secs_f64();
     println!("load {load:.1}s, {} of {} layers on gpu", engine.gpu_layers_used(), engine.n_layer());
 
+    if std::env::var("OZ_VERIFY").is_ok() {
+        let ks = [1usize, 2, 3, 4, 6, 8];
+        for (k, ms) in engine.probe_verify_cost(&opts, &ks, 9)? {
+            println!("verify k={k}: {ms:6.1} ms  ({:.1} ms per token)", ms / k as f64);
+        }
+        return Ok(());
+    }
     let repeat: usize = env("OZ_PROMPT_REPEAT").unwrap_or(60);
     let tokens: u32 = env("OZ_TOKENS").unwrap_or(96);
     let prompt = format!(

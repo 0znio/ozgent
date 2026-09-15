@@ -179,28 +179,6 @@ impl Debug for LlamaModelParams {
     }
 }
 
-/// The buffer type host-side tensors are placed in by an override.
-///
-/// The plain CPU buffer type by default. `OZ_PIN_EXPERTS` asks for the GPU's
-/// pinned host buffer instead, so transfers to the device skip CUDA's
-/// staging copy — at the cost of the tensors no longer being mmap-backed.
-fn host_side_buffer_type() -> llama_cpp_sys_2::ggml_backend_buffer_type_t {
-    if std::env::var("OZ_PIN_EXPERTS").is_ok() {
-        unsafe {
-            let gpu = llama_cpp_sys_2::ggml_backend_dev_by_type(
-                llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU,
-            );
-            if !gpu.is_null() {
-                let buft = llama_cpp_sys_2::ggml_backend_dev_host_buffer_type(gpu);
-                if !buft.is_null() {
-                    return buft;
-                }
-            }
-        }
-    }
-    unsafe { llama_cpp_sys_2::ggml_backend_cpu_buffer_type() }
-}
-
 impl LlamaModelParams {
     /// See [`KvOverrides`]
     ///
@@ -305,7 +283,7 @@ impl LlamaModelParams {
         }
 
         buft_override.pattern = key.as_ptr();
-        buft_override.buft = host_side_buffer_type();
+        buft_override.buft = unsafe { llama_cpp_sys_2::ggml_backend_cpu_buffer_type() };
 
         // set to null pointer for panic safety (as push may move the vector, invalidating the pointer)
         self.params.tensor_buft_overrides = null();
