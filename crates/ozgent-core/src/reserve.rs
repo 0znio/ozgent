@@ -65,6 +65,8 @@ fn prior_decode_bytes() -> u64 {
     PRIOR_DECODE_BYTES
 }
 
+const MIB: f64 = 1024.0 * 1024.0;
+
 /// How much to inflate the estimate while it is still young.
 ///
 /// A prediction from two observations should not be trusted like one from
@@ -88,7 +90,22 @@ pub struct Reserve {
     /// [`PRIOR_DECODE_BYTES`].
     #[serde(default = "prior_decode_bytes")]
     pub decode_bytes: u64,
+    /// The part of a context's scratch that does not scale with the window.
+    #[serde(default)]
+    pub constant_bytes: u64,
+    /// Exponentially decayed sums for fitting `constant + rate × work`:
+    /// count, Σx, Σy, Σx², Σxy, with x in millions of (context × batch)
+    /// elements and y in MiB.
+    #[serde(default)]
+    pub fit: [f64; 5],
+    /// Format of this record. Files older than [`VERSION`] learned their rate
+    /// by forcing every cost into it and are not trusted.
+    #[serde(default)]
+    pub version: u32,
 }
+
+/// See [`Reserve::version`].
+const VERSION: u32 = 2;
 
 impl Default for Reserve {
     fn default() -> Self {
@@ -97,6 +114,9 @@ impl Default for Reserve {
             rate: PRIOR_RATE,
             samples: 0,
             decode_bytes: PRIOR_DECODE_BYTES,
+            constant_bytes: 0,
+            fit: [0.0; 5],
+            version: VERSION,
         }
     }
 }
@@ -119,6 +139,12 @@ pub struct Shape {
     /// 262,144-token window still failed to allocate after being accounted
     /// for: 2.1 GB of mask predicted as 536 MB.
     pub n_batch: u32,
+    /// Scratch this particular model needs whatever the window, known from
+    /// its file rather than learned: with routed experts on the host, prefill
+    /// uploads one block's experts into the compute buffer. Kept out of the
+    /// learned figures because it belongs to the model, and learning it
+    /// globally is how one model's 339 MiB became every model's rate.
+    pub staging_bytes: u64,
 }
 
 impl Reserve {
@@ -131,7 +157,9 @@ impl Reserve {
     pub fn predict(&self, shape: Shape) -> u64 {
         let scaling = self.rate * Self::work(shape);
         let once = if shape.first_in_process { self.process_bytes as f64 } else { 0.0 };
-        ((once + scaling) * margin(self.samples)) as u64 + self.decode_bytes
+        ((once + self.constant_bytes as f64 + scaling) * margin(self.samples)) as u64
+            + shape.staging_bytes
+            + self.decode_bytes
     }
 
     /// Fold in what a first decode took beyond the context's reported buffers.
@@ -155,6 +183,9 @@ impl Reserve {
     /// carries no information, so it is dropped rather than averaged in.
     pub fn observe(&mut self, shape: Shape, overhead: u64) {
         let scaling = Self::work(shape);
+        // The model's own staging is known, so it is taken out before anything
+        // is learned from what is left.
+        let overhead = overhead.saturating_sub(shape.staging_bytes);
         // Each observation moves the estimate part of the way rather than
         // replacing it: one unusual load — a game starting mid-download, a
         // driver reporting late — should not throw the figure away.
@@ -162,19 +193,43 @@ impl Reserve {
         if shape.first_in_process {
             // This load paid for both, so the fixed part is whatever the
             // scaling part does not explain.
-            let implied = overhead as f64 - self.rate * scaling;
+            let implied = overhead as f64 - self.constant_bytes as f64 - self.rate * scaling;
             if implied > 0.0 {
                 self.process_bytes =
                     (self.process_bytes as f64 * (1.0 - weight) + implied * weight) as u64;
             }
         } else {
-            // Nothing fixed to pay, so all of it is the scaling part.
-            let implied = overhead as f64 / scaling;
-            if implied > 0.0 {
-                self.rate = self.rate * (1.0 - weight) + implied * weight;
-            }
+            // A constant and a rate, fitted together.
+            //
+            // Forcing the whole cost into the rate was wrong in a way that got
+            // worse with use: a context's scratch has a part that does not
+            // grow with the window, and an observation at a small window
+            // explains that part with an enormous rate. 339 MiB at 512 tokens
+            // is 339 bytes per element; averaged in, it took the rate from 20
+            // to 81, which then predicted 2.7 GB for a 16k window whose real
+            // buffer was 346 MiB — and opened that window at 512.
+            self.fit_point(scaling / 1e6, overhead as f64 / MIB);
         }
         self.samples = self.samples.saturating_add(1);
+    }
+
+    fn fit_point(&mut self, x: f64, y: f64) {
+        const KEEP: f64 = 0.9;
+        let [n, sx, sy, sxx, sxy] = self.fit.map(|v| v * KEEP);
+        let [n, sx, sy, sxx, sxy] = [n + 1.0, sx + x, sy + y, sxx + x * x, sxy + x * y];
+        self.fit = [n, sx, sy, sxx, sxy];
+        let mean_x = sx / n;
+        // Variance of the windows seen. Only once they are spread apart can a
+        // constant be told from a rate; until then the rate is held and the
+        // constant takes up whatever it does not explain.
+        let variance = sxx / n - mean_x * mean_x;
+        let rate_mib = if variance > 0.01 * mean_x.max(1.0).powi(2) {
+            ((n * sxy - sx * sy) / (n * n * variance)).max(0.0)
+        } else {
+            self.rate * 1e6 / MIB
+        };
+        self.rate = (rate_mib * MIB / 1e6).max(f64::MIN_POSITIVE);
+        self.constant_bytes = (((sy - rate_mib * sx) / n).max(0.0) * MIB) as u64;
     }
 
     /// Read what was learned on this machine, or start from the prior.
@@ -186,7 +241,7 @@ impl Reserve {
         std::fs::read_to_string(Self::path(paths))
             .ok()
             .and_then(|t| serde_json::from_str::<Self>(&t).ok())
-            .filter(|r| r.rate.is_finite() && r.rate > 0.0)
+            .filter(|r| r.version >= VERSION && r.rate.is_finite() && r.rate > 0.0)
             .unwrap_or_default()
     }
 
@@ -210,8 +265,8 @@ impl Reserve {
 mod tests {
     use super::*;
 
-    const SHAPE: Shape = Shape { first_in_process: true, ubatch: 512, n_embd: 2560, n_ctx: 32768, n_batch: 2048 };
-    const LATER: Shape = Shape { first_in_process: false, ubatch: 512, n_embd: 2560, n_ctx: 32768, n_batch: 2048 };
+    const SHAPE: Shape = Shape { first_in_process: true, ubatch: 512, n_embd: 2560, n_ctx: 32768, n_batch: 2048, staging_bytes: 0 };
+    const LATER: Shape = Shape { first_in_process: false, ubatch: 512, n_embd: 2560, n_ctx: 32768, n_batch: 2048, staging_bytes: 0 };
 
     #[test]
     fn a_later_model_is_not_charged_for_the_backend_again() {
@@ -248,6 +303,7 @@ mod tests {
             n_embd: 2560,
             n_ctx: 82_432,
             n_batch: 2048,
+            staging_bytes: 0,
         };
         let predicted = r.predict(measured) as f64;
         let actual = 3157.0 * 1024.0 * 1024.0;
@@ -348,6 +404,67 @@ mod tests {
         let old = r#"{"process_bytes":1,"rate":20.0,"samples":3}"#;
         let r: Reserve = serde_json::from_str(old).unwrap();
         assert_eq!(r.decode_bytes, PRIOR_DECODE_BYTES);
+    }
+
+
+    const MIB_U: u64 = 1024 * 1024;
+
+    #[test]
+    fn a_constant_cost_is_not_learned_as_a_rate() {
+        // GLM-4.7-Flash's compute buffer barely moves with the window — it is
+        // an upload of one block's experts. Read off llama.cpp: 339 MiB at 512
+        // tokens and 346 MiB at 16,384, with a 2048 batch.
+        let mut r = Reserve { samples: 100, ..Default::default() };
+        let small = Shape { n_ctx: 512, ..LATER };
+        let large = Shape { n_ctx: 16_384, ..LATER };
+        for _ in 0..6 {
+            r.observe(small, 339 * MIB_U);
+            r.observe(large, 346 * MIB_U);
+        }
+        let predicted = (r.predict(large) - r.decode_bytes) / MIB_U;
+        // The broken version predicted about 2.7 GB here and opened the window
+        // at 512 tokens.
+        assert!(predicted < 450, "predicted {predicted} MiB for a 346 MiB buffer");
+    }
+
+    #[test]
+    fn a_cost_that_does_scale_is_still_learned_as_one() {
+        let mut r = Reserve { samples: 100, rate: 1.0, ..Default::default() };
+        let small = Shape { n_ctx: 4096, ..LATER };
+        let large = Shape { n_ctx: 65_536, ..LATER };
+        let cost = |s: Shape| (20.0 * s.n_ctx as f64 * s.n_batch as f64) as u64;
+        for _ in 0..6 {
+            r.observe(small, cost(small));
+            r.observe(large, cost(large));
+        }
+        assert!((r.rate - 20.0).abs() < 2.0, "rate {}", r.rate);
+        assert!(r.constant_bytes < 16 * MIB_U, "constant {}", r.constant_bytes);
+    }
+
+    #[test]
+    fn a_models_staging_is_charged_to_that_model_only() {
+        let mut r = Reserve { samples: 100, ..Default::default() };
+        let moe = Shape { staging_bytes: 300 * MIB_U, ..LATER };
+        for _ in 0..6 {
+            r.observe(moe, 300 * MIB_U);
+        }
+        // Nothing of it is left in the figures every other model is sized by.
+        assert!(r.constant_bytes < MIB_U, "constant {}", r.constant_bytes);
+        // And the model that has it is still reserved for it.
+        assert!(r.predict(moe) >= 300 * MIB_U);
+    }
+
+    #[test]
+    fn a_reserve_learned_the_old_way_is_not_trusted() {
+        let dir = std::env::temp_dir().join(format!("ozgent-reserve-old-{}", std::process::id()));
+        let paths = crate::Paths::with_root(&dir);
+        let file = dir.join("cache").join("vram.json");
+        let _ = std::fs::create_dir_all(file.parent().unwrap());
+        std::fs::write(&paths.cache_dir().join("vram.json"),
+            r#"{"process_bytes":100820609,"rate":81.6,"samples":256,"decode_bytes":92882861}"#).unwrap();
+        let loaded = Reserve::load(&paths);
+        assert!((loaded.rate - PRIOR_RATE).abs() < 1e-9, "kept a polluted rate of {}", loaded.rate);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

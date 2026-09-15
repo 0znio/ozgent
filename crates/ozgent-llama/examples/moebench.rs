@@ -48,7 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ozgent_llama::backend::best_gpu().map(|d| d.memory_free as u64 / (1 << 20)).unwrap_or(0)
     };
     println!("free after load: {} MiB", free());
-    for round in 0..2 {
+    let rounds: usize = env("OZ_ROUNDS").unwrap_or(2);
+    for round in 0..rounds {
         let mut session = engine.session(&opts)?;
         println!("free after context: {} MiB", free());
         let (stats, _) = session.generate(&prompt, tokens, |_| true)?;

@@ -19,6 +19,8 @@ pub mod mtmd;
 pub mod mtp;
 pub mod nextn;
 pub mod ngram;
+#[cfg(feature = "llama")]
+pub mod pin;
 pub mod template;
 pub mod thinking;
 pub mod toolcall;

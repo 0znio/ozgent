@@ -378,7 +378,7 @@ fn string_key(gguf: *mut sys::gguf_context, key: &str) -> Option<String> {
 }
 
 /// Whether a per-block tensor name is a routed expert.
-fn is_routed_expert(tail: &str) -> bool {
+pub fn is_routed_expert(tail: &str) -> bool {
     // `_exps` marks the routed stack; `_shexp` marks the shared expert, which
     // is dense in practice and must not be evicted.
     matches!(

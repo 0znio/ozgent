@@ -43,6 +43,17 @@ fn sequences_for(slots: u32, want: Slots) -> u32 {
 /// Microseconds spent choosing tokens from logits, process-wide.
 pub static PICK_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The context parameters a probed scratch figure is valid for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScratchKey {
+    n_batch: u32,
+    ubatch: Option<u32>,
+    flash: bool,
+    kv_offload: bool,
+    sequences: u32,
+    unified: bool,
+}
+
 /// How many conversations a context should carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slots {
@@ -85,6 +96,13 @@ pub struct Engine {
     /// Layers whose routed experts were evicted to host memory. Non-zero
     /// means system RAM is holding weights, and is contended.
     cpu_moe_layers: u32,
+    /// This model's own compute scratch, measured once per set of context
+    /// parameters. See [`Engine::probed_reserve`].
+    scratch: std::sync::Mutex<Option<(ScratchKey, u64, f64)>>,
+    /// What prefill uploads into the compute buffer per micro-batch when
+    /// routed experts live on the host: the heaviest evicted block. Zero when
+    /// nothing is evicted. See `reserve::Shape::staging_bytes`.
+    staging_bytes: u64,
     /// True when the chat template wraps reasoning in `<think>` tags, i.e.
     /// this is a model that reasons unless told not to.
     reasoning: bool,
@@ -364,6 +382,18 @@ impl Engine {
             EngineError::Load { path: path.display().to_string(), reason }
         })?;
 
+        if std::env::var_os("OZ_PIN_MMAP").is_some() {
+            if let MoeOffload::Layers(n) = resolved_moe {
+                let t = std::time::Instant::now();
+                let bytes = crate::pin::pin_host_experts(path, n, resolved_tensors);
+                tracing::info!(
+                    "pinned {} MiB of host-side experts in place, in {:.1}s",
+                    bytes / (1 << 20),
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
+
         let template = model.chat_template(None).ok();
         let n_layer = model.n_layer();
 
@@ -446,6 +476,12 @@ impl Engine {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
             cpu_moe_layers: evicted_expert_layers,
+            scratch: std::sync::Mutex::new(None),
+            staging_bytes: if evicted_expert_layers > 0 || resolved_tensors > 0 {
+                layout.max_layer_expert_bytes
+            } else {
+                0
+            },
             reasoning,
             gen_prompt_tokens: Self::measure_generation_prompt(&model, &jinja, template.as_ref()),
             jinja,
@@ -800,6 +836,7 @@ impl Engine {
                                 shape.n_embd,
                                 window,
                                 shape.n_batch,
+                                shape.staging_bytes,
                             ),
                             measured,
                         );
@@ -911,13 +948,25 @@ impl Engine {
         // One budget, computed once, used both to choose how the cache is
         // stored and to size the window. See `choose_kv_split`.
         let host = ozgent_core::accel::available_host_memory();
-        let shape = crate::backend::reserve_shape(
-            opts.ubatch.unwrap_or(512),
-            self.model.n_embd() as u32,
-            requested,
-            opts.batch_size,
-        );
-        let reserve = crate::backend::reserve_for(shape);
+        let sequences = sequences_for(slots, want);
+        let unified = matches!(want, Slots::UpTo(_)) && sequences > 1;
+        let shape = ozgent_core::reserve::Shape {
+            // Free memory is read after the weights loaded, so whatever
+            // bringing the backend up cost has already been paid out of it.
+            // Charging it again here took 400 MB off every first window.
+            first_in_process: false,
+            ..crate::backend::reserve_shape(
+                opts.ubatch.unwrap_or(512),
+                self.model.n_embd() as u32,
+                requested,
+                opts.batch_size,
+                self.staging_bytes,
+            )
+        };
+        let total_window = if unified { requested } else { requested.saturating_mul(sequences) };
+        let reserve = self
+            .probed_reserve(backend, opts, sequences, unified, total_window)
+            .unwrap_or_else(|| crate::backend::reserve_for(shape));
         let budget = if opts.kv_offload {
             ozgent_core::accel::kv_budget_reserving(
                 free,
@@ -980,8 +1029,6 @@ impl Engine {
         // slice *and* splits every batch per stream, which a lone caller pays
         // for while using none of it: 44.5 tok/s against 46.8, and worse under
         // drafting, where every draft step pays it again.
-        let sequences = sequences_for(slots, want);
-        let unified = matches!(want, Slots::UpTo(_)) && sequences > 1;
         if !unified {
             // Each sequence gets a fixed slice, so the pool has to be that
             // many times larger — including one holding a shared prefix.
@@ -992,6 +1039,7 @@ impl Engine {
             self.model.n_embd() as u32,
             requested,
             opts.batch_size,
+            self.staging_bytes,
         );
 
         // Training context is a claim about which positions the model
@@ -1129,6 +1177,87 @@ impl Engine {
         // slice when it is not.
         let each = if unified { requested } else { (requested / sequences).max(1) };
         Ok((context, each, slots))
+    }
+
+    /// What this model's compute scratch will be at `window`, measured on
+    /// this model rather than predicted from others.
+    ///
+    /// A single learned rate cannot serve every model. Qwen3.5-4B needs 3.1 GB
+    /// of scratch at an 82,432-token window; GLM-4.7-Flash needs 346 MiB at
+    /// 16,384, nearly all of it one block's experts being uploaded, and almost
+    /// none of it growing with the window. A rate learned on the first sized
+    /// the second's 16k window at 512 tokens with 814 MiB free.
+    ///
+    /// So two small contexts are opened with the real parameters, llama.cpp's
+    /// own report of their compute buffers is read, and a constant and a
+    /// per-token rate are fitted through the two points. About a tenth of a
+    /// second, once per set of parameters, and then exact. `None` when a probe
+    /// cannot be opened, which leaves the learned estimate to answer.
+    fn probed_reserve(
+        &self,
+        backend: &'static LlamaBackend,
+        opts: &Resolved,
+        sequences: u32,
+        unified: bool,
+        window: u32,
+    ) -> Option<u64> {
+        let key = ScratchKey {
+            n_batch: opts.batch_size,
+            ubatch: opts.ubatch,
+            flash: opts.flash_attention,
+            kv_offload: opts.kv_offload,
+            sequences,
+            unified,
+        };
+        let cached = self.scratch.lock().ok()?.as_ref().filter(|(k, ..)| *k == key).map(|(_, c, r)| (*c, *r));
+        let (constant, per_token) = match cached {
+            Some(fit) => fit,
+            None => {
+                let flash = if opts.flash_attention {
+                    sys::LLAMA_FLASH_ATTN_TYPE_AUTO
+                } else {
+                    sys::LLAMA_FLASH_ATTN_TYPE_DISABLED
+                };
+                let value = if opts.flash_attention { CacheType::Q8_0 } else { CacheType::F16 };
+                let mut points = Vec::with_capacity(2);
+                for tokens in [1024u32, 4096] {
+                    let n_ctx = if unified { tokens } else { tokens * sequences };
+                    let mut p = LlamaContextParams::default()
+                        .with_n_ctx(NonZeroU32::new(n_ctx))
+                        .with_n_batch(opts.batch_size)
+                        .with_n_seq_max(sequences)
+                        .with_kv_unified(unified)
+                        .with_flash_attention_policy(flash)
+                        .with_op_offload(std::env::var("OZ_NO_OP_OFFLOAD").is_err())
+                        .with_offload_kqv(opts.kv_offload)
+                        .with_type_k(ggml_type(CacheType::Q8_0))
+                        .with_type_v(ggml_type(value));
+                    if let Some(n) = opts.ubatch {
+                        p = p.with_n_ubatch(n);
+                    }
+                    crate::llamalog::clear();
+                    let context = self.model.new_context(backend, p).ok()?;
+                    let buffers = crate::llamalog::compute_buffers();
+                    drop(context);
+                    if buffers == 0 {
+                        return None;
+                    }
+                    points.push((n_ctx as f64, buffers as f64));
+                }
+                let per_token = ((points[1].1 - points[0].1) / (points[1].0 - points[0].0)).max(0.0);
+                let constant = (points[0].1 - per_token * points[0].0).max(0.0) as u64;
+                tracing::debug!(
+                    "compute scratch for this model: {} MiB + {:.0} B per token",
+                    constant / (1 << 20),
+                    per_token
+                );
+                if let Ok(mut slot) = self.scratch.lock() {
+                    *slot = Some((key, constant, per_token));
+                }
+                (constant, per_token)
+            }
+        };
+        Some(constant + (per_token * window as f64) as u64 + crate::backend::decode_reserve())
     }
 
     /// One conversation with a cache of its own.

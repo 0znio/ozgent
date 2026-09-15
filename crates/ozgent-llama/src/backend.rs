@@ -505,6 +505,7 @@ pub fn reserve_shape(
     n_embd: u32,
     n_ctx: u32,
     n_batch: u32,
+    staging_bytes: u64,
 ) -> ozgent_core::reserve::Shape {
     ozgent_core::reserve::Shape {
         first_in_process: !BACKEND_UP.load(std::sync::atomic::Ordering::SeqCst),
@@ -512,6 +513,7 @@ pub fn reserve_shape(
         n_embd,
         n_ctx,
         n_batch,
+        staging_bytes,
     }
 }
 
@@ -649,7 +651,9 @@ impl Plan {
         // whatever llama.cpp allocates for itself. The second used to be a
         // percentage of the card; it is now a measured figure that scales
         // with the model rather than with the hardware.
-        let shape = reserve_shape(opts.ubatch.unwrap_or(512), layout.n_embd, window, opts.batch_size);
+        // Staging is added below, once it is known whether anything is evicted.
+        let shape =
+            reserve_shape(opts.ubatch.unwrap_or(512), layout.n_embd, window, opts.batch_size, 0);
         let overhead = ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
             + reserve_for(shape)
             + layout.fixed_gpu_bytes;
