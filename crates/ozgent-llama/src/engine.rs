@@ -2274,8 +2274,48 @@ impl<'a> Session<'a> {
         // 0.71 ms on device against a ~17.8 ms token budget, and exact on
         // Qwen3.5, whose cache refuses a partial trim outright.
         let by_trim = self.rollback_safe && self.can_trim;
+        // The model's own NextN head, when it has one and was asked for.
+        //
+        // Opt-in rather than part of `auto` for now. It drafts where n-grams
+        // cannot — ordinary prose, where they measured exactly zero — and the
+        // hidden states it needs cost nothing (48.4 tok/s against 49.0 with
+        // them on). But it is new, it writes into the cache the target is
+        // using, and the failure mode of getting that wrong is wrong output
+        // rather than an error. It earns `auto` by being measured, not by
+        // being plausible.
+        let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp) && !self.grammar_active {
+            match crate::mtp::MtpDrafter::new(
+                self.model,
+                backend()?,
+                &self.context,
+                self.context.n_ctx(),
+            ) {
+                Ok(Some(d)) => {
+                    // Unmasked, so a hidden state comes back for every position
+                    // the target decodes — including each verified draft.
+                    unsafe { crate::nextn::set_enabled(self.context.as_ptr(), true, false) };
+                    Some(d)
+                }
+                Ok(None) => {
+                    tracing::info!("this model has no nextn head; drafting from n-grams instead");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("nextn drafter unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // The hidden state of the last confirmed position, which is what the
+        // NextN head continues from. Carried between rounds because the
+        // drafting decision is made at the top of the loop and the state it
+        // needs was produced at the bottom of the previous one.
+        let mut mtp_hidden: Option<Vec<f32>> = None;
         let mut spec_on = !self.grammar_active
             && (drafter.is_some()
+                || mtp.is_some()
                 || matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto));
         let mut use_snapshot = spec_on && !by_trim;
         if use_snapshot && self.snapshot(false, true).is_err() {
@@ -2457,7 +2497,17 @@ impl<'a> Session<'a> {
                 let cap = budget
                     .min(room)
                     .min(n_batch.saturating_sub(1));
-                match drafter.as_mut() {
+                match (mtp.as_mut(), mtp_hidden.as_ref(), drafter.as_mut()) {
+                    // The model's own head. Like a draft model it proposes
+                    // from a distribution rather than from repetition, so it
+                    // needs neither the reach filter nor the probe shortening.
+                    (Some(m), Some(hidden), _) => {
+                        let want = (tuning.draft_tokens as usize)
+                            .min(room)
+                            .min(n_batch.saturating_sub(1));
+                        m.propose(pending, hidden, self.n_past, want)?
+                    }
+                    _ => match drafter.as_mut() {
                     // A draft model proposes from the whole distribution rather
                     // than from repetition, so it needs neither the reach
                     // filter nor the probe shortening — both exist to stop
@@ -2475,6 +2525,7 @@ impl<'a> Session<'a> {
                         .into_iter()
                         .map(LlamaToken)
                         .collect(),
+                    },
                 }
             } else {
                 Vec::new()
@@ -2543,10 +2594,28 @@ impl<'a> Session<'a> {
                 stats.proposed_drafts += draft.len();
             }
 
+            // The hidden state the next draft continues from, taken before
+            // `settle_draft` disturbs anything. Batch entry 0 is the confirmed
+            // token and 1..=accepted are the drafts that were kept, so the last
+            // confirmed position is exactly `accepted` — and `chosen`, about to
+            // become `pending`, is the token that follows it. Reading any other
+            // row drafts a continuation of the wrong position, which reads as
+            // fluent nonsense rather than as an error.
+            if mtp.is_some() {
+                let n_embd = self.model.n_embd() as usize;
+                mtp_hidden =
+                    unsafe { crate::nextn::embedding(self.context.as_ptr(), accepted as i32, n_embd) };
+            }
+
             self.settle_draft(
                 snapshot.as_ref(), start, pending, &draft, accepted, &mut batch, n_batch,
             )?;
             pending = chosen;
+        }
+        if mtp.is_some() {
+            // Left on, the next turn's prefill would emit a hidden state per
+            // prompt token for nobody.
+            unsafe { crate::nextn::set_enabled(self.context.as_ptr(), false, false) };
         }
 
         if think.spent() > 0 {

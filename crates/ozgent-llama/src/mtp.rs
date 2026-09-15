@@ -29,6 +29,38 @@ use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
 
 use crate::engine::EngineError;
 
+/// How sure the head must be to justify another forward pass.
+///
+/// Every proposal costs a decode of the NextN block, so a draft unlikely to be
+/// kept is not free the way an n-gram guess is. The first token is always
+/// proposed — the head has just been handed a fresh hidden state and its
+/// opinion there is the whole point — and each one after it has to earn its
+/// pass.
+///
+/// Swept on a 4B rather than chosen. Against 48 tok/s undrafted, on prose:
+///
+/// ```text
+/// ungated   41.1 tok/s   9 of 48 accepted
+/// 0.50      44.2         71 of 114
+/// 0.70      48.6         69 of 97
+/// 0.85      47.3         65 of 91
+/// 0.95      52.6         65 of 82
+/// ```
+///
+/// The pattern is not "accept more", it is "propose less". Every threshold
+/// above lands roughly the same number of tokens; what changes is how many
+/// passes were spent failing to. Ungated drafting was *slower* than no
+/// drafting at all.
+const MIN_CONFIDENCE: f32 = 0.95;
+
+/// The threshold in force, overridable while it is being tuned.
+fn min_confidence() -> f32 {
+    std::env::var("OZGENT_MTP_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MIN_CONFIDENCE)
+}
+
 /// A `llama_batch` carrying both a token and an embedding row per position.
 ///
 /// `llama_batch_init` allocates one or the other; the NextN graph needs both,
@@ -97,6 +129,7 @@ unsafe extern "C" {
 
 /// The model's NextN head, wired up to propose tokens.
 pub struct MtpDrafter<'a> {
+    min_confidence: f32,
     context: LlamaContext<'a>,
     batch: EmbdBatch,
     n_embd: usize,
@@ -135,6 +168,7 @@ impl<'a> MtpDrafter<'a> {
         // a hidden state back. The *target* is the one that must be unmasked.
         unsafe { crate::nextn::set_enabled(context.as_ptr(), true, true) };
         Ok(Some(Self {
+            min_confidence: min_confidence(),
             batch: EmbdBatch::new(1, n_embd),
             context,
             n_embd,
@@ -170,7 +204,20 @@ impl<'a> MtpDrafter<'a> {
                 tracing::debug!("mtp draft decode returned {rc} at step {step}");
                 break;
             }
-            let Some(next) = self.argmax() else { break };
+            let Some((next, confidence)) = self.argmax() else { break };
+            // Stop as soon as the head stops being sure.
+            //
+            // This is what separates a NextN drafter from an n-gram one. An
+            // n-gram proposal is a hash lookup and costs nothing, so proposing
+            // five to land one is free. Every NextN proposal is a forward pass
+            // through the block, so the same ratio is five times the cost for
+            // one token of benefit — measured, that made drafting *slower*
+            // than not drafting: 41.1 tok/s against 48.1, with 9 of 48
+            // proposals accepted. Drafting only while the head is confident
+            // spends the passes where they are likely to be kept.
+            if confidence < self.min_confidence && !drafted.is_empty() {
+                break;
+            }
             drafted.push(next);
 
             // Chain: the head's own hidden state feeds the next step.
@@ -200,8 +247,11 @@ impl<'a> MtpDrafter<'a> {
         Ok(drafted)
     }
 
-    /// The most likely token from the last decode.
-    fn argmax(&self) -> Option<LlamaToken> {
+    /// The most likely token from the last decode, and how sure the head is.
+    ///
+    /// Confidence is the softmax probability of the chosen token, which is
+    /// what decides whether another forward pass is worth spending.
+    fn argmax(&self) -> Option<(LlamaToken, f32)> {
         // SAFETY: a decode requesting logits at index 0 just succeeded, so the
         // row exists and is `n_vocab` wide.
         let logits = unsafe { sys::llama_get_logits_ith(self.context.as_ptr(), 0) };
@@ -215,6 +265,11 @@ impl<'a> MtpDrafter<'a> {
                 best = i;
             }
         }
-        Some(LlamaToken(best as i32))
+        // Softmax over the row, shifted by the maximum so the exponentials
+        // cannot overflow. Only the chosen token's share is wanted.
+        let top = row[best];
+        let total: f32 = row.iter().map(|v| (v - top).exp()).sum();
+        let confidence = if total > 0.0 { 1.0 / total } else { 0.0 };
+        Some((LlamaToken(best as i32), confidence))
     }
 }
