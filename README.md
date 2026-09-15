@@ -269,6 +269,15 @@ There is no maximum count, because every count is wrong for somebody: a 64 GB
 card holding ten models is fine. When the next one does not fit, ozgent
 offloads what does, and drops models nobody is using before it drops layers.
 
+One model answers **several conversations at once**, sharing a forward pass
+between them rather than queueing. Measured on a 4B model, four callers asking
+together finished in 4.0s where they used to take 8.3s one after another — 101
+tokens a second across them against 46 — and a single caller is unchanged. The
+prefix every conversation starts with, your system prompt and tool schemas, is
+held once and lent to each new conversation instead of being prefilled again:
+on a 2,260-token preamble that is 2,269 prompt tokens down to 9, and a first
+reply in 0.64s instead of 3.5s. Neither needs turning on.
+
 It holds **no model at all** until something asks it a question, and drops it
 again after fifteen idle minutes — a 4B model at Q4 is around 3 GB, and holding
 it overnight for one morning brief is 3 GB of nothing. Freed memory is returned
@@ -347,6 +356,23 @@ tool calls, reasoning and embeddings all work, and so do agents — `@name` in a
 message, or picked as the model. `ozgent web` serves the same API on its own
 port, over the model it already has loaded.
 → [docs/api.md](docs/api.md)
+
+### Models larger than your card
+
+A mixture-of-experts model keeps most of its weight in routed experts that any
+one token barely touches. `--cpu-moe` leaves those in system RAM and keeps
+attention on the GPU:
+
+```bash
+ozgent chat big-moe --cpu-moe       # every routed expert on the host
+ozgent chat big-moe --cpu-moe=16    # only the first 16 layers'
+```
+
+It trades a memory wall for a bandwidth cost — the model stops being bounded by
+VRAM and starts being bounded by how fast your RAM reads. This is the setting
+that makes a model *possible* rather than fast; if a smaller quantisation fits
+on the card outright, that will be quicker. In the web interface it is
+**Settings → CPU MoE layers**.
 
 ### Context sized to your hardware
 

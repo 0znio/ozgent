@@ -47,10 +47,12 @@ worse than saying so.
 | `--no-tools` | `tools` | `tools` | whether the model may call tools |
 | `--inference-mode` | `mode` | `inference_mode` | `gpu`, `gpu_ram`, or `ram` |
 | `--no-kv-offload` | `kv` | `kv_offload` | keep the KV cache in RAM, not VRAM |
+| `--cpu-moe[=N]`, `--cmoe` | — | `cpu_moe` | keep a mixture-of-experts model's routed experts in system RAM |
+| `--spec` | — | `speculative = { kind = "ngram" }` | speculative decoding: `auto`, `off`, `ngram`, `mtp` |
 
-Loading settings — `--gpu-layers`, `--no-gpu`, `--cpu-moe`, `--cache-type`,
-`--control-vector` — are in `ozgent --help`. They differ in one way that
-matters below.
+The rest of the loading settings — `--gpu-layers`, `--no-gpu`,
+`--cache-type`, `--control-vector`, `--ubatch`, `--batch-size` — are in
+`ozgent --help`. They differ in one way that matters below.
 
 ## The default model
 
@@ -149,6 +151,81 @@ cache buys nothing.
 
 Cheaper to try first: quantise the cache (`--cache-type q4_0`), or close
 whatever else is using the card.
+
+### Running a model far larger than the card
+
+A mixture-of-experts model keeps most of its weight in routed experts that any
+one token barely touches. `--cpu-moe` leaves those in system RAM and keeps
+attention on the GPU, which turns "will not fit" into "will run":
+
+```bash
+ozgent chat big-moe --cpu-moe          # every routed expert on the host
+ozgent chat big-moe --cpu-moe=16       # only the first 16 layers' experts
+ozgent web --cpu-moe                   # same flag on the daemon
+```
+
+The value needs an `=` when you give one — `--cpu-moe=16`, not `--cpu-moe 16`
+— because the flag is also valid bare. `--cmoe` is the short spelling.
+
+Bare offloads every routed expert and pins the rest of the model to the GPU,
+which is the setting for a model that has no chance of fitting otherwise. A
+number offloads the first N layers' experts and leaves the rest on the card,
+which is what you want when it *nearly* fits: move only as much as you must.
+Start bare, then walk the number down until it stops fitting.
+
+What it costs is bandwidth. Experts are a small fraction of the work per token
+and a large fraction of the bytes, so the model stops being bounded by VRAM and
+starts being bounded by how fast your system RAM can be read. Expect tokens per
+second in the low single digits on a desktop, not tens — this is the setting
+that makes a model *possible*, not fast. If a smaller quantisation of the same
+model fits on the card outright, that will be faster.
+
+In the web interface it is **Settings → the model → CPU MoE layers**, which
+takes `auto`, `off`, `all`, or a number. Like context length and cache types it
+is a loading setting, so the page says the model reloads on your next message.
+
+Speculative decoding is `auto` unless set, which means n-grams where the model
+has no head of its own. `mtp` drafts from a multi-token-prediction head when the
+model carries one; it is opt-in because whether it pays depends on the
+architecture. On a model whose layers are mostly recurrent it does not — a pass
+carrying two tokens costs nearly two passes there, so there is nothing for an
+accepted draft to save. The web interface has no field for this one; it is a
+flag or a `config.toml` entry.
+
+### Answering several conversations at once
+
+One model answers several conversations at the same time, sharing a forward
+pass between them rather than queueing. Nothing needs to be turned on; the cap
+is `parallel` under `[web]` in `config.toml`:
+
+```toml
+[web]
+parallel = 4      # the default
+```
+
+It is an upper bound, not a promise. Slots are only opened while memory holds
+them, so a card with room for one conversation answers one however high this is
+set — raising it never shortens anybody's context.
+
+Measured on a 4B model, four callers asking at once:
+
+| | one slot | four slots |
+|---|---|---|
+| a single caller | 46.8 tok/s | 46.3 tok/s |
+| four callers | 8.3s | 4.0s |
+| four callers, together | 46 tok/s | 101 tok/s |
+
+Two things follow from how it works. A conversation goes back to the slot
+holding its cache, so a follow-up is not re-read from cold. And the prefix every
+conversation begins with — your system prompt, the tool schemas — is held once
+and lent to each new conversation rather than prefilled again: on a
+2,260-token preamble that is 2,269 prompt tokens down to 9, and the first reply
+in 0.64s instead of 3.5s. Neither has a setting; both are simply on.
+
+The one thing a slot costs is speculative decoding on models that need to undo a
+rejected draft by snapshotting their whole state — those need a context to
+themselves. On short replies that is worth about 0.16s a turn. If you are the
+only person using this machine and you want that back, set `parallel = 1`.
 
 A window cut for a different reason says so instead:
 

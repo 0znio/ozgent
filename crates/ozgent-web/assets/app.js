@@ -2061,6 +2061,7 @@ const PARAMS = [
   { key: "cache_type_v",   label: "Value cache",     type: "select", options: ["", "auto", "f16", "q8_0", "q5_1", "q4_0"] },
   { key: "thinking",       label: "Reasoning",       type: "select", options: ["", "auto", "on", "off"] },
   { key: "flash_attention",label: "Flash attention", type: "select", options: ["", "true", "false"] },
+  { key: "prefix_reuse",   label: "Prefix reuse",    type: "select", options: ["", "longest", "off"] },
   { key: "tools",          label: "Tools",           type: "select", options: ["", "true", "false"] },
 ];
 

@@ -98,13 +98,6 @@ fn note_buffer(line: &str) {
     }
 }
 
-/// What the recurrent-state cache cost, as llama.cpp reported it.
-///
-/// Scales with `1 + n_rs_seq`, so one observation prices a rollback snapshot.
-pub fn rs_buffers() -> u64 {
-    RS_BYTES.lock().map(|b| *b).unwrap_or(0)
-}
-
 /// Route llama.cpp's output into the ring rather than onto stderr.
 pub fn capture() {
     // SAFETY: the callback holds no borrowed state and takes no user data.
