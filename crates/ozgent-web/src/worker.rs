@@ -489,6 +489,68 @@ pub fn release_memory() {
 
 /// Load one model and serve jobs against it until a different one is asked
 /// for, returning that job so the caller can load its model.
+/// A fingerprint of each prefix of a conversation.
+///
+/// `marks[i]` identifies `messages[..=i]`, so two turns of the same
+/// conversation agree on every mark up to where they diverge. That is what
+/// lets a follow-up be sent back to the slot whose cache already holds its
+/// history: the slot records the fingerprint of the messages it answered, and
+/// the next turn finds that same value among its own marks.
+fn prefix_marks(messages: &[Message]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut running = std::collections::hash_map::DefaultHasher::new();
+    let mut marks = Vec::with_capacity(messages.len());
+    for message in messages {
+        // Hashed field by field rather than through `Hash`, because what
+        // matters is what reaches the model: the role, the text, and the tool
+        // traffic that is rendered into the prompt beside it.
+        (message.role as u8).hash(&mut running);
+        for part in &message.content {
+            if let ozgent_core::Part::Text { text } = part {
+                text.hash(&mut running);
+            }
+        }
+        message.thinking.hash(&mut running);
+        for call in &message.tool_calls {
+            call.name.hash(&mut running);
+            call.arguments.to_string().hash(&mut running);
+        }
+        message.tool_call_id.hash(&mut running);
+        marks.push(running.clone().finish());
+    }
+    marks
+}
+
+/// Which slot should answer a turn whose prefixes are `marks`.
+///
+/// A conversation wants the slot whose cache already holds its history:
+/// sending a follow-up anywhere else costs a cold prefill, measured at 1.32 s
+/// a turn against 0.33 s when it goes back where it came from.
+///
+/// But a cache match must not beat an idle slot. Waiting for the matching
+/// slot to finish what it is doing costs a whole turn, where re-prefilling
+/// somewhere free costs a fraction of one — and preferring the match
+/// regardless piled two requests onto one slot while another sat empty, worth
+/// 1.56x against 2.19x with four callers. So free comes first, and the cache
+/// match decides between the slots that are free.
+fn route(marks: &[u64], served: &[u64], depth: &[usize]) -> usize {
+    let reach = |slot: usize| marks.iter().rposition(|m| *m == served[slot]);
+    (0..served.len())
+        .min_by_key(|&slot| {
+            (
+                // Free before busy, but no finer than that: a slot with three
+                // turns queued is not meaningfully worse than one with two.
+                depth[slot].min(1),
+                // Then the deepest cache match.
+                std::cmp::Reverse(reach(slot)),
+                // Then the shortest queue, then a stable choice.
+                depth[slot],
+                slot,
+            )
+        })
+        .unwrap_or(0)
+}
+
 fn serve_model(
     paths: &Paths,
     shared: &SharedConfig,
@@ -621,12 +683,20 @@ fn serve_model(
     member.working(false);
     let mmproj = found.manifest.projector_path(&found.dir);
 
-    // Requests the dispatcher has accepted and a slot has not yet taken.
-    // Whichever slot is free takes the next one; a slot blocked inside `recv`
-    // holds the lock only until something arrives, so the handoff is ordered
-    // without anybody polling.
-    let (work_tx, work_rx) = channel::<Box<Request>>();
-    let work_rx = std::sync::Mutex::new(work_rx);
+    // A queue per slot rather than one shared one, so a conversation can be
+    // sent back to the slot holding its cache. See `route`.
+    let mut work_tx = Vec::with_capacity(slots);
+    let mut work_rx = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        let (tx, rx) = channel::<Box<Request>>();
+        work_tx.push(tx);
+        work_rx.push(std::sync::Mutex::new(Some(rx)));
+    }
+    // What each slot last answered, and how much is waiting for it.
+    let served: Vec<std::sync::atomic::AtomicU64> =
+        (0..slots).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let depth: Vec<std::sync::atomic::AtomicUsize> =
+        (0..slots).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
     // How many slots are mid-answer. The pool's busy flag is one bit for the
     // whole model, so it is set when the first slot starts and cleared when
     // the last finishes — clearing it per slot would offer the model up for
@@ -639,7 +709,9 @@ fn serve_model(
 
     std::thread::scope(|scope| {
         for (i, mut session) in sessions.into_iter().enumerate() {
-            let (work_rx, busy, handback, stopping) = (&work_rx, &busy, &handback, &stopping);
+            let rx_mine = work_rx[i].lock().unwrap().take().expect("one receiver per slot");
+            let (busy, handback, stopping) = (&busy, &handback, &stopping);
+            let (served, depth) = (&served, &depth);
             let (engine, resolved, found, mmproj) = (&engine, &resolved, &found, &mmproj);
             std::thread::Builder::new()
                 .name(format!("ozgent-slot-{i}"))
@@ -650,8 +722,7 @@ fn serve_model(
                     // the cache of whichever session is using it.
                     let mut projector: Option<crate::worker::LoadedProjector<'_>> = None;
                     loop {
-                        let next = work_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(request) = next else { return };
+                        let Ok(request) = rx_mine.recv() else { return };
 
                         // Each request brings its own sampling. Re-resolving per
                         // turn is what keeps two clients on one model from
@@ -734,6 +805,20 @@ fn serve_model(
                         if let Err(e) = outcome {
                             let _ = request.out.send(Event::Error { message: e.to_string() });
                         }
+                        // Counted down here rather than on receipt, because
+                        // what `route` needs to know is how much work a slot
+                        // still has — not how much is sitting in its channel.
+                        // Decrementing on `recv` made every slot look idle the
+                        // instant it was handed something, so four concurrent
+                        // requests all went to slot zero and queued: 1.24x
+                        // where spreading them gives 2.19x.
+                        depth[i].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        // Remembered so the next turn of this conversation
+                        // comes back here, where its history is already cached.
+                        served[i].store(
+                            prefix_marks(&request.messages).last().copied().unwrap_or(0),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         // A turn that ended while a question was outstanding
                         // leaves nobody to answer it; the card is gone from the
                         // page with the stream.
@@ -750,7 +835,14 @@ fn serve_model(
         let mut queued = Some(first);
         loop {
             if let Some(request) = queued.take() {
-                if work_tx.send(request).is_err() {
+                let marks = prefix_marks(&request.messages);
+                let seen: Vec<u64> =
+                    served.iter().map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).collect();
+                let waiting: Vec<usize> =
+                    depth.iter().map(|d| d.load(std::sync::atomic::Ordering::SeqCst)).collect();
+                let slot = route(&marks, &seen, &waiting);
+                depth[slot].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if work_tx[slot].send(request).is_err() {
                     break;
                 }
             }
@@ -806,10 +898,57 @@ fn serve_model(
             }
         }
         // Ends every slot's `recv`, so the scope can join them.
-        drop(work_tx);
+        work_tx.clear();
     });
 
     Ok(handback.into_inner().unwrap_or_else(|e| e.into_inner()))
+}
+
+#[cfg(test)]
+mod routing {
+    use super::route;
+
+    #[test]
+    fn a_follow_up_goes_back_to_the_slot_that_answered_it() {
+        // Slot 1 answered a conversation whose last mark was 77; this turn
+        // extends it, so 77 is one of its marks.
+        let marks = [11, 77, 99];
+        assert_eq!(route(&marks, &[5, 77, 6], &[0, 0, 0]), 1);
+    }
+
+    #[test]
+    fn an_idle_slot_beats_a_busy_match() {
+        // Slot 0 holds the history but is mid-turn. Waiting for it costs a
+        // whole turn; re-prefilling on slot 2 costs part of one.
+        let marks = [11, 77];
+        assert_eq!(route(&marks, &[77, 5, 6], &[1, 1, 0]), 2);
+    }
+
+    #[test]
+    fn the_deepest_match_wins_among_free_slots() {
+        // Both slots know this conversation; slot 1 knows more of it.
+        let marks = [11, 77, 99];
+        assert_eq!(route(&marks, &[11, 99, 5], &[0, 0, 0]), 1);
+    }
+
+    #[test]
+    fn with_nothing_to_match_the_work_is_spread() {
+        let marks = [1, 2];
+        assert_eq!(route(&marks, &[0, 0, 0], &[1, 0, 0]), 1);
+        assert_eq!(route(&marks, &[0, 0, 0], &[1, 1, 0]), 2);
+        assert_eq!(route(&marks, &[0, 0, 0], &[2, 1, 3]), 1);
+    }
+
+    #[test]
+    fn everything_busy_falls_back_to_the_match() {
+        let marks = [11, 77];
+        assert_eq!(route(&marks, &[5, 77, 6], &[1, 2, 1]), 1);
+    }
+
+    #[test]
+    fn one_slot_is_always_a_valid_answer() {
+        assert_eq!(route(&[1], &[0], &[3]), 0);
+    }
 }
 
 /// Why an embedding request cannot be served.
