@@ -301,3 +301,39 @@ answer from what it has — and to say what is missing rather than invent it.
 A turn that ends without answering is asked once more. A model can close its
 reasoning and stop without either answering or calling anything, and the reply
 would otherwise be an empty string.
+
+## Why the tool list does not change per turn
+
+A recurring suggestion is to send only the schemas a request seems to need —
+"dynamic tool-schema injection" — on the grounds that eight schemas are a lot
+of tokens to carry every time. They are: measured on a 4B, the eight built-in
+tools cost **782 prompt tokens**, and `fetch_url` and `web_search` alone spend
+366 and 394 characters on their descriptions.
+
+Sending fewer would make things **slower**, not faster.
+
+The schemas sit at the front of the prompt, which is exactly the part
+[prefix reuse](daemon.md) already serves from the cache. They are paid for once
+per conversation and are free after that. Narrowing them changes the prefix, so
+the whole conversation behind it has to be prefilled again. Measured, same
+conversation, four turns:
+
+| turn | tools offered | prompt tokens | served from cache | prefill |
+|---|---|---|---|---|
+| 1 | all 8 | 802 | 0 | 434 ms |
+| 2 | all 8 | 38 | 797 | 100 ms |
+| 3 | **narrowed to 3** | 521 | **0** | 298 ms |
+| 4 | all 8 again | 5 | 830 | 42 ms |
+
+Turn 3 saved about 470 tokens of schema and paid 200 ms for it. Turn 4 is the
+tell: going back to the full list cost almost nothing, because that prefix was
+still held.
+
+So the tool list is deliberately stable. The cost worth attacking is the *cold*
+one — the first turn of a conversation — and that is a matter of writing
+shorter descriptions, not of choosing different tools each turn.
+
+The same reasoning explains something that looks like a bug and is not: an
+[agent](agents.md) with a narrower tool list pays a full prefill when it takes
+over. Its prefix genuinely is different — different tools, different system
+prompt — and there is nothing to reuse.
