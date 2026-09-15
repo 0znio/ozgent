@@ -100,6 +100,81 @@ const PROBE_DRAFT_TOKENS: usize = 3;
 const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
 
 impl Engine {
+    /// Time N sequences advanced one token, batched together against decoded
+    /// apart.
+    ///
+    /// The measurement the batching decision rests on. Weights are read once
+    /// per forward pass regardless of how many sequences ride along, so in
+    /// principle N callers cost about what one costs — but only while the card
+    /// still has work to spare at a batch of one. On a small model and a busy
+    /// GPU the ratio collapses to 1.0 and batching is not worth restructuring
+    /// the daemon for.
+    ///
+    /// Returns milliseconds for the batched decode and for the separate ones.
+    pub fn probe_batched_decode(
+        &self,
+        sequences: usize,
+        n_seq_max: u32,
+        rounds: usize,
+    ) -> Result<(f64, f64), EngineError> {
+        let backend = backend()?;
+        let params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(2048))
+            .with_n_seq_max(n_seq_max)
+            .with_n_batch(n_seq_max.max(32))
+            .with_n_threads(8)
+            .with_n_threads_batch(8);
+        let mut context = self
+            .model
+            .new_context(backend, params)
+            .map_err(|e| EngineError::Context(e.to_string()))?;
+
+        // Give every sequence one real token so the caches are not empty.
+        let seed = self
+            .model
+            .str_to_token("The", AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
+        let mut batch = LlamaBatch::new(n_seq_max as usize * 4, n_seq_max as i32);
+        for seq in 0..sequences {
+            batch.clear();
+            for (i, t) in seed.iter().enumerate() {
+                batch
+                    .add(*t, i as i32, &[seq as i32], i + 1 == seed.len())
+                    .map_err(|e| EngineError::Batch(e.to_string()))?;
+            }
+            context.decode(&mut batch).map_err(|e| EngineError::Decode(e.to_string()))?;
+        }
+        let base = seed.len() as i32;
+
+        // Together: one batch carrying a token for every sequence.
+        let together = std::time::Instant::now();
+        for round in 0..rounds {
+            batch.clear();
+            for seq in 0..sequences {
+                batch
+                    .add(seed[0], base + round as i32, &[seq as i32], true)
+                    .map_err(|e| EngineError::Batch(e.to_string()))?;
+            }
+            context.decode(&mut batch).map_err(|e| EngineError::Decode(e.to_string()))?;
+        }
+        let together = together.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+        // Apart: one batch per sequence, which is what the daemon does now.
+        let apart = std::time::Instant::now();
+        for round in 0..rounds {
+            for seq in 0..sequences {
+                batch.clear();
+                batch
+                    .add(seed[0], base + rounds as i32 + round as i32, &[seq as i32], true)
+                    .map_err(|e| EngineError::Batch(e.to_string()))?;
+                context.decode(&mut batch).map_err(|e| EngineError::Decode(e.to_string()))?;
+            }
+        }
+        let apart = apart.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+        Ok((together, apart))
+    }
+
     /// Load a GGUF file with the given resolved settings.
     pub fn load(path: &Path, opts: &Resolved) -> Result<Self, EngineError> {
         Self::load_reporting(path, opts, |_| {})
