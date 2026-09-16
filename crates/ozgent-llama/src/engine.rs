@@ -601,6 +601,14 @@ impl Engine {
     /// Falling back to a generic format when the GGUF has no template is worse
     /// than it sounds — the model will not recognise the turn markers — so the
     /// fallback is deliberately plain and the caller is told.
+    /// The tokens a prompt becomes, for a caller that needs to compare two of
+    /// them rather than decode one.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<LlamaToken>, EngineError> {
+        self.model
+            .str_to_token(text, AddBos::Always)
+            .map_err(|e| EngineError::Tokenize(e.to_string()))
+    }
+
     pub fn render_prompt(&self, messages: &[Message]) -> Result<String, EngineError> {
         self.render_prompt_with(messages, ozgent_core::ThinkingMode::Auto, Default::default())
     }
@@ -1792,6 +1800,29 @@ pub struct Session<'a> {
 unsafe impl Send for Session<'_> {}
 
 impl<'a> Session<'a> {
+    /// Hold `prefix` as the shared prefix before any turn asks for it.
+    ///
+    /// The commons is normally discovered: two prompts arrive, their common
+    /// head is noticed, and the third turn onwards borrows it. That works, and
+    /// it means the first turn of every conversation prefills the system
+    /// prompt and tool schemas in full — measured at 1665 ms for 2818 tokens
+    /// on a 4B — and the second turn pays the same again to fill the commons
+    /// itself. A caller that already knows what the stable head is does not
+    /// have to wait to be shown it twice.
+    ///
+    /// Returns how many tokens are now held, or zero when the prefix is too
+    /// short to be worth a sequence.
+    pub fn prewarm_commons(&self, prefix: &[LlamaToken]) -> Result<usize, EngineError> {
+        if !self.slot.hub().wants_commons(prefix.len()) {
+            return Ok(0);
+        }
+        self.slot
+            .hub()
+            .fill_commons(prefix)
+            .map_err(|e| EngineError::Decode(e.to_string()))?;
+        Ok(prefix.len())
+    }
+
     pub fn n_ctx(&self) -> u32 {
         self.n_ctx
     }

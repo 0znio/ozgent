@@ -677,6 +677,21 @@ fn serve_model(
         if slots == 1 { "" } else { "s" },
         sessions.first().map(|s| s.n_ctx()).unwrap_or(0),
     );
+    // The system prompt and tool schemas are the same on every turn, and they
+    // are most of the prompt: 2822 tokens against a user message of twenty.
+    // Held once here, every conversation borrows them for the cost of a cache
+    // copy instead of prefilling them itself.
+    //
+    // Done now rather than on the first turn because the model is loading
+    // anyway and nobody is waiting on a token yet. Left to discover itself,
+    // the shared prefix cannot exist until a second prompt has arrived to be
+    // compared against the first, so the first turn of every conversation
+    // prefills it in full and the second turn prefills it *again* to fill the
+    // commons -- 1665 ms and 1595 ms, measured, on a 4B that fits on the card.
+    if let Some(first) = sessions.first() {
+        prewarm(&engine, first, tools, &resolved);
+    }
+
     // Registered busy so nothing evicts it mid-load; it is loaded now, and the
     // turn loop below takes the flag again for each answer. Without this a
     // model would stay marked busy for ever and never become evictable.
@@ -1333,6 +1348,49 @@ fn run_agents(
 
 /// The built-in tools a plain turn offers, or `None` after reporting that the
 /// request named one that does not exist.
+/// Prefill the part of the prompt every turn repeats, before any turn asks.
+///
+/// The stable head is not guessed at: two prompts are rendered that differ
+/// only in the user's words, and their common run of tokens *is* the head, by
+/// construction. Anything that varies -- the message, the date, a per-turn
+/// instruction -- differs between the two and falls outside it. That matters
+/// more than saving the render: a prefix that is merely *probably* shared is a
+/// cache other conversations would borrow while describing something else.
+///
+/// A conversation offered a different set of tools simply will not match this
+/// prefix and prefills its own, which is what happens today for every
+/// conversation.
+fn prewarm(
+    engine: &Engine,
+    session: &ozgent_llama::engine::Session<'_>,
+    tools: &SharedTools,
+    resolved: &ozgent_core::options::Resolved,
+) {
+    let Some(t) = current_tools(tools) else { return };
+    let native_tools = engine.template_handles_tools();
+    let specs = t.host.tools().to_vec();
+    if specs.is_empty() {
+        return;
+    }
+    let render = |text: &str| {
+        let mut messages = vec![Message::user(text)];
+        prepare(&mut messages, &specs, native_tools, None, &[], None);
+        let prompt = engine
+            .render_prompt_full(&messages, resolved.thinking, resolved.reasoning_effort, &specs)
+            .ok()?;
+        engine.tokenize(&prompt).ok()
+    };
+    // Deliberately different lengths as well as different words, so a template
+    // that pads or counts cannot make the two agree past the head.
+    let (Some(a), Some(b)) = (render("a"), render("something else entirely")) else { return };
+    let shared = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    match session.prewarm_commons(&a[..shared]) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("holding the {n} tokens every conversation starts with"),
+        Err(e) => tracing::warn!("the shared prefix could not be held: {e}"),
+    }
+}
+
 fn offer(tools: Option<&Tools>, request: &Request) -> Option<Vec<ozgent_core::ToolSpec>> {
     let Some(t) = tools.filter(|_| request.tools_enabled) else { return Some(Vec::new()) };
     let mut out: Vec<ozgent_core::ToolSpec> = match &request.native_tools {

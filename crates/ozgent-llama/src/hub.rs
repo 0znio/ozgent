@@ -333,6 +333,21 @@ impl<'a> Hub<'a> {
         Some(prompt[..shared].to_vec())
     }
 
+    /// Whether a prefix of `len` tokens is worth holding, and nothing is
+    /// holding one yet.
+    ///
+    /// The discovery path asks this through [`consider`]; a caller that knows
+    /// the prefix up front asks it directly.
+    ///
+    /// [`consider`]: Hub::consider
+    pub fn wants_commons(&self, len: usize) -> bool {
+        if !self.has_commons || len < MIN_COMMONS {
+            return false;
+        }
+        let c = self.commons.lock().unwrap();
+        !c.filling && c.tokens.is_empty()
+    }
+
     /// Publish what the commons sequence now holds, or give up on filling it.
     pub fn filled(&self, tokens: Vec<LlamaToken>) {
         let mut c = self.commons.lock().unwrap();
