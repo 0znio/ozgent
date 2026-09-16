@@ -685,10 +685,30 @@ impl Plan {
         // percentage of the card; it is now a measured figure that scales
         // with the model rather than with the hardware.
         // Staging is added below, once it is known whether anything is evicted.
+        //
+        // The micro-batch must be the one the *context* will choose, not the
+        // default. `Engine::open` takes the wider batch whenever it costs no
+        // window, and scratch scales with it; planning the weights against the
+        // narrow one and then opening the wide one spends the difference out
+        // of the cache's budget, which is exactly the memory this reserve
+        // exists to protect.
+        let planned_batch = match opts.ubatch {
+            Some(n) => n,
+            None => opts.batch_size.max(crate::engine::WIDE_BATCH),
+        };
         let shape =
-            reserve_shape(opts.ubatch.unwrap_or(512), layout.n_embd, window, opts.batch_size, 0);
+            reserve_shape(planned_batch, layout.n_embd, window, planned_batch.max(opts.batch_size), 0);
+        // `decode_reserve` is the memory llama.cpp turns out to want on its
+        // first decode — lazily created cuBLAS workspaces and pool growth —
+        // and it is charged at context-open time whatever happens here. Left
+        // out of the placement decision, the weights are laid down as though
+        // it did not exist and the cache pays for it instead. Measured on a
+        // 23B MoE with four conversations: the plan left 15 MiB of an 8 GB
+        // card free, the 32k window asked for collapsed to 578 tokens, and a
+        // turn carrying tool schemas no longer fitted in its own context.
         let overhead = ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
             + reserve_for(shape)
+            + decode_reserve()
             + layout.fixed_gpu_bytes;
         let place = |overhead: u64| {
             resolve_auto(

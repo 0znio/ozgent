@@ -47,7 +47,7 @@ fn sequences_for(slots: u32, want: Slots) -> u32 {
 /// of candidates: llama.cpp's own default either side of it, and a wider one
 /// still would cost more scratch than the window can spare on a card this
 /// size. It is only ever taken when it costs no context.
-const WIDE_BATCH: u32 = 1024;
+pub(crate) const WIDE_BATCH: u32 = 1024;
 
 /// Microseconds spent choosing tokens from logits, process-wide.
 pub static PICK_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2132,6 +2132,29 @@ impl<'a> Session<'a> {
         Ok(LlamaToken(best as i32))
     }
 
+    /// The logits of the last decode on this session, as a row.
+    ///
+    /// [`Self::greedy_from_logits`] answers "which token", which is all a
+    /// probe needs. A turn needs the row itself, because the sampler — its
+    /// temperature, its penalties, its grammar — is what turns logits into a
+    /// token, and an image prompt deserves the same sampler as a text one.
+    ///
+    /// Read at `-1` for the same reason: llama.cpp resolves it to the last
+    /// output row, and a prefill asks for logits on the final prompt token
+    /// rather than on row zero.
+    fn last_logits_row(&self) -> Result<Vec<f32>, EngineError> {
+        // SAFETY: a decode that requested logits has just completed, and the
+        // row is copied out before anything else can decode over it.
+        let raw = unsafe {
+            ozgent_mtmd_sys::llama_cpp_sys_2::llama_get_logits_ith(self.slot.hub().raw(), -1)
+        };
+        if raw.is_null() {
+            return Err(EngineError::Decode("no logits".into()));
+        }
+        let n_vocab = self.model.n_vocab() as usize;
+        Ok(unsafe { std::slice::from_raw_parts(raw, n_vocab) }.to_vec())
+    }
+
     /// Turn the NextN head's output on or off for this session.
     ///
     /// Drafting from the head needs the target unmasked, which makes it emit a
@@ -2712,6 +2735,17 @@ impl<'a> Session<'a> {
                     });
                 }
                 self.n_past = new_past;
+                // The image prompt was decoded inside the projector, not
+                // through `prefill`, so the row the generation loop samples
+                // from has to be taken from the context directly.
+                //
+                // This is the whole of the vision regression: sampling used to
+                // read the context's last logits itself, so it did not care
+                // which branch had filled them. When that became a row handed
+                // back by `prefill`, this branch — which never calls it — went
+                // on setting `n_past` and nothing else, and every image turn
+                // ended in "the prompt produced no logits to generate from".
+                prefill_row = Some(self.last_logits_row()?);
                 self.media_dirty = true;
                 self.last_reused = 0;
                 stats.prompt_tokens = new_past as usize;
