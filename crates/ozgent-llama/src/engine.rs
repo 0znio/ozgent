@@ -2764,6 +2764,10 @@ impl<'a> Session<'a> {
                         context: n_ctx as usize,
                     });
                 }
+                // Everything between here and the prefill is cache bookkeeping
+                // — trimming, checkpoints, lending the shared prefix — and
+                // none of it is free on a model whose state must be copied.
+                let settle = std::time::Instant::now();
 
                 // A chat turn resends the whole conversation, so almost all of
                 // the prompt is already in the cache. Keeping the shared prefix
@@ -2881,10 +2885,18 @@ impl<'a> Session<'a> {
                     }
                 }
 
+                // Where the time before the first token actually goes. Token
+                // counts alone hide the answer: a turn that reuses 2817 of
+                // 2822 tokens and prefills 30 was measured taking *longer*
+                // than the turn that prefilled all 2822, because the saving
+                // was being handed straight back in state copies. Counts and
+                // milliseconds have to be visible together or that is
+                // invisible.
                 tracing::debug!(
-                    "prefix reuse: {reuse} of {} prompt tokens{}",
+                    "prefix: {reuse} of {} tokens reused{}, {} ms to here",
                     tokens.len(),
-                    if restored { " (restored from checkpoint)" } else { "" }
+                    if restored { " (restored from checkpoint)" } else { "" },
+                    settle.elapsed().as_millis()
                 );
                 self.n_past = reuse as i32;
                 self.last_reused = reuse;
@@ -2894,13 +2906,27 @@ impl<'a> Session<'a> {
                 // next turn will resend verbatim; the generation prompt after
                 // it is replaced by the reply the model is about to write.
                 let boundary = tokens.len().saturating_sub(self.gen_prompt_tokens).max(reuse);
+                // Two prefills, and the first one carries the bulk. Timing only
+                // the second said "2823 tokens in 64 ms" — the right count
+                // against the wrong clock — and made real prefill look free
+                // while the cost appeared to be somewhere it was not.
+                let filling = std::time::Instant::now();
+                let mut bulk = 0;
                 if boundary > reuse {
                     self.prefill(&tokens[reuse..boundary], false)?;
+                    bulk = boundary - reuse;
                     self.cached = tokens[..boundary].to_vec();
                     self.save_checkpoint(&tokens[..boundary]);
                 }
+                let tail_at = std::time::Instant::now();
                 prefill_row = self.prefill(&tokens[boundary..], true)?;
                 debug_assert!(prefill_row.is_some());
+                tracing::debug!(
+                    "prefill: {bulk} tokens of history in {} ms, {} of generation prompt in {} ms",
+                    (tail_at - filling).as_millis(),
+                    tokens.len() - boundary,
+                    tail_at.elapsed().as_millis()
+                );
                 self.cached = tokens.clone();
                 stats.prompt_tokens = tokens.len() - reuse;
                 stats.reused_tokens = reuse;
