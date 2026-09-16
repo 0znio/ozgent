@@ -60,7 +60,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..rounds {
         let mut session = engine.session(&opts)?;
         println!("free after context: {} MiB", free());
-        let (stats, _) = session.generate(&prompt, tokens, |_| true)?;
+        let mut text = String::new();
+        let (stats, _) = session.generate(&prompt, tokens, |t| {
+            text.push_str(t);
+            true
+        })?;
+        if std::env::var("OZ_ECHO").is_ok() {
+            println!("----8<----\n{text}\n---->8----");
+        }
         println!("free after generating: {} MiB", free());
         println!(
             "round {round}: prefill {:6.1} tok/s over {} tokens   decode {:5.1} tok/s over {}",

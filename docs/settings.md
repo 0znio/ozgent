@@ -192,6 +192,34 @@ carrying two tokens costs nearly two passes there, so there is nothing for an
 accepted draft to save. The web interface has no field for this one; it is a
 flag or a `config.toml` entry.
 
+#### Prefill speed on an offloaded model
+
+With experts in system RAM, prefill is bound by the link to the card, not by
+the card. Measured on GLM-4.7-Flash, each block left on the host costs 21.8 ms
+per 512-token micro-batch to send its 294 MB of experts — 13.5 GB/s, which is
+PCIe 4.0 x8 at its limit — and about two thirds of prefill is that traffic.
+
+Two consequences worth knowing.
+
+Those uploads are paid once per *micro-batch*, not per token, so a larger one
+spreads them over more tokens. `--ubatch 1024` measured 730 tok/s of prefill
+against 599, a fifth faster. It is not free: the compute buffer roughly
+doubles, about 350 MB here, which is memory that would otherwise hold another
+block's experts or more context. Worth setting when prompts are long — an agent
+turn with tool schemas and history — and not worth it for short chat turns,
+where decode is what you feel.
+
+And drafting has to stay short. Verifying k tokens in one pass is nearly free on
+an ordinary model; here each token routes to its own experts, and the pass reads
+the union of them from RAM:
+
+| tokens verified together | 1 | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|---|
+| pass | 50 ms | 54 | 68 | 103 | 136 |
+
+A second token is almost free, a fourth doubles the pass. At 80% acceptance a
+draft of two lands best; at 50% a draft of three is slower than not drafting.
+
 ### Answering several conversations at once
 
 One model answers several conversations at the same time, sharing a forward
