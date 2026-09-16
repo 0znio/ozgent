@@ -202,12 +202,20 @@ PCIe 4.0 x8 at its limit — and about two thirds of prefill is that traffic.
 Two consequences worth knowing.
 
 Those uploads are paid once per *micro-batch*, not per token, so a larger one
-spreads them over more tokens. `--ubatch 1024` measured 730 tok/s of prefill
-against 599, a fifth faster. It is not free: the compute buffer roughly
-doubles, about 350 MB here, which is memory that would otherwise hold another
-block's experts or more context. Worth setting when prompts are long — an agent
-turn with tool schemas and history — and not worth it for short chat turns,
-where decode is what you feel.
+spreads them over more tokens. **This is now chosen for you.** When neither
+`--ubatch` nor `--batch` is set, the planner weighs a 1024-wide batch against
+the 512-wide default and takes the wider one only if the context window does
+not shrink for it; the extra few hundred megabytes of scratch come out of the
+same budget as the cache, so where memory is tight the narrow batch wins and
+nothing is said. Measured, with no flags:
+
+| | prefill | decode |
+|---|---|---|
+| GLM-4.7-Flash, experts on the host | 316-335 -> **503-531** tok/s | 21, unchanged |
+| Qwen3.5-4B, wholly on the card | 1662 -> **1923** tok/s | 48, unchanged |
+
+Decode does not move, because decode sends one token at a time whatever the
+micro-batch is. Setting `--ubatch` yourself still overrides the choice.
 
 And drafting has to stay short. Verifying k tokens in one pass is nearly free on
 an ordinary model; here each token routes to its own experts, and the pass reads

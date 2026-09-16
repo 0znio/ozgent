@@ -19,7 +19,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     o.context_length = Some(env("OZ_CTX").unwrap_or(8192));
     o.temperature = Some(0.0);
     o.top_k = Some(1);
-    o.speculative = Some(ozgent_core::accel::Speculative::Off);
+    o.speculative = Some(match std::env::var("OZ_SPEC").as_deref() {
+        Ok("mtp") => ozgent_core::accel::Speculative::Mtp,
+        Ok("ngram") => ozgent_core::accel::Speculative::Ngram,
+        Ok("auto") => ozgent_core::accel::Speculative::Auto,
+        _ => ozgent_core::accel::Speculative::Off,
+    });
+    // Drafting is off for the rate runs, but the draft ceiling still decides
+    // how deep a recurrent rollback ring the context asks for — which is what
+    // `OZ_VERIFY` is measuring. Zero asks for none, which is the old
+    // behaviour and so the other half of that A/B.
+    if let Some(k) = env::<u32>("OZ_DRAFT") {
+        o.speculative_tuning =
+            Some(ozgent_core::accel::SpeculativeTuning { draft_tokens: k, ..Default::default() });
+    }
     o.ubatch = env("OZ_UBATCH");
     o.batch_size = env("OZ_BATCH");
     o.threads = env("OZ_THREADS");

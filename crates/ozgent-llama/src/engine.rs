@@ -40,6 +40,15 @@ fn sequences_for(slots: u32, want: Slots) -> u32 {
     }
 }
 
+/// The wider batch tried when nothing was asked for.
+///
+/// Prefill runs a batch through as physical chunks of this size, so doubling
+/// it halves the number of passes over the weights. Two is the useful number
+/// of candidates: llama.cpp's own default either side of it, and a wider one
+/// still would cost more scratch than the window can spare on a card this
+/// size. It is only ever taken when it costs no context.
+const WIDE_BATCH: u32 = 1024;
+
 /// Microseconds spent choosing tokens from logits, process-wide.
 pub static PICK_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1003,34 +1012,41 @@ impl Engine {
         let host = ozgent_core::accel::available_host_memory();
         let sequences = sequences_for(slots, want);
         let unified = matches!(want, Slots::UpTo(_)) && sequences > 1;
-        let shape = ozgent_core::reserve::Shape {
-            // Free memory is read after the weights loaded, so whatever
-            // bringing the backend up cost has already been paid out of it.
-            // Charging it again here took 400 MB off every first window.
-            first_in_process: false,
-            ..crate::backend::reserve_shape(
-                opts.ubatch.unwrap_or(512),
-                self.model.n_embd() as u32,
-                requested,
-                opts.batch_size,
-                self.staging_bytes,
-            )
-        };
         let total_window = if unified { requested } else { requested.saturating_mul(sequences) };
-        let reserve = self
-            .probed_reserve(backend, opts, sequences, unified, total_window)
-            .unwrap_or_else(|| crate::backend::reserve_for(shape));
-        let budget = if opts.kv_offload {
-            ozgent_core::accel::kv_budget_reserving(
-                free,
-                host,
-                self.gpu_layers_used,
-                self.n_layer,
-                Some(reserve),
-            )
-        } else {
-            ozgent_core::accel::kv_budget(0, host, 0, self.n_layer)
+        // Scratch and budget for one candidate micro-batch. Both are wanted
+        // twice below, once per candidate, so they are computed together.
+        let weigh = |ubatch: Option<u32>, n_batch: u32, window: u32| {
+            let shape = ozgent_core::reserve::Shape {
+                // Free memory is read after the weights loaded, so whatever
+                // bringing the backend up cost has already been paid out of
+                // it. Charging it again here took 400 MB off every first
+                // window.
+                first_in_process: false,
+                ..crate::backend::reserve_shape(
+                    ubatch.unwrap_or(512),
+                    self.model.n_embd() as u32,
+                    window,
+                    n_batch,
+                    self.staging_bytes,
+                )
+            };
+            let reserve = self
+                .probed_reserve(backend, opts, ubatch, n_batch, sequences, unified, total_window)
+                .unwrap_or_else(|| crate::backend::reserve_for(shape));
+            let budget = if opts.kv_offload {
+                ozgent_core::accel::kv_budget_reserving(
+                    free,
+                    host,
+                    self.gpu_layers_used,
+                    self.n_layer,
+                    Some(reserve),
+                )
+            } else {
+                ozgent_core::accel::kv_budget(0, host, 0, self.n_layer)
+            };
+            (reserve, budget)
         };
+        let (reserve, mut budget) = weigh(opts.ubatch, opts.batch_size, requested);
         tracing::debug!(
             "kv budget {} MiB of {} MiB free, reserving {} MiB",
             budget / (1024 * 1024),
@@ -1095,14 +1111,6 @@ impl Engine {
             // many times larger — including one holding a shared prefix.
             requested = requested.saturating_mul(sequences);
         }
-        let shape = crate::backend::reserve_shape(
-            opts.ubatch.unwrap_or(512),
-            self.model.n_embd() as u32,
-            requested,
-            opts.batch_size,
-            self.staging_bytes,
-        );
-
         // Training context is a claim about which positions the model
         // understands, not a promise that the cache for them fits in memory.
         // At the million-token windows recent models advertise, the cache runs
@@ -1119,8 +1127,48 @@ impl Engine {
         // `budget` was computed above, against a measured reserve rather than
         // a share of the card: the share allowed 3514 MiB of 5020 free, so a
         // cache that would have fitted at f16 was quantised for nothing.
-        let mut requested =
+        // A wider micro-batch is worth having when it is free. Prefill runs
+        // the whole batch through as physical chunks of `n_ubatch`, so a wider
+        // one is fewer chunks and fewer passes over the weights: measured at
+        // 288 -> 502 tok/s on a model whose experts live in host memory, where
+        // each chunk pays for its own upload, and 4% on one that fits on the
+        // card. What it costs is scratch — a few hundred megabytes — and that
+        // comes out of the same budget as the cache.
+        //
+        // So it is taken only when it costs no window. The rule is the one
+        // used everywhere else here: never trade away context for throughput,
+        // because a window that will not hold the conversation is not a
+        // faster session, it is a broken one. Where scratch is tight the
+        // narrow batch simply wins and nothing is said.
+        //
+        // A micro-batch cannot be wider than the batch that carries it, so the
+        // two move together or neither does. Raising only the micro-batch
+        // leaves it clamped back to the default 512 batch, which is how the
+        // first version of this silently did nothing at all.
+        let mut ubatch = opts.ubatch;
+        let mut n_batch = opts.batch_size;
+        let mut window =
             ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
+        if opts.ubatch.is_none() && opts.batch_size <= WIDE_BATCH {
+            let (_, wide_budget) = weigh(Some(WIDE_BATCH), WIDE_BATCH, requested);
+            let wide_window =
+                ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, wide_budget);
+            if wide_window >= window {
+                tracing::debug!("micro-batch {WIDE_BATCH} fits without shortening the window");
+                (ubatch, n_batch, budget, window) =
+                    (Some(WIDE_BATCH), WIDE_BATCH, wide_budget, wide_window);
+            }
+        }
+        // The shape that reaches `open_context` has to describe the batch that
+        // was actually chosen, not the candidate it was compared against.
+        let shape = crate::backend::reserve_shape(
+            ubatch.unwrap_or(512),
+            self.model.n_embd() as u32,
+            window,
+            n_batch,
+            self.staging_bytes,
+        );
+        let mut requested = window;
         let asked = opts.context_length.min(self.n_ctx_train.max(512)).saturating_mul(slots);
         if requested < asked {
             let wanted = self.kv_shape.bytes(asked, split) / (1024 * 1024);
@@ -1172,26 +1220,16 @@ impl Engine {
 
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(requested))
-            .with_n_batch(opts.batch_size)
+            .with_n_batch(n_batch)
             // One more than the conversations: the last sequence holds the
             // prefix they share. See `Commons`.
             .with_n_seq_max(sequences)
             .with_kv_unified(unified)
             // `n_rs_seq` — llama.cpp's ring of per-token recurrent snapshots,
-            // which makes a hybrid model's cache trimmable and so lets it undo
-            // a rejected draft without a whole-sequence snapshot — is
-            // deliberately not asked for. It worked, and it is still the right
-            // mechanism in principle, but three things settled it:
-            //
-            // * It cannot coexist with the shared prefix. Copying a sequence
-            //   while the ring is live fails inside CUDA, reproducibly.
-            // * Whether to ask for it would have to depend on `speculative`
-            //   and `prefix_reuse`, and those are per-turn settings. A context
-            //   parameter cannot follow a setting that changes under it.
-            // * It buys nothing anyway. It exists only for recurrent models,
-            //   and those are exactly the ones where verifying k drafted
-            //   tokens costs k passes — see `crate::mtp` for the measurement.
-            //   The one thing it enables is the one thing that cannot pay.
+            // which makes a hybrid model's cache trimmable and so lets a
+            // rejected draft be undone in place — is deliberately not asked
+            // for. It was built and measured rather than argued about; see
+            // `crate::mtp` for what the measurement said.
             .with_flash_attention_policy(flash)
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
@@ -1199,7 +1237,7 @@ impl Engine {
 
         // The physical micro-batch. Left at llama.cpp's default unless asked,
         // since it trades prefill parallelism against working-set size.
-        if let Some(n) = opts.ubatch {
+        if let Some(n) = ubatch {
             params = params.with_n_ubatch(n);
         }
 
@@ -1257,13 +1295,15 @@ impl Engine {
         &self,
         backend: &'static LlamaBackend,
         opts: &Resolved,
+        ubatch: Option<u32>,
+        n_batch: u32,
         sequences: u32,
         unified: bool,
         window: u32,
     ) -> Option<u64> {
         let key = ScratchKey {
-            n_batch: opts.batch_size,
-            ubatch: opts.ubatch,
+            n_batch,
+            ubatch,
             flash: opts.flash_attention,
             kv_offload: opts.kv_offload,
             sequences,
@@ -1284,7 +1324,7 @@ impl Engine {
                     let n_ctx = if unified { tokens } else { tokens * sequences };
                     let mut p = LlamaContextParams::default()
                         .with_n_ctx(NonZeroU32::new(n_ctx))
-                        .with_n_batch(opts.batch_size)
+                        .with_n_batch(n_batch)
                         .with_n_seq_max(sequences)
                         .with_kv_unified(unified)
                         .with_flash_attention_policy(flash)

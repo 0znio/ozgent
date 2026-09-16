@@ -50,17 +50,46 @@ use crate::engine::EngineError;
 /// was swept for — but there is nothing for them to win. Every accepted token
 /// has to be paid for in the verification pass at close to full price.
 ///
-/// The reason is the architecture. Most of this model's layers are recurrent:
-/// they walk a sequence one position at a time rather than attending over it
-/// at once, so `k` tokens of one sequence is `k` steps of work. Batching
-/// across *different* conversations is a different matter and does pay — those
-/// are one step each, taken together, which is the 2.2x the hub measures.
-/// Within one sequence there is no such saving to find.
+/// That was first blamed on the architecture: most of this model's layers are
+/// recurrent, so `k` tokens of one sequence was taken to be `k` steps of work
+/// that no batch could fold together. That explanation was wrong, and it is
+/// worth writing down why, because it was wrong in a way that hid a real
+/// mechanism behind a plausible story.
 ///
-/// So this is not a tuning problem and no threshold fixes it. It stays behind
-/// `--spec mtp` rather than joining `auto`, and on a model whose layers are
-/// ordinary attention it would be worth revisiting — the drafting machinery is
-/// correct, the model simply gives it nothing to earn.
+/// llama.cpp's recurrent memory admits one token per sequence per pass *only
+/// while it has nowhere to put the intermediate states*. Given `n_rs_seq`, a
+/// ring of per-token snapshots, it takes the whole draft in one micro-batch.
+/// The ring was added, on solo contexts, and verification duly collapsed:
+///
+/// ```text
+///   k     verify ms   ms per token
+///   1        20.0         20.0
+///   2        22.4         11.2
+///   3        29.2          9.7
+///   4        31.2          7.8
+///   8        52.6          6.6
+/// ```
+///
+/// Two tokens for 1.15x the cost of one. So the premise of speculation does
+/// hold here after all — and drafting still loses:
+///
+/// ```text
+///   spec off   48.4 tok/s
+///   mtp k=2    43.1
+///   mtp k=3    42.8
+///   ngram      46.7
+/// ```
+///
+/// What is left to pay for is the drafting itself. Each proposal costs a
+/// decode of the NextN block against a 20 ms target pass, the head has to be
+/// run once per token proposed, and the acceptance on prose does not cover it.
+/// The verification was never the thing standing in the way; it only looked
+/// like it because it had only ever been measured without the ring.
+///
+/// So the conclusion is unchanged and the reason is not. It stays behind
+/// `--spec mtp` rather than joining `auto`. The ring is not asked for, since
+/// its only consumer is speculation and speculation does not pay: it would
+/// cost recurrent-state snapshots in VRAM to enable a slower path.
 ///
 /// How sure the head must be to justify another forward pass.
 ///

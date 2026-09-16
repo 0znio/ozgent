@@ -43,3 +43,28 @@ As soon as a published `llama-cpp-sys-2` vendors a llama.cpp at or past
 `3733366720`. Drop the `[patch.crates-io]` line in the workspace root, delete
 this directory, and rebuild. Nothing else in ozgent depends on the patch —
 `vendor/llama-cpp-2` is a separate and still-needed patch, for mtmd.
+
+## Upstream tuning knobs that were measured and left off
+
+llama.cpp carries several opt-in environment switches. All were measured on this
+machine (RTX 5050 Laptop, 8 GB, sm_120, CUDA 13.3), interleaved and repeated,
+against GLM-4.7-Flash with host-side experts and Qwen3.5-4B wholly resident:
+
+| switch | what it does | result |
+|---|---|---|
+| `GGML_CUDA_GRAPH_OPT=1` | runs independent Q/K/V projections on concurrent streams | no change on either model |
+| `GGML_CUDA_REGISTER_HOST=1` | `cudaHostRegister`s the mmap'd weights so host->device runs at full PCIe speed | GLM prefill +4%, decode flat |
+| `GGML_OP_OFFLOAD_MIN_BATCH` | batch width above which weights are uploaded rather than computed on the CPU | not worth moving from its default of 32 |
+
+The first is reported upstream as +17-27% on a 4090/5090; it does nothing here.
+Worth re-measuring on a card with bandwidth to spare, which this one has not.
+
+## The CUDA toolkit trap does not apply here
+
+There is a widely repeated claim that Blackwell builds must use CUDA 12.8,
+because 13.x segfaults the MMQ kernel and forces a cuBLAS fallback that is ~5x
+slower at prompt processing. Checked rather than assumed: `cuobjdump` shows this
+build carries real `sm_120a`/`sm_121a` SASS, `GGML_CUDA_FORCE_CUBLAS` is `OFF`
+in the cache, and `ggml_cuda_should_use_mmq` returns true unconditionally on
+this compute capability via `turing_mma_available`. We are on the fast path
+under CUDA 13.3.
