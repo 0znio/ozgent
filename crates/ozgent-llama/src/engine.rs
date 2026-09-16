@@ -105,6 +105,9 @@ pub struct Engine {
     /// Layers whose routed experts were evicted to host memory. Non-zero
     /// means system RAM is holding weights, and is contended.
     cpu_moe_layers: u32,
+    /// What one layer's routed experts weigh. What a reload has to divide a
+    /// shortfall of VRAM by to know how many more layers to move to the host.
+    expert_bytes_per_layer: u64,
     /// This model's own compute scratch, measured once per set of context
     /// parameters. See [`Engine::probed_reserve`].
     scratch: std::sync::Mutex<Option<(ScratchKey, u64, f64)>>,
@@ -538,6 +541,7 @@ impl Engine {
             n_ctx_train: model.n_ctx_train(),
             gpu_layers_used: requested_layers.min(n_layer),
             cpu_moe_layers: evicted_expert_layers,
+            expert_bytes_per_layer: layout.expert_bytes_per_layer,
             scratch: std::sync::Mutex::new(None),
             staging_bytes: if evicted_expert_layers > 0 || resolved_tensors > 0 {
                 layout.max_layer_expert_bytes
@@ -601,6 +605,19 @@ impl Engine {
     /// Falling back to a generic format when the GGUF has no template is worse
     /// than it sounds — the model will not recognise the turn markers — so the
     /// fallback is deliberately plain and the caller is told.
+    /// Layers whose routed experts this load put in host memory.
+    pub fn cpu_moe_layers(&self) -> u32 {
+        self.cpu_moe_layers
+    }
+
+    /// How many more layers' experts must leave the card to free `bytes`.
+    /// `None` for a model with no routed experts, where there is nothing to
+    /// move and a shortfall has to be met some other way.
+    pub fn expert_layers_for(&self, bytes: u64) -> Option<u32> {
+        (self.expert_bytes_per_layer > 0)
+            .then(|| bytes.div_ceil(self.expert_bytes_per_layer).max(1) as u32)
+    }
+
     /// The tokens a prompt becomes, for a caller that needs to compare two of
     /// them rather than decode one.
     pub fn tokenize(&self, text: &str) -> Result<Vec<LlamaToken>, EngineError> {
@@ -804,7 +821,9 @@ impl Engine {
         params: LlamaContextParams,
         requested: u32,
         mut split: ozgent_core::accel::KvSplit,
-        shape: ozgent_core::reserve::Shape,
+        mut shape: ozgent_core::reserve::Shape,
+        narrow_to: Option<u32>,
+        floor: u32,
     ) -> Result<LlamaContext<'_>, EngineError> {
         let mut window = requested;
         // The retreat bisects rather than stepping by a fixed ratio.
@@ -827,6 +846,27 @@ impl Engine {
         // Whether the quantised KV cache has already been given up on. Once,
         // and then never again, so a genuine out-of-memory does not loop.
         let mut plain_cache = false;
+        // The micro-batch to fall back to before any context is given up.
+        //
+        // A widened micro-batch is scratch taken on the promise that it cost
+        // no window. When the allocation says otherwise it is the scratch that
+        // has to go, not the window, because the scratch is sized by the
+        // micro-batch and hardly at all by the context: shrinking the window
+        // from 32768 to 960 left a 1024-token micro-batch's buffer at 973 MiB,
+        // and a 1024-token batch can then never fit a 960-cell cache at all.
+        // Every prompt failed with `NoKvCacheSlot`, measured on a 35B MoE.
+        let mut narrow_to = narrow_to;
+        let mut narrow = |params: &mut LlamaContextParams,
+                          shape: &mut ozgent_core::reserve::Shape,
+                          narrow_to: &mut Option<u32>|
+         -> bool {
+            let Some(n) = narrow_to.take() else { return false };
+            *params = params.clone().with_n_batch(n).with_n_ubatch(n);
+            shape.ubatch = n;
+            shape.n_batch = n;
+            tracing::info!("the wider micro-batch did not fit; falling back to {n}");
+            true
+        };
 
         loop {
             crate::llamalog::clear();
@@ -845,6 +885,10 @@ impl Engine {
                     // a smaller window to try.
                     let starved = crate::backend::best_gpu()
                         .is_some_and(|d| (d.memory_free as u64) < crate::backend::decode_reserve());
+                    if starved && narrow(&mut params, &mut shape, &mut narrow_to) {
+                        drop(context);
+                        continue;
+                    }
                     if starved && window > ozgent_core::accel::MIN_CONTEXT {
                         tracing::debug!(
                             "a context of {window} leaves too little VRAM to decode in; trying smaller"
@@ -911,6 +955,22 @@ impl Engine {
                             measured,
                         );
                     }
+                    // Recorded first, refused second. The measurement above is
+                    // what makes a retry land: it is the real scratch, which the
+                    // plan that put the weights down had underestimated.
+                    if window < floor {
+                        let free = before.unwrap_or(0);
+                        let needed = self.kv_shape.bytes(floor, split)
+                            + measured
+                            + crate::backend::decode_reserve();
+                        let short_by = needed.saturating_sub(free).max(
+                            self.kv_shape
+                                .bytes(floor, split)
+                                .saturating_sub(self.kv_shape.bytes(window, split)),
+                        );
+                        drop(context);
+                        return Err(EngineError::WindowBelowFloor { opened: window, floor, short_by });
+                    }
                     return Ok(context);
                 }
                 Err(e) => {
@@ -919,6 +979,10 @@ impl Engine {
                     // `e` alone says nothing but "null reference".
                     let reason = crate::llamalog::reason().unwrap_or_else(|| e.to_string());
                     tracing::debug!("context of {window} failed: {reason}");
+                    if narrow(&mut params, &mut shape, &mut narrow_to) {
+                        first_reason.get_or_insert_with(|| reason.clone());
+                        continue;
+                    }
 
                     // Whether this model gets flash attention is not knowable
                     // before the context exists: `flash_attention = true` asks
@@ -1255,7 +1319,19 @@ impl Engine {
                 .with_n_threads_batch(opts.threads as i32);
         }
 
-        let mut context = self.open_context(backend, params, requested, split, shape)?;
+        let narrow_to = (ubatch != opts.ubatch).then_some(opts.batch_size.min(512).max(1));
+        // The smallest window worth opening: the one the placement planner
+        // already reserved for, before any weight was put down. Below it the
+        // weights were placed on an estimate that turned out wrong, and the
+        // answer is to move weights, not to shrink the conversation.
+        let floor = opts
+            .context_length
+            .min(self.n_ctx_train.max(512))
+            .min(crate::backend::PLANNING_WINDOW)
+            .saturating_mul(if unified { 1 } else { sequences })
+            .min(requested);
+        let mut context =
+            self.open_context(backend, params, requested, split, shape, narrow_to, floor)?;
 
         // Steering belongs to the context, not the turn: installed once here,
         // it shapes every generation until the session ends. Loading it lazily
@@ -1281,7 +1357,14 @@ impl Engine {
 
         // What one slot may use: the whole pool when it is shared, its own
         // slice when it is not.
-        let each = if unified { requested } else { (requested / sequences).max(1) };
+        // What actually opened, not what was asked for. The retreat above can
+        // hand back a far smaller context, and a session that still believes
+        // in the requested window never reports a prompt as too long: it sends
+        // it, and llama.cpp answers with a bare `NoKvCacheSlot` that says
+        // nothing about why. Measured: 32768 requested, 960 opened, and every
+        // turn failing that way while the log announced 32768 tokens each.
+        let opened = context.n_ctx();
+        let each = if unified { opened } else { (opened / sequences).max(1) };
         Ok((context, each, slots))
     }
 
@@ -3427,6 +3510,19 @@ pub enum EngineError {
     Missing { path: String },
     #[error("loading {path}: {reason}")]
     Load { path: String, reason: String },
+    /// The context that fitted is too small to be worth opening.
+    ///
+    /// Not a failure to allocate: something smaller did open. It is refused
+    /// because a window that cannot hold the prompt a model is always sent is
+    /// a session that fails on every turn, and that is worse than a slower one.
+    /// `short_by` is the VRAM the floor still needed, which is what a caller
+    /// frees by moving weights off the card before trying again.
+    #[error(
+        "only {opened} tokens of context fit beside the weights, below the {floor} this model needs; \
+         {short_by} more bytes of VRAM are required"
+    )]
+    WindowBelowFloor { opened: u32, floor: u32, short_by: u64 },
+
     #[error("creating a context: {0}")]
     Context(String),
     #[error("applying the chat template: {0}")]

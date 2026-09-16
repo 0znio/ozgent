@@ -628,7 +628,7 @@ pub fn moe_pattern(whole: u32, tensors: u32) -> Option<String> {
 /// much cache must fit for the result to be worth loading at all", so that a
 /// model with an enormous default window does not reserve its way out of the
 /// GPU entirely.
-const PLANNING_WINDOW: u32 = 8192;
+pub(crate) const PLANNING_WINDOW: u32 = 8192;
 
 impl Plan {
     /// Everything on the GPU, for when there is nothing to weigh up.

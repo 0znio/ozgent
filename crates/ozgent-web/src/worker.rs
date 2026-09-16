@@ -624,6 +624,7 @@ fn serve_model(
         );
     }
 
+    let mut resolved = resolved;
     let engine = match Engine::load_reporting(&weights, &resolved, move |p| {
         let pct = (p * 100.0) as u32;
         if pct > last {
@@ -669,6 +670,57 @@ fn serve_model(
     // second full-length cache fits beside the first. Concurrency that
     // silently halves somebody's context is not worth having.
     let cap = snapshot(shared).web.parallel();
+
+    // A placement is made against an estimate of llama.cpp's scratch, and on
+    // an architecture the estimate has not met it can be badly low: a 35B MoE
+    // was planned as though its compute buffer were a few hundred megabytes,
+    // asked for 1137 MiB, and the only thing left to give was the window --
+    // 32768 tokens became 960, which cannot hold the system prompt, and every
+    // turn failed. Trading the conversation away to keep a few more experts on
+    // the card is the wrong trade: experts on the host cost tokens per second,
+    // a window nothing fits in costs the model.
+    //
+    // So a load that offloaded experts is tried once before it is kept. If the
+    // window comes up short, the shortfall is exactly known, as is what one
+    // layer's experts weigh, so the reload moves precisely that many more
+    // layers to the host -- no guess, and no waiting for a learned estimate to
+    // converge over several failed loads.
+    //
+    // The attempt is dropped rather than kept because the sessions borrow the
+    // engine, and an engine that is still borrowed cannot be replaced.
+    let mut engine = engine;
+    if engine.cpu_moe_layers() > 0 {
+        let short = match engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap)) {
+            Err(ozgent_llama::engine::EngineError::WindowBelowFloor { opened, floor, short_by }) => {
+                Some((opened, floor, short_by))
+            }
+            _ => None,
+        };
+        if let Some((opened, floor, short_by)) = short {
+            let Some(extra) = engine.expert_layers_for(short_by) else {
+                anyhow::bail!("{}: only {opened} tokens of context fit, below {floor}", found.model);
+            };
+            let layers = (engine.cpu_moe_layers() + extra).min(engine.n_layer());
+            tracing::warn!(
+                "{}: only {opened} tokens of context fitted beside the weights, below {floor}; \
+                 moving the experts of {extra} more layer{} to system RAM ({layers} in all) and loading again",
+                found.model,
+                if extra == 1 { "" } else { "s" },
+            );
+            drop(engine);
+            resolved.cpu_moe = ozgent_core::accel::MoeOffload::Layers(layers);
+            let (admitted, _) = {
+                let weights = weights.clone();
+                let resolved = resolved.clone();
+                member.admit(crate::pool::PlanFor(move || {
+                    ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+                }))
+            };
+            engine = Engine::load(&weights, &resolved)
+                .map_err(|e| anyhow::anyhow!("reloading {}: {e}", found.model))?;
+            drop(admitted);
+        }
+    }
     let sessions = engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap))?;
     let slots = sessions.len();
     tracing::info!(

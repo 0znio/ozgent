@@ -72,13 +72,15 @@ impl Telegram {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Transport(e.to_string()))?;
+            .map_err(|e| ApiError::Transport(e.without_url().to_string()))?;
 
         let status = response.status();
         let payload: serde_json::Value = response
             .json()
             .await
-            .map_err(|e| ApiError::Transport(format!("unreadable reply from {method}: {e}")))?;
+            .map_err(|e| {
+                ApiError::Transport(format!("unreadable reply from {method}: {}", e.without_url()))
+            })?;
 
         if payload.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             return Ok(payload.get("result").cloned().unwrap_or(serde_json::Value::Null));
@@ -423,14 +425,21 @@ async fn download(api: &Telegram, file_id: &str) -> anyhow::Result<Vec<u8>> {
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("no file_path in the reply"))?;
+    // Every URL here carries the bot token, and a reqwest error prints the URL
+    // it failed on. These errors are logged, so left as they were they wrote
+    // the token into ozgent.log in plain text on every dropped connection --
+    // found in a real log file, under a routine `getUpdates` failure.
     let bytes = api
         .http
         .get(format!("{API}/file/bot{}/{path}", api.token))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?
         .bytes()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     Ok(bytes.to_vec())
 }
 
