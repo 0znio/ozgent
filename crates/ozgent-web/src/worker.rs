@@ -418,6 +418,10 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
     // borrow checker is satisfied without any self-referential trick — and
     // that is exactly why each model gets a thread rather than a slot in a
     // collection.
+    // Kept so a failure can still be told to the request that caused it.
+    // Only logged, a model that loaded and then could not open a context left
+    // the page at "loading 100%" for good, with the reason in a log file.
+    let asked = first.out.clone();
     if let Err(e) = serve_model(
         &context.paths,
         &context.config,
@@ -430,6 +434,7 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
         member,
     ) {
         tracing::error!("{e}");
+        let _ = asked.send(Event::Error { message: e.to_string() });
     }
 }
 
@@ -609,11 +614,35 @@ fn serve_model(
     // first and the plan is made again. A model half on the GPU is fine; one
     // pushed almost entirely onto the CPU because something nobody is using
     // still holds VRAM is not.
+    // The context holds one sequence per conversation plus the shared prefix,
+    // and on a hybrid model every one of them keeps a recurrent state beside
+    // each block on the card: placement has to know how many.
+    //
+    // For a model that does not fit, those states are paid for in blocks on
+    // the CPU. Ternary Bonsai 27B with four conversations' worth kept 50 of 64
+    // blocks on the card and decoded at 5.4 tok/s, for concurrency almost
+    // nothing uses. When fewer slots buy blocks, the model serves one
+    // conversation at a time and the rest wait their turn; a model that fits
+    // either way keeps them all.
+    let mut cap = snapshot(shared).web.parallel();
+    if cap > 1 {
+        let many = ozgent_llama::backend::Plan::for_model_with(&weights, &resolved, cap + 1);
+        let one = ozgent_llama::backend::Plan::for_model_with(&weights, &resolved, 2);
+        if !many.is_full() && one.layers > many.layers {
+            tracing::info!(
+                "{name}: one conversation at a time, which keeps {} blocks on the GPU instead of {}",
+                one.layers,
+                many.layers
+            );
+            cap = 1;
+        }
+    }
+    let sequences = cap + 1;
     let (admitted, plan) = {
         let weights = weights.clone();
         let resolved = resolved.clone();
         member.admit(crate::pool::PlanFor(move || {
-            ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+            ozgent_llama::backend::Plan::for_model_with(&weights, &resolved, sequences)
         }))
     };
     if !plan.is_full() {
@@ -630,7 +659,7 @@ fn serve_model(
     // the model reloaded, moved them again, and reloaded again.
     let requested = resolved.clone();
     let mut resolved = resolved;
-    let engine = match Engine::load_reporting(&weights, &resolved, move |p| {
+    let engine = match Engine::load_for(&weights, &resolved, sequences, move |p| {
         let pct = (p * 100.0) as u32;
         if pct > last {
             last = pct;
@@ -674,7 +703,6 @@ fn serve_model(
     // not by the number in the config: `UpTo` opens a second slot only when a
     // second full-length cache fits beside the first. Concurrency that
     // silently halves somebody's context is not worth having.
-    let cap = snapshot(shared).web.parallel();
 
     // A placement is made against an estimate of llama.cpp's scratch, and on
     // an architecture the estimate has not met it can be badly low: a 35B MoE
@@ -751,10 +779,10 @@ fn serve_model(
                         let weights = weights.clone();
                         let resolved = resolved.clone();
                         member.admit(crate::pool::PlanFor(move || {
-                            ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+                            ozgent_llama::backend::Plan::for_model_with(&weights, &resolved, sequences)
                         }))
                     };
-                    engine = Engine::load(&weights, &resolved)
+                    engine = Engine::load_for(&weights, &resolved, sequences, |_| {})
                         .map_err(|e| anyhow::anyhow!("reloading {}: {e}", found.model))?;
                     drop(admitted);
                     continue;
@@ -797,10 +825,10 @@ fn serve_model(
             let weights = weights.clone();
             let resolved = resolved.clone();
             member.admit(crate::pool::PlanFor(move || {
-                ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+                ozgent_llama::backend::Plan::for_model_with(&weights, &resolved, sequences)
             }))
         };
-        engine = Engine::load(&weights, &resolved)
+        engine = Engine::load_for(&weights, &resolved, sequences, |_| {})
             .map_err(|e| anyhow::anyhow!("reloading {}: {e}", found.model))?;
         drop(admitted);
     }

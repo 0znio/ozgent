@@ -657,7 +657,16 @@ impl Plan {
     }
 
     pub fn for_model(path: &std::path::Path, opts: &ozgent_core::Resolved) -> Self {
-        let layout = crate::layout::read(path).unwrap_or_default();
+        Self::for_model_with(path, opts, 1)
+    }
+
+    /// As [`Plan::for_model`], for a context that will hold `sequences`
+    /// conversations. Each one keeps its own recurrent state beside every
+    /// block, so on a hybrid model the sequence count changes what a block
+    /// costs on the card.
+    pub fn for_model_with(path: &std::path::Path, opts: &ozgent_core::Resolved, sequences: u32) -> Self {
+        let mut layout = crate::layout::read(path).unwrap_or_default();
+        layout.bytes_per_layer += layout.recurrent_bytes_per_layer * sequences.max(1) as u64;
         let device = best_gpu();
         let free = device.as_ref().map(|d| d.memory_free as u64).unwrap_or(0);
 

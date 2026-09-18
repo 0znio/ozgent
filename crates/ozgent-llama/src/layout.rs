@@ -58,6 +58,10 @@ pub struct Layout {
     /// head and its norm. The input embedding stays in host memory and is not
     /// counted.
     pub fixed_gpu_bytes: u64,
+    /// Recurrent state per sequence, averaged over every block: what one
+    /// conversation's linear-attention state costs for each block placed on
+    /// the GPU. Zero for a model without one. See [`recurrent_bytes`].
+    pub recurrent_bytes_per_layer: u64,
 }
 
 /// The routed-expert tensors, in the order eviction spends them.
@@ -101,6 +105,9 @@ pub fn read(path: &Path) -> Option<Layout> {
             .map(|arch| caching_layers(gguf, &arch, l.layers))
             .unwrap_or(l.layers);
         l.context_train = context_train(gguf);
+        l.recurrent_bytes_per_layer = string_key(gguf, "general.architecture")
+            .map(|arch| recurrent_bytes(gguf, &arch, l.layers, l.caching_layers) / l.layers.max(1) as u64)
+            .unwrap_or(0);
         l.n_embd = string_key(gguf, "general.architecture")
             .and_then(|arch| u32_key(gguf, &format!("{arch}.embedding_length")))
             .unwrap_or(0);
@@ -192,6 +199,7 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         first_moe_layer: per_block_experts.keys().next().map_or(0, |&i| i as u32),
         max_layer_expert_bytes: per_block_experts.values().copied().max().unwrap_or(0),
         fixed_gpu_bytes,
+        recurrent_bytes_per_layer: 0,
         layers,
         kv_elements_per_token: 0,
         caching_layers: layers,
@@ -284,6 +292,40 @@ fn caching_layers(gguf: *mut sys::gguf_context, arch: &str, layers: u32) -> u32 
     let main = layers.saturating_sub(nextn);
     let full = (0..main).filter(|i| (i + 1) % interval == 0).count() as u32;
     (full + nextn).max(1)
+}
+
+/// Recurrent state one sequence holds across the whole model, in bytes.
+///
+/// Fixed in size — the same at one token as at a million — and so invisible to
+/// any per-token figure, but not small: 748 MB for five conversations of a
+/// 27B hybrid. Never counted, it let placement put 63 of 64 blocks on an 8 GB
+/// card, after which no context of any size would open. It lives beside its
+/// block, so a block sent to the CPU takes its state with it, which is why it
+/// is priced per block.
+///
+/// llama.cpp's own sizes (`n_embd_r`, `n_embd_s` in `llama-hparams.cpp`), in
+/// f32, which is the type it keeps them in:
+///
+/// ```text
+/// conv  = (ssm.conv_kernel - 1) * (ssm.inner_size + 2 * ssm.group_count * ssm.state_size)
+/// state = ssm.state_size * ssm.inner_size
+/// ```
+///
+/// Checked against the allocation that failed: 47 blocks on the card, five
+/// sequences, 817,152 floats each, 768,122,880 bytes exactly. Architectures
+/// that size their state another way (RWKV, Kimi, MiniMax) are not priced and
+/// stay at zero, which is where every model was before.
+fn recurrent_bytes(gguf: *mut sys::gguf_context, arch: &str, layers: u32, caching: u32) -> u64 {
+    let key = |k: &str| u32_key(gguf, &format!("{arch}.ssm.{k}")).unwrap_or(0) as u64;
+    let (d_conv, d_inner, n_group, d_state) =
+        (key("conv_kernel"), key("inner_size"), key("group_count"), key("state_size"));
+    if d_inner == 0 || d_state == 0 {
+        return 0;
+    }
+    let conv = d_conv.saturating_sub(1) * (d_inner + 2 * n_group * d_state);
+    let state = d_state * d_inner;
+    let recurrent_layers = layers.saturating_sub(caching) as u64;
+    recurrent_layers * (conv + state) * 4
 }
 
 /// Turn declared KV-head counts into elements cached per token.

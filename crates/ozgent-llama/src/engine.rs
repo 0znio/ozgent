@@ -320,7 +320,7 @@ impl Engine {
 
     /// Load a GGUF file with the given resolved settings.
     pub fn load(path: &Path, opts: &Resolved) -> Result<Self, EngineError> {
-        Self::load_reporting(path, opts, |_| {})
+        Self::load_for(path, opts, 1, |_| {})
     }
 
     /// [`Engine::load`], calling `progress` with how far along it is, from 0
@@ -329,6 +329,18 @@ impl Engine {
     pub fn load_reporting(
         path: &Path,
         opts: &Resolved,
+        progress: impl FnMut(f32) + 'static,
+    ) -> Result<Self, EngineError> {
+        Self::load_for(path, opts, 1, progress)
+    }
+
+    /// [`Engine::load_reporting`] for a context that will hold `sequences`
+    /// conversations, which placement has to know on a hybrid model: each one
+    /// keeps a recurrent state beside every block on the card.
+    pub fn load_for(
+        path: &Path,
+        opts: &Resolved,
+        sequences: u32,
         mut progress: impl FnMut(f32) + 'static,
     ) -> Result<Self, EngineError> {
         let backend = backend()?;
@@ -349,7 +361,7 @@ impl Engine {
         // and tested and then wired only to expert eviction, so the option
         // documented as "the smallest offload that fits in VRAM" never searched
         // for anything on a dense model. It searches now.
-        let plan = crate::backend::Plan::for_model(path, opts);
+        let plan = crate::backend::Plan::for_model_with(path, opts, sequences);
         let requested_layers = match opts.gpu_layers {
             GpuLayers::Count(n) => n,
             GpuLayers::Keyword(GpuKeyword::Off) => 0,
@@ -1066,6 +1078,23 @@ impl Engine {
                     first_reason.get_or_insert(reason);
 
                     if window <= ozgent_core::accel::MIN_CONTEXT {
+                        // Nothing opened at all. Said as a shortfall when one
+                        // can be sized, so a caller that can move weights off
+                        // the card does, instead of giving up on a placement
+                        // that was simply a little too full.
+                        if let Some(free) = crate::backend::best_gpu().map(|d| d.memory_free as u64) {
+                            let needed = self.kv_shape.bytes(floor, split)
+                                + crate::backend::reserve_for(shape)
+                                + crate::backend::decode_reserve();
+                            if needed > free {
+                                tracing::debug!("no context opened: {}", first_reason.as_deref().unwrap_or(""));
+                                return Err(EngineError::WindowBelowFloor {
+                                    opened: 0,
+                                    floor,
+                                    short_by: needed - free,
+                                });
+                            }
+                        }
                         let reason = first_reason.unwrap_or_else(|| e.to_string());
                         return Err(EngineError::Context(format!(
                             "{reason} (tried down to {window} tokens of context)"
@@ -3353,6 +3382,24 @@ impl<'a> Session<'a> {
                  replaces trimming needs a context of its own; not speculating"
             );
             spec_on = false;
+        }
+        // Room first. A device snapshot is a second copy of the recurrent
+        // state on the card, and when there is no room for it llama.cpp does
+        // not return an error: it asserts, and the process is gone. A 27B
+        // hybrid with 55 of 64 blocks on an 8 GB card died on its first token
+        // that way, wanting 131 MiB that were not there.
+        if use_snapshot {
+            let need = self.state_bytes(false, true) as u64 + crate::backend::decode_reserve();
+            let free = crate::backend::best_gpu().map(|d| d.memory_free as u64).unwrap_or(0);
+            if free < need {
+                tracing::debug!(
+                    "no room for a device snapshot ({} MiB free, {} MiB needed); not speculating",
+                    free >> 20,
+                    need >> 20
+                );
+                spec_on = false;
+                use_snapshot = false;
+            }
         }
         if use_snapshot && self.snapshot(false, true).is_err() {
             // The device-resident path is what makes this affordable; without
