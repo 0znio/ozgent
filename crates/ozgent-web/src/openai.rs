@@ -858,6 +858,9 @@ async fn collect(
                     0
                 };
                 stop = finish_reason(&reason);
+                // The turn is over. Waiting for the channel to close instead
+                // tied the response to whoever else held a sender.
+                break;
             }
             Event::Error { message } => return Err(from_worker(message)),
             // A permission question cannot reach an OpenAI client — there is

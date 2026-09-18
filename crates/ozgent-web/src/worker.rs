@@ -428,7 +428,10 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
     // Kept so a failure can still be told to the request that caused it.
     // Only logged, a model that loaded and then could not open a context left
     // the page at "loading 100%" for good, with the reason in a log file.
-    let asked = first.out.clone();
+    // Weak: a strong clone kept the channel open for the thread's whole life,
+    // and a non-streaming API call, which ends when its channel closes, then
+    // never returned.
+    let asked = first.out.downgrade();
     if let Err(e) = serve_model(
         &context.paths,
         &context.config,
@@ -441,7 +444,9 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
         member,
     ) {
         tracing::error!("{e}");
-        let _ = asked.send(Event::Error { message: e.to_string() });
+        if let Some(out) = asked.upgrade() {
+            let _ = out.send(Event::Error { message: e.to_string() });
+        }
     }
 }
 

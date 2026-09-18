@@ -1579,6 +1579,7 @@ impl Engine {
             gate_applied: false,
             opts: opts.clone(),
             candidates: Vec::new(),
+            accepted: std::collections::VecDeque::new(),
         }
     }
 
@@ -1674,6 +1675,51 @@ impl LoopCounters {
             end.passes - self.passes,
         );
     }
+}
+
+/// The tokens a penalised top-`k` can come from: the recent tokens, and the
+/// raw top (`k` + recent) — see [`Session::pick_inner`] for why that is all.
+fn candidate_set(row: &[f32], k: usize, recent: &std::collections::VecDeque<LlamaToken>) -> Vec<usize> {
+    let mut keep = top_indices(row, k + recent.len());
+    for t in recent {
+        let i = t.0 as usize;
+        if i < row.len() && !keep.contains(&i) {
+            keep.push(i);
+        }
+    }
+    // In vocabulary order, as the full array is, so a tie between two equal
+    // logits is broken the same way.
+    keep.sort_unstable();
+    keep
+}
+
+/// The indices of the `n` largest values in `row`, in no particular order.
+///
+/// One pass with a small buffer: once it is full, almost every value fails
+/// the comparison against the smallest kept and costs nothing more, which is
+/// what makes this a fraction of the cost of sorting a whole vocabulary.
+fn top_indices(row: &[f32], n: usize) -> Vec<usize> {
+    let n = n.min(row.len());
+    let mut kept: Vec<usize> = Vec::with_capacity(n);
+    if n == 0 {
+        return kept;
+    }
+    let mut floor = f32::NEG_INFINITY;
+    let mut floor_at = 0usize;
+    for (i, &v) in row.iter().enumerate() {
+        if kept.len() < n {
+            kept.push(i);
+            if kept.len() == n {
+                floor_at = (0..n).min_by(|&a, &b| row[kept[a]].total_cmp(&row[kept[b]])).unwrap_or(0);
+                floor = row[kept[floor_at]];
+            }
+        } else if v > floor {
+            kept[floor_at] = i;
+            floor_at = (0..n).min_by(|&a, &b| row[kept[a]].total_cmp(&row[kept[b]])).unwrap_or(0);
+            floor = row[kept[floor_at]];
+        }
+    }
+    kept
 }
 
 /// Text and bytes of a token, the way generation needs them.
@@ -2050,6 +2096,9 @@ pub struct Session<'a> {
     opts: Resolved,
     /// The candidate array token selection fills, kept rather than rebuilt.
     candidates: Vec<llama_cpp_2::token::data::LlamaTokenData>,
+    /// The tokens the sampler has accepted since it was built, newest last,
+    /// as many as its repetition penalty remembers. See [`Session::pick_inner`].
+    accepted: std::collections::VecDeque<LlamaToken>,
 }
 
 // A session may be moved to the thread that will answer with it, which is how
@@ -2694,17 +2743,37 @@ impl<'a> Session<'a> {
     fn pick_inner(&mut self, row: &[f32]) -> LlamaToken {
         // One buffer for the life of the session, refilled in place.
         //
-        // The candidate array is a whole vocabulary of entries — 151,936 of
-        // them, 1.8 MB — and building a fresh one every token cost 2.0 ms of a
-        // 21 ms pass: the six percent this session had quietly lost on plain
-        // decoding, measured at 45.0 tok/s against 47.7 before the hub
-        // existed. llama.cpp's own sampler never paid it because it keeps its
-        // buffer; this now does too.
+        // The candidate array was a whole vocabulary of entries — 248,320 for
+        // Qwen3.5 — rebuilt and scanned on every token: 1.3 ms of a 19.5 ms
+        // token, the whole of the gap to Ollama's decode on the same GPU pass.
+        //
+        // Most of it can never matter. The chain is penalties, then top-k,
+        // then filters over what top-k kept; the penalties change only the
+        // logits of tokens the sampler has accepted recently, and a bias only
+        // the banned ones. Every other token keeps its logit and its order.
+        // So the top k afterwards lie within the recent tokens and the raw top
+        // (k + banned + recent): each recent or banned token pushed down makes
+        // room for at most one from below, and there are only so many.
+        // Handing the chain just that set selects exactly the token the full
+        // vocabulary would, down to the random draw, which sees the same
+        // candidates in the same order after top-k sorts them.
+        //
+        // Not with a grammar, which can mask any token and so needs them all,
+        // nor without a top-k, which leaves nothing to bound the set by.
+        let bound = if self.opts.temperature <= 0.0 { 1 } else { self.opts.top_k as usize };
+        let narrow = !self.grammar_active && bound > 0;
         let mut data = std::mem::take(&mut self.candidates);
         data.clear();
-        data.extend(row.iter().enumerate().map(|(i, &logit)| {
-            llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i as i32), logit, 0.0)
-        }));
+        if narrow {
+            let keep = candidate_set(row, bound + self.banned.len(), &self.accepted);
+            data.extend(keep.iter().map(|&i| {
+                llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i as i32), row[i], 0.0)
+            }));
+        } else {
+            data.extend(row.iter().enumerate().map(|(i, &logit)| {
+                llama_cpp_2::token::data::LlamaTokenData::new(LlamaToken(i as i32), logit, 0.0)
+            }));
+        }
         let mut candidates =
             llama_cpp_2::token::data_array::LlamaTokenDataArray::new(data, false);
         candidates.apply_sampler(&self.sampler);
@@ -2713,6 +2782,14 @@ impl<'a> Session<'a> {
             .expect("a sampler chain always selects a token");
         self.candidates = candidates.data;
         self.sampler.accept(token);
+        // The penalty's own memory, mirrored: the same length, the same order.
+        let remembered = self.opts.repeat_last_n as usize;
+        if remembered > 0 {
+            self.accepted.push_back(token);
+            while self.accepted.len() > remembered {
+                self.accepted.pop_front();
+            }
+        }
         token
     }
 
@@ -2892,6 +2969,7 @@ impl<'a> Session<'a> {
         // Any installed grammar is reapplied by the caller's `set_grammar`,
         // which runs after this on every turn.
         self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), &self.banned, None);
+        self.accepted.clear();
         self.grammar_active = false;
     }
 
@@ -2921,6 +2999,7 @@ impl<'a> Session<'a> {
             Vec::new()
         };
         self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), &self.banned, None);
+        self.accepted.clear();
         self.grammar_active = false;
     }
 
@@ -2941,6 +3020,7 @@ impl<'a> Session<'a> {
         // which silently disables speculation for the rest of the session.
         self.grammar_active = grammar.is_some();
         self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), &self.banned, constraint);
+        self.accepted.clear();
         Ok(())
     }
 
@@ -3919,6 +3999,66 @@ mod tests {
         // Building must not panic; a temp sampler at 0.0 would divide by zero.
         let opts = Options { temperature: Some(0.0), ..Default::default() }.resolve();
         let _ = build_sampler(&opts, 32_000);
+    }
+
+    /// The narrowed set must pick exactly what the whole vocabulary does,
+    /// through llama.cpp's own samplers, greedy and seeded, with a history
+    /// that keeps landing in the top of the distribution.
+    #[test]
+    fn the_narrowed_candidates_pick_what_the_full_vocabulary_would() {
+        use llama_cpp_2::token::data::LlamaTokenData;
+        use llama_cpp_2::token::data_array::LlamaTokenDataArray;
+        let n_vocab = 4000usize;
+        for temperature in [0.0f32, 0.8] {
+            let mut opts = ozgent_core::Options::default().resolve();
+            opts.temperature = temperature;
+            opts.top_k = 40;
+            opts.repeat_penalty = 1.3;
+            opts.repeat_last_n = 64;
+            opts.seed = Some(7);
+            let mut full = build_sampler_with(&opts, n_vocab as i32, &[], None);
+            let mut fast = build_sampler_with(&opts, n_vocab as i32, &[], None);
+            let mut recent: std::collections::VecDeque<LlamaToken> = Default::default();
+            let mut state = 12345u64;
+            let mut rand = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 1_000_000_007) as f32 / 100_000_000.0
+            };
+            for step in 0..400 {
+                let mut row: Vec<f32> = (0..n_vocab).map(|_| rand()).collect();
+                // Make recent tokens strong contenders, so the penalty matters.
+                for t in recent.iter().take(8) {
+                    row[t.0 as usize] = 12.0 + rand();
+                }
+                let pick = |sampler: &LlamaSampler, ids: Vec<usize>| {
+                    let data = ids.iter().map(|&i| LlamaTokenData::new(LlamaToken(i as i32), row[i], 0.0)).collect();
+                    let mut c = LlamaTokenDataArray::new(data, false);
+                    c.apply_sampler(sampler);
+                    c.selected_token().unwrap()
+                };
+                let a = pick(&full, (0..n_vocab).collect());
+                let b = pick(&fast, candidate_set(&row, opts.top_k.max(1) as usize, &recent));
+                assert_eq!(a, b, "step {step}, temperature {temperature}");
+                full.accept(a);
+                fast.accept(b);
+                recent.push_back(a);
+                if recent.len() > 64 {
+                    recent.pop_front();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn top_indices_finds_the_largest() {
+        let row = [0.5, 3.0, -1.0, 2.0, 9.0, 2.5, 0.0];
+        let mut got = top_indices(&row, 3);
+        got.sort();
+        assert_eq!(got, vec![1, 4, 5]);
+        assert_eq!(top_indices(&row, 0), Vec::<usize>::new());
+        assert_eq!(top_indices(&row, 99).len(), row.len());
     }
 
     #[test]

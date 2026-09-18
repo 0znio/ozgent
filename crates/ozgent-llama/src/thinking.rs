@@ -46,14 +46,13 @@ pub const DEFAULT_TAGS: &[TagPair] = &[
 /// model writes the trace and the closing tag but never an opening one — and
 /// a filter waiting to see one reads the whole trace as the answer.
 ///
-/// Counting rather than searching from the end: a conversation replays earlier
-/// assistant turns, each with its own complete block, so the question is
-/// whether one more was opened than closed.
+/// Decided by how the prompt ends, not by counting tags in it. A count was
+/// fooled by any message that mentions a tag: a user asking about `<think>`
+/// made one more opening than closing, the answer was filed as reasoning, and
+/// with reasoning hidden the reply came back empty and was generated again.
 pub fn open_at_end(prompt: &str) -> Option<&'static str> {
-    DEFAULT_TAGS
-        .iter()
-        .find(|t| prompt.matches(t.open).count() > prompt.matches(t.close).count())
-        .map(|t| t.close)
+    let tail = prompt.trim_end();
+    DEFAULT_TAGS.iter().find(|t| tail.ends_with(t.open)).map(|t| t.close)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +440,14 @@ mod tests {
     fn replayed_turns_do_not_confuse_the_count() {
         // Two complete blocks from history, then one opened for this turn.
         let p = "<think>a</think>x<think>b</think>y<|im_start|>assistant\n<think>\n";
+        assert_eq!(open_at_end(p), Some("</think>"));
+    }
+
+    #[test]
+    fn a_tag_mentioned_in_a_message_is_not_a_block() {
+        let p = "<|im_start|>user\nWhat does `<think>` do?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        assert_eq!(open_at_end(p), None);
+        let p = "<|im_start|>user\nA stray </think> here<|im_end|>\n<|im_start|>assistant\n<think>\n";
         assert_eq!(open_at_end(p), Some("</think>"));
     }
 

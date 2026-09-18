@@ -464,8 +464,15 @@ pub struct Mention {
 pub fn mentions(text: &str) -> Vec<Mention> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
+    let code = code_spans(text);
     let mut i = 0;
     while i < bytes.len() {
+        // Inside code, `@name` is an example of a call, not a call. A pasted
+        // README that showed how to ask `@stock-guru` ran the agent.
+        if let Some(&(_, end)) = code.iter().find(|(s, e)| *s <= i && i < *e) {
+            i = end;
+            continue;
+        }
         if bytes[i] == b'@' {
             let boundary = i == 0
                 || text[..i]
@@ -492,6 +499,41 @@ pub fn mentions(text: &str) -> Vec<Mention> {
         i += 1;
     }
     out
+}
+
+/// Byte ranges of `text` that are code: fenced blocks and inline spans.
+///
+/// An unclosed fence runs to the end, the way Markdown renders it; an
+/// unmatched backtick is just a backtick.
+fn code_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    // Byte comparisons only: a backtick is one byte and never part of a
+    // multi-byte character, whereas slicing `text` at an arbitrary byte would
+    // land inside one (a pasted `§` did, and the request panicked).
+    let find = |from: usize, pat: &[u8]| {
+        bytes[from.min(bytes.len())..].windows(pat.len()).position(|w| w == pat).map(|p| from + p)
+    };
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"```") {
+            let end = find(i + 3, b"```").map_or(bytes.len(), |e| e + 3);
+            spans.push((i, end));
+            i = end;
+        } else if bytes[i] == b'`' {
+            let close = bytes[i + 1..].iter().position(|&b| b == b'`' || b == b'\n');
+            match close {
+                Some(e) if bytes[i + 1 + e] == b'`' => {
+                    spans.push((i, i + 2 + e));
+                    i += 2 + e;
+                }
+                _ => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    spans
 }
 
 /// The mention being typed at the end of `before_caret`, if there is one.
@@ -621,6 +663,13 @@ pub fn handoff_note(task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mention_inside_code_is_not_a_call() {
+        let text = "Summarise § this:\n```\n@stock-guru how is NVDA § \n```\nand `@sentiment-analyser` too, but @deep-researcher yes";
+        let names: Vec<String> = mentions(text).into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["deep-researcher".to_string()]);
+    }
 
     #[test]
     fn the_handoff_tool_names_every_agent_and_reads_back() {

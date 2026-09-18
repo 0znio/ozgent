@@ -448,6 +448,8 @@ async fn collect(
             Event::Done { generated, prompt, stop: reason, .. } => {
                 usage = (prompt, generated);
                 stop = stop_reason(&reason);
+                // Ended; see openai::collect.
+                break;
             }
             Event::Error { message } => return Err(AnthropicError::from_worker(message)),
             _ => {}
