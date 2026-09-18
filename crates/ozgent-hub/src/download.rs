@@ -41,6 +41,16 @@ const SLICE_BYTES: u64 = 16 * 1024 * 1024;
 /// of requests and a ledger to match.
 const MAX_SLICES: usize = 1024;
 
+/// How long a connection may deliver nothing before it is abandoned and
+/// retried.
+const STALL: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Retries per slice before the download gives up. With the backoff that is
+/// about two minutes of a network being away — a dropped Wi-Fi, a router
+/// restart — before the error reaches the user, and the part file still
+/// resumes from there.
+const SLICE_RETRIES: u32 = 6;
+
 /// Progress callback: `(downloaded, total)` in bytes.
 pub type Progress<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
 
@@ -280,61 +290,109 @@ async fn download_parallel(
     let fetches = pending.into_iter().map(|(index, (start, end))| {
         let write_ledger = &write_ledger;
         async move {
-            let mut request = http.get(url).header(
-                reqwest::header::RANGE,
-                format!("bytes={start}-{end}"),
-            );
-            if let Some(t) = token {
-                request = request.bearer_auth(t);
-            }
-            let resp = request.send().await?;
+            // One slice, retried. A dropped connection used to abort the whole
+            // download — a 7 GB pull lost at 19% to one reset — although every
+            // other slice was fine and this one could simply start again.
+            let mut failures = 0u32;
+            loop {
+                let attempt: Result<(), HubError> = async {
+                    let mut request = http.get(url).header(
+                        reqwest::header::RANGE,
+                        format!("bytes={start}-{end}"),
+                    );
+                    if let Some(t) = token {
+                        request = request.bearer_auth(t);
+                    }
+                    let resp = request.send().await?;
 
-            // Anything but 206 means the range was ignored, and writing a
-            // whole-file body at an offset would corrupt everything.
-            if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                unsupported_ref.store(true, Ordering::Relaxed);
-                return Ok(());
-            }
+                    // Anything but 206 means the range was ignored, and writing a
+                    // whole-file body at an offset would corrupt everything.
+                    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                        unsupported_ref.store(true, Ordering::Relaxed);
+                        return Ok(());
+                    }
 
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(part)
-                .await
-                .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
-            file.seek(std::io::SeekFrom::Start(start))
-                .await
-                .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(part)
+                        .await
+                        .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
+                    file.seek(std::io::SeekFrom::Start(start))
+                        .await
+                        .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
 
-            let mut stream = resp.bytes_stream();
-            let mut written = 0u64;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                // A server that sends more than asked for would run into the
-                // next slice's bytes.
-                let room = (end - start + 1).saturating_sub(written) as usize;
-                let chunk = if chunk.len() > room { chunk.slice(..room) } else { chunk };
-                if chunk.is_empty() {
-                    break;
+                    let mut stream = resp.bytes_stream();
+                    let mut written = 0u64;
+                    loop {
+                        // A connection that has gone quiet is not coming back; waiting
+                        // on it held a download at a few KB/s until the network gave up.
+                        let next = tokio::time::timeout(STALL, stream.next())
+                            .await
+                            .map_err(|_| HubError::Stalled(format!("no data for {}s", STALL.as_secs())));
+                        let chunk = match next {
+                            Ok(Some(Ok(chunk))) => chunk,
+                            Ok(None) => break,
+                            Ok(Some(Err(e))) => {
+                                // Take back what this attempt counted, so a retry does
+                                // not push the progress bar past the end.
+                                done_ref.fetch_sub(written, Ordering::Relaxed);
+                                transferred_ref.fetch_sub(written, Ordering::Relaxed);
+                                return Err(e.into());
+                            }
+                            Err(e) => {
+                                done_ref.fetch_sub(written, Ordering::Relaxed);
+                                transferred_ref.fetch_sub(written, Ordering::Relaxed);
+                                return Err(e);
+                            }
+                        };
+                        // A server that sends more than asked for would run into the
+                        // next slice's bytes.
+                        let room = (end - start + 1).saturating_sub(written) as usize;
+                        let chunk = if chunk.len() > room { chunk.slice(..room) } else { chunk };
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        file.write_all(&chunk)
+                            .await
+                            .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
+                        written += chunk.len() as u64;
+                        transferred_ref.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        let so_far = done_ref.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                            + chunk.len() as u64;
+                        if let Some(cb) = progress {
+                            cb(so_far.min(total), total);
+                        }
+                    }
+                    file.flush()
+                        .await
+                        .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
+
+                    if written != end - start + 1 {
+                        done_ref.fetch_sub(written, Ordering::Relaxed);
+                        transferred_ref.fetch_sub(written, Ordering::Relaxed);
+                        return Err(HubError::Stalled(format!(
+                            "the connection closed {} bytes short",
+                            end - start + 1 - written
+                        )));
+                    }
+                    write_ledger(index).await;
+                    Ok(())
                 }
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
-                written += chunk.len() as u64;
-                transferred_ref.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                let so_far = done_ref.fetch_add(chunk.len() as u64, Ordering::Relaxed)
-                    + chunk.len() as u64;
-                if let Some(cb) = progress {
-                    cb(so_far.min(total), total);
+                .await;
+                match attempt {
+                    Ok(()) => return Ok::<(), HubError>(()),
+                    // A local failure — a full disk, a file that cannot be
+                    // opened — is not cured by asking the server again.
+                    Err(e @ HubError::Io { .. }) => return Err(e),
+                    Err(e) if failures >= SLICE_RETRIES => return Err(e),
+                    Err(e) => {
+                        failures += 1;
+                        let wait = std::time::Duration::from_secs((1u64 << failures).min(30));
+                        tracing::info!("slice {index} failed ({e}); retrying in {}s", wait.as_secs());
+                        tokio::time::sleep(wait).await;
+                    }
                 }
             }
-            file.flush()
-                .await
-                .map_err(|e| HubError::Io { path: part.display().to_string(), source: e })?;
-
-            if written == end - start + 1 {
-                write_ledger(index).await;
-            }
-            Ok::<(), HubError>(())
         }
     });
 

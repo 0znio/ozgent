@@ -228,6 +228,11 @@ pub enum HubError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
+    /// A connection that delivered nothing for too long, or ended before its
+    /// range was complete. Retried like any other network failure.
+    #[error("the download stalled: {0}")]
+    Stalled(String),
+
     #[error("repository {repo:?} not found on Hugging Face")]
     NotFound { repo: String },
 
