@@ -207,7 +207,9 @@ mod tests {
 
     #[test]
     fn a_bad_config_value_names_the_problem() {
+        // Only ever deserialised into, to see the error it raises.
         #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
         struct Holder {
             #[serde(default, deserialize_with = "deserialize_optional")]
             ctx: Option<u32>,

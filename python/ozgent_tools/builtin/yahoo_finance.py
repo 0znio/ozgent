@@ -69,6 +69,17 @@ MODULES = (
 #: Seconds a crumb is trusted before it is fetched again anyway.
 CRUMB_TTL = 6 * 3600
 
+#: Per-request timeout for the cookie and crumb handshake. It is two small
+#: requests that answer in under a second when Yahoo is healthy; at the
+#: default 20 s each, plus a retry, one stalled handshake held the session
+#: lock for longer than the whole 30 s tool budget and every other Yahoo call
+#: queued behind it and timed out with it.
+HANDSHAKE_TIMEOUT = 8.0
+
+#: Longest a call waits for another thread's handshake before giving up on
+#: the crumb and using an endpoint that does not need one.
+LOCK_WAIT = 10.0
+
 
 class _Session:
     """One cookie jar and the crumb that goes with it, shared by every call."""
@@ -93,14 +104,21 @@ class _Session:
             return exc.code, exc.read().decode("utf-8", "replace")[:500]
 
     def ensure_crumb(self, force: bool = False) -> str:
-        with self.lock:
+        if not self.lock.acquire(timeout=LOCK_WAIT):
+            raise ToolError("Yahoo Finance is slow to issue a session", retryable=True)
+        try:
             if self.crumb and not force and time.time() - self.fetched < CRUMB_TTL:
                 return self.crumb
             self.jar.clear()
             # This answers 404, and that is fine: the response still sets the
             # session cookie, which is all it is visited for.
-            self.get("https://fc.yahoo.com/")
-            status, body = self.get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+            try:
+                self.get("https://fc.yahoo.com/", timeout=HANDSHAKE_TIMEOUT)
+                status, body = self.get(
+                    "https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=HANDSHAKE_TIMEOUT
+                )
+            except OSError as exc:
+                raise ToolError(f"Yahoo Finance did not answer: {exc}", retryable=True) from exc
             crumb = body.strip()
             if status != 200 or not crumb or "<" in crumb or " " in crumb:
                 raise ToolError(
@@ -109,6 +127,8 @@ class _Session:
                 )
             self.crumb, self.fetched = crumb, time.time()
             return crumb
+        finally:
+            self.lock.release()
 
 
 _SESSION = _Session()
@@ -227,8 +247,61 @@ def shape_quote(item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _chart_quote(symbol: str) -> dict[str, Any]:
+    """A quote from the chart endpoint, which needs no crumb.
+
+    Fewer fields than the quote endpoint — no valuation ratios — but the price,
+    the day's move and range, volume and the 52-week range are all there.
+    """
+    data = _fetch(f"/v8/finance/chart/{urllib.parse.quote(symbol)}", {"range": "1d", "interval": "1d"})
+    result = ((data.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        raise ToolError(f"no quote for {symbol}. Use action 'search' to find the symbol.")
+    m = result.get("meta") or {}
+    price, prev = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
+    out = {
+        "symbol": m.get("symbol", symbol),
+        "name": m.get("longName") or m.get("shortName"),
+        "currency": m.get("currency"),
+        "exchange": m.get("fullExchangeName") or m.get("exchangeName"),
+        "price": _round(price),
+        "previous_close": _round(prev),
+        "day_high": _round(m.get("regularMarketDayHigh")),
+        "day_low": _round(m.get("regularMarketDayLow")),
+        "volume": m.get("regularMarketVolume"),
+        "year_high": _round(m.get("fiftyTwoWeekHigh")),
+        "year_low": _round(m.get("fiftyTwoWeekLow")),
+    }
+    if price is not None and prev:
+        out["change"] = _round(price - prev)
+        out["change_percent"] = _round((price - prev) / prev * 100, 2)
+    when = _iso(m.get("regularMarketTime"))
+    if when:
+        out["as_of"] = when
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _quote(symbols: list[str]) -> dict[str, Any]:
-    data = _fetch("/v7/finance/quote", {"symbols": ",".join(symbols)}, crumb=True)
+    try:
+        data = _fetch("/v7/finance/quote", {"symbols": ",".join(symbols)}, crumb=True)
+    except ToolError as exc:
+        # The full quote needs a session Yahoo sometimes will not give. The
+        # chart endpoint does not, so a price is still available; say which
+        # fields are missing rather than fail the whole call.
+        if not exc.retryable:
+            raise
+        quotes, missing = [], []
+        for s in symbols:
+            try:
+                quotes.append(_chart_quote(s))
+            except ToolError:
+                missing.append(s)
+        if not quotes:
+            raise
+        out: dict[str, Any] = {"quotes": quotes, "note": "valuation fields unavailable; Yahoo refused a session"}
+        if missing:
+            out["not_found"] = missing
+        return out
     results = (data.get("quoteResponse") or {}).get("result") or []
     if not results:
         raise ToolError(f"no quote for {', '.join(symbols)}. Use action 'search' to find the symbol.")
@@ -504,7 +577,19 @@ async def yahoo_finance(
     # Headlines can be asked for by topic as well as by ticker; a model
     # researching "NVIDIA" reasonably puts that in `query`.
     if action == "news" and not symbol.strip() and query.strip():
-        result = await asyncio.to_thread(_search, query.strip(), 0, count)
+        result = await asyncio.to_thread(_search, query.strip(), 1, count)
+        # A phrase like "Nvidia NVDA stock" matches nothing as written —
+        # Yahoo's search does not split it — but it names a company, and that
+        # company's headlines are what was meant. Its words are tried alone,
+        # the ones shaped like a ticker first.
+        if not result["news"]:
+            words = [w.strip(".,;:()") for w in query.split()]
+            words.sort(key=lambda w: not (w.isupper() and 1 <= len(w) <= 6))
+            for word in words[:4]:
+                found = await asyncio.to_thread(_search, word, 1, count)
+                if found["news"]:
+                    result = found
+                    break
         if not result["news"]:
             raise ToolError(f"no recent headlines for {query!r}; try web_search with category 'news'")
         return {

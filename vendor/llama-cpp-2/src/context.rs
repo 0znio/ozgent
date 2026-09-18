@@ -82,6 +82,7 @@ impl<'model> LlamaContext<'model> {
         self.context.as_ptr()
     }
 
+    /// The most tokens one `decode` call may carry.
     pub fn n_batch(&self) -> u32 {
         unsafe { llama_cpp_sys_2::llama_n_batch(self.context.as_ptr()) }
     }

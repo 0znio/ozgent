@@ -85,7 +85,7 @@ fn run<'a>(
         if model.is_eog_token(token) {
             break;
         }
-        out.push_str(&model.token_to_str(token, llama_cpp_2::model::Special::Tokenize)?);
+        out.push_str(&String::from_utf8_lossy(&model.token_to_piece_bytes(token, 64, true, None)?));
         let got = slot.run(vec![token], pos, ozgent_llama::hub::Logits::Last)?;
         pos += 1;
         logits = got.into_last();

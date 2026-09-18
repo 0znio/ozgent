@@ -48,7 +48,7 @@ const WINDOW: usize = 16;
 
 /// Suppressed rounds before drafting is retried, so a change of workload can
 /// re-enable acceleration mid-turn.
-const PROBE_AFTER: u32 = 24;
+pub(crate) const PROBE_AFTER: u32 = 24;
 
 /// Drafted tokens needed before the acceptance rate is trusted.
 const MIN_EVIDENCE: u32 = 24;

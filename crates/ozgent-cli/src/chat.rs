@@ -66,7 +66,7 @@ pub async fn run(
     model: Option<String>,
     options: &crate::cli::OptionFlags,
 ) -> Result<()> {
-    let mut name = model
+    let name = model
         .or_else(|| config.default_model.clone())
         .context(
             "no model given and no default_model set in config.toml.\n\
@@ -344,10 +344,6 @@ impl<'a> Chat<'a> {
         out
     }
 
-
-    fn opts_show_stats(&self) -> bool {
-        std::env::var("OZGENT_STATS").is_ok()
-    }
 
     /// Decide whether a call may run, asking the user if the policy says to.
     ///
@@ -1092,27 +1088,6 @@ impl<'a> Chat<'a> {
     }
 }
 
-/// Tokens a call is given to finish its arguments before it is asked about.
-///
-/// The whole point of asking early is to ask before a file's `content` has
-/// been generated, so this cannot be large. It only has to be long enough
-/// that a compact call — a command, a search — arrives complete and is asked
-/// about in full, which takes a couple of dozen tokens.
-const ARGUMENT_GRACE: usize = 24;
-
-/// What one generation produced, after the reasoning and tool-call streams
-/// have been told apart.
-struct Reply {
-    text: String,
-    thinking: Option<String>,
-    /// A permission answered while the call was still being written, so the
-    /// tool loop does not ask a second time about the same call.
-    early_permission: Option<(String, ozgent_core::Choice)>,
-    /// The model began a tool call, whether or not it parsed. Used to decide
-    /// when a grammar-constrained retry is worth attempting.
-    attempted_call: bool,
-}
-
 enum Flow {
     Continue,
     Exit,
@@ -1235,28 +1210,6 @@ fn truncate_middle(s: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
-/// Compact JSON for a one-line trace of a tool call.
-fn compact(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    if s.len() > 80 { format!("{}…", &s[..77]) } else { s }
-}
-
-/// Tool output can be large; a whole search response would crowd out the
-/// conversation, so it is capped before entering the context.
-fn truncate_result(s: &str) -> String {
-    const MAX: usize = 4000;
-    if s.len() <= MAX {
-        return s.to_string();
-    }
-    let mut end = MAX;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…\n[truncated, {} bytes total]", &s[..end], s.len())
-}
-
-
-
 /// Clear the terminal and put the cursor at the top.
 ///
 /// Written straight to the terminal rather than through the theme: this is a
@@ -1365,13 +1318,6 @@ Editing      Shift-Enter for a new line (Alt-Enter or Ctrl-J in terminals
 
 Paste an image path or URL in a message and it is picked up automatically.
 Type @ for the agents; Tab or Enter picks one.";
-
-/// Every agent, for the model to hand a turn to. Read per turn, so one saved a
-/// moment ago is included.
-fn catalog_agents(paths: &Paths) -> Vec<ozgent_core::Agent> {
-    ozgent_core::AgentCatalog::load(paths).all().to_vec()
-}
-
 
 /// `█████░░░░░  42%`: a bar a terminal can draw in any font.
 pub fn progress_bar(fraction: f32, width: usize) -> String {
@@ -1591,54 +1537,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_results_are_capped_before_entering_context() {
-        let big = "x".repeat(10_000);
-        let out = truncate_result(&big);
-        assert!(out.len() < 5000, "must be capped, got {}", out.len());
-        assert!(out.contains("truncated"), "and must say so: {}", &out[out.len() - 40..]);
-        assert_eq!(truncate_result("small"), "small");
-    }
-
-    #[test]
-    fn truncation_never_splits_a_character() {
-        let s = "é".repeat(5000);
-        let out = truncate_result(&s);
-        assert!(out.is_char_boundary(out.len()), "must remain valid UTF-8");
-    }
-
-    #[test]
-    fn compact_shortens_long_arguments() {
-        let v = serde_json::json!({"q": "y".repeat(200)});
-        assert!(compact(&v).len() <= 81, "should be one line");
-        assert!(compact(&serde_json::json!({"a": 1})).contains("\"a\""));
-    }
-
-    #[test]
     fn first_line_truncates_multiline_descriptions() {
         assert_eq!(ozgent_tools::first_line("one\ntwo\nthree"), "one");
         assert_eq!(ozgent_tools::first_line(""), "");
     }
-}
-
-/// Tokens the grounding pass may spend before the real turn begins.
-const GROUNDING_LIMIT: u32 = 200;
-
-/// The system-prompt note built from what the model saw.
-///
-/// Naming the only reason a tool is still warranted is load-bearing: given the
-/// observation alone the model read the image correctly and then searched the
-/// web for it anyway.
-fn grounded_note(observation: &str) -> String {
-    format!(
-        "You have already looked at the attached media. This is what is actually \
-         in it:\n{observation}\n\nAnswer the user from that observation. It is a \
-         complete and accurate record of the media, so questions about what the \
-         media contains, shows, or looks like are already answered — do not use a \
-         tool for them, and do not ask the user to describe it.\n\nUse a tool only \
-         if the user asked for something the media cannot contain: a current \
-         price, recent news, today's weather, or another fact from the outside \
-         world."
-    )
 }
 
 /// Whether a line is a slash command rather than a message.

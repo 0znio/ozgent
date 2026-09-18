@@ -3,8 +3,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::num::NonZeroU16;
 use std::os::raw::c_int;
 use std::path::Path;
-use std::ptr::{self, NonNull};
-use std::slice;
+use std::ptr::NonNull;
 use std::str::Utf8Error;
 
 use crate::context::params::LlamaContextParams;
@@ -13,7 +12,7 @@ use crate::llama_backend::LlamaBackend;
 use crate::model::params::LlamaModelParams;
 use crate::sampling::LlamaSampler;
 use crate::token::LlamaToken;
-use crate::token_type::{LlamaTokenAttr, LlamaTokenAttrs};
+use crate::token_type::LlamaTokenAttrs;
 use crate::{
     ApplyChatTemplateError, ChatTemplateError, LlamaContextLoadError, LlamaLoraAdapterInitError,
     LlamaModelLoadError, MetaValError, NewLlamaChatMessageError, StringToTokenError,
@@ -97,9 +96,13 @@ impl LlamaChatMessage {
 /// The Rope type that's used within the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeType {
+    /// Rotary embedding over consecutive dimension pairs.
     Norm,
+    /// GPT-NeoX style: the two halves of the head dimension are rotated together.
     NeoX,
+    /// Multi-section rotary embedding (text, height, width), as Qwen-VL uses.
     MRope,
+    /// Rotary embedding for vision encoders.
     Vision,
 }
 
@@ -112,18 +115,6 @@ pub enum AddBos {
     Never,
 }
 
-/// How to determine if we should tokenize special tokens
-#[deprecated(
-    since = "0.1.0",
-    note = "This enum is a mixture of options for llama cpp providing less flexibility it only used with deprecated methods and will be removed in the future."
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Special {
-    /// Allow tokenizing special and/or control tokens which otherwise are not exposed and treated as plaintext. Does not insert a leading space.
-    Tokenize,
-    /// Treat special and/or control tokens as plaintext.
-    Plaintext,
-}
 
 unsafe impl Send for LlamaModel {}
 
@@ -204,78 +195,8 @@ impl LlamaModel {
         LlamaToken(token)
     }
 
-    /// Convert single token to a string.
-    ///
-    /// # Errors
-    ///
-    /// See [`TokenToStringError`] for more information.
-    #[deprecated(since = "0.1.0", note = "Use `token_to_piece` instead")]
-    pub fn token_to_str(
-        &self,
-        token: LlamaToken,
-        special: Special,
-    ) -> Result<String, TokenToStringError> {
-        // TODO lsptrip None is acutally not quite the origignal behavior of this function,
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        self.token_to_piece(
-            token,
-            &mut decoder,
-            matches!(special, Special::Tokenize),
-            None,
-        )
-    }
 
-    /// Convert single token to bytes.
-    ///
-    /// # Errors
-    /// See [`TokenToStringError`] for more information.
-    ///
-    /// # Panics
-    /// If a [`TokenToStringError::InsufficientBufferSpace`] error returned by
-    /// [`Self::token_to_bytes_with_size`] contains a positive nonzero value. This should never
-    /// happen.
-    #[deprecated(since = "0.1.0", note = "Use `token_to_piece_bytes` instead")]
-    pub fn token_to_bytes(
-        &self,
-        token: LlamaToken,
-        special: Special,
-    ) -> Result<Vec<u8>, TokenToStringError> {
-        // TODO lsptrip None is acutally not quite the origignal behavior of this function,
-        match self.token_to_piece_bytes(token, 8, matches!(special, Special::Tokenize), None) {
-            Err(TokenToStringError::InsufficientBufferSpace(i)) => self.token_to_piece_bytes(
-                token,
-                (-i).try_into().expect("Error buffer size is positive"),
-                matches!(special, Special::Tokenize),
-                None,
-            ),
-            x => x,
-        }
-    }
 
-    /// Convert a vector of tokens to a single string.
-    ///
-    /// # Errors
-    ///
-    /// See [`TokenToStringError`] for more information.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use `token_to_piece` for each token individually instead"
-    )]
-    pub fn tokens_to_str(
-        &self,
-        tokens: &[LlamaToken],
-        special: Special,
-    ) -> Result<String, TokenToStringError> {
-        let mut builder: Vec<u8> = Vec::with_capacity(tokens.len() * 4);
-        for piece in tokens
-            .iter()
-            .copied()
-            .map(|t| self.token_to_piece_bytes(t, 8, matches!(special, Special::Tokenize), None))
-        {
-            builder.extend_from_slice(&piece?);
-        }
-        Ok(String::from_utf8(builder)?)
-    }
 
     /// Convert a string to a Vector of tokens.
     ///
@@ -460,107 +381,8 @@ impl LlamaModel {
         }
     }
 
-    /// Convert a token to a string with a specified buffer size.
-    ///
-    /// Generally you should use [`LlamaModel::token_to_str`] as it is able to decode tokens with
-    /// any length.
-    ///
-    /// # Errors
-    ///
-    /// - if the token type is unknown
-    /// - the resultant token is larger than `buffer_size`.
-    /// - the string returend by llama-cpp is not valid utf8.
-    ///
-    /// # Panics
-    ///
-    /// - if `buffer_size` does not fit into a [`c_int`].
-    /// - if the returned size from llama-cpp does not fit into a [`usize`]. (this should never happen)
-    #[deprecated(since = "0.1.0", note = "Use `token_to_piece` instead")]
-    pub fn token_to_str_with_size(
-        &self,
-        token: LlamaToken,
-        buffer_size: usize,
-        special: Special,
-    ) -> Result<String, TokenToStringError> {
-        let bytes = self.token_to_piece_bytes(
-            token,
-            buffer_size,
-            matches!(special, Special::Tokenize),
-            None,
-        )?;
-        Ok(String::from_utf8(bytes)?)
-    }
 
-    /// Convert a token to bytes with a specified buffer size.
-    ///
-    /// Generally you should use [`LlamaModel::token_to_bytes`] as it is able to handle tokens of
-    /// any length.
-    ///
-    /// # Errors
-    ///
-    /// - if the token type is unknown
-    /// - the resultant token is larger than `buffer_size`.
-    ///
-    /// # Panics
-    ///
-    /// - if `buffer_size` does not fit into a [`c_int`].
-    /// - if the returned size from llama-cpp does not fit into a [`usize`]. (this should never happen)
-    #[deprecated(since = "0.1.0", note = "Use `token_to_piece_bytes` instead")]
-    pub fn token_to_bytes_with_size(
-        &self,
-        token: LlamaToken,
-        buffer_size: usize,
-        special: Special,
-        lstrip: Option<NonZeroU16>,
-    ) -> Result<Vec<u8>, TokenToStringError> {
-        if token == self.token_nl() {
-            return Ok(b"\n".to_vec());
-        }
 
-        // unsure what to do with this in the face of the 'special' arg + attr changes
-        let attrs = self.token_attr(token);
-        if attrs.is_empty()
-            || attrs
-                .intersects(LlamaTokenAttr::Unknown | LlamaTokenAttr::Byte | LlamaTokenAttr::Unused)
-            || attrs.contains(LlamaTokenAttr::Control)
-                && (token == self.token_bos() || token == self.token_eos())
-        {
-            return Ok(Vec::new());
-        }
-
-        let special = match special {
-            Special::Tokenize => true,
-            Special::Plaintext => false,
-        };
-
-        let string = CString::new(vec![b'*'; buffer_size]).expect("no null");
-        let len = string.as_bytes().len();
-        let len = c_int::try_from(len).expect("length fits into c_int");
-        let buf = string.into_raw();
-        let lstrip = lstrip.map_or(0, |it| i32::from(it.get()));
-        let size = unsafe {
-            llama_cpp_sys_2::llama_token_to_piece(
-                self.vocab_ptr(),
-                token.0,
-                buf,
-                len,
-                lstrip,
-                special,
-            )
-        };
-
-        match size {
-            0 => Err(TokenToStringError::UnknownTokenType),
-            i if i.is_negative() => Err(TokenToStringError::InsufficientBufferSpace(i)),
-            size => {
-                let string = unsafe { CString::from_raw(buf) };
-                let mut bytes = string.into_bytes();
-                let len = usize::try_from(size).expect("size is positive and fits into usize");
-                bytes.truncate(len);
-                Ok(bytes)
-            }
-        }
-    }
     /// The number of tokens the model was trained on.
     ///
     /// This returns a `c_int` for maximum compatibility. Most of the time it can be cast to an i32
@@ -638,6 +460,7 @@ impl LlamaModel {
         self.model.as_ptr()
     }
 
+    /// Transformer blocks in the model, as the GGUF declares them.
     pub fn n_layer(&self) -> u32 {
         // It's never possible for this to panic because while the API interface is defined as an int32_t,
         // the field it's accessing is a uint32_t.

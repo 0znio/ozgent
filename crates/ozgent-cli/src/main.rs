@@ -916,12 +916,6 @@ async fn chat(
 }
 
 
-/// Context window given to a draft model.
-///
-/// It is re-synced to the confirmed transcript every round and never needs the
-/// target's full window; a large KV here would only take VRAM the target needs.
-const DRAFT_CONTEXT: u32 = 4096;
-
 /// Answer one prompt and exit.
 ///
 /// A client of the daemon like everything else, over the stateless

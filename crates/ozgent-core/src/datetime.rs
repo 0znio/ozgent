@@ -109,21 +109,30 @@ impl DateTime {
             + self.second as i64
     }
 
-    /// What the model is told about today, in the system prompt.
+    /// What the model is told about today, in the system prompt, for a
+    /// wall-clock time in the zone called `zone`.
     ///
     /// The date only. This line opens every prompt, and anything in it that
     /// changes invalidates everything cached after it: carrying the time to
     /// the minute made a reply sent in a new minute prefill the whole
     /// conversation again — five to ten seconds on a model larger than the
     /// card. The time travels with each message instead; see [`Self::stamp`].
-    pub fn prompt_line(&self) -> String {
+    ///
+    /// The zone is named because a bare time is read as UTC or US Eastern by
+    /// default, and "this evening" then means someone else's evening.
+    pub fn prompt_line_in(&self, zone: &str) -> String {
         format!(
-            "Today is {}, {} {} {} (UTC).",
+            "Today is {}, {} {} {}. The user's time zone is {zone}; times given are in it.",
             self.weekday_name(),
             self.day,
             self.month_name(),
             self.year,
         )
+    }
+
+    /// [`Self::prompt_line_in`] for a time already in UTC.
+    pub fn prompt_line(&self) -> String {
+        self.prompt_line_in("UTC")
     }
 
     /// The mark put in front of a user message sent at this moment, as seen
@@ -134,10 +143,10 @@ impl DateTime {
     /// named only when it is not today's.
     pub fn stamp(&self, today: &DateTime) -> String {
         if (self.year, self.month, self.day) == (today.year, today.month, today.day) {
-            format!("[{:02}:{:02} UTC]", self.hour, self.minute)
+            format!("[{:02}:{:02}]", self.hour, self.minute)
         } else {
             format!(
-                "[{} {} {}, {:02}:{:02} UTC]",
+                "[{} {} {}, {:02}:{:02}]",
                 &self.weekday_name()[..3],
                 self.day,
                 &self.month_name()[..3],
@@ -283,8 +292,8 @@ mod tests {
     #[test]
     fn a_stamp_names_the_day_only_when_it_is_not_today() {
         let today = DateTime::civil(2026, 9, 18, 12, 0, 0);
-        assert_eq!(DateTime::civil(2026, 9, 18, 9, 5, 0).stamp(&today), "[09:05 UTC]");
-        assert_eq!(DateTime::civil(2026, 9, 17, 22, 40, 0).stamp(&today), "[Thu 17 Sep, 22:40 UTC]");
+        assert_eq!(DateTime::civil(2026, 9, 18, 9, 5, 0).stamp(&today), "[09:05]");
+        assert_eq!(DateTime::civil(2026, 9, 17, 22, 40, 0).stamp(&today), "[Thu 17 Sep, 22:40]");
     }
 
     #[test]

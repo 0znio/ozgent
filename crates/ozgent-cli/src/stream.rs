@@ -63,7 +63,9 @@ pub async fn render(
     let mut running: Option<String> = None;
     let mut loading: Option<String> = None;
 
-    // Ticks the screen between events; see `Ui::idle`.
+    // Ticks the screen between events; see `Ui::idle`. Armed here so a Ctrl-C
+    // from an earlier turn does not stop this one before it starts.
+    crate::input::arm_interrupt();
     let mut heartbeat = tokio::time::interval(crate::tui::ui::SPIN);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

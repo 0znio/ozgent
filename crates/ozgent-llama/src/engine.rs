@@ -14,7 +14,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
@@ -531,8 +531,8 @@ impl Engine {
         let jinja = if raw_template.is_empty() {
             None
         } else {
-            let bos = model.token_to_str(model.token_bos(), Special::Tokenize).unwrap_or_default();
-            let eos = model.token_to_str(model.token_eos(), Special::Tokenize).unwrap_or_default();
+            let bos = model.token_text(model.token_bos());
+            let eos = model.token_text(model.token_eos());
             match crate::template::ChatTemplate::new(&raw_template, bos, eos) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -893,7 +893,7 @@ impl Engine {
         let mut narrow_to = narrow_to;
         let wide = shape.ubatch;
         *self.narrowed.lock().unwrap() = None;
-        let mut narrow = |params: &mut LlamaContextParams,
+        let narrow = |params: &mut LlamaContextParams,
                           shape: &mut ozgent_core::reserve::Shape,
                           narrow_to: &mut Option<u32>|
          -> bool {
@@ -1098,7 +1098,7 @@ impl Engine {
         opts: &Resolved,
         want: Slots,
     ) -> Result<(LlamaContext<'_>, u32, u32), EngineError> {
-        let mut slots = match want {
+        let slots = match want {
             Slots::Exact(n) => n.max(1),
             Slots::UpTo(n) => n.max(1),
         };
@@ -1280,7 +1280,7 @@ impl Engine {
             n_batch,
             self.staging_bytes,
         );
-        let mut requested = window;
+        let requested = window;
         let asked = opts.context_length.min(self.n_ctx_train.max(512)).saturating_mul(slots);
         if requested < asked {
             let wanted = self.kv_shape.bytes(asked, split) / (1024 * 1024);
@@ -1629,6 +1629,34 @@ impl LoopCounters {
             callback_ns as f64 / 1e6 / tokens.max(1) as f64,
             end.passes - self.passes,
         );
+    }
+}
+
+/// Text and bytes of a token, the way generation needs them.
+///
+/// Special tokens are rendered — `<think>` must reach the reasoning filter
+/// as text — and nothing is stripped. `token_to_piece_bytes` reports a buffer
+/// that is too small with the size it needed, so a long piece costs one more
+/// call rather than a failure.
+trait TokenText {
+    fn token_piece(&self, token: LlamaToken) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError>;
+    fn token_text(&self, token: LlamaToken) -> String;
+}
+
+impl TokenText for LlamaModel {
+    fn token_piece(&self, token: LlamaToken) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError> {
+        match self.token_to_piece_bytes(token, 32, true, None) {
+            Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(need)) => {
+                self.token_to_piece_bytes(token, need.unsigned_abs() as usize, true, None)
+            }
+            other => other,
+        }
+    }
+
+    fn token_text(&self, token: LlamaToken) -> String {
+        self.token_piece(token)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -2242,7 +2270,6 @@ impl<'a> Session<'a> {
     /// a row of zeros links and reads perfectly well while meaning the head
     /// never ran.
     pub fn probe_nextn(&mut self, prompt: &str) -> Result<(usize, f32), EngineError> {
-        let n_batch = (self.n_batch as usize).max(1);
         self.reset();
 
         let n_embd = self.model.n_embd() as usize;
@@ -2288,7 +2315,6 @@ impl<'a> Session<'a> {
         prompt: &str,
         want: usize,
     ) -> Result<(String, Vec<String>), EngineError> {
-        let n_batch = (self.n_batch as usize).max(1);
         self.reset();
 
         let n_embd = self.model.n_embd() as usize;
@@ -2328,7 +2354,7 @@ impl<'a> Session<'a> {
         self.cached = tokens;
 
         let render = |t: LlamaToken| {
-            self.model.token_to_str(t, Special::Tokenize).unwrap_or_else(|_| "<?>".into())
+            self.model.token_text(t)
         };
         Ok((render(target_next), drafted.into_iter().map(render).collect()))
     }
@@ -2407,7 +2433,6 @@ impl<'a> Session<'a> {
         partial: bool,
         on_device: bool,
     ) -> Result<(String, String, usize), EngineError> {
-        let n_batch = (self.n_batch as usize).max(1);
 
         self.reset();
         let tokens = self
@@ -2462,7 +2487,6 @@ impl<'a> Session<'a> {
         if context.len() as i32 + n as i32 >= n_ctx {
             return Ok(Vec::new());
         }
-        let n_batch = (self.n_batch as usize).max(1);
 
         // Anything the drafter has not absorbed yet. A divergence means the
         // target went somewhere this session never saw, so start over rather
@@ -2522,7 +2546,6 @@ impl<'a> Session<'a> {
         on_device: bool,
         partial: bool,
     ) -> Result<(f64, f64, usize), EngineError> {
-        let n_batch = (self.n_batch as usize).max(1);
 
         self.reset();
         let tokens = self
@@ -2568,7 +2591,7 @@ impl<'a> Session<'a> {
             }
             let bytes = self
                 .model
-                .token_to_bytes(token, Special::Tokenize)
+                .token_piece(token)
                 .map_err(|e| EngineError::Detokenize(e.to_string()))?;
             out.push_str(&decoder.push(&bytes));
 
@@ -2951,7 +2974,7 @@ impl<'a> Session<'a> {
         // The logits the prompt ends on, which is where generation starts.
         // Carried out of the prefill rather than read back from the context,
         // which by then may be running somebody else's pass.
-        let mut prefill_row: Option<Vec<f32>> = None;
+        let mut prefill_row: Option<Vec<f32>>;
 
         // An image becomes embeddings, not token ids. Once mtmd has written
         // them into the cache there is no token sequence that describes what is
@@ -3222,7 +3245,7 @@ impl<'a> Session<'a> {
         let counters = LoopCounters::now();
         let mut decoder = Utf8Buffer::new();
         let limit = if max_tokens == 0 { u32::MAX } else { max_tokens };
-        let mut reason = StopReason::TokenLimit;
+        let reason;
 
         // Self-speculation mines the context for repeated n-grams. It needs no
         // second model, and a wrong guess is simply discarded, so output is
@@ -3330,7 +3353,7 @@ impl<'a> Session<'a> {
         // How long to stay quiet before testing the water again. A rejected
         // probe costs an extra forward pass on the snapshot path, so probing
         // has to be rarer there to stay cheap.
-        let probe_every = if use_snapshot { 96 } else { 24 };
+        let probe_every = if use_snapshot { crate::ngram::PROBE_AFTER * 4 } else { crate::ngram::PROBE_AFTER };
         // How far a match must extend behind the key before it is worth
         // betting on. Zero keeps the trim path exactly as it was; on the
         // snapshot path a wrong bet costs an extra forward pass, so a bare
@@ -3370,7 +3393,7 @@ impl<'a> Session<'a> {
          -> Result<(bool, Option<String>), EngineError> {
             let started = std::time::Instant::now();
             let bytes = model
-                .token_to_bytes(token, Special::Tokenize)
+                .token_piece(token)
                 .map_err(|e| EngineError::Detokenize(e.to_string()))?;
             let text = decoder.push(&bytes);
             // Checked before the callback so a slow consumer cannot delay the
@@ -3606,7 +3629,6 @@ impl<'a> Session<'a> {
             // row drafts a continuation of the wrong position, which reads as
             // fluent nonsense rather than as an error.
             if mtp.is_some() {
-                let n_embd = self.model.n_embd() as usize;
                 // Taken from this slot's own rows of the pass. Read off the
                 // context directly it would be whichever row of the shared
                 // batch happened to sit at that index — another conversation's

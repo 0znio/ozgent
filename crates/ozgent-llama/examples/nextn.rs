@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     use std::sync::atomic::Ordering::Relaxed;
-    let mut run = |spec, label: &str| -> Result<(String, f64), Box<dyn std::error::Error>> {
+    let run = |spec, label: &str| -> Result<(String, f64), Box<dyn std::error::Error>> {
         ozgent_llama::hub::PASS_MICROS.store(0, Relaxed);
         ozgent_llama::hub::PASS_COUNT.store(0, Relaxed);
         ozgent_llama::mtp::STEP_MICROS.store(0, Relaxed);

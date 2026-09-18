@@ -68,12 +68,28 @@ pub struct Turn {
 /// that the timer has already fired is what turns the prompt back into the
 /// question it is.
 /// What the model is told about the date, for the chat and for agents alike.
-/// The time itself arrives stamped on each user message.
+/// The time itself arrives stamped on each user message, in the same zone.
+///
+/// The zone is this machine's. It is the one the user set up, and the only
+/// one ozgent knows without asking; a phone on the other side of the world
+/// talking to it over a channel still gets the owner's clock.
 pub(crate) fn date_line() -> String {
+    let zone = ozgent_core::Zone::local();
+    let now = ozgent_core::DateTime::now().to_unix();
     format!(
         "{} Each user message begins with the time it was sent.",
-        ozgent_core::DateTime::now().prompt_line()
+        zone.local_at(now).prompt_line_in(&zone_label(&zone, now))
     )
+}
+
+/// "Asia/Kolkata (UTC+05:30)", or plain "UTC".
+fn zone_label(zone: &ozgent_core::Zone, at: i64) -> String {
+    let offset = zone.label_at(at);
+    if zone.name().eq_ignore_ascii_case(&offset) {
+        offset
+    } else {
+        format!("{} ({offset})", zone.name())
+    }
 }
 
 pub(crate) fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::Caller>) -> Option<String> {
@@ -100,9 +116,10 @@ pub(crate) fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::C
 /// every earlier message renders exactly as it did on its own turn and the
 /// cache holding it stays valid.
 fn stamp_user_messages(messages: &mut [ozgent_memory::StoredMessage]) {
-    let today = ozgent_core::DateTime::now();
+    let zone = ozgent_core::Zone::local();
+    let today = zone.local_at(ozgent_core::DateTime::now().to_unix());
     for m in messages.iter_mut().filter(|m| m.role == "user") {
-        let sent = ozgent_core::DateTime::from_unix(m.created_at);
+        let sent = zone.local_at(m.created_at);
         m.content = format!("{} {}", sent.stamp(&today), m.content);
     }
 }
@@ -414,7 +431,8 @@ mod tests {
     #[test]
     fn date_awareness_alone_is_unchanged_by_any_of_this() {
         let text = system_prompt(true, None).unwrap();
-        assert!(text.starts_with(&ozgent_core::DateTime::now().prompt_line()), "{text}");
+        assert!(text.starts_with("Today is "), "{text}");
+        assert!(text.contains("time zone"), "the zone must be named: {text}");
         assert_eq!(text.lines().count(), 1, "{text}");
     }
 }

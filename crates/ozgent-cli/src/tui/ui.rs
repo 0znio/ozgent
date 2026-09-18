@@ -287,30 +287,8 @@ impl Ui {
     /// events did come, everything they carried landed at once. Returns true
     /// when the user asked to stop the reply.
     pub fn idle(&mut self) -> bool {
-        if self.screen.is_none() {
-            return false;
-        }
         self.tick();
-        let mut changed = false;
-        while let Some(key) = self.screen.as_ref().and_then(|s| s.key(Duration::ZERO).ok().flatten()) {
-            match key {
-                Key::Interrupt => return true,
-                // Sending mid-reply is not possible; what was typed stays in
-                // the field for when the reply is done.
-                Key::Enter => {}
-                other => {
-                    if !matches!(other, Key::Press(..) | Key::Drag(..) | Key::Release(..)) {
-                        self.selection = None;
-                    }
-                    self.edit(other);
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.render();
-        }
-        false
+        self.poll_interrupt()
     }
 
     /// Stop the spinner, leaving the line as a plain record of what happened.
@@ -660,7 +638,14 @@ impl Ui {
                     self.edit(key);
                     self.render();
                 }
-                _ => {}
+                // Sending mid-reply is not possible, and a key that would
+                // leave the field is not taken from it.
+                Key::Enter | Key::Eof => {}
+                // Anything typed is kept for the next message rather than lost.
+                other => {
+                    self.edit(other);
+                    self.render();
+                }
             }
         }
         stop || crate::input::interrupted()
