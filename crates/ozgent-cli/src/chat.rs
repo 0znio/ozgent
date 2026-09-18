@@ -310,6 +310,11 @@ impl<'a> Chat<'a> {
         if finished.used.is_some() {
             self.used = finished.used;
         }
+        if self.config.ui.show_stats {
+            if let Some(stats) = &finished.stats {
+                self.ui.say(self.theme.style(Style::dim(), stats));
+            }
+        }
         if finished.window.is_some() {
             self.window = finished.window;
         }

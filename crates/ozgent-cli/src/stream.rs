@@ -31,6 +31,8 @@ pub struct Finished {
     pub window: Option<u32>,
     /// Set when the turn ended badly. The text has already been shown.
     pub failed: bool,
+    /// The turn's figures, one line, for `[ui] show_stats`.
+    pub stats: Option<String>,
 }
 
 /// Answers a permission question. Takes the screen rather than capturing it,
@@ -234,6 +236,13 @@ pub async fn render(
                 let prompt = event["prompt"].as_u64().unwrap_or(0);
                 let generated = event["generated"].as_u64().unwrap_or(0);
                 out.used = Some((prompt + generated) as u32);
+                let reused = event["reused"].as_u64().unwrap_or(0);
+                let prompt_ms = event["prompt_ms"].as_u64().unwrap_or(0);
+                out.stats = Some(format!(
+                    "{generated} tokens at {:.1} tok/s · prompt {prompt} read in {:.2}s, {reused} reused",
+                    out.rate.unwrap_or(0.0),
+                    prompt_ms as f64 / 1000.0,
+                ));
                 break;
             }
 
