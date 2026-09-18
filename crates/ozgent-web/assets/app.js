@@ -1349,38 +1349,68 @@ function setStreaming(on) {
 
 // ------------------------------------------------------------ attachments
 
-/// A tool call shown as one collapsed row that can be opened for the detail.
-///
-/// The interesting argument leads — for a search that is the query, and it is
-/// what a reader scans for — with the rest kept as muted context.
+/// How each tool reads in the transcript: an icon, what it is doing while it
+/// runs and what it did once finished, and the argument a reader scans for.
+/// A tool not listed here still reads as a sentence ("Used my_tool").
+const TOOL_WORDS = {
+  web_search: { icon: "i-search", doing: "Searching the web", done: "Searched the web", lead: ["query"] },
+  fetch_url: { icon: "i-globe", doing: "Reading", done: "Read", lead: ["url"], host: true },
+  read_file: { icon: "i-file", doing: "Reading", done: "Read", lead: ["path"] },
+  write_file: { icon: "i-pen", doing: "Writing", done: "Wrote", lead: ["path"] },
+  list_dir: { icon: "i-folder", doing: "Looking in", done: "Looked in", lead: ["path"] },
+  run_command: { icon: "i-terminal", doing: "Running", done: "Ran", lead: ["command"] },
+  yahoo_finance: { icon: "i-chart", doing: "Checking the market", done: "Checked the market", lead: ["symbol", "query"] },
+  reddit: { icon: "i-chat", doing: "Reading Reddit", done: "Read Reddit", lead: ["query", "subreddit", "post"] },
+  schedule: { icon: "i-clock", doing: "Scheduling", done: "Scheduled", lead: ["name", "prompt"] },
+};
+
+function toolWords(name) {
+  return TOOL_WORDS[name] ?? {
+    icon: "i-wrench",
+    doing: `Using ${name}`,
+    done: `Used ${name}`,
+    lead: ["path", "query", "url", "command", "symbol"],
+  };
+}
+
+/// The one argument that says what a call acted on, and the rest.
+function toolArgs(name, raw) {
+  const args = { ...(raw ?? {}) };
+  delete args[UNFINISHED];
+  const words = toolWords(name);
+  const key = words.lead.find((k) => args[k] !== undefined && args[k] !== "");
+  let lead = key ? String(args[key]) : "";
+  // A page is known by its site; the full address is in the detail.
+  if (words.host && lead) {
+    try { lead = new URL(lead).host.replace(/^www\./, ""); } catch (_) { /* not a URL */ }
+  }
+  // Yahoo's action says what kind of look it was: "quote NVDA".
+  if (name === "yahoo_finance" && args.action) lead = `${args.action} ${lead}`.trim();
+  const rest = Object.entries(args).filter(([k]) => k !== key && !(name === "yahoo_finance" && k === "action"));
+  return { lead: clip(lead, 90), rest };
+}
+
+/// A tool call as one quiet line — icon, what it is doing, what on — that
+/// opens onto what it was given and what came back. The same shape as the
+/// reasoning line above it, so a turn reads as one account of the work.
 function openToolCard(answerEl, event) {
   const card = document.createElement("details");
   card.className = "tool-card running";
-  // Whichever argument names the thing acted on leads. A path identifies a
-  // read better than the query does; a search has only its query.
-  const args = event.arguments ?? {};
-  const leadKey = ["path", "query", "url", "city"].find((k) => args[k] !== undefined);
-  const lead = leadKey ? String(args[leadKey]) : "";
-  const rest = Object.entries(args)
-    .filter(([k]) => k !== leadKey)
-    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
-    .join("  ");
-
+  card.dataset.tool = event.name;
+  const words = toolWords(event.name);
   card.innerHTML =
     '<summary>' +
-      '<span class="dot"></span>' +
-      '<span class="nm"></span>' +
+      `<svg class="ic tc-icon" aria-hidden="true"><use href="#${words.icon}"></use></svg>` +
+      '<span class="tc-verb"></span>' +
       '<span class="lead"></span>' +
       '<span class="rest"></span>' +
-      '<span class="ms">running</span>' +
+      '<span class="ms"></span>' +
+      '<svg class="ic tc-chev" aria-hidden="true"><use href="#i-chevron"></use></svg>' +
     '</summary>' +
-    '<div class="tool-detail"></div>';
-  card.querySelector(".nm").textContent = event.name;
-  card.querySelector(".lead").textContent = lead;
-  card.querySelector(".rest").textContent = rest;
-  // Named but not yet written: the dot is already pulsing, so this only has
-  // to say what the pulse is for.
-  if (!leadKey && !rest) card.querySelector(".ms").textContent = "writing the call…";
+    '<div class="tool-detail"><div class="tc-args"></div></div>';
+  card.querySelector(".tc-verb").textContent = words.doing;
+  card.title = event.name;
+  fillToolCard(card, event);
   answerEl.before(card);
   return card;
 }
@@ -1388,24 +1418,33 @@ function openToolCard(answerEl, event) {
 /// The key the server adds to say a call is still being written.
 const UNFINISHED = "\u2026";
 
-/// Put the arguments into a card that was opened before they existed.
+/// Put the arguments into a card, including one opened before they existed.
 ///
 /// A call asked about early has only the arguments that were finished in
 /// time, and the server marks it. That marker is a fact about the card, not
-/// an argument, so it becomes the label rather than a row of its own.
+/// an argument, so it becomes the status rather than a row of its own.
 function fillToolCard(card, event) {
-  const args = { ...(event.arguments ?? {}) };
-  const unfinished = UNFINISHED in args;
-  delete args[UNFINISHED];
-
-  const leadKey = ["path", "query", "url", "city"].find((k) => args[k] !== undefined);
-  card.querySelector(".lead").textContent = leadKey ? String(args[leadKey]) : "";
-  card.querySelector(".rest").textContent = Object.entries(args)
-    .filter(([k]) => k !== leadKey)
-    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
-    .join("  ");
+  const name = card.dataset.tool;
+  const unfinished = UNFINISHED in (event.arguments ?? {});
+  const { lead, rest } = toolArgs(name, event.arguments);
+  card.querySelector(".lead").textContent = lead;
+  card.querySelector(".rest").textContent = "";
   card.querySelector(".ms").textContent =
-    unfinished ? "generating the content…" : "running";
+    unfinished ? "writing…" : !lead && !rest.length ? "writing the call…" : "";
+
+  // Everything it was given, as a short list rather than JSON.
+  const box = card.querySelector(".tc-args");
+  box.replaceChildren();
+  const all = { ...(event.arguments ?? {}) };
+  delete all[UNFINISHED];
+  for (const [k, v] of Object.entries(all)) {
+    const row = document.createElement("div");
+    row.className = "tc-arg";
+    row.innerHTML = '<span class="k"></span><span class="v"></span>';
+    row.querySelector(".k").textContent = k;
+    row.querySelector(".v").textContent = clip(typeof v === "string" ? v : JSON.stringify(v), 400);
+    box.append(row);
+  }
 }
 
 /// Ask whether a tool call may run, on the panel above the composer.
@@ -1537,12 +1576,20 @@ function closeToolCard(card, event) {
   if (event.ok && event.name === "schedule" && jobPill(card, event)) return;
   card.classList.remove("running");
   card.classList.toggle("bad", !event.ok);
+  const words = toolWords(card.dataset.tool ?? event.name);
+  card.querySelector(".tc-verb").textContent = words.done;
   card.querySelector(".ms").textContent =
     event.ms >= 1000 ? `${(event.ms / 1000).toFixed(1)}s` : `${event.ms} ms`;
 
-  // The arguments stay: they are what the row is about. Only a failure
-  // replaces them, because then the reason is the useful thing to show.
-  if (!event.ok) card.querySelector(".rest").textContent = event.summary ?? "failed";
+  // What it was about stays on the line. A failure adds its reason, because
+  // then that is the useful thing to read; a success adds how much came back.
+  // Counted only when they are hits — a title or an address — not whatever
+  // list a tool happened to call `results`.
+  const hits = event.detail?.results;
+  const found = Array.isArray(hits) && hits.some((r) => r?.url || r?.title) ? hits.length : null;
+  card.querySelector(".rest").textContent = !event.ok
+    ? clip(event.summary ?? "failed", 90)
+    : found != null ? `${found} result${found === 1 ? "" : "s"}` : "";
 
   const detail = card.querySelector(".tool-detail");
   const results = event.detail?.results;
@@ -1570,6 +1617,16 @@ function closeToolCard(card, event) {
       list.append(li);
     }
     detail.append(list);
+  } else if (["text", "content", "stdout", "error"].some((k) => typeof event.detail?.[k] === "string")) {
+    // A page, a file, a command's output, or a failure, shown as itself. As
+    // JSON it was one long string of escaped newlines. Files and output keep
+    // their monospace; a page reads as prose.
+    const d = event.detail;
+    const code = typeof d.content === "string" || typeof d.stdout === "string";
+    const body = document.createElement(code ? "pre" : "div");
+    body.className = `tool-text${event.ok ? "" : " bad"}`;
+    body.textContent = (d.text ?? d.content ?? d.stdout ?? d.error).slice(0, 6000);
+    detail.append(body);
   } else {
     const pre = document.createElement("pre");
     pre.textContent = JSON.stringify(event.detail, null, 2).slice(0, 4000);
