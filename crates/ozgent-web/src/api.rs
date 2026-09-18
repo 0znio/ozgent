@@ -25,6 +25,8 @@ pub fn router(state: State) -> Router {
         .route("/media/{name}", get(media_file))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
+        .route("/favicon.ico", get(favicon))
+        .route("/logo.png", get(logo))
         .route("/api/models", get(models))
         .route("/api/conversations", get(list_conversations).post(new_conversation))
         .route("/api/conversations/{id}", delete(drop_conversation))
@@ -60,6 +62,21 @@ async fn js() -> impl IntoResponse {
     (
         [("content-type", "text/javascript; charset=utf-8")],
         include_str!("../assets/app.js"),
+    )
+}
+
+/// Cached for a day: both ship inside the binary and change only with it.
+async fn favicon() -> impl IntoResponse {
+    (
+        [("content-type", "image/x-icon"), ("cache-control", "public, max-age=86400")],
+        include_bytes!("../assets/favicon.ico").as_slice(),
+    )
+}
+
+async fn logo() -> impl IntoResponse {
+    (
+        [("content-type", "image/png"), ("cache-control", "public, max-age=86400")],
+        include_bytes!("../assets/logo.png").as_slice(),
     )
 }
 

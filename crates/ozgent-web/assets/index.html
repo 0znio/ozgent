@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>ozgent</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/logo.png">
   <!-- Before the stylesheet, so the stored theme is in place for the first
        paint. Deferred to app.js it would land a frame later, as a flash of the
        other theme. The page used to carry a hard-coded data-theme="dark" here,
@@ -119,16 +121,12 @@
   <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
     <circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/>
   </symbol>
-  <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M12 3l1.9 5.3L19 10l-5.1 1.7L12 17l-1.9-5.3L5 10l5.1-1.7z"/>
-    <path d="M18.5 15.5l.7 1.9 1.8.6-1.8.6-.7 1.9-.7-1.9-1.8-.6 1.8-.6z"/>
-  </symbol>
 </svg>
 
 <div class="layout">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
-      <span class="mark">ozgent</span>
+      <span class="mark"><img class="logo" src="/logo.png" alt="" width="20" height="20">ozgent</span>
       <button class="icon-btn" id="new-chat" data-tip="New chat" aria-label="New chat">
         <svg class="ic"><use href="#i-plus"></use></svg>
       </button>
@@ -192,7 +190,7 @@
 
     <div class="thread" id="thread">
       <div class="empty" id="empty">
-        <svg class="ic empty-mark"><use href="#i-spark"></use></svg>
+        <img class="empty-logo" src="/logo.png" alt="" width="56" height="56">
         <h1>ozgent</h1>
         <p>Models running on your machine. Nothing leaves it unless a tool asks.</p>
       </div>

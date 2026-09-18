@@ -191,6 +191,16 @@ body {
 /* A single amber pip after the name: the one place the accent appears when
    nothing is happening, so the palette is introduced before it is used to
    mean something. */
+.mark { display: inline-flex; align-items: center; }
+.mark .logo {
+  width: 20px; height: 20px; margin-right: 8px;
+  border-radius: 5px;
+}
+.empty-logo {
+  width: 56px; height: 56px; border-radius: 13px;
+  margin-bottom: var(--s2);
+  box-shadow: 0 1px 3px rgb(0 0 0 / .18);
+}
 .mark::after {
   content: "";
   display: inline-block;

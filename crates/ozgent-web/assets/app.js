@@ -2037,7 +2037,7 @@ async function openRoute() {
   // `/new` and anything unrecognised land on an empty chat.
   state.conversation = null;
   el.thread.innerHTML =
-    '<div class="empty" id="empty"><h1>ozgent</h1><p>Local models, your machine. Pick a model and start typing.</p></div>';
+    '<div class="empty" id="empty"><img class="empty-logo" src="/logo.png" alt="" width="56" height="56"><h1>ozgent</h1><p>Local models, your machine. Pick a model and start typing.</p></div>';
   loadConversations();
 }
 

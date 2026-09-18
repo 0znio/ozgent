@@ -1,4 +1,4 @@
-# ozgent
+<p align="center"><img src="docs/images/ozgent_back.jpg" alt="ozgent" width="100%"></p>
 
 Run language models on your own machine — and let them actually *do* things.
 
