@@ -337,7 +337,9 @@ keeping are retrieved into later chats.
 question is always "where did I talk about the deploy script", and nobody
 remembers which thread it was. **Retry** regenerates a reply, **Edit** puts one
 of your messages back in the composer, and either way everything after it is
-dropped, including facts learned from it. Any conversation downloads as
+dropped, including facts learned from it. Each reply keeps the speed it was
+written at and how long the model thought before it, so a reloaded
+conversation still shows both. Any conversation downloads as
 Markdown, because a local-first program should never be the only thing that can
 read your own data.
 

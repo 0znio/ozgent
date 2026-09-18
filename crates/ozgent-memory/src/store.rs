@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub struct Store {
     db: Connection,
@@ -62,6 +62,8 @@ pub struct StoredMessage {
     pub tool_call_id: Option<String>,
     /// JSON array of file names under the media directory.
     pub media: Option<String>,
+    /// JSON object of what the reply cost to generate; see SCHEMA_V10.
+    pub stats: Option<String>,
     pub tokens: i64,
     pub created_at: i64,
 }
@@ -232,6 +234,9 @@ impl Store {
         if current < 9 {
             self.db.execute_batch(SCHEMA_V9)?;
         }
+        if current < 10 {
+            self.db.execute_batch(SCHEMA_V10)?;
+        }
 
         self.db
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -267,6 +272,15 @@ impl Store {
         self.db.execute(
             "UPDATE messages SET media = ?1 WHERE id = ?2",
             params![json, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record what generating a reply cost.
+    pub fn set_message_stats(&self, message_id: i64, stats: &str) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE messages SET stats = ?1 WHERE id = ?2",
+            params![stats, message_id],
         )?;
         Ok(())
     }
@@ -527,7 +541,7 @@ impl Store {
     pub fn messages(&self, conversation_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT id, conversation_id, seq, role, content, thinking, tool_calls,
-                    tool_call_id, tokens, created_at, media
+                    tool_call_id, tokens, created_at, media, stats
              FROM messages WHERE conversation_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![conversation_id], row_to_message)?;
@@ -542,7 +556,7 @@ impl Store {
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT id, conversation_id, seq, role, content, thinking, tool_calls,
-                    tool_call_id, tokens, created_at, media
+                    tool_call_id, tokens, created_at, media, stats
              FROM messages WHERE conversation_id = ?1
              ORDER BY seq DESC LIMIT ?2",
         )?;
@@ -890,6 +904,7 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         tokens: r.get(8)?,
         created_at: r.get(9)?,
         media: r.get(10).ok().flatten(),
+        stats: r.get(11).ok().flatten(),
     })
 }
 
@@ -1103,6 +1118,12 @@ CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at DESC);
 /// before this step is not wrong, only incomplete.
 const SCHEMA_V9: &str = "
 ALTER TABLE channel_chats ADD COLUMN identities TEXT;
+";
+
+/// The v10 step: what generating a reply cost — speed, tokens, how long it
+/// reasoned — as a JSON object, so a reloaded conversation shows it too.
+const SCHEMA_V10: &str = "
+ALTER TABLE messages ADD COLUMN stats TEXT;
 ";
 
 #[derive(Debug, thiserror::Error)]

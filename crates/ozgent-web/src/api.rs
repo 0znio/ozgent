@@ -514,6 +514,9 @@ struct MessageInfo {
     /// Tool activity for this turn, in the order it happened.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<serde_json::Value>,
+    /// What the reply cost: speed, tokens, how long it reasoned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<serde_json::Value>,
     /// URLs of the attachments this message carried.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     media: Vec<String>,
@@ -534,6 +537,7 @@ async fn messages(
             text: m.content,
             created_at: m.created_at,
             thinking: m.thinking.filter(|t| !t.trim().is_empty()),
+            stats: m.stats.as_deref().and_then(|raw| serde_json::from_str(raw).ok()),
             tool_calls: m
                 .tool_calls
                 .as_deref()

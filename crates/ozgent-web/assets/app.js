@@ -639,6 +639,7 @@ function highlightCached(src, lang) {
 /// stays a pure string function and the DOM work happens once per block
 /// instead of on every streamed token.
 function dressCode(root) {
+  justify(root);
   for (const pre of root.querySelectorAll("pre")) {
     if (pre.parentElement?.classList.contains("code-block")) continue;
 
@@ -721,12 +722,27 @@ async function copyText(text) {
   }
 }
 
+/// Mark the paragraphs that justify well.
+///
+/// Justified text reads beautifully until a line has little to stretch: a
+/// short paragraph, or one holding a long URL or a stretch of code, which
+/// cannot break and leaves the rest of its line full of gaps. Those stay
+/// ragged; the rest are justified and hyphenated (see `.answer p.just`).
+function justify(root) {
+  for (const p of root.querySelectorAll(":scope > p, .answer > p")) {
+    const text = p.textContent;
+    const stubborn = [...p.querySelectorAll("code, a")].some((n) => n.textContent.length > 28);
+    const longWord = /\S{32,}/.test(text);
+    p.classList.toggle("just", text.length >= 160 && !stubborn && !longWord);
+  }
+}
+
 // -------------------------------------------------------------- rendering
 
 // The answer lives in its own child so the reasoning block can sit above it
 // inside the body. Putting reasoning beside `.body` made it a flex item of
 // `.msg`, which rendered it as a narrow column next to the text.
-function addMessage(role, text = "", seq = null) {
+function addMessage(role, text = "", seq = null, stats = null) {
   document.getElementById("empty")?.remove();
   const wrap = document.createElement("div");
   wrap.className = `msg ${role}`;
@@ -740,7 +756,9 @@ function addMessage(role, text = "", seq = null) {
   const answer = wrap.querySelector(".answer");
   if (role === "user") answer.innerHTML = withMentions(text);
   else { answer.innerHTML = markdown(text); dressCode(answer); }
-  if (seq != null) wrap.append(messageActions(role, seq, text));
+  // Under the text, inside the body: appended to the message itself it became
+  // a third column beside the answer and took its width.
+  if (seq != null) body.append(messageActions(role, seq, text, stats));
   el.thread.append(wrap);
   scrollToTail();
   return { body, answer };
@@ -752,7 +770,7 @@ function addMessage(role, text = "", seq = null) {
 /// asks the same question again; "edit" drops the question too and puts it
 /// back in the composer. One operation, so the two cannot disagree about what
 /// happens to everything after them.
-function messageActions(role, seq, text) {
+function messageActions(role, seq, text, stats = null) {
   const row = document.createElement("div");
   row.className = "msg-acts";
   const add = (label, icon, onclick) => {
@@ -760,21 +778,64 @@ function messageActions(role, seq, text) {
     b.type = "button";
     b.className = "msg-act";
     b.title = label;
+    b.setAttribute("aria-label", label);
     b.innerHTML = `<svg class="ic"><use href="#${icon}"></use></svg><span>${label}</span>`;
     b.onclick = onclick;
     row.append(b);
+    return b;
   };
 
   if (role === "user") {
     add("Edit", "i-edit", () => editFrom(seq));
   } else {
     add("Retry", "i-retry", () => regenerate(seq));
-    add("Copy", "i-copy", async () => {
-      try { await navigator.clipboard.writeText(text); el.stat.textContent = "copied"; }
-      catch { el.stat.textContent = "could not copy"; }
+    const copy = add("Copy", "i-copy", async () => {
+      const ok = await copyText(text);
+      copy.querySelector("span").textContent = ok ? "Copied" : "Copy failed";
+      setTimeout(() => { copy.querySelector("span").textContent = "Copy"; }, 1500);
     });
+    const pill = speedPill(stats);
+    if (pill) row.append(pill);
   }
   return row;
+}
+
+/// The generation speed of a reply, as a pill, with the rest on hover.
+function speedPill(stats) {
+  const rate = Number(stats?.tokens_per_second);
+  if (!rate) return null;
+  const pill = document.createElement("span");
+  pill.className = "speed-pill";
+  pill.textContent = `${rate.toFixed(1)} tok/s`;
+  const parts = [`${(stats.generated ?? 0).toLocaleString()} tokens`];
+  if (stats.prompt_ms != null) {
+    parts.push(`prompt ${(stats.prompt ?? 0).toLocaleString()} read in ${(stats.prompt_ms / 1000).toFixed(2)}s`);
+  }
+  if (stats.reused) parts.push(`${stats.reused.toLocaleString()} reused`);
+  pill.title = parts.join(" · ");
+  return pill;
+}
+
+/// Give the pair just written the actions a stored pair has.
+///
+/// A streamed reply has no position until it is stored, and the server stores
+/// it before it says the turn is done, so asking now finds it.
+async function attachActions(conversation) {
+  let messages;
+  try {
+    messages = await api(`/api/conversations/${conversation}/messages`);
+  } catch (_) {
+    return;
+  }
+  if (state.conversation !== conversation) return;
+  const lastOf = (role) => [...messages].reverse().find((m) => (role === "user") === (m.role === "user"));
+  for (const role of ["user", "assistant"]) {
+    const m = lastOf(role);
+    const node = [...el.thread.querySelectorAll(`.msg.${role}`)].pop();
+    if (!m || !node || node.dataset.seq) continue;
+    node.dataset.seq = m.seq;
+    node.querySelector(".body").append(messageActions(role, m.seq, m.text, m.stats));
+  }
 }
 
 /// Drop this reply and everything after it, then ask the question again.
@@ -828,10 +889,27 @@ function reasoningPane(body) {
   if (!pane) {
     pane = document.createElement("details");
     pane.className = "think";
-    pane.innerHTML = '<summary>reasoning</summary><div class="think-body"></div>';
+    pane.innerHTML =
+      '<summary><span class="think-label">Thinking</span>' +
+      '<svg class="ic think-chev" aria-hidden="true"><use href="#i-chevron"></use></svg></summary>' +
+      '<div class="think-body"></div>';
     body.prepend(pane);
   }
   return pane.querySelector(".think-body");
+}
+
+/// Say how long the model reasoned, once it has stopped.
+function finishReasoning(pane, ms) {
+  if (!pane) return;
+  pane.classList.remove("streaming");
+  const label = pane.querySelector(".think-label");
+  if (!label) return;
+  if (ms == null) {
+    label.textContent = "Thought process";
+  } else {
+    const s = Math.max(1, Math.round(ms / 1000));
+    label.textContent = s < 60 ? `Thought for ${s}s` : `Thought for ${Math.floor(s / 60)}m ${s % 60}s`;
+  }
 }
 
 // ---------------------------------------------------------------- agents
@@ -903,6 +981,17 @@ class ReplyView {
     this.agent = null;
     this.think = null;
     this.reasoning = "";
+    // When reasoning started and last grew, for "Thought for 12s".
+    this.thinkStart = null;
+    this.thinkLast = null;
+  }
+
+  /// Reasoning has stopped: turn "Thinking" into how long it took.
+  endThinking() {
+    const pane = this.body.querySelector(":scope > .think.streaming");
+    if (!pane) return;
+    const ms = this.thinkStart ? this.thinkLast - this.thinkStart : null;
+    finishReasoning(pane, ms);
   }
 
   cursor(on) {
@@ -918,12 +1007,15 @@ class ReplyView {
     this.segText += t;
     this.seg.innerHTML = markdown(this.segText);
     dressCode(this.seg);
-    this.body.querySelector(":scope > .think")?.classList.remove("streaming");
+    this.endThinking();
   }
 
   thinking(t) {
     this.reasoning += t;
     if (!this.reasoning.trim()) return;
+    const now = performance.now();
+    this.thinkStart = this.thinkStart ?? now;
+    this.thinkLast = now;
     this.think = this.think ?? reasoningPane(this.body);
     this.think.closest(".think").classList.add("streaming");
     this.think.innerHTML = markdown(this.reasoning);
@@ -974,7 +1066,8 @@ class ReplyView {
   /// Stop every animation that says something is still happening.
   settle() {
     this.agent?.stop();
-    for (const t of this.body.querySelectorAll(".think.streaming")) t.classList.remove("streaming");
+    this.endThinking();
+    for (const t of this.body.querySelectorAll(".think.streaming")) finishReasoning(t, null);
     this.cursor(false);
   }
 }
@@ -1562,6 +1655,7 @@ async function openConversation(id, { route = true } = {}) {
       m.role === "user" ? "user" : "assistant",
       m.text,
       m.seq,
+      m.stats,
     );
     // A reload must show the whole turn, not just its conclusion.
     imageStrip(body, (m.media ?? []).map((src) => ({ src, alt: "attachment" })));
@@ -1569,12 +1663,16 @@ async function openConversation(id, { route = true } = {}) {
       const pane = reasoningPane(body);
       pane.innerHTML = markdown(m.thinking);
       dressCode(pane);
+      finishReasoning(pane.closest(".think"), m.stats?.thinking_ms);
     }
     if (m.role !== "user" && (m.tool_calls ?? []).length) {
       // Rebuilt from the stored text so cards and agent blocks land where
       // they happened, not stacked above the reply.
       answer.replaceChildren();
       replayReply(new ReplyView(body, answer), m.text ?? "", m.tool_calls);
+      // The replay ran the agents' reasoning through the live path, which
+      // timed it at replay speed; the stored duration is the real one.
+      finishReasoning(body.querySelector(":scope > .think"), m.stats?.thinking_ms);
     }
   }
   loadConversations();
@@ -1874,6 +1972,7 @@ async function send(text) {
     setStreaming(false);
     state.abort = null;
     loadConversations();
+    if (state.conversation) attachActions(state.conversation);
   }
 }
 

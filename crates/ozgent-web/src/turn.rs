@@ -267,10 +267,35 @@ fn relay(
         let mut activity: Vec<serde_json::Value> = Vec::new();
         // The agent running now, so its calls and reasoning are filed under it.
         let mut agent: Option<usize> = None;
+        // When the reply's own reasoning began and last grew, for "thought for
+        // 12s" — measured here because the page that watched it may be gone.
+        let mut reasoned: Option<(std::time::Instant, std::time::Instant)> = None;
+        let mut stats: Option<serde_json::Value> = None;
+        // Held back until the reply is stored, so a page that reloads the
+        // conversation the moment it sees the end finds the reply there.
+        let mut last: Option<Event> = None;
 
         while let Some(event) = rx.recv().await {
+            // Timed across the reply's and any agent's reasoning alike: the
+            // page shows both in the one pane this duration labels.
+            if let Event::Thinking { text } = &event {
+                if !text.trim().is_empty() {
+                    let now = std::time::Instant::now();
+                    reasoned = Some((reasoned.map_or(now, |(first, _)| first), now));
+                }
+            }
             match &event {
                 Event::Answer { text } => answer.push_str(text),
+                Event::Done { generated, tokens_per_second, reused, prompt, prompt_ms, .. } => {
+                    stats = Some(serde_json::json!({
+                        "generated": generated,
+                        "tokens_per_second": (tokens_per_second * 10.0).round() / 10.0,
+                        "prompt": prompt,
+                        "prompt_ms": prompt_ms,
+                        "reused": reused,
+                        "thinking_ms": reasoned.map(|(a, b)| (b - a).as_millis() as u64),
+                    }));
+                }
                 Event::Thinking { text } => match agent {
                     // An agent's reasoning belongs in its own block, not in the
                     // message's: a reload has to put it back where it was.
@@ -356,10 +381,13 @@ fn relay(
                 _ => {}
             }
             let finished = matches!(event, Event::Done { .. } | Event::Error { .. });
+            if finished {
+                last = Some(event);
+                break;
+            }
             // A send failure means the caller went away. Stop relaying, but
             // fall through to persist whatever arrived first.
-            let gone = out_tx.send(event).is_err();
-            if finished || gone {
+            if out_tx.send(event).is_err() {
                 break;
             }
         }
@@ -367,7 +395,14 @@ fn relay(
         // caller that disappeared mid-generation still frees the GPU.
         drop(rx);
 
+        // Always said last, whatever became of the reply.
+        let finish = |last: Option<Event>| {
+            if let Some(event) = last {
+                let _ = out_tx.send(event);
+            }
+        };
         if answer.trim().is_empty() {
+            finish(last);
             return;
         }
         let store = state.store.lock().unwrap();
@@ -386,11 +421,16 @@ fn relay(
             0,
         ) {
             Ok(id) => {
+                if let Some(stats) = &stats {
+                    let _ = store.set_message_stats(id, &stats.to_string());
+                }
                 let _ =
                     store.put_embedding(OwnerKind::Message, id, &state.embedder.embed(answer.trim()));
             }
             Err(e) => tracing::error!("persisting the reply: {e}"),
         }
+        drop(store);
+        finish(last);
     });
 
     out_rx

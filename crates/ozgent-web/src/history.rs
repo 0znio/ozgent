@@ -287,6 +287,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             media: None,
+            stats: None,
             tokens: 0,
             created_at: 1_755_648_000,
         }
