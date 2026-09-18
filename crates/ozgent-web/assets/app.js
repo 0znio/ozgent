@@ -786,7 +786,7 @@ function messageActions(role, seq, text, stats = null) {
   };
 
   if (role === "user") {
-    add("Edit", "i-edit", () => editFrom(seq));
+    add("Edit", "i-edit", () => startEdit(row.closest(".msg"), seq));
   } else {
     add("Retry", "i-retry", () => regenerate(seq));
     const copy = add("Copy", "i-copy", async () => {
@@ -851,13 +851,58 @@ async function regenerate(seq) {
   send(out?.message ?? question.text);
 }
 
-/// Put a message back in the composer, dropping it and everything after.
-async function editFrom(seq) {
-  if (state.streaming || !state.conversation) return;
-  const out = await rewind(seq);
-  el.input.value = out?.message ?? "";
-  el.input.focus();
-  el.input.dispatchEvent(new Event("input"));
+/// Edit a sent message where it stands.
+///
+/// Nothing is dropped until the edit is sent. It used to rewind the moment
+/// Edit was pressed and hand the text to the composer, so there was no way
+/// back: cancelling meant the reply was already gone, and a reload lost the
+/// message too.
+function startEdit(node, seq) {
+  if (!node || state.streaming || node.classList.contains("editing")) return;
+  const body = node.querySelector(".body");
+  const answer = body.querySelector(".answer");
+  const original = answer.textContent;
+  node.classList.add("editing");
+
+  const box = document.createElement("div");
+  box.className = "edit-box";
+  box.innerHTML =
+    '<textarea class="edit-text" rows="1" aria-label="Edit message"></textarea>' +
+    '<div class="edit-acts"><span class="hint">Sending replaces this message and everything after it.</span>' +
+    '<span class="spacer"></span>' +
+    '<button type="button" class="ghost-btn edit-cancel">Cancel</button>' +
+    '<button type="button" class="primary-btn edit-send">Send</button></div>';
+  const text = box.querySelector("textarea");
+  text.value = original;
+  const fit = () => { text.style.height = "auto"; text.style.height = `${text.scrollHeight}px`; };
+  text.addEventListener("input", fit);
+
+  const hidden = [...body.children];
+  for (const c of hidden) c.hidden = true;
+  body.append(box);
+  fit();
+  text.focus();
+  text.setSelectionRange(text.value.length, text.value.length);
+
+  const close = () => {
+    box.remove();
+    for (const c of hidden) c.hidden = false;
+    node.classList.remove("editing");
+  };
+  const submit = async () => {
+    const next = text.value.trim();
+    if (!next || state.streaming) return;
+    if (next === original.trim()) return close();
+    close();
+    await rewind(seq);
+    send(next);
+  };
+  box.querySelector(".edit-cancel").onclick = close;
+  box.querySelector(".edit-send").onclick = submit;
+  text.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+  });
 }
 
 /// Remove everything from `seq` on, on the server and on screen.
@@ -1256,10 +1301,24 @@ function showGauge() {
 const distanceFromTail = () =>
   el.thread.scrollHeight - el.thread.scrollTop - el.thread.clientHeight;
 
+/// Something was added below. The view stays where the reader put it — a
+/// reply being written never drags the page down under them — and the
+/// "Latest" button appears once there is something out of sight.
 function scrollToTail() {
-  // Only follow the tail if the reader is already near it. Reading back
-  // through a long answer must not be yanked forward by the next token.
-  if (distanceFromTail() < 160) el.thread.scrollTop = el.thread.scrollHeight;
+  syncToLatest();
+}
+
+/// Go to the end, for the moments that ask for it: opening a conversation.
+function jumpToTail() {
+  el.thread.scrollTop = el.thread.scrollHeight;
+  syncToLatest();
+}
+
+/// Bring a message just sent to the top of the view, so its reply has the
+/// whole screen to arrive in without the page having to follow it.
+function scrollToMessage(node) {
+  if (!node) return;
+  el.thread.scrollTop = Math.max(0, node.offsetTop - 12);
   syncToLatest();
 }
 
@@ -1623,12 +1682,12 @@ async function loadConversations() {
     });
     row.querySelector(".del").addEventListener("click", async (e) => {
       e.stopPropagation();
+      // A reply still being written into it is stopped first: it would
+      // otherwise be stored into a conversation that no longer exists.
+      if (state.conversation === c.id) state.abort?.abort();
       await api(`/api/conversations/${c.id}`, { method: "DELETE" });
-      if (state.conversation === c.id) {
-        state.conversation = null;
-        el.thread.replaceChildren();
-      }
-      loadConversations();
+      if (state.conversation === c.id) newConversation();
+      else loadConversations();
     });
     el.convs.append(row);
   }
@@ -1647,8 +1706,7 @@ async function openConversation(id, { route = true } = {}) {
   const messages = await api(`/api/conversations/${id}/messages`);
   el.thread.replaceChildren();
   if (!messages.length) {
-    el.thread.innerHTML =
-      '<div class="empty" id="empty"><h1>ozgent</h1><p>Say something to begin.</p></div>';
+    el.thread.innerHTML = EMPTY;
   }
   for (const m of messages) {
     const { body, answer } = addMessage(
@@ -1675,6 +1733,7 @@ async function openConversation(id, { route = true } = {}) {
       finishReasoning(body.querySelector(":scope > .think"), m.stats?.thinking_ms);
     }
   }
+  jumpToTail();
   loadConversations();
   setDrawer(false);
   syncExport();
@@ -1699,13 +1758,16 @@ async function startConversation() {
 }
 
 /// Clear the view and wait for the first message.
+/// What an empty conversation shows, wherever one is started.
+const EMPTY =
+  '<div class="empty" id="empty"><img class="empty-logo" src="/logo.png" alt="" width="56" height="56">' +
+  "<h1>ozgent</h1><p>Local models, your machine. Pick a model and start typing.</p></div>";
+
 function newConversation() {
   state.conversation = null;
   gauge.used = 0;
   showGauge();
-  el.thread.replaceChildren();
-  el.thread.innerHTML =
-    '<div class="empty" id="empty"><h1>ozgent</h1><p>Say something to begin.</p></div>';
+  el.thread.innerHTML = EMPTY;
   setRoute(null);
   loadConversations();
   setDrawer(false);
@@ -1775,6 +1837,7 @@ async function send(text) {
     el.stat.textContent = `${ignored} non-image attachment(s) ignored`;
   }
   const { body, answer: answerEl } = addMessage("assistant", "");
+  scrollToMessage(body.closest(".msg")?.previousElementSibling);
   const view = new ReplyView(body, answerEl);
   view.cursor(true);
   setStreaming(true);
@@ -2135,8 +2198,7 @@ async function openRoute() {
   }
   // `/new` and anything unrecognised land on an empty chat.
   state.conversation = null;
-  el.thread.innerHTML =
-    '<div class="empty" id="empty"><img class="empty-logo" src="/logo.png" alt="" width="56" height="56"><h1>ozgent</h1><p>Local models, your machine. Pick a model and start typing.</p></div>';
+  el.thread.innerHTML = EMPTY;
   loadConversations();
 }
 

@@ -2412,3 +2412,19 @@ a.ghost-btn { text-decoration: none; }
 }
 .adm-top .primary-btn .ic,
 .adm-top .ghost-btn .ic { width: 15px; height: 15px; flex: none; }
+
+/* Editing a sent message in place: the text becomes a field, with the two
+   ways out beside it. Nothing is dropped until Send. */
+.msg.editing .body { flex: 1; }
+.edit-box { display: flex; flex-direction: column; gap: var(--s2); }
+.edit-text {
+  width: 100%; resize: none; overflow: hidden;
+  background: var(--raised); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 9px 11px; font: inherit; line-height: 1.5;
+}
+.edit-text:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.edit-acts { display: flex; align-items: center; gap: var(--s2); }
+.edit-acts .spacer { flex: 1; }
+.edit-acts .hint { font-size: var(--t-micro); color: var(--ink-faint); }
+.edit-acts .ghost-btn { width: auto; }
