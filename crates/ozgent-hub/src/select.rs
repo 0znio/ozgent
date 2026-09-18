@@ -27,6 +27,19 @@ impl RepoFile {
         let name = file_name(&self.path).to_ascii_lowercase();
         name.starts_with("mmproj") || name.contains("mmproj")
     }
+
+    /// Speculative-decoding drafters ship beside a model and are never the
+    /// model. They carry no tokenizer and read the target's hidden states, so
+    /// installed alone they cannot load at all.
+    ///
+    /// Treating them as quantisations is how a Bonsai repository installed a
+    /// 3.6B `dspark` drafter as "BF16" — the only name in it the table knew.
+    pub fn is_drafter(&self) -> bool {
+        let upper = file_name(&self.path).to_ascii_uppercase();
+        ["DSPARK", "DFLASH", "EAGLE", "EAGLE3", "DRAFT", "DRAFTER"]
+            .iter()
+            .any(|marker| find_token(&upper, marker).is_some())
+    }
 }
 
 /// Quantisation names, longest first so `Q4_K_M` wins over `Q4_K` and
@@ -37,6 +50,12 @@ const QUANTS: &[&str] = &[
     "IQ2_M", "IQ2_S", "IQ3_XS", "IQ3_M", "IQ3_S",
     "Q2_K_L", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q4_K_M", "Q4_K_S",
     "Q5_K_M", "Q5_K_S", "TQ1_0", "TQ2_0",
+    // Ternary and binary packs. `Q2_G64` is Prism's name for llama.cpp's own
+    // Q2_0 block layout. Their plain `Q2_0` stores type 42 with 128-value
+    // groups where llama.cpp's type 42 has 64, and `PQ2_0` uses a type id
+    // only their fork defines; llama.cpp rejects both when it reads the file
+    // header, so they are listed but will not load here.
+    "Q2_G64", "PQ2_0", "PQ1_0", "Q2_0", "Q1_0",
     "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q6_K", "Q8_0", "Q2_K",
     // The 4-bit float formats. A repository that offers one and nothing else
     // listed here showed no quantisations at all, because `quantisations`
@@ -187,7 +206,7 @@ pub fn select(
     }
 
     let (projectors, weights): (Vec<&RepoFile>, Vec<&RepoFile>) =
-        gguf.into_iter().partition(|f| f.is_mmproj());
+        gguf.into_iter().filter(|f| !f.is_drafter()).partition(|f| f.is_mmproj());
 
     // Group shards, keyed by quantisation.
     let mut groups: std::collections::BTreeMap<String, Vec<&RepoFile>> = Default::default();
@@ -265,10 +284,28 @@ fn auto_pick(
     groups.keys().next().cloned().unwrap_or_default()
 }
 
+/// The vision projector a repository's install would take, if it has one.
+///
+/// One answer for every place that shows or installs a projector, so the
+/// listing says what the download will actually fetch.
+pub fn projector(files: &[RepoFile]) -> Option<&RepoFile> {
+    let all: Vec<&RepoFile> = files.iter().filter(|f| f.is_gguf() && f.is_mmproj()).collect();
+    pick_mmproj(&all)
+}
+
+/// Whether a file is a candidate for the main weights.
+impl RepoFile {
+    pub fn is_weights(&self) -> bool {
+        self.is_gguf() && !self.is_mmproj() && !self.is_drafter()
+    }
+}
+
 /// Prefer F16 for the projector: F32 doubles the size for no practical gain,
-/// and BF16 is not universally supported by older builds.
+/// and BF16 is not universally supported by older builds. Q8_0 before BF16:
+/// a vision tower at eight bits is indistinguishable in use, and where a
+/// repository offers both it is usually the one its authors recommend.
 fn pick_mmproj<'a>(projectors: &[&'a RepoFile]) -> Option<&'a RepoFile> {
-    for want in ["F16", "BF16", "F32"] {
+    for want in ["F16", "Q8_0", "BF16", "F32"] {
         if let Some(p) = projectors
             .iter()
             .find(|p| quant_of(&p.path).as_deref() == Some(want))
@@ -293,7 +330,7 @@ pub struct Quant {
 /// same choices with the same sizes.
 pub fn quantisations(files: &[RepoFile]) -> Vec<Quant> {
     let mut by_quant: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
-    for f in files.iter().filter(|f| f.is_gguf() && !f.is_mmproj()) {
+    for f in files.iter().filter(|f| f.is_gguf() && !f.is_mmproj() && !f.is_drafter()) {
         if let Some(q) = quant_of(&f.path) {
             let e = by_quant.entry(q).or_insert((0, 0));
             e.0 += f.size;
@@ -411,6 +448,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_drafter_is_never_offered_as_the_model() {
+        let files = vec![
+            f("Ternary-Bonsai-27B-F16.gguf", 53_810_000_000),
+            f("Ternary-Bonsai-27B-Q2_g64.gguf", 7_590_000_000),
+            f("Ternary-Bonsai-27B-dspark-Q4_1.gguf", 1_950_000_000),
+            f("Ternary-Bonsai-27B-dspark-bf16.gguf", 7_290_000_000),
+            f("Ternary-Bonsai-27B-mmproj-BF16.gguf", 930_000_000),
+            f("Ternary-Bonsai-27B-mmproj-Q8_0.gguf", 630_000_000),
+        ];
+        let names: Vec<String> = quantisations(&files).into_iter().map(|q| q.quant).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains(&"Q2_G64".to_string()) && names.contains(&"F16".to_string()), "{names:?}");
+        let chosen = select(&files, None, Some(8_000_000_000)).unwrap();
+        assert_eq!(chosen.quant, "Q2_G64");
+        assert!(chosen.mmproj.unwrap().path.contains("Q8_0"));
+    }
 
     fn f(path: &str, size: u64) -> RepoFile {
         RepoFile { path: path.into(), size, sha256: None }

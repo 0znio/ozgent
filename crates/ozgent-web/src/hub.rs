@@ -213,7 +213,7 @@ pub async fn repo(Query(query): Query<RepoQuery>) -> Result<Json<serde_json::Val
     let info = client.repo(&request.repo_id, &request.revision).await.map_err(from_hub)?;
 
     let rows = ozgent_hub::quantisations(&info.files);
-    let projector = info.files.iter().find(|f| f.is_mmproj()).map(|f| f.size);
+    let projector = ozgent_hub::projector(&info.files).map(|f| f.size);
     let gpu = vram();
     let memory = gpu.as_ref().map(|(bytes, _)| *bytes);
     let suggested = ozgent_hub::recommend(&rows, projector.unwrap_or(0), memory);
@@ -227,7 +227,7 @@ pub async fn repo(Query(query): Query<RepoQuery>) -> Result<Json<serde_json::Val
             let first = info
                 .files
                 .iter()
-                .filter(|f| f.is_gguf() && !f.is_mmproj())
+                .filter(|f| f.is_weights())
                 .filter(|f| ozgent_hub::quant_of(&f.path).as_deref() == Some(smallest.quant.as_str()))
                 .map(|f| f.path.clone())
                 .min();

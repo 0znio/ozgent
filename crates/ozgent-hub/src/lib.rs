@@ -18,4 +18,4 @@ pub use hf::{Client, Found, HubError, RepoInfo};
 pub use import::{ImportRequest, Imported, import, suggest_reference, verify_gguf};
 pub use install::{Event, Installed, PullRequest, pull};
 pub use progress::{Bar, bytes as human_bytes};
-pub use select::{Quant, RepoFile, Selection, SelectError, derive_ref, quant_of, quantisations, recommend, select};
+pub use select::{Quant, RepoFile, Selection, SelectError, derive_ref, projector, quant_of, quantisations, recommend, select};

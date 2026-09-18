@@ -514,7 +514,7 @@ async fn header_shape(
     let path = info
         .files
         .iter()
-        .filter(|f| f.is_gguf() && !f.is_mmproj())
+        .filter(|f| f.is_weights())
         .filter(|f| ozgent_hub::quant_of(&f.path).as_deref() == Some(smallest.0.as_str()))
         .map(|f| f.path.clone())
         .min()?;
@@ -565,7 +565,7 @@ async fn pull(
         if info.gated { println!("  gated: accept the licence on Hugging Face and set HF_TOKEN"); }
         println!();
         let rows = quant_rows(&info);
-        let mmproj = info.files.iter().find(|f| f.is_mmproj()).map(|f| f.size).unwrap_or(0);
+        let mmproj = ozgent_hub::projector(&info.files).map(|f| f.size).unwrap_or(0);
         let gpu = gpu_memory();
         let shape = header_shape(&client, &info, &request.revision, &rows).await;
         if gpu.is_some() && shape.is_some() {
@@ -580,7 +580,7 @@ async fn pull(
         if let Some(s) = &shape {
             println!("\ntrained for {} tokens of context", ozgent_core::format_count(s.context_train));
         }
-        if let Some(mm) = info.files.iter().find(|f| f.is_mmproj()) {
+        if let Some(mm) = ozgent_hub::projector(&info.files) {
             println!("\nvision projector: {} ({})", mm.path, human(mm.size));
         }
         return Ok(());
@@ -591,7 +591,7 @@ async fn pull(
     if request.quant.is_none() {
         let info = client.repo(&request.repo_id, &request.revision).await?;
         let rows = quant_rows(&info);
-        let mmproj = info.files.iter().find(|f| f.is_mmproj()).map(|f| f.size);
+        let mmproj = ozgent_hub::projector(&info.files).map(|f| f.size);
         let free_vram = ozgent_llama::backend::best_gpu().map(|d| d.memory_free as u64);
         let shape = header_shape(&client, &info, &request.revision, &rows).await;
         request.quant = choose_quant(&rows, mmproj, free_vram, shape.as_ref())?;
