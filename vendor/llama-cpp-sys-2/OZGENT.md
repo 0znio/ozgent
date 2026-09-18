@@ -26,6 +26,18 @@ the release tarball, unmodified. Nothing else is built.
   with the languages upstream's CMake gives them — `sha1.c` as C++, `sha256.c`
   and `xxhash.c` as C, because `hash.cpp` includes them inside `extern "C"`.
 
+## One local change to llama.cpp itself
+
+`ggml/src/ggml-cpu/arch/x86/quants.c` gains an AVX2 `ggml_vec_dot_q2_0_q8_0`,
+and the x86 line aliasing it to the generic version is removed from
+`arch-fallback.h`. Upstream ships CUDA kernels for Q2_0 but only the scalar
+loop on x86, so any Ternary Bonsai layer that does not fit on the card ran at
+scalar speed. The kernel extracts the four 2-bit planes with one per-64-bit
+shift and transposes the activations to match; measured 5.3x faster (207 vs
+1100 ns on a 5120-wide row, Zen 5) and equal to the scalar result to float
+rounding (2.3e-4 relative, over 2000 random rows of valid Q8_0 data).
+Re-apply both edits after an upgrade until upstream has its own.
+
 ## Upgrading again
 
 Copy the same directories from a newer release over `llama.cpp/`, rebuild, and

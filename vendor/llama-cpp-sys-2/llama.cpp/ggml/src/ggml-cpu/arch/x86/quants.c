@@ -698,6 +698,64 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX2__)
+// ozgent: not upstream. Upstream has no x86 kernel for Q2_0, so Ternary
+// Bonsai's layers on the CPU ran through the scalar loop; this is 5.3x faster
+// on a 5120-wide row (207 vs 1100 ns, Zen 5). See vendor/llama-cpp-sys-2/OZGENT.md.
+// Q2_0 x Q8_0 dot product, AVX2. One Q2_0 block (64 weights, codes 0..3
+// meaning -1..2) spans two Q8_0 blocks. Each byte packs four consecutive
+// weights, lowest bits first.
+//
+// Unpacking in place would need a different shift for each byte of a word,
+// which AVX2 cannot do. Instead the four 2-bit planes are pulled out at once
+// with a per-64-bit shift, which leaves plane e of bytes 0..7 at positions
+// 8e..8e+7 — weight 4b+e at 8e+b — and the activations are transposed to
+// match: one in-lane shuffle and one cross-lane permute per 32 values.
+static inline float ggml_vec_dot_q2_0_q8_0_avx2(int n, const block_q2_0 * x, const block_q8_0 * y) {
+    const int nb = n / QK2_0;
+    const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i one = _mm256_set1_epi8(1);
+    const __m256i transpose = _mm256_setr_epi8(
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m256i interleave = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        for (int k = 0; k < 2; ++k) {
+            const block_q8_0 * yb = &y[2 * i + k];
+            uint64_t packed;
+            memcpy(&packed, &x[i].qs[8 * k], sizeof(packed));
+            __m256i qx = _mm256_srlv_epi64(_mm256_set1_epi64x((long long) packed), shifts);
+            qx = _mm256_sub_epi8(_mm256_and_si256(qx, m3), one);
+
+            __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
+            qy = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, transpose), interleave);
+
+            const __m256 d = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(yb->d));
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+    }
+    return hsum_float_8(acc);
+}
+#endif
+
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK2_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+#if defined(__AVX2__)
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    *s = ggml_vec_dot_q2_0_q8_0_avx2(n, (const block_q2_0 *) vx, (const block_q8_0 *) vy);
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

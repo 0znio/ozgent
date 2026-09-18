@@ -2334,12 +2334,27 @@ a.ghost-btn { text-decoration: none; }
    ----------------------------------------------------------------------
    In the sidebar, above the list it filters, because that is the list you
    were looking at when you gave up finding it by eye. */
-.search-box { position: relative; display: flex; align-items: center; }
+/* Inset by the list's own padding, full width, and the rows' radius, so the
+   box lines up with the conversations it filters instead of sitting against
+   the sidebar edge. Quiet until used: it is a tool, not the headline. */
+.search-box {
+  position: relative; display: flex; align-items: center;
+  margin: var(--s2) 8px 0;
+}
 .search-box .ic {
-  position: absolute; left: 9px; width: 14px; height: 14px;
+  position: absolute; left: 10px; width: 14px; height: 14px;
   color: var(--ink-faint); pointer-events: none;
 }
-.search-box input { padding-left: 30px; }
+.search-box input {
+  flex: 1; width: 100%;
+  padding: 7px 10px 7px 31px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border-color: var(--line-soft);
+}
+.search-box input:hover { border-color: var(--line); }
+.search-box input:focus { background: var(--raised); border-color: transparent; }
+.search-box input::placeholder { color: var(--ink-faint); }
 .search-results { display: flex; flex-direction: column; gap: 2px; }
 .search-hit {
   display: flex; flex-direction: column; gap: 2px;
