@@ -42,6 +42,23 @@ fn main() {
     for file in mtmd_sources(&mtmd) {
         build.file(file);
     }
+    // The helper names each bitmap by a SHA-256 of its bytes, from a vendored
+    // hash that upstream's CMake links in as a library of its own.
+    let hash = source.join("vendor/hash");
+    if hash.join("hash.cpp").is_file() {
+        // Mixed languages behind `.c` names: sha1 opens a namespace and is
+        // C++, while sha256 and xxhash are C and `hash.cpp` includes them
+        // inside `extern "C"`, so they must keep unmangled names.
+        build.include(&hash);
+        for file in ["hash.cpp", "sha1/sha1.c"] {
+            build.file(hash.join(file));
+        }
+        cc::Build::new()
+            .include(&hash)
+            .files(["xxhash/xxhash.c", "sha256/sha256.c"].map(|f| hash.join(f)))
+            .warnings(false)
+            .compile("mtmd-hash");
+    }
     build.compile("mtmd");
 
     // mtmd's symbols resolve against the llama and ggml libraries that

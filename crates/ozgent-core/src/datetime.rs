@@ -109,16 +109,42 @@ impl DateTime {
             + self.second as i64
     }
 
+    /// What the model is told about today, in the system prompt.
+    ///
+    /// The date only. This line opens every prompt, and anything in it that
+    /// changes invalidates everything cached after it: carrying the time to
+    /// the minute made a reply sent in a new minute prefill the whole
+    /// conversation again — five to ten seconds on a model larger than the
+    /// card. The time travels with each message instead; see [`Self::stamp`].
     pub fn prompt_line(&self) -> String {
         format!(
-            "Today is {}, {} {} {}. The current time is {:02}:{:02} UTC.",
+            "Today is {}, {} {} {} (UTC).",
             self.weekday_name(),
             self.day,
             self.month_name(),
             self.year,
-            self.hour,
-            self.minute
         )
+    }
+
+    /// The mark put in front of a user message sent at this moment, as seen
+    /// from `today`.
+    ///
+    /// Taken from when the message was stored, so an old message renders the
+    /// same on every later turn and the cache before it survives. The date is
+    /// named only when it is not today's.
+    pub fn stamp(&self, today: &DateTime) -> String {
+        if (self.year, self.month, self.day) == (today.year, today.month, today.day) {
+            format!("[{:02}:{:02} UTC]", self.hour, self.minute)
+        } else {
+            format!(
+                "[{} {} {}, {:02}:{:02} UTC]",
+                &self.weekday_name()[..3],
+                self.day,
+                &self.month_name()[..3],
+                self.hour,
+                self.minute
+            )
+        }
     }
 }
 
@@ -244,6 +270,21 @@ mod tests {
         assert!(line.contains("Wednesday"), "{line}");
         assert!(line.contains("20 August 2025"), "{line}");
         assert!(line.contains("UTC"), "the zone must be explicit: {line}");
+    }
+
+    #[test]
+    fn the_prompt_line_carries_no_time_of_day() {
+        // It opens every prompt; a minute in it breaks the cache every minute.
+        let a = DateTime::civil(2026, 9, 18, 9, 1, 0).prompt_line();
+        let b = DateTime::civil(2026, 9, 18, 23, 59, 59).prompt_line();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_stamp_names_the_day_only_when_it_is_not_today() {
+        let today = DateTime::civil(2026, 9, 18, 12, 0, 0);
+        assert_eq!(DateTime::civil(2026, 9, 18, 9, 5, 0).stamp(&today), "[09:05 UTC]");
+        assert_eq!(DateTime::civil(2026, 9, 17, 22, 40, 0).stamp(&today), "[Thu 17 Sep, 22:40 UTC]");
     }
 
     #[test]

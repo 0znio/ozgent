@@ -192,7 +192,7 @@ impl Backend {
             let body = res.text().await.unwrap_or_default();
             anyhow::bail!("{status}: {}", message_in(&body));
         }
-        Ok(Stream { res: Some(res), buffer: String::new(), done: false })
+        Ok(Stream { res: Some(res), buffer: String::new(), partial: Vec::new(), done: false })
     }
 
     /// A one-shot completion, with no conversation and no memory.
@@ -214,7 +214,7 @@ impl Backend {
             let body = res.text().await.unwrap_or_default();
             anyhow::bail!("{status}: {}", message_in(&body));
         }
-        Ok(Stream { res: Some(res), buffer: String::new(), done: false })
+        Ok(Stream { res: Some(res), buffer: String::new(), partial: Vec::new(), done: false })
     }
 
     /// Answer a permission question the daemon asked.
@@ -264,6 +264,10 @@ fn message_in(body: &str) -> String {
 pub struct Stream {
     res: Option<reqwest::Response>,
     buffer: String,
+    /// Bytes of a character the last chunk cut in half. Network chunks fall
+    /// wherever they fall, and decoding each on its own turned a split
+    /// character into two replacement marks.
+    partial: Vec<u8>,
     done: bool,
 }
 
@@ -284,7 +288,10 @@ impl Stream {
             }
             let Some(res) = self.res.as_mut() else { return Ok(None) };
             match res.chunk().await? {
-                Some(bytes) => self.buffer.push_str(&String::from_utf8_lossy(&bytes)),
+                Some(bytes) => {
+                    self.partial.extend_from_slice(&bytes);
+                    decode_into(&mut self.buffer, &mut self.partial);
+                }
                 None => {
                     self.done = true;
                     // One more pass: the last event may have arrived without
@@ -312,6 +319,28 @@ impl Stream {
     fn take_rest(&mut self) -> Option<serde_json::Value> {
         let block = std::mem::take(&mut self.buffer);
         parse(&block)
+    }
+}
+
+/// Move every complete character of `pending` into `out`, keeping back only
+/// the start of one that has not finished arriving.
+fn decode_into(out: &mut String, pending: &mut Vec<u8>) {
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            out.push_str(text);
+            pending.clear();
+        }
+        // Cut short at the end: keep the tail for the next chunk.
+        Err(e) if e.error_len().is_none() => {
+            let valid = e.valid_up_to();
+            out.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or_default());
+            pending.drain(..valid);
+        }
+        // Genuinely malformed, which waiting will not mend.
+        Err(_) => {
+            out.push_str(&String::from_utf8_lossy(pending));
+            pending.clear();
+        }
     }
 }
 
@@ -456,7 +485,7 @@ mod tests {
     // --------------------------------------------------------- the stream
 
     fn events(text: &str) -> Vec<serde_json::Value> {
-        let mut stream = Stream { res: None, buffer: text.to_string(), done: true };
+        let mut stream = Stream { res: None, buffer: text.to_string(), partial: Vec::new(), done: true };
         let mut out = Vec::new();
         while let Some(event) = stream.take().or_else(|| stream.take_rest()) {
             out.push(event);
@@ -479,12 +508,27 @@ mod tests {
         let mut stream = Stream {
             res: None,
             buffer: "data: {\"type\":\"answ".to_string(),
+            partial: Vec::new(),
             done: false,
         };
         assert!(stream.take().is_none(), "half an event is not an event");
         stream.buffer.push_str("er\",\"text\":\"hi\"}\n\n");
         let event = stream.take().expect("now it is complete");
         assert_eq!(event["text"], "hi");
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_survives() {
+        let bytes = "data: {\"text\":\"é\"}\n\n".as_bytes();
+        let cut = bytes.iter().position(|&b| b == 0xc3).unwrap() + 1;
+        let mut out = String::new();
+        let mut pending = Vec::new();
+        pending.extend_from_slice(&bytes[..cut]);
+        decode_into(&mut out, &mut pending);
+        assert_eq!(pending.len(), 1, "half a character is held back");
+        pending.extend_from_slice(&bytes[cut..]);
+        decode_into(&mut out, &mut pending);
+        assert!(out.contains('é') && !out.contains('\u{fffd}'), "{out:?}");
     }
 
     #[test]

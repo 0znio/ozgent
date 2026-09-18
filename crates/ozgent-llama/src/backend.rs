@@ -233,6 +233,23 @@ mod real {
 #[cfg(feature = "llama")]
 pub use real::{best_gpu, devices, supports_gpu_offload};
 
+/// Host memory a new allocation can have without pushing anything out, in
+/// bytes.
+///
+/// Not the CPU device's own figure: on Linux ggml reports the whole of RAM as
+/// free whatever is using it. The kernel's `MemAvailable` counts memory that
+/// is free or can be reclaimed without swapping, which is the question.
+pub fn host_available() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+    let from_kernel = meminfo.as_deref().and_then(|m| {
+        m.lines()
+            .find_map(|l| l.strip_prefix("MemAvailable:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
+            .map(|kb| kb * 1024)
+    });
+    from_kernel.or_else(|| devices().into_iter().find(|d| !d.is_gpu()).map(|d| d.memory_free))
+}
+
 #[cfg(not(feature = "llama"))]
 pub fn devices() -> Vec<Device> {
     Vec::new()

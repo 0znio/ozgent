@@ -160,6 +160,7 @@ impl<'a> Projector<'a> {
                     image.bytes.as_ptr(),
                     image.bytes.len(),
                     false,
+                    sys::mtmd_helper_init_opt_default(),
                 )
             };
             if wrapper.bitmap.is_null() {

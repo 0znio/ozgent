@@ -18,7 +18,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::backend::{Backend, Stream};
-use crate::tui::Ui;
+use crate::tui::{Part, Ui};
 
 /// What a finished turn produced, for the status line and `/copy`.
 #[derive(Debug, Default)]
@@ -53,13 +53,36 @@ pub async fn render(
     decide: Decide,
 ) -> Result<Finished> {
     let mut out = Finished::default();
-    let mut thinking = String::new();
+    // What the live block shows: the reply since it was last committed, in
+    // the order it was written. Emptied at every commit, because what was
+    // committed is already on screen and repeating it would draw it twice.
+    let mut parts: Vec<Part> = Vec::new();
+
     // The name of the call being announced, so a result can close the line it
     // opened rather than guessing which one it belongs to.
     let mut running: Option<String> = None;
     let mut loading: Option<String> = None;
 
-    while let Some(event) = events.next().await? {
+    // Ticks the screen between events; see `Ui::idle`.
+    let mut heartbeat = tokio::time::interval(crate::tui::ui::SPIN);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let event = tokio::select! {
+            biased;
+            event = events.next() => event?,
+            _ = heartbeat.tick() => {
+                if ui.idle() {
+                    // Dropping the stream closes the connection, and the
+                    // daemon stops generating when its reader goes away.
+                    ui.settle();
+                    ui.say(theme.style(ozgent_render::Style::dim(), "stopped"));
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(event) = event else { break };
         let kind = event["type"].as_str().unwrap_or("");
         match kind {
             // Before anything is generated, and only when a model has to be
@@ -86,15 +109,18 @@ pub async fn render(
             }
 
             "thinking" => {
-                thinking.push_str(event["text"].as_str().unwrap_or(""));
+                let text = event["text"].as_str().unwrap_or("");
                 if show_thinking {
-                    ui.stream(Some(&thinking), &out.answer, false);
+                    Part::extend(&mut parts, true, text);
+                    ui.stream(&parts, false);
                 }
             }
 
             "answer" => {
-                out.answer.push_str(event["text"].as_str().unwrap_or(""));
-                ui.stream(show_thinking.then_some(thinking.as_str()), &out.answer, false);
+                let text = event["text"].as_str().unwrap_or("");
+                out.answer.push_str(text);
+                Part::extend(&mut parts, false, text);
+                ui.stream(&parts, false);
             }
 
             // The model has committed to a call and is still writing it. Said
@@ -103,8 +129,9 @@ pub async fn render(
             // screen simply stops while a file is generated.
             "tool_call_started" => {
                 let name = event["name"].as_str().unwrap_or("a tool").to_string();
-                ui.stream(show_thinking.then_some(thinking.as_str()), &out.answer, true);
+                ui.stream(&parts, true);
                 ui.commit();
+                parts.clear();
                 ui.begin_activity(format!("{name} — writing the call…"));
                 running = Some(name);
             }
@@ -113,8 +140,9 @@ pub async fn render(
                 let name = event["name"].as_str().unwrap_or("a tool").to_string();
                 let args = crate::chat::pretty_args(&event["arguments"]);
                 if running.as_deref() != Some(name.as_str()) {
-                    ui.stream(show_thinking.then_some(thinking.as_str()), &out.answer, true);
+                    ui.stream(&parts, true);
                     ui.commit();
+                    parts.clear();
                 }
                 ui.begin_activity(if args.is_empty() {
                     name.clone()
@@ -171,8 +199,9 @@ pub async fn render(
                 if !out.answer.trim().is_empty() {
                     out.answer.push_str("\n\n");
                 }
-                ui.stream(show_thinking.then_some(thinking.as_str()), &out.answer, true);
+                ui.stream(&parts, true);
                 ui.commit();
+                parts.clear();
                 ui.say(theme.style(
                     ozgent_render::Style::dim(),
                     &format!("@{name} — {description}"),
@@ -223,8 +252,8 @@ pub async fn render(
 
     // Whatever arrived, painted once more and committed, so the reply is on
     // the screen as a finished block rather than a throttled half-frame.
-    if !out.answer.trim().is_empty() || !thinking.trim().is_empty() {
-        ui.stream(show_thinking.then_some(thinking.as_str()), &out.answer, true);
+    if parts.iter().any(|p| !p.text.trim().is_empty()) {
+        ui.stream(&parts, true);
         ui.commit();
     }
     Ok(out)

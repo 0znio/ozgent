@@ -624,6 +624,11 @@ fn serve_model(
         );
     }
 
+    // What was asked for, kept apart from what the load settles on. The load
+    // may move more experts to the host than asked, and comparing each turn's
+    // settings against *that* read as a changed setting on every message:
+    // the model reloaded, moved them again, and reloaded again.
+    let requested = resolved.clone();
     let mut resolved = resolved;
     let engine = match Engine::load_reporting(&weights, &resolved, move |p| {
         let pct = (p * 100.0) as u32;
@@ -689,37 +694,84 @@ fn serve_model(
     // The attempt is dropped rather than kept because the sessions borrow the
     // engine, and an engine that is still borrowed cannot be replaced.
     let mut engine = engine;
-    if engine.cpu_moe_layers() > 0 {
-        let short = match engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap)) {
+    // Two reasons to move more experts to system RAM and load again, each
+    // taken at most once. Both are about a model already split across the
+    // card and the host, where one more layer of experts on the host costs
+    // little and the alternatives cost a great deal.
+    let auto_experts = matches!(
+        resolved.cpu_moe,
+        ozgent_core::accel::MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::Auto)
+    );
+    let mut floor_done = false;
+    let mut wide_done = false;
+    while engine.cpu_moe_layers() > 0 {
+        // Reduced to plain data at once: the sessions borrow the engine,
+        // which may be about to be replaced.
+        let probe = match engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap)) {
+            Ok(_) => Ok(()),
             Err(ozgent_llama::engine::EngineError::WindowBelowFloor { opened, floor, short_by }) => {
-                Some((opened, floor, short_by))
+                Err(Some((opened, floor, short_by)))
             }
-            _ => None,
+            Err(_) => Err(None),
         };
-        if let Some((opened, floor, short_by)) = short {
-            let Some(extra) = engine.expert_layers_for(short_by) else {
-                anyhow::bail!("{}: only {opened} tokens of context fit, below {floor}", found.model);
-            };
-            let layers = (engine.cpu_moe_layers() + extra).min(engine.n_layer());
-            tracing::warn!(
-                "{}: only {opened} tokens of context fitted beside the weights, below {floor}; \
-                 moving the experts of {extra} more layer{} to system RAM ({layers} in all) and loading again",
-                found.model,
-                if extra == 1 { "" } else { "s" },
-            );
-            drop(engine);
-            resolved.cpu_moe = ozgent_core::accel::MoeOffload::Layers(layers);
-            let (admitted, _) = {
-                let weights = weights.clone();
-                let resolved = resolved.clone();
-                member.admit(crate::pool::PlanFor(move || {
-                    ozgent_llama::backend::Plan::for_model(&weights, &resolved)
-                }))
-            };
-            engine = Engine::load(&weights, &resolved)
-                .map_err(|e| anyhow::anyhow!("reloading {}: {e}", found.model))?;
-            drop(admitted);
-        }
+        let extra = match probe {
+            // The window that fitted is below what the model needs: nothing
+            // works until more room is found.
+            Err(Some((opened, floor, short_by))) if !floor_done =>
+            {
+                floor_done = true;
+                let Some(extra) = engine.expert_layers_for(short_by) else {
+                    anyhow::bail!("{}: only {opened} tokens of context fit, below {floor}", found.model);
+                };
+                tracing::warn!(
+                    "{}: only {opened} tokens of context fitted beside the weights, below {floor}; \
+                     moving the experts of {extra} more layer{} to system RAM and loading again",
+                    found.model,
+                    if extra == 1 { "" } else { "s" },
+                );
+                extra
+            }
+            // The context opened, but on the narrow micro-batch. With experts
+            // on the host every micro-batch of a prefill uploads all of them
+            // across the bus, so halving how many there are nearly halves
+            // prefill: on a 35B MoE with 28 of 40 layers' experts on the host,
+            // 1024 against 512 measured 589 tok/s against 378, for 26.2 tok/s
+            // of decoding against 26.4 with two more layers moved. Worth it
+            // for a few layers; not for many, where decoding starts to pay —
+            // four more and a 2048 batch cost twelve percent — so it is
+            // bounded to a twentieth of the model.
+            Ok(()) if auto_experts && !wide_done => {
+                wide_done = true;
+                let Some(extra) = engine
+                    .wide_batch_shortfall()
+                    .and_then(|bytes| engine.expert_layers_for(bytes))
+                    .filter(|extra| extra * 20 <= engine.n_layer())
+                else {
+                    break;
+                };
+                tracing::info!(
+                    "{}: moving the experts of {extra} more layer{} to system RAM for the wider \
+                     micro-batch, which roughly halves how often a prefill re-uploads them",
+                    found.model,
+                    if extra == 1 { "" } else { "s" },
+                );
+                extra
+            }
+            _ => break,
+        };
+        let layers = (engine.cpu_moe_layers() + extra).min(engine.n_layer());
+        drop(engine);
+        resolved.cpu_moe = ozgent_core::accel::MoeOffload::Layers(layers);
+        let (admitted, _) = {
+            let weights = weights.clone();
+            let resolved = resolved.clone();
+            member.admit(crate::pool::PlanFor(move || {
+                ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+            }))
+        };
+        engine = Engine::load(&weights, &resolved)
+            .map_err(|e| anyhow::anyhow!("reloading {}: {e}", found.model))?;
+        drop(admitted);
     }
     let sessions = engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap))?;
     let slots = sessions.len();
@@ -741,7 +793,7 @@ fn serve_model(
     // prefills it in full and the second turn prefills it *again* to fill the
     // commons -- 1665 ms and 1595 ms, measured, on a 4B that fits on the card.
     if let Some(first) = sessions.first() {
-        prewarm(&engine, first, tools, &resolved);
+        prewarm(&engine, first, tools, &resolved, paths, &snapshot(shared));
     }
 
     // Registered busy so nothing evicts it mid-load; it is loaded now, and the
@@ -779,7 +831,7 @@ fn serve_model(
             let rx_mine = work_rx[i].lock().unwrap().take().expect("one receiver per slot");
             let (busy, handback, stopping) = (&busy, &handback, &stopping);
             let (served, depth) = (&served, &depth);
-            let (engine, resolved, found, mmproj) = (&engine, &resolved, &found, &mmproj);
+            let (engine, resolved, requested, found, mmproj) = (&engine, &resolved, &requested, &found, &mmproj);
             std::thread::Builder::new()
                 .name(format!("ozgent-slot-{i}"))
                 .spawn_scoped(scope, move || {
@@ -808,7 +860,7 @@ fn serve_model(
                         // when the weights load. Handing the request back sends
                         // it to a freshly loaded model, which is what "applies on
                         // your next message" has to mean if it is to be true.
-                        if resolved.needs_reload(&per_turn) {
+                        if requested.needs_reload(&per_turn) {
                             tracing::info!(
                                 "a load-time setting changed; reloading {}",
                                 found.model
@@ -1417,16 +1469,34 @@ fn prewarm(
     session: &ozgent_llama::engine::Session<'_>,
     tools: &SharedTools,
     resolved: &ozgent_core::options::Resolved,
+    paths: &Paths,
+    config: &Config,
 ) {
     let Some(t) = current_tools(tools) else { return };
     let native_tools = engine.template_handles_tools();
-    let specs = t.host.tools().to_vec();
-    if specs.is_empty() {
+    // The head of a real turn, built the way `turn::start` and `run` build it:
+    // the same system prompt, the same tools, the handoff tool and its note.
+    // Rendering without them produced a prefix that no real prompt shared —
+    // a template that puts the system text ahead of the tools diverged three
+    // tokens in, and the held prefix was never once lent.
+    let system = crate::turn::system_prompt(config.ui.date_awareness, None);
+    let handoff = if config.tools.handoff {
+        ozgent_core::AgentCatalog::load(paths).all().to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut specs = t.host.tools().to_vec();
+    specs.extend(ozgent_core::agents::handoff_spec(&handoff));
+    if specs.is_empty() && system.is_none() {
         return;
     }
     let render = |text: &str| {
-        let mut messages = vec![Message::user(text)];
+        let mut messages: Vec<Message> = system.iter().map(|s| Message::system(s.as_str())).collect();
+        messages.push(Message::user(text));
         prepare(&mut messages, &specs, native_tools, None, &[], None);
+        if specs.iter().any(|s| s.name == ozgent_core::agents::HANDOFF_TOOL) {
+            append_system(&mut messages, &ozgent_core::agents::handoff_prompt(&handoff));
+        }
         let prompt = engine
             .render_prompt_full(&messages, resolved.thinking, resolved.reasoning_effort, &specs)
             .ok()?;

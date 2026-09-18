@@ -67,10 +67,13 @@ pub struct Turn {
 /// tool, and spends the answer explaining why it could not. Saying plainly
 /// that the timer has already fired is what turns the prompt back into the
 /// question it is.
-fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::Caller>) -> Option<String> {
+pub(crate) fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::Caller>) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if date_aware {
-        lines.push(ozgent_core::DateTime::now().prompt_line());
+        lines.push(format!(
+            "{} Each user message begins with the time it was sent.",
+            ozgent_core::DateTime::now().prompt_line()
+        ));
     }
     if let Some(name) = caller.and_then(|c| c.origin.strip_prefix("job:")) {
         lines.push(format!(
@@ -82,6 +85,20 @@ fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::Caller>) -> 
         ));
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Put the time each user message was sent in front of it.
+///
+/// This is how the model knows the time now that the system prompt carries
+/// only the date. It comes from the stored timestamp rather than the clock, so
+/// every earlier message renders exactly as it did on its own turn and the
+/// cache holding it stays valid.
+fn stamp_user_messages(messages: &mut [ozgent_memory::StoredMessage]) {
+    let today = ozgent_core::DateTime::now();
+    for m in messages.iter_mut().filter(|m| m.role == "user") {
+        let sent = ozgent_core::DateTime::from_unix(m.created_at);
+        m.content = format!("{} {}", sent.stamp(&today), m.content);
+    }
 }
 
 /// Start a turn. The receiver yields every event until `Done` or `Error`.
@@ -139,6 +156,10 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
 
         let config = state.config.lock().unwrap();
         let system = system_prompt(config.ui.date_awareness, turn.caller.as_ref());
+        let mut assembled = assembled;
+        if config.ui.date_awareness {
+            stamp_user_messages(&mut assembled.recent);
+        }
         assembled.to_messages(system.as_deref())
     };
 
@@ -387,6 +408,7 @@ mod tests {
     #[test]
     fn date_awareness_alone_is_unchanged_by_any_of_this() {
         let text = system_prompt(true, None).unwrap();
-        assert_eq!(text, ozgent_core::DateTime::now().prompt_line());
+        assert!(text.starts_with(&ozgent_core::DateTime::now().prompt_line()), "{text}");
+        assert_eq!(text.lines().count(), 1, "{text}");
     }
 }

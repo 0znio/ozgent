@@ -23,13 +23,36 @@ pub enum Source {
     /// Exactly these lines, at any width. Boxes and rules draw themselves and
     /// must not be re-flowed into nonsense.
     Fixed(Vec<String>),
-    /// A reply being written: reasoning above, answer below.
+    /// A reply being written, as the model wrote it: reasoning and answer in
+    /// the order they arrived.
     ///
-    /// One block rather than two because they are re-rendered together on
-    /// every token, and because the reasoning has to disappear cleanly the
-    /// moment the answer starts — which it cannot do if it is already a
-    /// committed block of its own.
-    Reply { thinking: Option<String>, answer: String },
+    /// A list rather than one reasoning field above one answer, because a
+    /// model can go back to reasoning after it has started answering. Folding
+    /// that second block into the first moved it above text written before
+    /// it, and the transcript no longer read in the order it happened.
+    ///
+    /// One block rather than one per part because they are re-rendered
+    /// together on every token.
+    Reply { parts: Vec<Part> },
+}
+
+/// One run of a reply: reasoning, or answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    pub thinking: bool,
+    pub text: String,
+}
+
+impl Part {
+    /// Add streamed text to the reply, starting a new part only when the kind
+    /// changes, so a token stream becomes a handful of parts rather than one
+    /// per token.
+    pub fn extend(parts: &mut Vec<Part>, thinking: bool, text: &str) {
+        match parts.last_mut() {
+            Some(last) if last.thinking == thinking => last.text.push_str(text),
+            _ => parts.push(Part { thinking, text: text.to_string() }),
+        }
+    }
 }
 
 /// One unit of transcript: a message, a note, a tool card.
@@ -50,11 +73,19 @@ impl Block {
     pub fn fixed(lines: Vec<String>) -> Self {
         Self { source: Source::Fixed(lines), lines: Vec::new() }
     }
+    /// Reasoning followed by an answer, the common shape.
+    #[cfg(test)]
     pub fn reply(thinking: Option<String>, answer: impl Into<String>) -> Self {
-        Self {
-            source: Source::Reply { thinking, answer: answer.into() },
-            lines: Vec::new(),
+        let mut parts = Vec::new();
+        if let Some(text) = thinking {
+            parts.push(Part { thinking: true, text });
         }
+        parts.push(Part { thinking: false, text: answer.into() });
+        Self::reply_parts(parts)
+    }
+
+    pub fn reply_parts(parts: Vec<Part>) -> Self {
+        Self { source: Source::Reply { parts }, lines: Vec::new() }
     }
 
     fn render(&mut self, theme: &Theme, width: usize) {
@@ -66,21 +97,37 @@ impl Block {
             Source::Fixed(lines) => lines.clone(),
             Source::Plain(text) => wrap_styled(text, width),
             Source::Markdown(text) => render_markdown(theme, width, text),
-            Source::Reply { thinking, answer } => {
+            Source::Reply { parts } => {
                 let mut lines = Vec::new();
-                // Reasoning is subordinate to the answer and is styled that
-                // way rather than parsed: a model's scratch notes are not
-                // markdown, and rendering them as such turns a stray `#` into
-                // a heading three times the weight of the reply.
-                if let Some(text) = thinking.as_ref().filter(|t| !t.trim().is_empty()) {
-                    let styled = theme.style(theme.thinking, text.trim());
-                    lines.extend(wrap_styled(&styled, width));
-                    if !answer.trim().is_empty() {
+                for part in parts {
+                    let text = if part.thinking { part.text.trim() } else { part.text.as_str() };
+                    // An empty reasoning block is what a model that decides
+                    // not to reason still emits; it takes no room.
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    if !lines.is_empty() {
                         lines.push(String::new());
                     }
-                }
-                if !answer.is_empty() {
-                    lines.extend(render_markdown(theme, width, answer));
+                    if part.thinking {
+                        // Reasoning is subordinate to the answer and is styled
+                        // that way rather than parsed: a model's scratch notes
+                        // are not markdown, and rendering them as such turns a
+                        // stray `#` into a heading three times the weight of
+                        // the reply.
+                        //
+                        // Styled line by line after wrapping, not wrapped after
+                        // styling: the screen draws whichever lines are in
+                        // view, and a style opened on a line scrolled off the
+                        // top never reaches the ones below it.
+                        lines.extend(
+                            wrap_styled(text, width)
+                                .into_iter()
+                                .map(|line| theme.style(theme.thinking, &line)),
+                        );
+                    } else {
+                        lines.extend(render_markdown(theme, width, text));
+                    }
                 }
                 lines
             }
@@ -272,6 +319,62 @@ fn render_markdown(theme: &Theme, width: usize, text: &str) -> Vec<String> {
 /// why this cannot simply be `str::chars().chunks()`: cutting a colour code in
 /// half spills the colour over the rest of the screen.
 fn wrap_styled(text: &str, width: usize) -> Vec<String> {
+    carry_styles(wrap_raw(text, width))
+}
+
+/// Make every line stand on its own.
+///
+/// A style opened on one line and closed several lines later only works when
+/// the lines are printed in one go. The screen draws whichever lines are in
+/// view, so each line reopens what is still in force above it and closes it
+/// again at its end.
+fn carry_styles(lines: Vec<String>) -> Vec<String> {
+    let mut active = String::new();
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut out = String::with_capacity(active.len() + line.len() + 4);
+            out.push_str(&active);
+            out.push_str(&line);
+            for sgr in sgr_sequences(&line) {
+                if sgr == "\x1b[0m" || sgr == "\x1b[m" {
+                    active.clear();
+                } else {
+                    active.push_str(sgr);
+                }
+            }
+            if !active.is_empty() {
+                out.push_str("\x1b[0m");
+            }
+            out
+        })
+        .collect()
+}
+
+/// The select-graphic-rendition escapes in `line`, in order.
+fn sgr_sequences(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let start = i;
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'm' {
+                out.push(&line[start..=j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn wrap_raw(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     for paragraph in text.split('\n') {
         if display_width(paragraph) <= width {
@@ -450,6 +553,45 @@ mod tests {
         let mut t = transcript();
         t.set_live(Block::reply(Some("# not a heading".into()), ""));
         assert!(t.visible(10).join("").contains("# not a heading"));
+    }
+
+    #[test]
+    fn a_style_is_reopened_on_every_wrapped_line() {
+        // The screen draws the lines in view, not the whole block: a line
+        // whose style was opened three lines up must still carry it.
+        let styled = format!("\x1b[2m{}\x1b[0m", "word ".repeat(30));
+        let lines = wrap_styled(&styled, 20);
+        assert!(lines.len() > 3);
+        for line in &lines {
+            assert!(line.starts_with("\x1b[2m"), "{line:?}");
+            assert!(line.ends_with("\x1b[0m"), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn plain_text_wraps_without_escapes() {
+        let lines = wrap_styled(&"word ".repeat(30), 20);
+        assert!(lines.iter().all(|l| !l.contains('\x1b')), "{lines:?}");
+    }
+
+    #[test]
+    fn reasoning_resumed_after_the_answer_stays_in_order() {
+        let mut parts = Vec::new();
+        Part::extend(&mut parts, true, "first thought");
+        Part::extend(&mut parts, false, "Some answer.");
+        Part::extend(&mut parts, true, "second ");
+        Part::extend(&mut parts, true, "thought");
+        Part::extend(&mut parts, false, "More answer.");
+        assert_eq!(parts.len(), 4, "runs of one kind share a part");
+
+        let mut t = transcript();
+        t.set_live(Block::reply_parts(parts));
+        let out = t.visible(20).join("\n");
+        let order: Vec<usize> = ["first thought", "Some answer", "second thought", "More answer"]
+            .iter()
+            .map(|s| out.find(s).unwrap_or_else(|| panic!("{s} missing from {out}")))
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{out}");
     }
 
     #[test]

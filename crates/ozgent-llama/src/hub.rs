@@ -115,6 +115,11 @@ pub static PASS_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Tokens those passes carried, so a verification batch can be told from a
 /// plain decode.
 pub static PASS_TOKENS: AtomicU64 = AtomicU64::new(0);
+/// Microseconds the driver spent holding a pass open for slots that had not
+/// asked yet.
+pub static GATHER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Microseconds from `run` being called to its answer, waits included.
+pub static RUN_MICROS: AtomicU64 = AtomicU64::new(0);
 
 struct Pending {
     id: u64,
@@ -575,7 +580,8 @@ impl<'a> Hub<'a> {
         if q.waiting.is_empty() {
             return q;
         }
-        let deadline = Instant::now() + self.window(&q);
+        let opened = Instant::now();
+        let deadline = opened + self.window(&q);
         while field_incomplete(q.waiting.len(), q.running) {
             let now = Instant::now();
             if now >= deadline {
@@ -584,6 +590,7 @@ impl<'a> Hub<'a> {
             let (guard, _) = self.woke.wait_timeout(q, deadline - now).unwrap();
             q = guard;
         }
+        GATHER_MICROS.fetch_add(opened.elapsed().as_micros() as u64, Ordering::Relaxed);
         q
     }
 
@@ -819,7 +826,10 @@ impl<'a> Slot<'a> {
         hidden: bool,
     ) -> Result<Outcome, HubError> {
         self.resume();
-        self.hub.run(Work { seq: self.seq, tokens, pos, logits, hidden })
+        let started = Instant::now();
+        let out = self.hub.run(Work { seq: self.seq, tokens, pos, logits, hidden });
+        RUN_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        out
     }
 
     /// Reach the context for the operations that are not decodes.

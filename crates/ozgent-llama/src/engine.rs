@@ -111,6 +111,11 @@ pub struct Engine {
     /// This model's own compute scratch, measured once per set of context
     /// parameters. See [`Engine::probed_reserve`].
     scratch: std::sync::Mutex<Option<(ScratchKey, u64, f64)>>,
+    /// Set when the widened micro-batch did not fit and the context opened
+    /// with the narrow one: `(wide, narrow, narrow scratch bytes)`. What a
+    /// caller needs to decide whether moving a little more to the host would
+    /// buy the wide one back. See [`Engine::wide_batch_shortfall`].
+    narrowed: std::sync::Mutex<Option<(u32, u32, u64)>>,
     /// What prefill uploads into the compute buffer per micro-batch when
     /// routed experts live on the host: the heaviest evicted block. Zero when
     /// nothing is evicted. See `reserve::Shape::staging_bytes`.
@@ -349,7 +354,7 @@ impl Engine {
         };
 
         let mut params = Box::pin(LlamaModelParams::default()
-            .with_n_gpu_layers(requested_layers)
+            .with_n_gpu_layers(llama_gpu_layers(requested_layers, plan.total_layers))
             .with_use_mmap(opts.use_mmap)
             .with_use_mlock(opts.use_mlock)
             .with_main_gpu(opts.main_gpu as i32)
@@ -543,6 +548,7 @@ impl Engine {
             cpu_moe_layers: evicted_expert_layers,
             expert_bytes_per_layer: layout.expert_bytes_per_layer,
             scratch: std::sync::Mutex::new(None),
+            narrowed: std::sync::Mutex::new(None),
             staging_bytes: if evicted_expert_layers > 0 || resolved_tensors > 0 {
                 layout.max_layer_expert_bytes
             } else {
@@ -608,6 +614,19 @@ impl Engine {
     /// Layers whose routed experts this load put in host memory.
     pub fn cpu_moe_layers(&self) -> u32 {
         self.cpu_moe_layers
+    }
+
+    /// VRAM the widened micro-batch was short by, when the last context had
+    /// to open with the narrow one instead.
+    ///
+    /// Estimated rather than measured, because the wide one never allocated:
+    /// compute scratch grows close to linearly with the micro-batch, so the
+    /// narrow one's measured size scales to it. An estimate is safe here —
+    /// if it is short, the next open narrows again exactly as this one did.
+    pub fn wide_batch_shortfall(&self) -> Option<u64> {
+        let (wide, narrow, bytes) = (*self.narrowed.lock().unwrap())?;
+        (narrow > 0 && wide > narrow)
+            .then(|| bytes.saturating_mul((wide - narrow) as u64) / narrow as u64)
     }
 
     /// How many more layers' experts must leave the card to free `bytes`.
@@ -856,6 +875,8 @@ impl Engine {
         // and a 1024-token batch can then never fit a 960-cell cache at all.
         // Every prompt failed with `NoKvCacheSlot`, measured on a 35B MoE.
         let mut narrow_to = narrow_to;
+        let wide = shape.ubatch;
+        *self.narrowed.lock().unwrap() = None;
         let mut narrow = |params: &mut LlamaContextParams,
                           shape: &mut ozgent_core::reserve::Shape,
                           narrow_to: &mut Option<u32>|
@@ -939,6 +960,9 @@ impl Engine {
                     } else {
                         0
                     };
+                    if shape.ubatch < wide && measured > 0 {
+                        *self.narrowed.lock().unwrap() = Some((wide, shape.ubatch, measured));
+                    }
                     if measured > 0 {
                         tracing::info!(
                             "compute buffers: {} MiB at {window} ctx",
@@ -1480,7 +1504,7 @@ impl Engine {
             n_ctx: window,
             n_batch: hub.n_batch() as u32,
             slot: hub.slot(seq),
-            sampler: build_sampler(opts),
+            sampler: build_sampler(opts, self.model.n_vocab()),
             n_past: 0,
             cached: Vec::new(),
             reuse: opts.prefix_reuse,
@@ -1490,7 +1514,7 @@ impl Engine {
             rollback_safe: self.rollback_safe,
             gen_prompt_tokens: self.gen_prompt_tokens,
             media_dirty: false,
-            cpu_moe_layers: self.cpu_moe_layers,
+            host_expert_bytes: self.cpu_moe_layers as u64 * self.expert_bytes_per_layer,
             checkpoints: Vec::new(),
             checkpoint_tick: 0,
             tool_grammars: Vec::new(),
@@ -1550,20 +1574,85 @@ fn ggml_type(t: CacheType) -> KvCacheType {
     }
 }
 
-fn build_sampler(opts: &Resolved) -> LlamaSampler {
-    build_sampler_with(opts, None)
+/// Where a generation loop's time went, from process-wide counters.
+///
+/// Deltas, so a turn reads only its own share — exact for one caller, and an
+/// upper bound on each part when several slots overlap.
+struct LoopCounters {
+    pass: u64,
+    passes: u64,
+    run: u64,
+    gather: u64,
+    pick: u64,
+}
+
+impl LoopCounters {
+    fn now() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        LoopCounters {
+            pass: crate::hub::PASS_MICROS.load(Relaxed),
+            passes: crate::hub::PASS_COUNT.load(Relaxed),
+            run: crate::hub::RUN_MICROS.load(Relaxed),
+            gather: crate::hub::GATHER_MICROS.load(Relaxed),
+            pick: PICK_MICROS.load(Relaxed),
+        }
+    }
+
+    fn report(&self, tokens: usize, took: std::time::Duration, callback_ns: u128) {
+        let end = Self::now();
+        let per = |a: u64, b: u64| (a - b) as f64 / 1000.0 / tokens.max(1) as f64;
+        tracing::debug!(
+            "per token over {tokens}: total {:.2} ms, pass {:.2}, run {:.2}, gather {:.2}, pick {:.2}, callback {:.2} ms ({} passes)",
+            took.as_secs_f64() * 1000.0 / tokens.max(1) as f64,
+            per(end.pass, self.pass),
+            per(end.run, self.run),
+            per(end.gather, self.gather),
+            per(end.pick, self.pick),
+            callback_ns as f64 / 1e6 / tokens.max(1) as f64,
+            end.passes - self.passes,
+        );
+    }
+}
+
+/// Translate "this many transformer blocks on the GPU" into llama.cpp's count.
+///
+/// llama.cpp counts the output head as one more layer and fills from the top:
+/// the first block on the GPU is `n_layer_all + 1 - n_gpu_layers`. Passing the
+/// block count straight through therefore left block 0 on the CPU whenever
+/// every block was meant to be on the card — a CPU matmul and a round trip
+/// across the bus on every token, and a forward pass split in two. That was
+/// 20.1 ms a token against llama-server's 17.0 on the same model and window.
+///
+/// When every block is planned for the card, all is asked for outright:
+/// `n_layer_all` also counts blocks the planner does not, such as a NextN
+/// head, and a count that is one short puts block 0 back on the CPU. When
+/// only some are, the head is added — the planner has already reserved room
+/// for it in `fixed_gpu_bytes`.
+fn llama_gpu_layers(blocks: u32, total: u32) -> u32 {
+    if blocks == 0 {
+        0
+    } else if blocks >= total {
+        u32::MAX
+    } else {
+        blocks + 1
+    }
+}
+
+fn build_sampler(opts: &Resolved, n_vocab: i32) -> LlamaSampler {
+    build_sampler_with(opts, n_vocab, None)
 }
 
 /// Build the sampler chain, optionally led by a grammar constraint.
 ///
 /// The constraint goes first so it masks the logits before any shaping sees
 /// them; applied afterwards it could only reject, and sampling would stall.
-fn build_sampler_with(opts: &Resolved, grammar: Option<LlamaSampler>) -> LlamaSampler {
+fn build_sampler_with(opts: &Resolved, n_vocab: i32, grammar: Option<LlamaSampler>) -> LlamaSampler {
     let mut chain: Vec<LlamaSampler> = Vec::new();
     if let Some(g) = grammar {
         chain.push(g);
     }
     chain.push(LlamaSampler::penalties(
+        n_vocab,
         opts.repeat_last_n as i32,
         opts.repeat_penalty,
         0.0,
@@ -1590,39 +1679,6 @@ fn seed_of(opts: &Resolved) -> u32 {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0)
     })
-}
-
-#[allow(dead_code)]
-fn build_sampler_old(opts: &Resolved) -> LlamaSampler {
-    let seed = opts.seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    });
-
-    // Temperature 0 means "be deterministic", which greedy expresses exactly;
-    // a temp sampler at 0.0 would divide by zero.
-    if opts.temperature <= 0.0 {
-        return LlamaSampler::chain_simple([
-            LlamaSampler::penalties(
-                opts.repeat_last_n as i32,
-                opts.repeat_penalty,
-                0.0,
-                0.0,
-            ),
-            LlamaSampler::greedy(),
-        ]);
-    }
-
-    LlamaSampler::chain_simple([
-        LlamaSampler::penalties(opts.repeat_last_n as i32, opts.repeat_penalty, 0.0, 0.0),
-        LlamaSampler::top_k(opts.top_k as i32),
-        LlamaSampler::top_p(opts.top_p, 1),
-        LlamaSampler::min_p(opts.min_p, 1),
-        LlamaSampler::temp(opts.temperature),
-        LlamaSampler::dist(seed),
-    ])
 }
 
 /// Length of the longest shared prefix of two token sequences.
@@ -1817,9 +1873,9 @@ fn lru_victim(used: &[u64]) -> Option<usize> {
 
 /// One conversation against one KV cache.
 pub struct Session<'a> {
-    /// Layers whose routed experts sit in host memory, carried from the
-    /// engine so the checkpoint budget can stand aside for them.
-    cpu_moe_layers: u32,
+    /// Bytes of routed experts held in host memory, carried from the engine
+    /// so the checkpoint budget can stand aside for them.
+    host_expert_bytes: u64,
     model: &'a LlamaModel,
     /// This conversation's claim on a context that may be shared with others.
     /// A session built by [`Engine::session`] has the context to itself; one
@@ -2049,21 +2105,22 @@ impl<'a> Session<'a> {
     /// Bytes the whole set of checkpoints may occupy, or `None` when free
     /// memory is unknown.
     fn checkpoint_budget(&self) -> Option<usize> {
-        let free = crate::backend::devices()
-            .into_iter()
-            .find(|d| !d.is_gpu())
-            .map(|d| d.memory_free)?;
-        // Nothing at all when the host is already holding weights.
+        let free = crate::backend::host_available()?;
+        // Experts evicted to system RAM come first.
         //
-        // A mixture-of-experts model with experts evicted to system RAM reads
-        // them on every single token. Saved prompt states are pure cache and
-        // can always be rebuilt by prefilling; expert weights cannot, and a
-        // host short of room for them pages from disk at a gigabyte a token.
-        // Prompt latency is worth a great deal, but not that.
-        if self.cpu_moe_layers > 0 {
-            return Some(0);
-        }
-        Some(free / CHECKPOINT_RAM_SHARE)
+        // A mixture-of-experts model reads them on every token, and a host
+        // short of room for them pages from disk at a gigabyte a token. Saved
+        // prompt states are pure cache, so they get only what is left once the
+        // experts are counted as fully resident — whether or not the page
+        // cache happens to hold all of them right now, since it will.
+        //
+        // This used to be nothing at all. That was safe and it was also the
+        // five-to-ten-second pause before every reply on a model larger than
+        // the card: with no checkpoint to return to, a hybrid model's
+        // recurrent state cannot be rewound, and each turn prefilled the whole
+        // conversation again.
+        let left = free.saturating_sub(self.host_expert_bytes as usize);
+        Some(left / CHECKPOINT_RAM_SHARE)
     }
 
     /// The saved state that shares the longest whole prefix with `tokens`.
@@ -2712,7 +2769,7 @@ impl<'a> Session<'a> {
         // The sampler is built from these, so it has to be rebuilt with them.
         // Any installed grammar is reapplied by the caller's `set_grammar`,
         // which runs after this on every turn.
-        self.sampler = build_sampler(&self.opts);
+        self.sampler = build_sampler(&self.opts, self.model.n_vocab());
         self.grammar_active = false;
     }
 
@@ -2738,7 +2795,7 @@ impl<'a> Session<'a> {
         // would leave the flag claiming a constraint that was never installed,
         // which silently disables speculation for the rest of the session.
         self.grammar_active = grammar.is_some();
-        self.sampler = build_sampler_with(&self.opts, constraint);
+        self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), constraint);
         Ok(())
     }
 
@@ -3071,6 +3128,7 @@ impl<'a> Session<'a> {
             .unwrap_or_default();
 
         let gen_started = Instant::now();
+        let counters = LoopCounters::now();
         let mut decoder = Utf8Buffer::new();
         let limit = if max_tokens == 0 { u32::MAX } else { max_tokens };
         let mut reason = StopReason::TokenLimit;
@@ -3493,6 +3551,7 @@ impl<'a> Session<'a> {
         }
         stats.generation_ms = gen_started.elapsed().as_millis();
         stats.callback_ms = callback_ns / 1_000_000;
+        counters.report(stats.generated_tokens, gen_started.elapsed(), callback_ns);
         self.slot.hub().note_decoded();
         // Whatever comes next — a tool call, another round, the end of the
         // turn — this session is not about to ask for a token, so nobody
@@ -3684,13 +3743,25 @@ mod tests {
     fn temperature_zero_selects_greedy_sampling() {
         // Building must not panic; a temp sampler at 0.0 would divide by zero.
         let opts = Options { temperature: Some(0.0), ..Default::default() }.resolve();
-        let _ = build_sampler(&opts);
+        let _ = build_sampler(&opts, 32_000);
+    }
+
+    #[test]
+    fn every_planned_block_and_the_head_go_to_the_gpu() {
+        // llama.cpp's first GPU block is n_layer + 1 - n_gpu_layers, so a
+        // 32-block model needs 33 for block 0 to be on the card.
+        // A full plan asks for everything, so blocks the planner does not
+        // count (a NextN head) cannot push block 0 off the card.
+        assert!(llama_gpu_layers(32, 32) > 33);
+        assert!(llama_gpu_layers(40, 40) > 42);
+        assert_eq!(llama_gpu_layers(10, 32), 11, "a partial plan adds the head");
+        assert_eq!(llama_gpu_layers(0, 32), 0, "none means none, head included");
     }
 
     #[test]
     fn a_normal_temperature_builds_a_full_chain() {
         let opts = Options::default().resolve();
-        let _ = build_sampler(&opts);
+        let _ = build_sampler(&opts, 32_000);
     }
 }
 

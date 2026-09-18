@@ -12,7 +12,7 @@ use ozgent_core::permission::{Choice, Effect};
 use ozgent_render::{Color, Style, Theme, display_width};
 
 use super::frame::{self, Layout, MAX_PROMPT_ROWS};
-use super::{Block, Editor, Key, Screen, Transcript};
+use super::{Block, Editor, Key, Part, Screen, Transcript};
 use crate::input::{Input, Prompt};
 use crate::status::Segment;
 
@@ -279,6 +279,40 @@ impl Ui {
         self.render();
     }
 
+    /// Keep the screen alive while a turn waits on the daemon.
+    ///
+    /// Nothing else runs between two events, and a tool call can go seconds
+    /// without one. The spinner stood still and keys went unanswered for the
+    /// whole of it, which is indistinguishable from a hang — and when the
+    /// events did come, everything they carried landed at once. Returns true
+    /// when the user asked to stop the reply.
+    pub fn idle(&mut self) -> bool {
+        if self.screen.is_none() {
+            return false;
+        }
+        self.tick();
+        let mut changed = false;
+        while let Some(key) = self.screen.as_ref().and_then(|s| s.key(Duration::ZERO).ok().flatten()) {
+            match key {
+                Key::Interrupt => return true,
+                // Sending mid-reply is not possible; what was typed stays in
+                // the field for when the reply is done.
+                Key::Enter => {}
+                other => {
+                    if !matches!(other, Key::Press(..) | Key::Drag(..) | Key::Release(..)) {
+                        self.selection = None;
+                    }
+                    self.edit(other);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.render();
+        }
+        false
+    }
+
     /// Stop the spinner, leaving the line as a plain record of what happened.
     pub fn settle(&mut self) {
         if self.activity.is_none() {
@@ -355,16 +389,18 @@ impl Ui {
     ///
     /// `force` bypasses the throttle for the last token of a turn, which would
     /// otherwise sit unpainted until something else happened.
-    pub fn stream(&mut self, thinking: Option<&str>, answer: &str, force: bool) {
+    pub fn stream(&mut self, parts: &[Part], force: bool) {
         if self.screen.is_none() {
             // With no screen to repaint, the forced call is the finished text
             // — the reply, or what came before a tool call — and it is
             // printed once. It used to be dropped, and a piped chat printed
             // every tool line and never an answer.
+            let answer: String =
+                parts.iter().filter(|p| !p.thinking).map(|p| p.text.as_str()).collect();
             if force && !answer.trim().is_empty() {
                 let width = ozgent_render::terminal_width();
                 let rendered =
-                    ozgent_render::MarkdownRenderer::new(self.theme.clone(), width).render(answer);
+                    ozgent_render::MarkdownRenderer::new(self.theme.clone(), width).render(&answer);
                 println!("{}", rendered.trim_end());
             }
             return;
@@ -372,7 +408,7 @@ impl Ui {
         if !force && self.last_frame.elapsed() < FRAME {
             return;
         }
-        self.transcript.set_live(Block::reply(thinking.map(str::to_string), answer.to_string()));
+        self.transcript.set_live(Block::reply_parts(parts.to_vec()));
         self.render();
     }
 

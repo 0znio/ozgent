@@ -46,7 +46,7 @@ use ozgent_render::crossterm::{
 static ENHANCED_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub use editor::Editor;
-pub use transcript::{Block, Transcript};
+pub use transcript::{Block, Part, Transcript};
 pub use ui::{Submission, Ui};
 
 /// The terminal, taken over for as long as this lives.
