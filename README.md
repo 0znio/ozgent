@@ -406,6 +406,7 @@ ozgent web --inference-mode gpu_ram
 | [daemon.md](docs/daemon.md) | running ozgent in the background |
 | [api.md](docs/api.md) | the HTTP API, endpoint by endpoint |
 | [install.md](docs/install.md) | deploying to another machine |
+| [technical.md](docs/technical.md) | how inference works: placement, KV cache, batching, caching, threads |
 
 ---
 
