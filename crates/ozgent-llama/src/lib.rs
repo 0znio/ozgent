@@ -21,6 +21,7 @@ pub mod nextn;
 pub mod ngram;
 pub mod template;
 pub mod thinking;
+pub mod threads;
 pub mod toolcall;
 pub mod toolgate;
 pub mod utf8;

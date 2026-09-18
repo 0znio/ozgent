@@ -108,6 +108,9 @@ pub struct Engine {
     /// What one layer's routed experts weigh. What a reload has to divide a
     /// shortfall of VRAM by to know how many more layers to move to the host.
     expert_bytes_per_layer: u64,
+    /// What one transformer block weighs, experts included. What a dense
+    /// model's reload divides a shortfall by.
+    bytes_per_layer: u64,
     /// This model's own compute scratch, measured once per set of context
     /// parameters. See [`Engine::probed_reserve`].
     scratch: std::sync::Mutex<Option<(ScratchKey, u64, f64)>>,
@@ -547,6 +550,7 @@ impl Engine {
             gpu_layers_used: requested_layers.min(n_layer),
             cpu_moe_layers: evicted_expert_layers,
             expert_bytes_per_layer: layout.expert_bytes_per_layer,
+            bytes_per_layer: layout.bytes_per_layer,
             scratch: std::sync::Mutex::new(None),
             narrowed: std::sync::Mutex::new(None),
             staging_bytes: if evicted_expert_layers > 0 || resolved_tensors > 0 {
@@ -635,6 +639,13 @@ impl Engine {
     pub fn expert_layers_for(&self, bytes: u64) -> Option<u32> {
         (self.expert_bytes_per_layer > 0)
             .then(|| bytes.div_ceil(self.expert_bytes_per_layer).max(1) as u32)
+    }
+
+    /// How many more whole blocks must leave the card to free `bytes`, for a
+    /// model with no experts to move instead. `None` when the block size is
+    /// unknown.
+    pub fn block_layers_for(&self, bytes: u64) -> Option<u32> {
+        (self.bytes_per_layer > 0).then(|| bytes.div_ceil(self.bytes_per_layer).max(1) as u32)
     }
 
     /// The tokens a prompt becomes, for a caller that needs to compare two of
@@ -1555,14 +1566,18 @@ impl Engine {
         let unified_pool = matches!(want, Slots::UpTo(_)) && sequences_for(slots, want) > 1;
         let commons = matches!(want, Slots::UpTo(_));
         Ok((
-            std::sync::Arc::new(crate::hub::Hub::new(
-                context,
-                self.model.n_vocab() as usize,
-                self.model.n_embd() as usize,
-                slots,
-                unified_pool,
-                commons,
-            )),
+            std::sync::Arc::new(
+                crate::hub::Hub::new(
+                    context,
+                    self.model.n_vocab() as usize,
+                    self.model.n_embd() as usize,
+                    slots,
+                    unified_pool,
+                    commons,
+                )
+                // A count the user set is theirs; unset, it is measured.
+                .with_thread_tuning(opts.threads == 0),
+            ),
             each,
         ))
     }

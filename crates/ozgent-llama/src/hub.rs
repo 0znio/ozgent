@@ -204,6 +204,9 @@ pub struct Hub<'a> {
     commons: Mutex<Commons>,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
+    /// Chooses the CPU thread count for decode passes, when nobody set one.
+    /// See [`crate::threads`].
+    threads: Mutex<Option<ThreadState>>,
     /// How many times each sequence's cache has been taken to make room for
     /// another. A session compares this with what it last saw before trusting
     /// what it believes is cached; see [`Slot::evictions`].
@@ -241,9 +244,27 @@ impl<'a> Hub<'a> {
             nextn: Mutex::new(0),
             commons: Mutex::new(Commons::default()),
             fixed_window: None,
+            threads: Mutex::new(None),
             // One past the conversations, for the commons.
             evictions: (0..=slots.max(1)).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    /// Measure the decode thread count instead of taking llama.cpp's default.
+    pub fn with_thread_tuning(self, on: bool) -> Self {
+        if on {
+            let physical = crate::threads::physical_cores();
+            let state = ThreadState {
+                tuner: crate::threads::Tuner::new(physical),
+                physical,
+                logical: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(physical),
+                applied: None,
+                usage: crate::threads::Usage::now(),
+                batch: physical,
+            };
+            *self.threads.lock().unwrap() = Some(state);
+        }
+        self
     }
 
     /// Pin the gather window instead of deriving it. Only for measuring what
@@ -669,6 +690,14 @@ impl<'a> Hub<'a> {
         }
 
         let mut ctx = self.context.lock().unwrap();
+        // A decode pass carries a token or two per slot; anything wider is a
+        // prefill, which is timed by its length and would tell the tuner
+        // nothing about decoding.
+        let decoding = total <= (self.slots as usize) * 2;
+        let mut tuning = self.threads.lock().unwrap();
+        if let Some(t) = tuning.as_mut() {
+            t.apply(&mut ctx);
+        }
         let started = Instant::now();
         let mut decoded = ctx.decode(&mut llama);
         // The cache is one pool shared by every conversation. Full, it is
@@ -742,6 +771,12 @@ impl<'a> Hub<'a> {
                 Ok(Outcome { rows, hidden })
             })
             .collect();
+        if decoding {
+            if let Some(t) = tuning.as_mut() {
+                t.record(started.elapsed());
+            }
+        }
+        drop(tuning);
         PASS_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         PASS_COUNT.fetch_add(1, Ordering::Relaxed);
         PASS_TOKENS.fetch_add(total as u64, Ordering::Relaxed);
@@ -773,6 +808,54 @@ impl<'a> Hub<'a> {
             tracing::info!("the shared cache was full; cleared idle conversations {cleared:?} to make room");
         }
         !cleared.is_empty()
+    }
+}
+
+/// The thread tuner and what it needs to know about the machine.
+struct ThreadState {
+    tuner: crate::threads::Tuner,
+    physical: u32,
+    logical: u32,
+    /// The `(decode, batch)` counts the context was last set to.
+    applied: Option<(u32, u32)>,
+    /// CPU time at the start of the last measurement, for what other
+    /// programs used since.
+    usage: Option<crate::threads::Usage>,
+    /// Threads for prefill: every free physical core. Prefill on the CPU is
+    /// compute-bound, unlike decode.
+    batch: u32,
+}
+
+impl ThreadState {
+    fn apply(&mut self, ctx: &mut LlamaContext<'_>) {
+        let want = (self.tuner.current(), self.batch);
+        if self.applied != Some(want) {
+            unsafe {
+                ozgent_mtmd_sys::llama_cpp_sys_2::llama_set_n_threads(
+                    ctx.as_ptr(),
+                    want.0 as i32,
+                    want.1 as i32,
+                )
+            };
+            self.applied = Some(want);
+        }
+    }
+
+    fn record(&mut self, took: Duration) {
+        let was_settled = !self.tuner.measuring();
+        self.tuner.record(took);
+        // A new round of measuring has just begun: size it to the cores that
+        // are free now, from what other programs used since the last round.
+        if was_settled && self.tuner.measuring() {
+            let now = crate::threads::Usage::now();
+            if let (Some(before), Some(after)) = (self.usage, now) {
+                let others = after.others_since(&before, self.logical);
+                let free = crate::threads::available(self.physical, others);
+                self.batch = free;
+                self.tuner.restart(Some(free));
+            }
+            self.usage = now;
+        }
     }
 }
 

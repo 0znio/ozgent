@@ -702,9 +702,15 @@ fn serve_model(
         resolved.cpu_moe,
         ozgent_core::accel::MoeOffload::Keyword(ozgent_core::accel::MoeKeyword::Auto)
     );
+    let auto_layers = matches!(
+        resolved.gpu_layers,
+        ozgent_core::options::GpuLayers::Keyword(ozgent_core::options::GpuKeyword::Auto)
+    );
     let mut floor_done = false;
     let mut wide_done = false;
-    while engine.cpu_moe_layers() > 0 {
+    // Only a model already split between the card and the host is probed: one
+    // wholly on the card has nothing to move, and its load pays nothing extra.
+    while engine.cpu_moe_layers() > 0 || (auto_layers && engine.gpu_layers_used() < engine.n_layer()) {
         // Reduced to plain data at once: the sessions borrow the engine,
         // which may be about to be replaced.
         let probe = match engine.sessions(&resolved, ozgent_llama::engine::Slots::UpTo(cap)) {
@@ -720,16 +726,41 @@ fn serve_model(
             Err(Some((opened, floor, short_by))) if !floor_done =>
             {
                 floor_done = true;
-                let Some(extra) = engine.expert_layers_for(short_by) else {
+                // Experts first: a layer's experts cost a MoE model far less
+                // on the host than a whole block does. A dense model has only
+                // whole blocks to move.
+                if let Some(extra) = engine.expert_layers_for(short_by) {
+                    tracing::warn!(
+                        "{}: only {opened} tokens of context fitted beside the weights, below {floor}; \
+                         moving the experts of {extra} more layer{} to system RAM and loading again",
+                        found.model,
+                        if extra == 1 { "" } else { "s" },
+                    );
+                    extra
+                } else if let Some(extra) = engine.block_layers_for(short_by).filter(|_| auto_layers) {
+                    let keep = engine.gpu_layers_used().saturating_sub(extra);
+                    tracing::warn!(
+                        "{}: only {opened} tokens of context fitted beside the weights, below {floor}; \
+                         keeping {keep} of {} layers on the GPU and loading again",
+                        found.model,
+                        engine.n_layer(),
+                    );
+                    drop(engine);
+                    resolved.gpu_layers = ozgent_core::options::GpuLayers::Count(keep);
+                    let (admitted, _) = {
+                        let weights = weights.clone();
+                        let resolved = resolved.clone();
+                        member.admit(crate::pool::PlanFor(move || {
+                            ozgent_llama::backend::Plan::for_model(&weights, &resolved)
+                        }))
+                    };
+                    engine = Engine::load(&weights, &resolved)
+                        .map_err(|e| anyhow::anyhow!("reloading {}: {e}", found.model))?;
+                    drop(admitted);
+                    continue;
+                } else {
                     anyhow::bail!("{}: only {opened} tokens of context fit, below {floor}", found.model);
-                };
-                tracing::warn!(
-                    "{}: only {opened} tokens of context fitted beside the weights, below {floor}; \
-                     moving the experts of {extra} more layer{} to system RAM and loading again",
-                    found.model,
-                    if extra == 1 { "" } else { "s" },
-                );
-                extra
+                }
             }
             // The context opened, but on the narrow micro-batch. With experts
             // on the host every micro-batch of a prefill uploads all of them
