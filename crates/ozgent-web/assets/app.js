@@ -1898,7 +1898,7 @@ function slider(spec, effective, override, onChange) {
 
   const show = (v, chosen) => {
     readout.textContent =
-      spec.zero && Number(v) === 0 ? spec.zero : String(v);
+      spec.zero && Number(v) === 0 ? spec.zero : tidyNumber(v, spec.step);
     readout.classList.toggle("inherited", !chosen);
     const pct = ((v - spec.min) / (spec.max - spec.min)) * 100;
     input.style.setProperty("--fill", `${Math.max(0, Math.min(100, pct))}%`);
@@ -2046,24 +2046,102 @@ async function openRoute() {
 // Every knob the engine exposes, with the input type to render it as. The
 // order is the order a person reasons about them: sampling first, then the
 // memory/VRAM decisions, then the escape hatches.
-const PARAMS = [
-  { key: "temperature",    label: "Temperature",     type: "number", step: "0.05" },
-  { key: "top_p",          label: "Top-p",           type: "number", step: "0.01" },
-  { key: "top_k",          label: "Top-k",           type: "number", step: "1" },
-  { key: "min_p",          label: "Min-p",           type: "number", step: "0.01" },
-  { key: "repeat_penalty", label: "Repeat penalty",  type: "number", step: "0.05" },
-  { key: "repeat_last_n",  label: "Repeat window",   type: "number", step: "1" },
-  { key: "max_tokens",     label: "Max tokens",      type: "number", step: "1" },
-  { key: "context_length", label: "Context length",  type: "number", step: "256" },
-  { key: "gpu_layers",     label: "GPU layers",      type: "text",   placeholder: "auto, off, or a number" },
-  { key: "cpu_moe",        label: "CPU MoE layers",  type: "text",   placeholder: "auto, off, all, or a number" },
-  { key: "cache_type_k",   label: "Key cache",       type: "select", options: ["", "auto", "f16", "q8_0", "q5_1", "q4_0"] },
-  { key: "cache_type_v",   label: "Value cache",     type: "select", options: ["", "auto", "f16", "q8_0", "q5_1", "q4_0"] },
-  { key: "thinking",       label: "Reasoning",       type: "select", options: ["", "auto", "on", "off"] },
-  { key: "flash_attention",label: "Flash attention", type: "select", options: ["", "true", "false"] },
-  { key: "prefix_reuse",   label: "Prefix reuse",    type: "select", options: ["", "longest", "off"] },
-  { key: "tools",          label: "Tools",           type: "select", options: ["", "true", "false"] },
+/// The Model tab, grouped by what somebody is trying to change.
+///
+/// It was sixteen identical boxes reading "inherit", with the real value in
+/// grey in a corner and performance internals level with temperature. Each
+/// row now shows the value in force and whether it is this model's own, and
+/// the internals sit behind one fold with automatic as the answer.
+const MODEL_GROUPS = [
+  {
+    title: "Response style",
+    presets: true,
+    rows: [
+      { key: "temperature", label: "Temperature", kind: "range", min: 0, max: 2, step: 0.05,
+        hint: "Lower is focused and repeatable, higher is more varied." },
+      { key: "top_p", label: "Top-p", kind: "range", min: 0.05, max: 1, step: 0.01,
+        hint: "Only words inside this share of the probability are considered." },
+      { key: "top_k", label: "Top-k", kind: "range", min: 1, max: 200, step: 1,
+        hint: "Only the k likeliest words are considered." },
+      { key: "min_p", label: "Min-p", kind: "range", min: 0, max: 0.5, step: 0.01,
+        hint: "Drops words far less likely than the best one." },
+      { key: "repeat_penalty", label: "Repeat penalty", kind: "range", min: 1, max: 1.5, step: 0.01,
+        hint: "Discourages repeating recent words. 1 is off." },
+      { key: "repeat_last_n", label: "Repeat window", kind: "range", min: 0, max: 512, step: 16, unit: "tokens",
+        hint: "How far back the repeat penalty looks." },
+    ],
+  },
+  {
+    title: "Length and memory",
+    rows: [
+      { key: "context_length", label: "Context window", kind: "range", min: 2048, max: 32768, step: 1024,
+        unit: "tokens", reload: true,
+        hint: "How much of the conversation the model can see at once. Larger takes more memory." },
+      { key: "max_tokens", label: "Longest reply", kind: "range", min: 0, max: 4096, step: 256,
+        unit: "tokens", zero: "no limit", hint: "A reply is cut off after this many tokens." },
+    ],
+  },
+  {
+    title: "Thinking",
+    rows: [
+      { key: "thinking", label: "Thinking", kind: "choice",
+        options: [["auto", "Automatic"], ["on", "Always"], ["off", "Never"]],
+        hint: "Whether a reasoning model thinks before it answers." },
+      { key: "reasoning_effort", label: "Effort", kind: "choice",
+        options: [["low", "Low"], ["medium", "Medium"], ["high", "High"]],
+        hint: "How long it may think." },
+    ],
+  },
+  {
+    title: "Tools",
+    rows: [
+      { key: "tools", label: "Tools", kind: "choice", options: [[true, "On"], [false, "Off"]],
+        hint: "Let this model search the web, read files and hand work to agents." },
+    ],
+  },
+  {
+    title: "Performance",
+    advanced: true,
+    note: "Automatic is right for almost everyone. These reload the model on your next message.",
+    rows: [
+      { key: "gpu_layers", label: "Layers on the GPU", kind: "auto-number", reload: true,
+        keywords: [["auto", "Automatic"], ["off", "None"]],
+        hint: "How much of the model lives on the graphics card. Automatic fits as much as there is room for." },
+      { key: "cpu_moe", label: "Experts in system RAM", kind: "auto-number", reload: true,
+        keywords: [["auto", "Automatic"], ["off", "None"], ["all", "All"]],
+        hint: "For mixture-of-experts models bigger than the card: how many layers keep their experts in RAM." },
+      { key: "cache_type_k", label: "Key cache", kind: "choice", reload: true,
+        options: [["auto", "Automatic"], ["f16", "f16"], ["q8_0", "q8_0"], ["q5_1", "q5_1"], ["q4_0", "q4_0"]],
+        hint: "How the conversation's memory is stored. Smaller formats fit a longer window." },
+      { key: "cache_type_v", label: "Value cache", kind: "choice", reload: true,
+        options: [["auto", "Automatic"], ["f16", "f16"], ["q8_0", "q8_0"], ["q5_1", "q5_1"], ["q4_0", "q4_0"]],
+        hint: "As above, for the other half of that memory." },
+      { key: "flash_attention", label: "Flash attention", kind: "choice", reload: true,
+        options: [[true, "On"], [false, "Off"]], hint: "A faster attention kernel. Off only to diagnose a problem." },
+      { key: "prefix_reuse", label: "Reuse the conversation", kind: "choice",
+        options: [["longest", "On"], ["off", "Off"]],
+        hint: "Keep what was already read between messages. Off makes every reply read everything again." },
+    ],
+  },
 ];
+
+/// Response-style presets. "Model default" clears them, so the model's own
+/// recommended values apply.
+const STYLE_PRESETS = [
+  ["Precise", { temperature: 0.2, top_p: 0.9, top_k: 20, min_p: 0.05 }],
+  ["Model default", null],
+  ["Creative", { temperature: 1.0, top_p: 0.95, top_k: 80, min_p: 0.02 }],
+];
+const STYLE_KEYS = ["temperature", "top_p", "top_k", "min_p"];
+
+/// A number as somebody would write it: never more than two decimals, and
+/// no trailing zeros.
+function tidyNumber(v, step) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v ?? "");
+  const places = step && step < 1 ? Math.min(2, (String(step).split(".")[1] || "").length) : 0;
+  return places ? String(Number(n.toFixed(places))) : n.toLocaleString("en-US");
+}
 
 let settingsCache = { config: null, options: null, tools: null };
 
@@ -2222,70 +2300,181 @@ async function deleteAgent() {
 
 // ---- model parameters ----
 
-function renderParams(data) {
+/// What the Model tab is editing: this model's overrides, changed in place.
+let modelEdit = { data: null, values: {} };
+
+function renderParams(data, values = null) {
+  // Which folds were open, so a redraw after a preset does not snap them shut.
+  const open = [...document.querySelectorAll("#params details")].map((d) => d.open);
+  modelEdit = { data, values: values ?? { ...data.overrides } };
   const box = $("params");
   box.replaceChildren();
-  $("params-for").textContent = `Settings for ${data.model}. Values shown grey are inherited.`;
+  $("params-for").textContent = data.model;
 
-  for (const spec of PARAMS) {
-    const wrap = document.createElement("div");
-    wrap.className = "param";
-    const override = data.overrides[spec.key];
-    const effective = data.effective[spec.key];
-    if (override !== undefined && override !== null) wrap.classList.add("set");
-
-    const id = `p-${spec.key}`;
-    const label = document.createElement("label");
-    label.htmlFor = id;
-    label.innerHTML =
-      `<span>${spec.label}</span><span class="inherited">${escapeHtml(String(effective ?? ""))}</span>`;
-    wrap.append(label);
-
-    let field;
-    if (spec.type === "select") {
-      field = document.createElement("select");
-      for (const o of spec.options) {
-        const opt = document.createElement("option");
-        opt.value = o;
-        opt.textContent = o === "" ? "inherit" : o;
-        field.append(opt);
-      }
-      field.value = override === undefined || override === null ? "" : String(override);
-    } else {
-      field = document.createElement("input");
-      field.type = spec.type;
-      if (spec.step) field.step = spec.step;
-      field.placeholder = spec.placeholder ?? "inherit";
-      field.value = override === undefined || override === null ? "" : String(override);
+  for (const group of MODEL_GROUPS) {
+    const section = document.createElement(group.advanced ? "details" : "section");
+    section.className = "pgroup";
+    const head = document.createElement(group.advanced ? "summary" : "h3");
+    head.textContent = group.title;
+    section.append(head);
+    if (group.note) {
+      const note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = group.note;
+      section.append(note);
     }
-    field.id = id;
-    field.dataset.key = spec.key;
-    field.addEventListener("input", () => wrap.classList.toggle("set", field.value !== ""));
-    wrap.append(field);
-    box.append(wrap);
+    if (group.presets) section.append(presetBar());
+    for (const spec of group.rows) section.append(paramRow(spec));
+    // Opened when something in it has already been changed, so a custom
+    // setting is never hidden behind the fold.
+    if (group.advanced && group.rows.some((r) => r.key in modelEdit.values)) section.open = true;
+    box.append(section);
   }
+  if (values) document.querySelectorAll("#params details").forEach((d, i) => { if (open[i]) d.open = true; });
 }
 
-// Only non-empty fields are sent: an empty box means "inherit", which is a
-// removed key rather than a stored null.
-function collectParams() {
-  const out = {};
-  for (const field of $("params").querySelectorAll("[data-key]")) {
-    const raw = field.value.trim();
-    if (!raw) continue;
-    const spec = PARAMS.find((p) => p.key === field.dataset.key);
-    if (raw === "true" || raw === "false") out[spec.key] = raw === "true";
-    else if (spec.type === "number") {
-      const n = Number(raw);
-      if (!Number.isNaN(n)) out[spec.key] = n;
-    } else out[spec.key] = raw;
+function presetBar() {
+  const bar = document.createElement("div");
+  bar.className = "presets";
+  for (const [name, values] of STYLE_PRESETS) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ghost-btn";
+    b.textContent = name;
+    b.addEventListener("click", () => {
+      for (const k of STYLE_KEYS) delete modelEdit.values[k];
+      if (values) Object.assign(modelEdit.values, values);
+      renderParams(modelEdit.data, modelEdit.values);
+    });
+    bar.append(b);
   }
-  // Two controls, deliberately. They were one, which threw away the fact that
-  // keys and values tolerate very different precision — `auto` now holds the
-  // keys high and spends the values first. Naming one and leaving the other on
-  // auto still means "store the cache like this", which `auto` resolution in
-  // the engine handles; nothing is forced here any more.
-  return out;
+  return bar;
+}
+
+function paramRow(spec) {
+  const data = modelEdit.data;
+  const row = document.createElement("div");
+  row.className = "prow";
+  const custom = spec.key in modelEdit.values && modelEdit.values[spec.key] !== null;
+  const inherited = data.inherited?.[spec.key] ?? data.effective[spec.key];
+  const value = custom ? modelEdit.values[spec.key] : inherited;
+  row.classList.toggle("custom", custom);
+
+  const label = (v) => {
+    if (spec.kind === "choice") {
+      const hit = spec.options.find(([o]) => String(o) === String(v));
+      return hit ? hit[1] : String(v);
+    }
+    if (spec.kind === "auto-number") {
+      const hit = spec.keywords.find(([o]) => String(o) === String(v));
+      return hit ? hit[1] : `${v} layers`;
+    }
+    if (spec.zero && Number(v) === 0) return spec.zero;
+    return `${tidyNumber(v, spec.step)}${spec.unit ? ` ${spec.unit}` : ""}`;
+  };
+
+  const head = document.createElement("div");
+  head.className = "phead";
+  head.innerHTML =
+    '<span class="pname"></span>' +
+    (spec.reload ? '<span class="ptag" title="Changing this reloads the model">reloads</span>' : "") +
+    '<span class="spacer"></span><span class="pvalue"></span>' +
+    '<button type="button" class="preset-reset" title="Back to the default">reset</button>';
+  head.querySelector(".pname").textContent = spec.label;
+  const readout = head.querySelector(".pvalue");
+  const paint = (v, isCustom) => {
+    readout.textContent = label(v);
+    readout.title = isCustom ? `default: ${label(inherited)}` : "default";
+    row.classList.toggle("custom", isCustom);
+  };
+  paint(value, custom);
+  head.querySelector(".preset-reset").addEventListener("click", () => {
+    delete modelEdit.values[spec.key];
+    row.replaceWith(paramRow(spec));
+  });
+  row.append(head);
+
+  const set = (v) => {
+    modelEdit.values[spec.key] = v;
+    paint(v, true);
+  };
+
+  if (spec.kind === "range") {
+    const max = spec.key === "context_length" || spec.key === "max_tokens"
+      ? Math.max(spec.max, Number(data.limits?.[spec.key]) || 0)
+      : spec.max;
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = spec.min;
+    input.max = max;
+    input.step = spec.step;
+    input.value = String(value ?? spec.min);
+    input.setAttribute("aria-label", spec.label);
+    const fill = () => {
+      const pct = ((input.value - spec.min) / (max - spec.min)) * 100;
+      input.style.setProperty("--fill", `${Math.max(0, Math.min(100, pct))}%`);
+    };
+    fill();
+    input.addEventListener("input", () => { set(Number(input.value)); fill(); });
+    const wrap = document.createElement("div");
+    wrap.className = "slider";
+    wrap.append(input);
+    row.append(wrap);
+  } else if (spec.kind === "choice") {
+    row.append(segments(spec.options, value, (v) => set(v), spec.label));
+  } else if (spec.kind === "auto-number") {
+    const isNumber = value !== undefined && value !== null && /^\d+$/.test(String(value));
+    const options = [...spec.keywords, ["__n", "Custom"]];
+    const number = document.createElement("input");
+    number.type = "number";
+    number.min = "0";
+    number.className = "pnumber";
+    number.value = isNumber ? String(value) : "";
+    number.placeholder = "layers";
+    number.hidden = !isNumber;
+    number.setAttribute("aria-label", `${spec.label}, number of layers`);
+    number.addEventListener("input", () => {
+      if (/^\d+$/.test(number.value)) set(number.value);
+    });
+    row.append(segments(options, isNumber ? "__n" : value, (v) => {
+      number.hidden = v !== "__n";
+      if (v === "__n") number.focus();
+      else set(v);
+    }, spec.label));
+    row.append(number);
+  }
+
+  const hint = document.createElement("p");
+  hint.className = "phint";
+  hint.textContent = spec.hint;
+  row.append(hint);
+  return row;
+}
+
+function segments(options, current, onPick, label) {
+  const group = document.createElement("div");
+  group.className = "segmented";
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", label);
+  for (const [value, text] of options) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    b.setAttribute("aria-pressed", String(String(value) === String(current)));
+    b.addEventListener("click", () => {
+      for (const other of group.children) other.setAttribute("aria-pressed", "false");
+      b.setAttribute("aria-pressed", "true");
+      onPick(value);
+    });
+    group.append(b);
+  }
+  return group;
+}
+
+/// This model's overrides as edited. Keys the tab does not show — a system
+/// prompt set elsewhere — pass through untouched.
+function collectParams() {
+  return { ...modelEdit.values };
 }
 
 // ---- tools ----

@@ -1372,7 +1372,7 @@ fn run_agents(
     let date = snapshot(&permissions.config)
         .ui
         .date_awareness
-        .then(|| ozgent_core::DateTime::now().prompt_line());
+        .then(|| crate::turn::date_line());
 
     let mut conversation = request.messages.clone();
     for (index, agent) in agents.iter().enumerate() {

@@ -1307,17 +1307,56 @@ body {
 
 /* Two columns of labelled fields; the label carries the inherited value so an
    empty box is never ambiguous. */
-.params { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 10px 16px; }
-.param { display: flex; flex-direction: column; gap: 3px; }
-.param label { font-size: 12px; color: var(--ink-soft); display: flex; justify-content: space-between; gap: 8px; }
-.param .inherited { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
-.param input, .param select {
-  background: var(--raised); color: var(--ink);
-  border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 5px 9px; font: inherit; font-size: 13px; width: 100%;
+/* --- Settings > Model: grouped rows, value in force on the right -------- */
+
+.params { display: flex; flex-direction: column; gap: 18px; }
+.pgroup { display: flex; flex-direction: column; gap: 4px; }
+.pgroup > h3, .pgroup > summary {
+  margin: 0 0 2px; font-size: 11.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint);
 }
-.param input:focus, .param select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-.param.set input, .param.set select { border-color: var(--accent); }
+.pgroup > summary { cursor: pointer; list-style: revert; }
+.pgroup > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pgroup > .hint { margin: 2px 0 6px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+.presets .ghost-btn { width: auto; flex: 0 0 auto; font-size: 12px; padding: 4px 12px; }
+
+.prow {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; border: 1px solid var(--line-soft);
+  border-radius: var(--radius); background: var(--panel);
+}
+.prow.custom { border-color: var(--line); }
+.phead { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.phead .pname { font-size: 13px; color: var(--ink); }
+.phead .spacer { flex: 1; }
+.phead .pvalue {
+  font-family: var(--mono); font-size: 12px; color: var(--ink-faint);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* A value this model sets for itself is state, and state is amber. */
+.prow.custom .pvalue { color: var(--accent); }
+.ptag {
+  font-size: 10.5px; color: var(--ink-faint);
+  border: 1px solid var(--line); border-radius: 99px; padding: 0 6px;
+}
+.preset-reset {
+  font: inherit; font-size: 11.5px; color: var(--ink-soft);
+  background: none; border: 0; padding: 0 2px; cursor: pointer;
+  display: none;
+}
+.prow.custom .preset-reset { display: inline; }
+.preset-reset:hover { color: var(--ink); text-decoration: underline; }
+.preset-reset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.phint { margin: 0; font-size: 12px; color: var(--ink-soft); line-height: 1.4; }
+.prow .segmented { background: var(--bg); border: 1px solid var(--line-soft); }
+.prow .segmented button { text-transform: none; }
+.pnumber {
+  width: 8rem; background: var(--raised); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 5px 9px; font: inherit; font-size: 13px;
+}
+.pnumber:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .tool-list { display: flex; flex-direction: column; gap: 6px; }
 .tool {
@@ -1474,6 +1513,12 @@ body {
 
 /* Segmented choice, for settings with named levels rather than a range. */
 .choice { display: flex; flex-direction: column; gap: .35rem; }
+.choice .label {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  font-size: 12px; color: var(--ink-soft);
+}
+.choice .value { font-family: var(--mono); font-size: 11.5px; color: var(--ink); }
+.choice .value.inherited { color: var(--ink-faint); }
 .segmented {
   display: grid;
   grid-auto-flow: column;

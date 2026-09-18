@@ -581,9 +581,9 @@ async fn put_settings(
     }
     body.save(&state.paths)?;
     *state.config.lock().unwrap() = body;
-    // The worker captured the old config at spawn; drop the model so the next
-    // turn reloads it under the new settings.
-    state.worker.unload();
+    // Nothing to unload: the worker reads the live config on every turn and
+    // reloads by itself only when a load-time setting changed. Unloading here
+    // made every press of Save cost a full model load on the next message.
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -676,6 +676,9 @@ struct ModelOptions {
     effective: serde_json::Value,
     /// Only the keys set for this model in `config.toml`.
     overrides: serde_json::Value,
+    /// What each setting would be with none of this model's own overrides:
+    /// the value a per-setting reset goes back to.
+    inherited: serde_json::Value,
     /// Bounds the page should not let the user exceed, read from the model
     /// itself. Without these the settings page invents its own, and a model
     /// trained for 256k gets a slider that stops at 32k.
@@ -702,13 +705,38 @@ async fn model_options(
     Ok(Json(ModelOptions {
         model: key,
         effective: serde_json::to_value(resolved_view(&resolved))?,
-        overrides: serde_json::to_value(&overrides)?,
+        overrides: tidy(serde_json::to_value(&overrides)?),
+        inherited: resolved_view(&config.defaults.clone().merge(&found.manifest.defaults).resolve()),
         limits: serde_json::json!({
             "context_length": context_max,
             // Output cannot exceed the window it has to fit inside.
             "max_tokens": context_max.unwrap_or(resolved.context_length),
         }),
     }))
+}
+
+/// A settings object as a person would read it: no null entries, and every
+/// number the shortest decimal that means the same `f32` — the type every
+/// fractional setting is stored as.
+fn tidy(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k, tidy(v))).collect(),
+        ),
+        serde_json::Value::Number(n) if n.is_f64() => {
+            n.as_f64().map(|f| serde_json::json!(decimal(f as f32))).unwrap_or(serde_json::Value::Number(n))
+        }
+        other => other,
+    }
+}
+
+/// A setting stored as `f32`, as the decimal it was written as.
+///
+/// JSON numbers are `f64`, and widening `0.8f32` gives 0.800000011920929 —
+/// which the settings page then showed. The shortest decimal that reads back
+/// as the same `f32` is the number somebody actually typed.
+fn decimal(x: f32) -> f64 {
+    format!("{x}").parse().unwrap_or(x as f64)
 }
 
 /// A flat, JSON-friendly view of the resolved options for display.
@@ -721,14 +749,16 @@ fn resolved_view(r: &ozgent_core::options::Resolved) -> serde_json::Value {
         "flash_attention": r.flash_attention,
         "cache_type_k": format!("{:?}", r.cache_type_k).to_lowercase(),
         "cache_type_v": format!("{:?}", r.cache_type_v).to_lowercase(),
-        "temperature": r.temperature,
-        "top_p": r.top_p,
+        "temperature": decimal(r.temperature),
+        "top_p": decimal(r.top_p),
         "top_k": r.top_k,
-        "min_p": r.min_p,
-        "repeat_penalty": r.repeat_penalty,
+        "min_p": decimal(r.min_p),
+        "repeat_penalty": decimal(r.repeat_penalty),
         "repeat_last_n": r.repeat_last_n,
         "max_tokens": r.max_tokens,
         "thinking": format!("{:?}", r.thinking).to_lowercase(),
+        "reasoning_effort": r.reasoning_effort.to_string(),
+        "prefix_reuse": format!("{:?}", r.prefix_reuse).to_lowercase(),
         "tools": r.tools,
         "system_prompt": r.system_prompt,
     })
@@ -744,8 +774,9 @@ async fn set_model_options(
 
     let mut config = state.config.lock().unwrap();
     // An empty override layer is removed rather than stored, so the file does
-    // not accumulate sections that say nothing.
-    if serde_json::to_value(&body)?.as_object().is_some_and(|o| o.is_empty()) {
+    // not accumulate sections that say nothing. Unset fields serialise as
+    // null, so "empty" means nothing but nulls.
+    if tidy(serde_json::to_value(&body)?).as_object().is_some_and(|o| o.is_empty()) {
         config.models.remove(&key);
     } else {
         config.models.insert(key, body);
@@ -753,8 +784,11 @@ async fn set_model_options(
     config.save(&state.paths)?;
     drop(config);
 
-    // The loaded model was built from the old settings.
-    state.worker.unload();
+    // No unload here. Every turn re-resolves its options against the live
+    // config, and the worker reloads by itself when a load-time setting —
+    // context, layers, cache types — actually differs from what is loaded.
+    // Unloading on every save made a temperature change cost a full model
+    // load on the next message.
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1264,5 +1298,21 @@ mod asset_tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    #[test]
+    fn a_stored_setting_reads_back_as_it_was_typed() {
+        assert_eq!(super::decimal(0.8).to_string(), "0.8");
+        assert_eq!(super::decimal(0.95).to_string(), "0.95");
+        assert_eq!(super::decimal(1.1).to_string(), "1.1");
+    }
+
+    #[test]
+    fn a_settings_object_drops_nulls_and_float_noise() {
+        let v = serde_json::json!({ "temperature": 0.20000000298023224f64, "seed": null, "top_k": 20 });
+        assert_eq!(super::tidy(v), serde_json::json!({ "temperature": 0.2, "top_k": 20 }));
     }
 }

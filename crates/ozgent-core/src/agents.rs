@@ -279,10 +279,10 @@ impl Agent {
             out.push_str("\n\n");
         }
         out.push_str(&format!(
-            "You are @{}, an agent: {}.\nThe user called you by name to handle \
-             their latest message. The earlier conversation is there for context. \
-             Do the job below, then give your report as your reply; it is shown \
-             to the user as your answer.\n",
+            "You are @{}, an agent: {}.\nYou are handling the user's latest \
+             message; the earlier conversation is there for context. Do the job \
+             below, then give your report as your reply — it is shown to the user \
+             as the answer, so it must stand on its own.\n",
             self.name,
             self.definition.description.trim().trim_end_matches('.'),
         ));

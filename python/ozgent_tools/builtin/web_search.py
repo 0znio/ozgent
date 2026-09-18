@@ -19,9 +19,11 @@ Configure in ``~/ozgent/configs/config.toml``::
 
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import re
+import time
 from typing import Annotated, Any, Awaitable, Callable, Literal
 
 from ..base import ToolError, get_config, tool
@@ -31,6 +33,35 @@ Category = Literal["web", "news"]
 
 # provider name -> coroutine(query, category, count, settings) -> payload
 PROVIDERS: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {}
+
+#: Seconds to leave between two requests to one provider.
+#:
+#: A model asking four questions at once sends four searches in the same
+#: instant, and Brave's free plan answers one a second: three of the four came
+#: back 429 and the model searched again. Queued this far apart they all
+#: succeed, and the batch still runs alongside every other tool. Overridden
+#: per provider with `min_interval` in its settings, for a paid plan.
+PACE = {"brave": 1.05, "duckduckgo": 1.0}
+
+
+class _Pacer:
+    """Spaces requests to one provider, however many are in flight."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.last = 0.0
+
+    async def wait(self, interval: float) -> None:
+        if interval <= 0:
+            return
+        async with self.lock:
+            delay = self.last + interval - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.last = time.monotonic()
+
+
+_PACERS: dict[str, _Pacer] = {}
 
 
 def provider(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -272,6 +303,8 @@ async def web_search(
 
     count = max(1, min(int(count), 20))
 
+    interval = float(settings.get("min_interval", PACE.get(name, 0.0)))
+    await _PACERS.setdefault(name, _Pacer()).wait(interval)
     try:
         payload = await fn(query, category, count, settings)
     except HttpError as exc:

@@ -11,9 +11,9 @@ pub fn tool_preamble(tools: &[ozgent_core::ToolSpec]) -> String {
          Wait for the result before answering.\n\n\
          Call a tool only to get something you do not already have. If the \
          answer is in front of you — in this conversation, or in an image or \
-         file attached to it — answer from that directly. Do not search to \
-         confirm what you can already see, and do not search just because you \
-         are unsure; say what you can see and what you cannot.\n\n\
+         file attached to it — answer from that directly, without searching to \
+         confirm it. For anything recent or changing — news, prices, releases, \
+         who holds a role now — look it up rather than answer from memory.\n\n\
          Available tools:\n",
     );
     for t in tools {

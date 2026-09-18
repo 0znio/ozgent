@@ -67,13 +67,19 @@ pub struct Turn {
 /// tool, and spends the answer explaining why it could not. Saying plainly
 /// that the timer has already fired is what turns the prompt back into the
 /// question it is.
+/// What the model is told about the date, for the chat and for agents alike.
+/// The time itself arrives stamped on each user message.
+pub(crate) fn date_line() -> String {
+    format!(
+        "{} Each user message begins with the time it was sent.",
+        ozgent_core::DateTime::now().prompt_line()
+    )
+}
+
 pub(crate) fn system_prompt(date_aware: bool, caller: Option<&ozgent_schedule::Caller>) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if date_aware {
-        lines.push(format!(
-            "{} Each user message begins with the time it was sent.",
-            ozgent_core::DateTime::now().prompt_line()
-        ));
+        lines.push(date_line());
     }
     if let Some(name) = caller.and_then(|c| c.origin.strip_prefix("job:")) {
         lines.push(format!(
