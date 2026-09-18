@@ -2053,7 +2053,10 @@ async function send(text) {
           el.stat.textContent =
             `${event.generated} tok · ${event.tokens_per_second.toFixed(1)}/s${reused}`;
           // What the turn cost: the prompt it processed plus what it wrote.
-          gauge.used = (event.prompt ?? 0) + (event.generated ?? 0);
+          // What the context holds now. The turn's prompt and generated
+          // totals count every tool round's re-read again, and on a long
+          // agent turn ran to 50k of a 32k window.
+          gauge.used = event.context || (event.prompt ?? 0) + (event.generated ?? 0);
           showGauge();
           // An answer that simply stops looks like a crash. Say why.
           const why = {

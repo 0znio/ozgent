@@ -235,7 +235,10 @@ pub async fn render(
                 // the context used never included what retrieval added.
                 let prompt = event["prompt"].as_u64().unwrap_or(0);
                 let generated = event["generated"].as_u64().unwrap_or(0);
-                out.used = Some((prompt + generated) as u32);
+                // What the context holds now; the sums count each tool
+                // round's re-read again. Older daemons do not send it.
+                let held = event["context"].as_u64().filter(|n| *n > 0);
+                out.used = Some(held.unwrap_or(prompt + generated) as u32);
                 let reused = event["reused"].as_u64().unwrap_or(0);
                 let prompt_ms = event["prompt_ms"].as_u64().unwrap_or(0);
                 out.stats = Some(format!(

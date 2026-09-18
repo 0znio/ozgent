@@ -675,6 +675,7 @@ fn stream(
                         reused: 0,
                         stop: "EndOfText".into(),
                         prompt: 0,
+                        context: 0,
                         prompt_ms: 0,
                         drafted: 0,
                         accepted: 0,
@@ -806,7 +807,8 @@ mod tests {
             reused: 0,
             stop: "EndOfText".into(),
             prompt: 9,
-            prompt_ms: 1,
+            context: 0,
+                        prompt_ms: 1,
             drafted: 0,
             accepted: 0,
         }

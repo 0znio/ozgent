@@ -139,8 +139,15 @@ pub enum Event {
         tokens_per_second: f64,
         reused: usize,
         stop: String,
-        /// Prompt tokens actually processed, for API usage accounting.
+        /// Prompt tokens actually processed, for API usage accounting. Summed
+        /// over every round of a turn, so not a measure of how full the
+        /// context is: see `context`.
         prompt: u32,
+        /// Tokens held in the context when the turn ended: what a gauge of
+        /// the window should show. The sums above count each tool round's
+        /// re-read again and ran past the window on a long agent turn.
+        #[serde(default)]
+        context: u32,
         /// Time spent on prefill. Reported so a caller can see prefix reuse
         /// working: a turn that reuses its prefix pays almost nothing here.
         prompt_ms: u64,
@@ -1392,6 +1399,7 @@ fn turn(
         reused: totals.reused,
         stop: if totals.handed_back { "ToolCalls".to_string() } else { format!("{:?}", totals.stop) },
         prompt: totals.prompt_tokens,
+        context: session.used(),
         prompt_ms: totals.prompt_ms as u64,
         drafted: totals.proposed,
         accepted: totals.accepted,
@@ -2673,7 +2681,8 @@ mod tests {
             reused: 64,
             stop: "EndOfText".into(),
             prompt: 40,
-            prompt_ms: 210,
+            context: 0,
+                        prompt_ms: 210,
             drafted: 30,
             accepted: 21,
         })
@@ -2698,7 +2707,8 @@ mod tests {
             reused: 0,
             stop: "EndOfText".into(),
             prompt: 5,
-            prompt_ms: 10,
+            context: 0,
+                        prompt_ms: 10,
             drafted: 0,
             accepted: 0,
         })

@@ -839,7 +839,7 @@ async fn collect(
                 "type": "function",
                 "function": { "name": name, "arguments": arguments.to_string() },
             })),
-            Event::Done { generated, tokens_per_second, reused, stop: reason, prompt, prompt_ms, drafted, accepted } => {
+            Event::Done { generated, tokens_per_second, reused, stop: reason, prompt, prompt_ms, drafted, accepted, .. } => {
                 timings.completion_tokens = generated;
                 timings.tokens_per_second = tokens_per_second;
                 timings.cached_prompt_tokens = reused;
@@ -994,7 +994,7 @@ fn stream_chunks(
                     }]),
                 );
             }
-            Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms, drafted, accepted } => {
+            Event::Done { generated, tokens_per_second, reused, stop, prompt, prompt_ms, drafted, accepted, .. } => {
                 let usage = serde_json::json!({
                     "prompt_tokens": prompt,
                     "completion_tokens": generated,
