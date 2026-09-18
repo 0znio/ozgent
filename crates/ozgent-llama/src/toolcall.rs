@@ -26,6 +26,11 @@ const OPENERS: &[(&str, Option<&str>)] = &[
     ("<function=", Some("</function>")),
 ];
 
+/// Every marker that can open a tool call.
+pub fn openers() -> impl Iterator<Item = &'static str> {
+    OPENERS.iter().map(|(open, _)| *open)
+}
+
 /// The tool a half-written call is for, as soon as its name is readable.
 ///
 /// A tool call is parsed from the finished reply, which is the right moment to

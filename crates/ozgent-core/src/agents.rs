@@ -555,12 +555,17 @@ pub fn handoff_spec(agents: &[Agent]) -> Option<crate::ToolSpec> {
                     "enum": names,
                     "description": "Which agent.",
                 },
+                // Optional and short on purpose. The agent reads the whole
+                // conversation, so a task restating it is pure generation
+                // before anything happens: on a 35B model at 26 tok/s the
+                // model spent five seconds writing an essay the agent could
+                // already see, and that was the pause before every handoff.
                 "task": {
                     "type": "string",
-                    "description": "What the agent should do, with everything it needs from the conversation — names, tickers, dates, what the user wants back.",
+                    "description": "Optional. The agent reads the whole conversation, so leave this out unless one short sentence would stop it missing something.",
                 },
             },
-            "required": ["agent", "task"],
+            "required": ["agent"],
         }),
         output_schema: None,
         effect: crate::permission::Effect::Read,
@@ -596,9 +601,9 @@ pub fn handoff_prompt(agents: &[Agent]) -> String {
         .collect();
     format!(
         "Specialist agents can take a request off your hands with the {HANDOFF_TOOL} tool:\n{}\n\
-         When the user's request is one of these jobs, call {HANDOFF_TOOL} with that agent and a \
-         clear task instead of doing the job yourself with your own tools. Otherwise answer \
-         yourself.",
+         When the user's request is one of these jobs, call {HANDOFF_TOOL} with that agent instead \
+         of doing the job yourself with your own tools; it reads the conversation, so there is no \
+         need to restate the request. Otherwise answer yourself.",
         list.join("\n")
     )
 }

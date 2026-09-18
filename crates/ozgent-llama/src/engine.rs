@@ -759,7 +759,23 @@ impl Engine {
                 tools: tools.iter().map(crate::template::tool_json).collect(),
                 ..Default::default()
             };
-            match jinja.render(messages, opts) {
+            // Many templates allow a system message only at the start, and
+            // raise otherwise. The built-in fallback that follows has no
+            // notion of tools at all, so a stray system message further down
+            // — a handoff note, a client's mid-conversation instruction —
+            // quietly took every tool away from the turn: an agent sent to
+            // research wrote "I will now search" and stopped, with nothing to
+            // search with. Folding the late ones into the first is what those
+            // templates expect, and is tried before giving up on the template.
+            let first = jinja.render(messages, opts.clone());
+            let rendered = match (first, merge_system_messages(messages)) {
+                (Err(e), Some(merged)) => {
+                    tracing::debug!("template refused the message layout ({e}); merging system messages");
+                    jinja.render(&merged, opts)
+                }
+                (result, _) => result,
+            };
+            match rendered {
                 Ok(prompt) => {
                     // The whole prompt, at trace level. Whether a turn reasons
                     // depends on what the template wrote, and reading it is
@@ -768,7 +784,7 @@ impl Engine {
                     tracing::trace!(target: "ozgent::prompt", "{prompt}");
                     return Ok(prompt);
                 }
-                Err(e) => tracing::debug!("falling back to the built-in template: {e}"),
+                Err(e) => tracing::warn!("the model's own chat template failed, so the built-in one is used and tools are not described: {e}"),
             }
         }
 
@@ -1509,6 +1525,8 @@ impl Engine {
             cached: Vec::new(),
             reuse: opts.prefix_reuse,
             last_reused: 0,
+            banned: Vec::new(),
+            evictions_seen: 0,
             grammar_active: false,
             can_trim: true,
             rollback_safe: self.rollback_safe,
@@ -1614,6 +1632,26 @@ impl LoopCounters {
     }
 }
 
+/// `messages` with every system message folded into one at the start, or
+/// `None` when they are already laid out that way.
+fn merge_system_messages(messages: &[Message]) -> Option<Vec<Message>> {
+    let late = messages
+        .iter()
+        .enumerate()
+        .any(|(i, m)| m.role == Role::System && i > 0);
+    if !late {
+        return None;
+    }
+    let system: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.text_content())
+        .collect();
+    let mut out = vec![Message::system(system.join("\n\n"))];
+    out.extend(messages.iter().filter(|m| m.role != Role::System).cloned());
+    Some(out)
+}
+
 /// Translate "this many transformer blocks on the GPU" into llama.cpp's count.
 ///
 /// llama.cpp counts the output head as one more layer and fills from the top:
@@ -1639,17 +1677,29 @@ fn llama_gpu_layers(blocks: u32, total: u32) -> u32 {
 }
 
 fn build_sampler(opts: &Resolved, n_vocab: i32) -> LlamaSampler {
-    build_sampler_with(opts, n_vocab, None)
+    build_sampler_with(opts, n_vocab, &[], None)
 }
 
 /// Build the sampler chain, optionally led by a grammar constraint.
 ///
 /// The constraint goes first so it masks the logits before any shaping sees
 /// them; applied afterwards it could only reject, and sampling would stall.
-fn build_sampler_with(opts: &Resolved, n_vocab: i32, grammar: Option<LlamaSampler>) -> LlamaSampler {
+fn build_sampler_with(
+    opts: &Resolved,
+    n_vocab: i32,
+    banned: &[LlamaToken],
+    grammar: Option<LlamaSampler>,
+) -> LlamaSampler {
     let mut chain: Vec<LlamaSampler> = Vec::new();
     if let Some(g) = grammar {
         chain.push(g);
+    }
+    if !banned.is_empty() {
+        let biases: Vec<llama_cpp_2::token::logit_bias::LlamaLogitBias> = banned
+            .iter()
+            .map(|t| llama_cpp_2::token::logit_bias::LlamaLogitBias::new(*t, f32::NEG_INFINITY))
+            .collect();
+        chain.push(LlamaSampler::logit_bias(n_vocab, &biases));
     }
     chain.push(LlamaSampler::penalties(
         n_vocab,
@@ -1891,6 +1941,11 @@ pub struct Session<'a> {
     cached: Vec<LlamaToken>,
     reuse: PrefixReuse,
     last_reused: usize,
+    /// Tokens the sampler may never pick; see [`Session::forbid_tool_calls`].
+    banned: Vec<LlamaToken>,
+    /// The slot's eviction count when this session last looked; see
+    /// [`crate::hub::Slot::evictions`].
+    evictions_seen: u64,
     /// Set while a GBNF constraint is installed. Speculation must be off in
     /// that case; see `generate`.
     grammar_active: bool,
@@ -2769,7 +2824,7 @@ impl<'a> Session<'a> {
         // The sampler is built from these, so it has to be rebuilt with them.
         // Any installed grammar is reapplied by the caller's `set_grammar`,
         // which runs after this on every turn.
-        self.sampler = build_sampler(&self.opts, self.model.n_vocab());
+        self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), &self.banned, None);
         self.grammar_active = false;
     }
 
@@ -2777,6 +2832,29 @@ impl<'a> Session<'a> {
     /// that need to know what actually took effect.
     pub fn options(&self) -> &Resolved {
         &self.opts
+    }
+
+    /// Make it impossible for this session to open a tool call, or possible
+    /// again.
+    ///
+    /// For a round that must be an answer. Asked in words, a model whose
+    /// history is full of calls writes another one anyway, and with no tool to
+    /// run the reply is lost. Every call marker that is one token in this
+    /// vocabulary is given no probability at all; a marker spelt out over
+    /// several tokens cannot be banned this way and is left to the words.
+    pub fn forbid_tool_calls(&mut self, on: bool) {
+        self.banned = if on {
+            crate::toolcall::openers()
+                .filter_map(|marker| {
+                    let t = self.model.str_to_token(marker, AddBos::Never).ok()?;
+                    (t.len() == 1).then(|| t[0])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), &self.banned, None);
+        self.grammar_active = false;
     }
 
     pub fn set_grammar(&mut self, grammar: Option<&str>) -> Result<(), EngineError> {
@@ -2795,7 +2873,7 @@ impl<'a> Session<'a> {
         // would leave the flag claiming a constraint that was never installed,
         // which silently disables speculation for the rest of the session.
         self.grammar_active = grammar.is_some();
-        self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), constraint);
+        self.sampler = build_sampler_with(&self.opts, self.model.n_vocab(), &self.banned, constraint);
         Ok(())
     }
 
@@ -2884,6 +2962,19 @@ impl<'a> Session<'a> {
             self.cached.clear();
             self.n_past = 0;
             self.media_dirty = false;
+        }
+
+        // The cache is shared, and a conversation that ran out of room took
+        // this one's while it was idle. What `cached` describes is gone; the
+        // saved checkpoints are host copies and still good.
+        let evictions = self.slot.evictions();
+        if evictions != self.evictions_seen {
+            if !self.cached.is_empty() {
+                tracing::debug!("this conversation's cache was taken for another; starting from its checkpoints");
+            }
+            self.evictions_seen = evictions;
+            self.cached.clear();
+            self.n_past = 0;
         }
 
         match media {
@@ -3022,7 +3113,7 @@ impl<'a> Session<'a> {
                 // have saved the most.
                 if self.reuse != PrefixReuse::Off {
                     if let Some(target) =
-                        self.slot.hub().consider(&tokens)
+                        self.slot.hub().consider(self.slot.seq(), &tokens)
                     {
                         tracing::info!(
                             "holding the {} tokens every conversation starts with",
@@ -3744,6 +3835,20 @@ mod tests {
         // Building must not panic; a temp sampler at 0.0 would divide by zero.
         let opts = Options { temperature: Some(0.0), ..Default::default() }.resolve();
         let _ = build_sampler(&opts, 32_000);
+    }
+
+    #[test]
+    fn late_system_messages_are_folded_into_the_first() {
+        let messages = vec![
+            Message::system("be brief"),
+            Message::user("hi"),
+            Message::system("handed over"),
+        ];
+        let merged = merge_system_messages(&messages).expect("one was late");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text_content(), "be brief\n\nhanded over");
+        assert_eq!(merged[1].role, Role::User);
+        assert!(merge_system_messages(&merged).is_none(), "already in place");
     }
 
     #[test]

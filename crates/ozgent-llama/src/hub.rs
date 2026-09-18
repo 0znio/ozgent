@@ -146,6 +146,9 @@ struct Queue {
     /// moment they get one. The driver waits for these before running a pass;
     /// see [`Hub::gather`].
     running: usize,
+    /// Which sequences those are. Their cache is in use this instant and may
+    /// not be taken to make room; see [`Hub::make_room`].
+    live: std::collections::HashSet<i32>,
 }
 
 /// The prefix every conversation on this hub begins with, held once.
@@ -169,9 +172,9 @@ struct Queue {
 struct Commons {
     /// Exactly what the commons sequence holds, or empty.
     tokens: Vec<LlamaToken>,
-    /// The previous prompt seen, so a shared prefix can be noticed without
-    /// anybody declaring one.
-    previous: Vec<LlamaToken>,
+    /// The previous prompt seen and the slot that sent it, so a shared prefix
+    /// can be noticed without anybody declaring one.
+    previous: Option<(i32, Vec<LlamaToken>)>,
     /// Set while a slot is filling the commons, so the others do not all
     /// decide to do it at once.
     filling: bool,
@@ -201,6 +204,10 @@ pub struct Hub<'a> {
     commons: Mutex<Commons>,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
+    /// How many times each sequence's cache has been taken to make room for
+    /// another. A session compares this with what it last saw before trusting
+    /// what it believes is cached; see [`Slot::evictions`].
+    evictions: Vec<AtomicU64>,
 }
 
 // A `LlamaContext` is a pointer into llama.cpp, which is happy to be used from
@@ -234,6 +241,8 @@ impl<'a> Hub<'a> {
             nextn: Mutex::new(0),
             commons: Mutex::new(Commons::default()),
             fixed_window: None,
+            // One past the conversations, for the commons.
+            evictions: (0..=slots.max(1)).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
@@ -310,20 +319,37 @@ impl<'a> Hub<'a> {
         self.commons.lock().unwrap().tokens.clone()
     }
 
-    /// Note a prompt, and say what to do about the shared prefix.
+    /// Note a prompt from slot `seq`, and say what to do about the shared
+    /// prefix.
     ///
     /// Returns the tokens a caller should put into the commons sequence, when
     /// this prompt reveals that the current one is missing something every
     /// conversation shares. Nobody declares the shared prefix: it is whatever
-    /// two consecutive prompts turn out to begin with.
-    pub fn consider(&self, prompt: &[LlamaToken]) -> Option<Vec<LlamaToken>> {
+    /// prompts from two different conversations turn out to begin with.
+    ///
+    /// Two prompts from the same slot say nothing about that. They are one
+    /// conversation going on — the next turn, or the round after a tool call —
+    /// and share almost everything. Comparing them once made an agent's whole
+    /// transcript "the prefix every conversation starts with": 6740 tokens
+    /// prefilled a second time, 3.5 s before its next round, and the real
+    /// shared head thrown away for a prefix no other conversation had.
+    pub fn consider(&self, seq: i32, prompt: &[LlamaToken]) -> Option<Vec<LlamaToken>> {
         if !self.has_commons {
             return None;
         }
         let mut c = self.commons.lock().unwrap();
-        let shared = shared_head(&c.previous, prompt);
-        c.previous = prompt.to_vec();
+        let shared = match c.previous.replace((seq, prompt.to_vec())) {
+            Some((from, previous)) if from != seq => shared_head(&previous, prompt),
+            _ => return None,
+        };
         if c.filling || shared < MIN_COMMONS {
+            return None;
+        }
+        // It must stay a prefix of what it already was, or conversations
+        // holding a copy of the old one are describing a cache that no longer
+        // matches — and a prefix two conversations happen to share is no
+        // reason to evict the one every conversation does.
+        if !c.tokens.is_empty() && !prompt.starts_with(&c.tokens) {
             return None;
         }
         // Only grown, and only by enough to be worth a rebuild: a commons that
@@ -331,9 +357,6 @@ impl<'a> Hub<'a> {
         if shared <= c.tokens.len() + c.tokens.len() / 4 && !c.tokens.is_empty() {
             return None;
         }
-        // It must stay a prefix of what it already was, or conversations
-        // holding a copy of the old one are describing a cache that no longer
-        // matches.
         c.filling = true;
         Some(prompt[..shared].to_vec())
     }
@@ -647,7 +670,37 @@ impl<'a> Hub<'a> {
 
         let mut ctx = self.context.lock().unwrap();
         let started = Instant::now();
-        if let Err(e) = ctx.decode(&mut llama) {
+        let mut decoded = ctx.decode(&mut llama);
+        // The cache is one pool shared by every conversation. Full, it is
+        // mostly full of conversations nobody is talking to: take their room
+        // rather than fail the one that is being used. llama.cpp finds room
+        // for the whole batch before it writes anything, so a refusal leaves
+        // the cache untouched and the same batch can simply be tried again.
+        if matches!(decoded, Err(llama_cpp_2::DecodeError::NoKvCacheSlot)) {
+            let busy: Vec<i32> = batch.iter().map(|p| p.work.seq).collect();
+            if self.make_room(&mut ctx, &busy) {
+                decoded = ctx.decode(&mut llama);
+            }
+            // Still no room: the shared prefix goes too. It is a cache like
+            // any other, and a conversation that has borrowed it keeps its
+            // own claim on those cells — only the spare copy is given up.
+            //
+            // `try_lock`, because `lend` takes the commons lock before the
+            // context and this pass already holds the context. Waiting here
+            // could deadlock; skipping only costs the last resort.
+            if matches!(decoded, Err(llama_cpp_2::DecodeError::NoKvCacheSlot)) && self.has_commons {
+                if let Ok(mut c) = self.commons.try_lock() {
+                    let seq = self.commons_seq();
+                    if !c.filling && ctx.clear_kv_cache_seq(Some(seq as u32), None, None).is_ok() {
+                        c.tokens.clear();
+                        drop(c);
+                        tracing::info!("the shared cache was still full; gave up the shared prefix too");
+                        decoded = ctx.decode(&mut llama);
+                    }
+                }
+            }
+        }
+        if let Err(e) = decoded {
             return batch.iter().map(|_| Err(e.to_string())).collect();
         }
 
@@ -693,6 +746,33 @@ impl<'a> Hub<'a> {
         PASS_COUNT.fetch_add(1, Ordering::Relaxed);
         PASS_TOKENS.fetch_add(total as u64, Ordering::Relaxed);
         out
+    }
+}
+
+impl<'a> Hub<'a> {
+    /// Clear every conversation's cache that nobody is using right now, to
+    /// make room for `busy`. Returns whether anything was cleared.
+    ///
+    /// Only sequences not generating at this instant: a parked slot is between
+    /// rounds or waiting on a tool, and will notice at the start of its next
+    /// round (see [`Slot::evictions`]) and come back from its saved state. The
+    /// commons stays; every new conversation starts from it.
+    fn make_room(&self, ctx: &mut LlamaContext<'a>, busy: &[i32]) -> bool {
+        let live = self.queue.lock().unwrap().live.clone();
+        let mut cleared = Vec::new();
+        for seq in 0..self.slots as i32 {
+            if busy.contains(&seq) || live.contains(&seq) {
+                continue;
+            }
+            if ctx.clear_kv_cache_seq(Some(seq as u32), None, None).is_ok() {
+                self.evictions[seq as usize].fetch_add(1, Ordering::AcqRel);
+                cleared.push(seq);
+            }
+        }
+        if !cleared.is_empty() {
+            tracing::info!("the shared cache was full; cleared idle conversations {cleared:?} to make room");
+        }
+        !cleared.is_empty()
     }
 }
 
@@ -787,11 +867,20 @@ impl<'a> Slot<'a> {
         &self.hub
     }
 
+    /// How many times this slot's cache has been cleared to make room for
+    /// another conversation. A change since last looked means nothing the
+    /// session believes is cached is there any more.
+    pub fn evictions(&self) -> u64 {
+        self.hub.evictions.get(self.seq as usize).map_or(0, |e| e.load(Ordering::Acquire))
+    }
+
     /// Say that this slot is generating and will keep asking for tokens.
     pub fn resume(&mut self) {
         if !self.running {
             self.running = true;
-            self.hub.queue.lock().unwrap().running += 1;
+            let mut q = self.hub.queue.lock().unwrap();
+            q.running += 1;
+            q.live.insert(self.seq);
         }
     }
 
@@ -801,6 +890,7 @@ impl<'a> Slot<'a> {
             self.running = false;
             let mut q = self.hub.queue.lock().unwrap();
             q.running = q.running.saturating_sub(1);
+            q.live.remove(&self.seq);
             // A driver may be holding a pass open for this slot right now.
             self.hub.woke.notify_all();
         }

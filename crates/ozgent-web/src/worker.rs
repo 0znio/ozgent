@@ -1375,9 +1375,6 @@ fn run_agents(
         .then(|| ozgent_core::DateTime::now().prompt_line());
 
     let mut conversation = request.messages.clone();
-    if let Some(note) = note {
-        conversation.push(Message::system(note));
-    }
     for (index, agent) in agents.iter().enumerate() {
         let (offered, missing) = agent.offer(&available);
         let _ = request.out.send(Event::AgentStart {
@@ -1405,10 +1402,15 @@ fn run_agents(
         // The agent's instructions replace the chat's system prompt rather
         // than joining it: a persona written for the chat, or a client's
         // description of tools the agent does not have, would contradict the
-        // job it was called to do. A handoff note is kept: it is the job.
-        let keep = note.map(str::to_string);
-        messages.retain(|m| m.role != ozgent_core::Role::System || Some(m.text_content()) == keep);
+        // job it was called to do. A handoff note joins the instructions: it
+        // is the job. Joined rather than sent as a message of its own after
+        // the conversation, which templates that take a system message only
+        // at the start refuse — and the fallback has no tools to offer.
+        messages.retain(|m| m.role != ozgent_core::Role::System);
         messages.insert(0, Message::system(system));
+        if let Some(note) = note {
+            append_system(&mut messages, note);
+        }
         // Images belong to the first agent: they are evaluated into the cache
         // once, with that agent's prompt around them.
         let (media_images, media_note) = if index == 0 { (images, observation) } else { (&[][..], None) };
@@ -1738,14 +1740,19 @@ fn rounds(
 
     for round in 0..=max_rounds {
         out.rounds = round + 1;
-        let last = round == max_rounds || offered.is_empty();
+        // Room is checked before every round after the first, because every
+        // round adds tool results and nothing else bounds their sum: an agent
+        // reading eight pages reached 30,899 tokens of a 32,768 window and
+        // the whole answer was lost to a full cache.
+        let cramped = round > 0 && !make_room_for_answer(engine, session, resolved, thinking, &mut messages, offered);
+        let last = round == max_rounds || offered.is_empty() || cramped;
         // Out of rounds, with tools still on the table. Left there, the model
         // spends this turn on one more call, and the visible text before that
         // call — nothing — becomes the answer. Taking them away and asking for
         // an answer is what turns an exhausted loop into a reply.
         if last && round > 0 && !offered.is_empty() {
             session.set_tools(&[]);
-            messages.push(Message::system(OUT_OF_ROUNDS));
+            nudge(&mut messages, if cramped { OUT_OF_ROOM } else { OUT_OF_ROUNDS });
         }
         let media = (round == 0 && !images.is_empty())
             .then(|| projector.map(|p| (p, images, &request.images[..])))
@@ -1778,7 +1785,7 @@ fn rounds(
             next_call_id += 1;
         }
         out.text = parsed.text.clone();
-        tracing::debug!(calls = parsed.calls.len(), "tool round {round}");
+        tracing::debug!(calls = parsed.calls.len(), last, cramped, text = parsed.text.len(), "tool round {round}");
 
         // Reasoning, then nothing. A model can close its thought and stop
         // without either answering or calling anything, and the turn then
@@ -1787,10 +1794,33 @@ fn rounds(
         // silent the second time, that is its reply and the loop ends.
         if !parsed.has_calls() && parsed.text.trim().is_empty() && !nudged {
             nudged = true;
-            messages.push(Message::system(ANSWER_NOW));
+            nudge(&mut messages, ANSWER_NOW);
             continue;
         }
 
+        // Told to answer and called a tool anyway. Whatever came before the
+        // call is a preamble — "I will now search…" — not an answer, and
+        // ending here returns it after all that work. So it is asked once more
+        // with the tools gone from the prompt altogether: the only thing left
+        // to write is the answer. That costs reading the prompt again, once,
+        // and only when the instruction was ignored.
+        if last && parsed.has_calls() && !offered.is_empty() {
+            tracing::info!("the model called a tool on its last round; asking again without tools");
+            session.forbid_tool_calls(true);
+            let retried = generate(
+                engine, session, resolved, thinking, &messages, None, request, &[], permissions, agent,
+            );
+            session.forbid_tool_calls(false);
+            let (reply, stats, reason, _) = retried?;
+            out.generated += stats.generated_tokens as u32;
+            out.prompt_tokens += stats.prompt_tokens as u32;
+            out.elapsed_ms += stats.generation_ms;
+            out.prompt_ms += stats.prompt_ms;
+            out.reused += stats.reused_tokens;
+            out.stop = reason;
+            out.text = ozgent_llama::extract_tool_calls(&reply).text;
+            break;
+        }
         if last || !parsed.has_calls() {
             break;
         }
@@ -1927,13 +1957,12 @@ fn rounds(
                 let offered_names = offered_names.clone();
                 async move {
                     if !reachable {
-                        return (
-                            Err(ozgent_tools::ToolCallError::NotOffered {
-                                name: call.name.clone(),
-                                offered: offered_names,
-                            }),
-                            0,
-                        );
+                        let outcome = Err(ozgent_tools::ToolCallError::NotOffered {
+                            name: call.name.clone(),
+                            offered: offered_names,
+                        });
+                        report(request, call, &outcome, 0);
+                        return (outcome, 0);
                     }
                     let Some(by_user) = *allowed else {
                         // "Declined" and "nobody was there" are different
@@ -1946,12 +1975,16 @@ fn rounds(
                         } else {
                             ozgent_tools::ToolCallError::Unattended { name }
                         };
-                        return (Err(refused), 0);
+                        let outcome = Err(refused);
+                        report(request, call, &outcome, 0);
+                        return (outcome, 0);
                     };
                     let started = std::time::Instant::now();
                     let outcome =
                         t.host.call_approved(&call.name, call.arguments.clone(), by_user).await;
-                    (outcome, started.elapsed().as_millis() as u64)
+                    let ms = started.elapsed().as_millis() as u64;
+                    report(request, call, &outcome, ms);
+                    (outcome, ms)
                 }
             }),
         ));
@@ -1959,8 +1992,9 @@ fn rounds(
         // Consumed in the model's original order, not completion order: the
         // results become the next prompt, so letting a race decide their order
         // would make the same turn produce different continuations.
-        for (call, (outcome, ms)) in parsed.calls.iter().zip(outcomes) {
-            record(request, session, &mut messages, call, outcome, ms);
+        // Each was already reported to the client as it finished.
+        for (call, (outcome, _)) in parsed.calls.iter().zip(outcomes) {
+            feed(session, &mut messages, call, outcome);
         }
     }
     Ok(out)
@@ -1975,18 +2009,31 @@ fn record(
     outcome: Result<serde_json::Value, ozgent_tools::ToolCallError>,
     ms: u64,
 ) {
-    let (ok, summary, detail, payload) = match outcome {
-        Ok(value) => {
-            let text = serde_json::to_string(&value).unwrap_or_default();
-            (true, summarise(&value), value, text)
-        }
+    report(request, call, &outcome, ms);
+    feed(session, messages, call, outcome);
+}
+
+/// Tell the client how one call went.
+///
+/// Sent as each call finishes, not when the batch does. Held until the
+/// slowest had finished, a one-second search sat behind a thirty-second
+/// timeout with nothing on screen, and then every card resolved at once —
+/// which is exactly what a frozen interface looks like.
+fn report(
+    request: &Request,
+    call: &ozgent_core::ToolCall,
+    outcome: &Result<serde_json::Value, ozgent_tools::ToolCallError>,
+    ms: u64,
+) {
+    let (ok, summary, detail) = match outcome {
+        Ok(value) => (true, summarise(value), value.clone()),
         // A tool failure is information the model can act on, not an error
         // for the user: it is fed back so the model can retry or explain,
         // exactly as the terminal client does.
         Err(e) => {
             let text = e.for_model();
             let summary = ozgent_tools::first_line(&text).to_string();
-            (false, summary, serde_json::json!({ "error": text.clone() }), text)
+            (false, summary, serde_json::json!({ "error": text }))
         }
     };
     let _ = request.out.send(Event::ToolResult {
@@ -1997,6 +2044,19 @@ fn record(
         ms,
         detail,
     });
+}
+
+/// Hand one call's result back to the model.
+fn feed(
+    session: &ozgent_llama::engine::Session<'_>,
+    messages: &mut Vec<Message>,
+    call: &ozgent_core::ToolCall,
+    outcome: Result<serde_json::Value, ozgent_tools::ToolCallError>,
+) {
+    let payload = match outcome {
+        Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
+        Err(e) => e.for_model(),
+    };
     // A search asked for 20 results can return more text than the whole
     // context window holds. Unbounded, it crowds out the room the model needs
     // to answer and the reply stops mid-sentence — which reads like a crash
@@ -2043,6 +2103,134 @@ pub const OUT_OF_ROUNDS: &str = "\
 You have no tool calls left. Answer now, using only what the tool results \
 above actually contain. If they did not give you enough, say what you found \
 and what is still missing — do not fill the gap with a guess.";
+
+/// Put an instruction from ozgent where the model will read it next.
+///
+/// Onto the end of the last message rather than as a system message of its
+/// own. Most templates take a system message only at the start, so a late one
+/// is folded into the first — which changes the top of the prompt and makes
+/// the whole conversation be read again, five seconds at ten thousand tokens,
+/// to deliver one sentence.
+fn nudge(messages: &mut Vec<Message>, text: &str) {
+    match messages.last_mut() {
+        Some(m) if matches!(m.role, ozgent_core::Role::Tool | ozgent_core::Role::User) => {
+            let joined = format!("{}\n\n[{text}]", m.text_content());
+            let mut replaced = m.clone();
+            replaced.content = vec![ozgent_core::Part::Text { text: joined }];
+            *m = replaced;
+        }
+        _ => messages.push(Message::user(format!("[{text}]"))),
+    }
+}
+
+pub const OUT_OF_ROOM: &str = "\
+The conversation is close to the limit of what you can hold, so there is no \
+room for more tool calls. Answer now, using only what the tool results above \
+actually contain, and say what is still missing.";
+
+/// Where compaction starts, and where it stops, as shares of the window.
+///
+/// Three quarters leaves room for a round's reasoning, a call and a result of
+/// the size [`fit_budget`] allows; stopping at a half keeps compaction from
+/// running again on the very next round.
+const COMPACT_ABOVE: (usize, usize) = (3, 4);
+const COMPACT_TO: (usize, usize) = (1, 2);
+
+/// The most of the window a prompt may take and still leave room to answer.
+const FITS: (usize, usize) = (17, 20);
+
+/// How much of an older tool result survives compaction, in characters.
+const COMPACTED_CHARS: usize = 1200;
+
+/// Keep the conversation inside the window before another round.
+///
+/// Older tool results are cut to their opening, oldest first: the model has
+/// already read them and acted on them, and what it concluded is in its own
+/// messages. The newest results are left whole — they are what this round is
+/// about to use. Returns false when even that cannot make room, which is the
+/// point to stop calling tools and answer.
+fn make_room_for_answer(
+    engine: &Engine,
+    session: &ozgent_llama::engine::Session<'_>,
+    resolved: &ozgent_core::options::Resolved,
+    thinking: ThinkingMode,
+    messages: &mut [Message],
+    offered: &[ozgent_core::ToolSpec],
+) -> bool {
+    let window = session.n_ctx() as usize;
+    let size = |messages: &[Message]| -> Option<usize> {
+        let prompt = engine
+            .render_prompt_full(messages, thinking, resolved.reasoning_effort, offered)
+            .ok()?;
+        engine.tokenize(&prompt).ok().map(|t| t.len())
+    };
+    let Some(mut used) = size(messages) else { return true };
+    tracing::debug!("room check: {used} of {window} tokens");
+    if used * COMPACT_ABOVE.1 <= window * COMPACT_ABOVE.0 {
+        return true;
+    }
+    // The results of the latest round are the ones after the last assistant
+    // message; everything before that is fair game.
+    let newest = messages
+        .iter()
+        .rposition(|m| m.role == ozgent_core::Role::Assistant)
+        .unwrap_or(messages.len());
+    let mut compacted = 0;
+    for i in 0..newest {
+        if used * COMPACT_TO.1 <= window * COMPACT_TO.0 {
+            break;
+        }
+        let m = &messages[i];
+        if m.role != ozgent_core::Role::Tool {
+            continue;
+        }
+        let text = m.text_content();
+        if text.len() <= COMPACTED_CHARS {
+            continue;
+        }
+        let cut = text.floor_char_boundary(COMPACTED_CHARS);
+        let short = format!(
+            "{}\n[… {} more characters, cut to make room. You have already read this result.]",
+            &text[..cut],
+            text.len() - cut
+        );
+        let id = m.tool_call_id.clone().unwrap_or_default();
+        messages[i] = Message::tool_result(id, short);
+        compacted += 1;
+        if let Some(now) = size(messages) {
+            used = now;
+        }
+    }
+    // Still too big to answer in, which happens when one round's results
+    // alone are: four parallel searches each within their own budget came to
+    // more than a 12k window. Then the longest result is halved, whatever
+    // round it came from, until the prompt fits with room for a reply. Every
+    // result keeps its opening; nothing is dropped outright.
+    while used * FITS.1 > window * FITS.0 {
+        let longest = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == ozgent_core::Role::Tool)
+            .map(|(i, m)| (i, m.text_content().len()))
+            .filter(|(_, len)| *len > COMPACTED_CHARS / 2)
+            .max_by_key(|(_, len)| *len);
+        let Some((i, len)) = longest else { break };
+        let text = messages[i].text_content();
+        let cut = text.floor_char_boundary(len / 2);
+        let short = format!("{}\n[… cut to make room.]", &text[..cut]);
+        let id = messages[i].tool_call_id.clone().unwrap_or_default();
+        messages[i] = Message::tool_result(id, short);
+        compacted += 1;
+        match size(messages) {
+            Some(now) => used = now,
+            None => break,
+        }
+    }
+    if compacted > 0 {
+        tracing::info!("the conversation neared its window; cut tool results {compacted} time(s), now {used} of {window} tokens");
+    }
+    used * COMPACT_ABOVE.1 <= window * COMPACT_ABOVE.0
+}
 
 /// Tokens the grounding pass may spend. Enough for a faithful description,
 /// short enough that it costs a fraction of a second.
