@@ -1284,6 +1284,56 @@ const SETTABLE: &str =
     "thinking, effort, temperature, top_p, top_k, min_p, repeat_penalty, max_tokens, seed, \
      ctx, mode, kv, tools";
 
+/// The commands the prompt offers while a `/` is being typed, each with the
+/// line it shows beside it.
+///
+/// The same commands the parser accepts and `/help` prints. A test keeps the
+/// three in step, because a command missing from here is one nobody
+/// discovers and one listed here that the parser refuses is worse.
+pub(crate) const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "this list"),
+    ("/new", "start a new conversation"),
+    ("/clear", "start a new conversation and clear the screen"),
+    ("/conv", "past conversations · <n> reopen · rm <n> delete"),
+    ("/think", "on, off or auto — show or suppress reasoning"),
+    ("/effort", "low, medium or high — how long the model may reason"),
+    ("/system", "set the system prompt"),
+    ("/remember", "pin a fact for this and future chats"),
+    ("/memory", "what is remembered"),
+    ("/models", "list models, or switch to one"),
+    ("/config", "show or change this model's settings"),
+    ("/tools", "list tools, or point one at a provider"),
+    ("/agents", "list agents, or show one"),
+    ("/call", "force a tool call, constrained by grammar"),
+    ("/permissions", "what tools may do without asking"),
+    ("/default", "use this model when none is named"),
+    ("/copy", "copy the last reply to the clipboard"),
+    ("/stats", "model and context state"),
+    ("/exit", "quit"),
+];
+
+/// The command being typed at the cursor, if the line is one.
+///
+/// Only while it is still a bare word: once an argument has been started the
+/// command has been chosen, and a panel over the prompt is then in the way.
+pub(crate) fn typing_command(before: &str) -> Option<&str> {
+    let rest = before.strip_prefix('/')?;
+    (!rest.contains(char::is_whitespace)
+        && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(rest)
+}
+
+/// The commands matching what has been typed, the ones that start with it
+/// first — so `/mem` finds `/memory` before anything that merely contains it.
+pub(crate) fn matching_commands(typed: &str) -> Vec<&'static (&'static str, &'static str)> {
+    let q = typed.to_ascii_lowercase();
+    let starts = COMMANDS.iter().filter(|(name, _)| name[1..].starts_with(&q));
+    let contains = COMMANDS
+        .iter()
+        .filter(|(name, _)| !name[1..].starts_with(&q) && name[1..].contains(&q));
+    starts.chain(contains).collect()
+}
+
 const HELP: &str = "\
 /help              this list
 /exit              quit
@@ -1352,6 +1402,43 @@ mod tests {
             "content": "line one\nline two\nline three\n",
         }));
         assert!(!out.contains('\n'), "{out:?}");
+    }
+
+    #[test]
+    fn the_prompt_suggests_exactly_what_help_documents() {
+        // Three lists have to agree: what the parser accepts, what `/help`
+        // prints, and what the prompt offers. This catches two of the three.
+        for (name, _) in super::COMMANDS {
+            assert!(HELP.contains(name), "{name} is suggested but undocumented");
+        }
+        for line in HELP.lines() {
+            let Some(word) = line.split_whitespace().next() else { continue };
+            let word = word.trim_end_matches(',');
+            if !word.starts_with('/') {
+                continue;
+            }
+            assert!(
+                super::COMMANDS.iter().any(|(name, _)| *name == word),
+                "{word} is documented but never suggested"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_is_suggested_only_while_it_is_a_bare_word() {
+        assert_eq!(super::typing_command("/mem"), Some("mem"));
+        assert_eq!(super::typing_command("/"), Some(""));
+        assert_eq!(super::typing_command("/conv 2"), None, "an argument means it was chosen");
+        assert_eq!(super::typing_command("hello /help"), None);
+        assert_eq!(super::typing_command("/home/me/photo.png"), None, "a path is not a command");
+    }
+
+    #[test]
+    fn the_closest_command_comes_first() {
+        let found = super::matching_commands("mem");
+        assert_eq!(found.first().map(|(n, _)| *n), Some("/memory"));
+        assert!(super::matching_commands("zzz").is_empty());
+        assert_eq!(super::matching_commands("").len(), super::COMMANDS.len());
     }
 
     #[test]

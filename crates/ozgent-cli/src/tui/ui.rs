@@ -90,6 +90,16 @@ pub struct Ui {
 /// Most agents the `@` panel lists at once.
 const PANEL_ROWS: usize = 6;
 
+/// One row of the panel above the prompt.
+struct Suggestion {
+    /// What replaces what has been typed when this row is taken.
+    insert: String,
+    /// The name, as it is shown.
+    label: String,
+    /// The line beside it: what the command does, or what the agent is for.
+    hint: String,
+}
+
 /// A permission question, as the bar shows it.
 struct Question {
     tool: String,
@@ -136,64 +146,90 @@ impl Ui {
         self.agents = agents;
     }
 
-    /// The agents matching the mention at the caret, and where it starts.
-    fn suggestions(&self) -> Option<(usize, Vec<&ozgent_core::Agent>)> {
+    /// One row of the panel above the prompt: what it puts in the line, and
+    /// what it shows while being chosen.
+    fn suggestions(&self) -> Option<(usize, &'static str, Vec<Suggestion>)> {
+        let text = self.editor.text();
+        let before = &text[..self.editor.cursor()];
+
+        // A line that is still a bare `/word` is a command being chosen, and
+        // the commands are the same list `/help` prints.
+        if let Some(typed) = crate::chat::typing_command(before) {
+            if self.dismissed == Some(0) {
+                return None;
+            }
+            let found: Vec<Suggestion> = crate::chat::matching_commands(typed)
+                .into_iter()
+                .map(|(name, hint)| Suggestion {
+                    insert: format!("{name} "),
+                    label: (*name).to_string(),
+                    hint: (*hint).to_string(),
+                })
+                .collect();
+            return (!found.is_empty()).then_some((0, "commands", found));
+        }
+
         if self.agents.all().is_empty() {
             return None;
         }
-        let text = self.editor.text();
-        let (start, typed) = ozgent_core::agents::typing_mention(&text[..self.editor.cursor()])?;
+        let (start, typed) = ozgent_core::agents::typing_mention(before)?;
         if self.dismissed == Some(start) {
             return None;
         }
-        let found = self.agents.suggest(typed);
-        (!found.is_empty()).then_some((start, found))
+        let found: Vec<Suggestion> = self
+            .agents
+            .suggest(typed)
+            .into_iter()
+            .map(|agent| Suggestion {
+                insert: format!("@{} ", agent.name),
+                label: format!("@{}", agent.name),
+                hint: match agent.definition.tools.is_empty() {
+                    true => agent.definition.description.clone(),
+                    false => format!(
+                        "{}  [{}]",
+                        agent.definition.description,
+                        agent.definition.tools.join(", ")
+                    ),
+                },
+            })
+            .collect();
+        (!found.is_empty()).then_some((start, "agents", found))
     }
 
     /// The rows the `@` panel adds above the prompt, empty when it is closed.
     fn panel(&self, width: usize) -> Vec<String> {
-        let Some((_, found)) = self.suggestions() else { return Vec::new() };
+        let Some((_, kind, found)) = self.suggestions() else { return Vec::new() };
         let dim = |s: &str| self.theme.style(Style::dim(), s);
         let mut rows = vec![frame::truncate(
-            &dim("  agents · ↑↓ choose · Tab or Enter insert · Esc close"),
+            &dim(&format!("  {kind} · ↑↓ choose · Tab or Enter insert · Esc close")),
             width,
         )];
         let active = self.pick.min(found.len() - 1);
         // A window of the list that keeps the highlighted row in view.
         let first = active.saturating_sub(PANEL_ROWS - 1);
-        for (i, agent) in found.iter().enumerate().skip(first).take(PANEL_ROWS) {
+        for (i, item) in found.iter().enumerate().skip(first).take(PANEL_ROWS) {
             let chosen = i == active;
             let marker = if chosen { "› " } else { "  " };
             let name = self.theme.style(
                 Style { bold: true, color: chosen.then_some(Color::Cyan), ..Default::default() },
-                &format!("@{}", agent.name),
+                &item.label,
             );
-            let tools = if agent.definition.tools.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", agent.definition.tools.join(", "))
-            };
-            let line = format!(
-                "{marker}{name}  {}{}",
-                agent.definition.description,
-                dim(&tools)
-            );
-            rows.push(frame::truncate(&line, width));
+            rows.push(frame::truncate(&format!("{marker}{name}  {}", dim(&item.hint)), width));
         }
         rows
     }
 
     /// Keys the `@` panel owns while it is open. Returns true if it used one.
     fn panel_key(&mut self, key: &Key) -> bool {
-        let Some((start, found)) = self.suggestions() else { return false };
+        let Some((start, _, found)) = self.suggestions() else { return false };
         let count = found.len();
-        let chosen = found[self.pick.min(count - 1)].name.clone();
+        let chosen = found[self.pick.min(count - 1)].insert.clone();
         match key {
             Key::Up => self.pick = (self.pick + count - 1) % count,
             Key::Down => self.pick = (self.pick + 1) % count,
             Key::Tab | Key::Enter => {
                 let cursor = self.editor.cursor();
-                self.editor.replace(start, cursor, &format!("@{chosen} "));
+                self.editor.replace(start, cursor, &chosen);
                 self.pick = 0;
             }
             Key::Escape => self.dismissed = Some(start),
@@ -204,16 +240,17 @@ impl Ui {
 
     /// Keep the highlighted row with the mention it belongs to.
     fn sync_panel(&mut self) {
-        let start = self.suggestions().map(|(s, _)| s);
+        let start = self.suggestions().map(|(s, ..)| s);
         if start != self.pick_start {
             self.pick = 0;
             self.pick_start = start;
         }
-        // A dismissal lasts only as long as that mention does.
+        // A dismissal lasts only as long as the mention or command does.
         if let Some(d) = self.dismissed {
             let text = self.editor.text();
-            let still = ozgent_core::agents::typing_mention(&text[..self.editor.cursor()])
-                .is_some_and(|(s, _)| s == d);
+            let before = &text[..self.editor.cursor()];
+            let still = ozgent_core::agents::typing_mention(before).is_some_and(|(s, _)| s == d)
+                || (d == 0 && crate::chat::typing_command(before).is_some());
             if !still {
                 self.dismissed = None;
             }
