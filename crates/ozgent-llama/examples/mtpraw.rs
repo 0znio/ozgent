@@ -131,6 +131,9 @@ fn main() {
             cp.n_ubatch = 512;
             cp.n_seq_max = 1;
             cp.n_rs_seq = rs;
+            if let Some(n) = std::env::var("NOUT").ok().and_then(|v| v.parse().ok()) {
+                cp.n_outputs_max = n;
+            }
             cp.type_k = sys::GGML_TYPE_Q8_0;
             cp.type_v = sys::GGML_TYPE_Q8_0;
             cp.flash_attn_type = if std::env::var("NOFA").is_ok() {

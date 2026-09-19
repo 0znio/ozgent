@@ -93,6 +93,16 @@ The plan reserves, before any weight is placed:
   tokens.
 - **Fixed GPU tensors**: the output head and its norm.
 
+Compute scratch is also what one setting buys back. llama.cpp sizes a
+context's scratch for the worst case its batch allows — every row of a
+micro-batch producing a full vocabulary of logits — and nothing here ever
+asks for that: a prefill chunk wants one row and a verification wants the
+confirmed token plus its draft. Capping it (`n_outputs_max`, a row per
+conversation per drafted token, floor 16) took the scratch of a 4B at a
+65,536-token window from 1,138 MiB to 632 MiB. Half a gigabyte, for nothing
+given up — it becomes window, or the room a vision projector needs, or
+another block of experts on the card.
+
 A model's **vision projector** is not reserved for, because it is loaded only
 when an image arrives — long after the window was sized. It is placed by what
 is free at that moment: on the card when it fits, on the CPU when it does

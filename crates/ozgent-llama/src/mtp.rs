@@ -70,6 +70,15 @@ use ozgent_mtmd_sys::llama_cpp_sys_2 as sys;
 
 use crate::engine::EngineError;
 
+/// Microseconds inside the head's two decodes — catching up on what the model
+/// read, and proposing — and how many of each. The whole economics of drafting
+/// rests on these being small against a ~10 ms pass, so they are counted
+/// rather than assumed.
+pub static ABSORB_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ABSORBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROPOSE_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROPOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Tokens drafted per round. See the module documentation for why one.
 pub const DRAFT_TOKENS: usize = 1;
 
@@ -301,8 +310,14 @@ impl<'a> Drafter<'a> {
         if self.batch.len() == 0 {
             return;
         }
+        let started = std::time::Instant::now();
         // SAFETY: the batch and context are live.
         let rc = unsafe { sys::llama_decode(self.context.as_ptr(), self.batch.raw) };
+        ABSORB_MICROS.fetch_add(
+            started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ABSORBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if rc != 0 {
             // A head that fell behind drafts worse, and that is all.
             tracing::debug!("mtp catch-up decode returned {rc}");
@@ -337,12 +352,18 @@ impl<'a> Drafter<'a> {
         if rows.is_empty() {
             return out;
         }
+        let started = std::time::Instant::now();
         // SAFETY: the batch and context are live.
         let rc = unsafe { sys::llama_decode(self.context.as_ptr(), self.batch.raw) };
         if rc != 0 {
             tracing::debug!("mtp draft decode returned {rc}");
             return out;
         }
+        PROPOSE_MICROS.fetch_add(
+            started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        PROPOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for (row, &i) in rows.iter().enumerate() {
             // SAFETY: the decode asked for logits on every row it carried.
             let logits = unsafe { sys::llama_get_logits_ith(self.context.as_ptr(), row as i32) };

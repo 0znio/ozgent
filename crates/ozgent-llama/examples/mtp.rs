@@ -9,7 +9,15 @@
 use ozgent_core::accel::Speculative;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).with_target(false).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_max_level(if std::env::var("VERBOSE").is_ok() {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
+        .init();
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: mtp <model.gguf> [rounds] [prompt-file...]");
     let rounds: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(2);
@@ -191,6 +199,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let counters = || {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (am, ac) = (
+            ozgent_llama::mtp::ABSORB_MICROS.swap(0, Relaxed),
+            ozgent_llama::mtp::ABSORBS.swap(0, Relaxed),
+        );
+        let (pm, pc) = (
+            ozgent_llama::mtp::PROPOSE_MICROS.swap(0, Relaxed),
+            ozgent_llama::mtp::PROPOSES.swap(0, Relaxed),
+        );
+        if ac + pc > 0 {
+            println!(
+                "           head: catching up {:.2} ms x{ac}, proposing {:.2} ms x{pc}",
+                am as f64 / 1000.0 / ac.max(1) as f64,
+                pm as f64 / 1000.0 / pc.max(1) as f64
+            );
+        }
+    };
+
     for (name, prompt) in &prompts {
         let (mut off_rates, mut on_rates) = (Vec::new(), Vec::new());
         let (mut off_text, mut on_text) = (String::new(), String::new());
@@ -232,6 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || if off_text.len() == on_text.len() { "identical".to_string() } else { "one ends early".into() },
                 |i| format!("parts at char {i} of {}", off_text.len()),
             );
+        counters();
         println!(
             "{name:10} off {off:5.1} tok/s   head {on:5.1} tok/s   {:+.0}%   accepted {acc}/{prop}   prefill {:.0} vs {:.0} ms   text {same}",
             100.0 * (on / off - 1.0),

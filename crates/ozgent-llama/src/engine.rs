@@ -1438,6 +1438,16 @@ impl Engine {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(requested))
             .with_n_batch(n_batch)
+            // Rows of logits one micro-batch may produce. llama.cpp sizes its
+            // compute scratch for the worst case — every row of the batch
+            // asking for a full vocabulary — which nothing here ever does: a
+            // prefill chunk wants one row, and a verification wants the
+            // confirmed token plus its draft. Measured on Qwen3.5-4B at a 512
+            // micro-batch: 495 MiB of scratch against 130 with this set,
+            // which is 365 MiB of window, or the room a vision projector
+            // needs. It grows with the micro-batch, so on the daemon's wider
+            // one it is about a gigabyte.
+            .with_n_outputs_max(outputs_max(sequences))
             // One more than the conversations: the last sequence holds the
             // prefix they share. See `Commons`.
             .with_n_seq_max(sequences)
@@ -1567,6 +1577,10 @@ impl Engine {
                     let mut p = LlamaContextParams::default()
                         .with_n_ctx(NonZeroU32::new(n_ctx))
                         .with_n_batch(n_batch)
+                        // The probe has to be shaped like the context it is
+                        // predicting, or it measures a scratch nobody will
+                        // allocate.
+                        .with_n_outputs_max(outputs_max(sequences))
                         .with_n_seq_max(sequences)
                         .with_kv_unified(unified)
                         .with_flash_attention_policy(flash)
@@ -1689,6 +1703,20 @@ impl Engine {
 }
 
 /// Map our cache type onto llama.cpp's KV cache type.
+/// Rows of logits a micro-batch may ask for, on a context carrying
+/// `sequences` conversations.
+///
+/// Every conversation may verify a draft in the same pass, which is the
+/// confirmed token plus what was drafted for it. The floor leaves room for
+/// the diagnostics that ask for more — [`Engine::probe_verify_cost`] times
+/// batches of up to eight — and costs a megabyte of scratch per row.
+fn outputs_max(sequences: u32) -> u32 {
+    if let Some(n) = std::env::var("OZGENT_OUTPUTS_MAX").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    (sequences * (1 + crate::mtp::DRAFT_TOKENS as u32)).max(16)
+}
+
 /// The vision projector installed beside `model`, and what it weighs.
 ///
 /// Zero when the model has none. Read from the directory rather than from a
