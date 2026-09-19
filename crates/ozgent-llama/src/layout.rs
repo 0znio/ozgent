@@ -62,6 +62,10 @@ pub struct Layout {
     /// conversation's linear-attention state costs for each block placed on
     /// the GPU. Zero for a model without one. See [`recurrent_bytes`].
     pub recurrent_bytes_per_layer: u64,
+    /// Multi-token-prediction blocks appended past the main stack: a draft
+    /// head the model carries for speculating with itself. Zero on most
+    /// models. See [`crate::mtp`].
+    pub nextn_layers: u32,
 }
 
 /// The routed-expert tensors, in the order eviction spends them.
@@ -110,6 +114,9 @@ pub fn read(path: &Path) -> Option<Layout> {
             .unwrap_or(0);
         l.n_embd = string_key(gguf, "general.architecture")
             .and_then(|arch| u32_key(gguf, &format!("{arch}.embedding_length")))
+            .unwrap_or(0);
+        l.nextn_layers = string_key(gguf, "general.architecture")
+            .and_then(|arch| u32_key(gguf, &format!("{arch}.nextn_predict_layers")))
             .unwrap_or(0);
     }
     unsafe { sys::gguf_free(gguf) };
@@ -205,6 +212,7 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         caching_layers: layers,
         n_embd: 0,
         context_train: 0,
+        nextn_layers: 0,
     })
 }
 

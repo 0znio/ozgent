@@ -526,6 +526,16 @@ impl LlamaModelParams {
         self
     }
 
+    /// Load the model's multi-token-prediction layers, when it has any.
+    ///
+    /// llama.cpp skips them by default; a draft context built over a model
+    /// loaded without them aborts on its first graph.
+    #[must_use]
+    pub fn with_load_mtp(mut self, load_mtp: bool) -> Self {
+        self.params.load_mtp = load_mtp;
+        self
+    }
+
     /// sets `vocab_only`
     #[must_use]
     pub fn with_vocab_only(mut self, vocab_only: bool) -> Self {

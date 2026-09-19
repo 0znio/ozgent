@@ -70,10 +70,20 @@ why it is priced per block, times sequences.
 
 The plan reserves, before any weight is placed:
 
-- **A floor of KV cache**: the cache for `min(context, 8192)` tokens
-  (`PLANNING_WINDOW`) at q8_0. Not the whole requested window, because the
-  window is elastic and the weights are not. Reserving a 107k window would
-  leave room for four of a 4B's 33 blocks.
+- **A window worth having**: cache at q8_0 for the largest of 64k, 48k, 32k,
+  16k and the 8,192-token floor (`PLANNING_WINDOW`) that costs less than a
+  tenth of the weights on the card. The window is elastic and the weights are
+  not — reserving a full 107k window outright would leave room for four of a
+  4B's 33 blocks — but leaving the window to whatever the weights happen to
+  spare is just as wrong on a model near or above the size of the card: a
+  session that cannot hold a document, several tool results and an agent's
+  transcript fails the task however fast it decodes. Measured on
+  Qwen3.6-35B-A3B, whose cache sits on one layer in four: planning for 64k
+  moved one expert block of 41 to the host and opened the whole 64k window,
+  with no measurable change in decode speed (medians of five alternating runs,
+  18.9 against 19.5 tok/s, inside this laptop's own drift). A dense model
+  whose cache costs gigabytes a window fails the tenth test and keeps its
+  weights.
 - **Compute scratch**, sized for the micro-batch the context will actually
   choose (§4), from a model learned per install.
 - **The decode reserve**: memory llama.cpp allocates lazily on the first
@@ -82,6 +92,16 @@ The plan reserves, before any weight is placed:
   a 23B MoE was placed with 15 MiB spare and its 32k window collapsed to 578
   tokens.
 - **Fixed GPU tensors**: the output head and its norm.
+
+A model's **vision projector** is not reserved for, because it is loaded only
+when an image arrives — long after the window was sized. It is placed by what
+is free at that moment: on the card when it fits, on the CPU when it does
+not, which costs a few hundred milliseconds an image instead of the tens of
+milliseconds it costs on the card. llama.cpp aborts the process rather than
+failing when a buffer will not fit, and that is what the first image on a 4B
+with a 107,008-token window did. Shortening the window or quantising the
+cache harder to make room would cost every turn, image or not, and a model
+whose weights already fill the card has nothing to give either way.
 
 ### Experts before blocks
 
@@ -376,23 +396,40 @@ because masking every turn costs accuracy on stronger models.
 ## 9. Speculative decoding
 
 Speculation proposes several tokens and verifies them in one pass. At
-temperature 0 it must produce exactly the text plain decoding would.
+temperature 0 it must produce the text plain decoding would. The one
+exception is inherent to batching: where the model's top two choices are
+within a few hundredths of a logit, a two-token batch's float order can pick
+the other, exactly as a prefill's can.
 
 - **n-gram drafting** (`ngram.rs`): longest-match lookup in the context, a
   short key ranked by how far the match extends backwards, adaptive draft
   length, and a rolling acceptance rate that stops drafting when it does not
   pay and probes again later.
-- **Hybrid models cannot trim a rejected draft**; the recurrent state has
-  already absorbed it. The first version produced *different text* 10%
-  slower. That is now detected. Rollback is done by snapshotting the sequence
-  state on the device before a draft, which is only sound when one slot has
-  the context to itself, and only attempted when free VRAM covers the
-  snapshot: llama.cpp asserts rather than failing when it cannot allocate
-  one, which killed the process on Bonsai's first token.
-- **MTP / NextN** (Qwen's built-in draft head): implemented and measured,
-  including llama.cpp's partial-rollback ring. It verified cheaply (k=2 at
-  1.15× a single pass) but lost end to end, 43 against 48 tok/s, because the
-  NextN head runs once per proposed token. Off by default.
+- **MTP / NextN** (`mtp.rs`): the model's own trained draft head, the default
+  (`--spec auto`) whenever the GGUF carries one (`<arch>.nextn_predict_layers`,
+  e.g. `unsloth/Qwen3.5-4B-MTP-GGUF`). One drafted token per round. Three
+  things make it pay where the first attempt lost:
+  - the head's layers are loaded (`load_mtp`), and its context, which keeps a
+    KV cache of its own, absorbs every position the model decodes, fed the
+    model's hidden state at the position before;
+  - a hybrid model's context gets llama.cpp's `n_rs_seq` ring, so a rejected
+    draft is trimmed instead of snapshotted and replayed. The ring is only
+    exact straight after a multi-token batch, so nothing but draft
+    verification ever trims a hybrid model's cache;
+  - the hub owns one drafter per context and gathers the draft steps of every
+    conversation into one decode, since each step reads the whole output head.
+
+  Measured on Qwen3.5-4B-MTP, same process, drafting off against on: code
+  +42%, math +42%, Hindi +33%, prose +27%, text identical. Four concurrent
+  conversations: +40-47% total. Qwen3.6-35B-A3B-MTP with experts in system
+  RAM: code +36%, prose +18%. The tool-call gate stays live: when a call
+  begins, its grammar goes in and drafting stops for the rest of the turn.
+- **Hybrid models without a head** still cannot trim a rejected draft: the
+  recurrent state has already absorbed it. There, n-gram drafting snapshots
+  the sequence state on the device, which is only sound when one slot has the
+  context to itself, and only attempted when free VRAM covers the snapshot:
+  llama.cpp asserts rather than failing when it cannot allocate one, which
+  killed the process on Bonsai's first token.
 - **DSpark / DFlash drafters** (e.g. Bonsai's) are not supported: upstream
   llama.cpp cannot load the `dspark` architecture, and the installer never
   offers a drafter as a model.
@@ -496,6 +533,18 @@ Through the daemon, the path the web UI, terminal and API all use:
 | Qwen3.6-35B decode | 22.9 tok/s | 27.9 tok/s | llama-bench 26.4 |
 | Qwen3.6-35B follow-up, first token | 5–10 s | ~1–2 s | |
 | Ternary Bonsai 27B | did not load | 12.4 tok/s | llama-bench 9.0 (same split) |
+
+With the model's own draft head (§9), on the GGUFs that carry one:
+
+| | Plain | Drafting | Drafts accepted |
+|---|---|---|---|
+| Qwen3.5-4B-MTP, code | 57.0 tok/s | 80.8 tok/s | 88% |
+| Qwen3.5-4B-MTP, prose | 56.8 tok/s | 72.2 tok/s | 69% |
+| Qwen3.5-4B-MTP, four conversations at once | 133 tok/s | 188 tok/s | |
+| Qwen3.6-35B-A3B-MTP, code | 27.9 tok/s | 38.1 tok/s | 94% |
+
+Greedy text is identical to plain decoding in every case above, over four
+prompts and three-turn conversations.
 
 How these were measured, and the traps: never compare separate runs on this
 laptop; compare within a run. Never time the first turn after a load. A

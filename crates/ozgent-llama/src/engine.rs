@@ -129,6 +129,8 @@ pub struct Engine {
     /// False when the model keeps state that cannot be rolled back, which
     /// makes draft rejection unsafe. See [`Engine::rollback_safe`].
     rollback_safe: bool,
+    /// The model's MTP layers were loaded, so its contexts draft with them.
+    mtp: bool,
     /// The model's own chat template, when it could be compiled.
     jinja: Option<crate::template::ChatTemplate>,
     /// Tokens the template appends to open the assistant's turn.
@@ -143,6 +145,11 @@ pub struct Engine {
     /// On-disk size of the weights, used as the denominator when deciding
     /// whether KV traffic dominates weight traffic.
     weight_bytes: u64,
+    /// What this model's vision projector will want on the card, when one is
+    /// installed beside it. Held back from the window: the projector is
+    /// loaded on the first image, long after placement, and llama.cpp aborts
+    /// the process rather than failing when it cannot allocate.
+    projector_bytes: u64,
 }
 
 /// How far an n-gram match must extend behind the key before it is drafted,
@@ -283,7 +290,6 @@ impl Engine {
                     tokens: chunk.to_vec(),
                     pos,
                     logits: crate::hub::Logits::Last,
-                    hidden: false,
                 })
                 .map_err(|e| EngineError::Decode(e.to_string()))?;
             pos += chunk.len() as i32;
@@ -306,7 +312,6 @@ impl Engine {
                         tokens,
                         pos,
                         logits: crate::hub::Logits::All,
-                        hidden: false,
                     })
                     .map_err(|e| EngineError::Decode(e.to_string()))?;
                 times.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -368,8 +373,15 @@ impl Engine {
             GpuLayers::Keyword(GpuKeyword::Auto) => plan.layers,
         };
 
+        // The model's own draft head, when it carries one and drafting is
+        // wanted. llama.cpp leaves those layers on disk unless asked, and a
+        // draft context over a model loaded without them aborts on its first
+        // graph rather than failing. See `crate::mtp`.
+        let mtp = matches!(opts.speculative, Speculative::Mtp | Speculative::Auto)
+            && crate::layout::read(path).is_some_and(|l| l.nextn_layers > 0);
         let mut params = Box::pin(LlamaModelParams::default()
             .with_n_gpu_layers(llama_gpu_layers(requested_layers, plan.total_layers))
+            .with_load_mtp(mtp)
             .with_use_mmap(opts.use_mmap)
             .with_use_mlock(opts.use_mlock)
             .with_main_gpu(opts.main_gpu as i32)
@@ -575,8 +587,10 @@ impl Engine {
             jinja,
             n_layer,
             rollback_safe,
+            mtp: mtp && unsafe { sys::llama_model_n_layer_nextn(model.as_ptr()) } > 0,
             kv_shape,
             weight_bytes,
+            projector_bytes: projector_beside(path),
             template,
             model,
         })
@@ -854,7 +868,30 @@ impl Engine {
         mmproj: &std::path::Path,
         opts: &Resolved,
     ) -> Result<crate::mtmd::Projector<'_>, EngineError> {
-        let on_gpu = !matches!(opts.gpu_layers, GpuLayers::Keyword(GpuKeyword::Off));
+        // Where it goes is decided by what is free at the moment it loads,
+        // not by what was free when the weights were placed. By then the
+        // window, the cache and the draft head have all been allocated, and
+        // llama.cpp aborts the process rather than failing when a buffer will
+        // not fit — which is how the first image on a 4B with a 107,008-token
+        // window ended the daemon.
+        //
+        // On the card it encodes an image in tens of milliseconds; on the
+        // host, in a few hundred. That is the right thing to give up. Nothing
+        // else is: shortening the window or quantising the cache harder would
+        // cost every turn, image or not, and a model whose weights already
+        // fill the card — a mixture-of-experts with its experts in system RAM
+        // — has no room to give either way.
+        let allowed = !matches!(opts.gpu_layers, GpuLayers::Keyword(GpuKeyword::Off));
+        let free = crate::backend::best_gpu().map(|g| g.memory_free as u64).unwrap_or(0);
+        let need = self.projector_bytes + crate::backend::decode_reserve();
+        let on_gpu = allowed && free >= need;
+        if allowed && !on_gpu {
+            tracing::info!(
+                "reading images on the cpu: the projector wants {} MiB and {} MiB is free on the card",
+                need >> 20,
+                free >> 20
+            );
+        }
         crate::mtmd::Projector::load(mmproj, &self.model, on_gpu, opts.threads as i32)
             .map_err(|e| EngineError::Load {
                 path: mmproj.display().to_string(),
@@ -1137,7 +1174,7 @@ impl Engine {
         &self,
         opts: &Resolved,
         want: Slots,
-    ) -> Result<(LlamaContext<'_>, u32, u32), EngineError> {
+    ) -> Result<(LlamaContext<'_>, u32, u32, Option<crate::mtp::Drafter<'_>>), EngineError> {
         let slots = match want {
             Slots::Exact(n) => n.max(1),
             Slots::UpTo(n) => n.max(1),
@@ -1154,6 +1191,33 @@ impl Engine {
                 self.n_ctx_train
             );
         }
+
+        // The draft head's context opens first, so the window below is sized
+        // against what it leaves rather than squeezing it out afterwards: one
+        // layer's cache and a small scratch, measured by opening it. Wide
+        // enough to take in a whole prefill chunk in one decode.
+        let drafter = if self.mtp && !matches!(opts.speculative, Speculative::Off) {
+            let seqs = sequences_for(slots, want);
+            let pooled = matches!(want, Slots::UpTo(_)) && seqs > 1;
+            let window = if pooled { requested } else { requested.saturating_mul(seqs) };
+            match crate::mtp::Drafter::new(
+                &self.model,
+                backend,
+                window,
+                opts.batch_size.max(WIDE_BATCH),
+                seqs,
+                pooled,
+                opts.flash_attention,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("not drafting with the model's own head: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // `auto` is resolved here rather than at parse time because it needs
         // the VRAM left *after* the weights are resident, which is only known
@@ -1198,7 +1262,7 @@ impl Engine {
             };
             (reserve, budget)
         };
-        let (reserve, mut budget) = weigh(opts.ubatch, opts.batch_size, requested);
+        let (reserve, budget) = weigh(opts.ubatch, opts.batch_size, requested);
         tracing::debug!(
             "kv budget {} MiB of {} MiB free, reserving {} MiB",
             budget / (1024 * 1024),
@@ -1299,6 +1363,7 @@ impl Engine {
         // first version of this silently did nothing at all.
         let mut ubatch = opts.ubatch;
         let mut n_batch = opts.batch_size;
+        let mut budget = budget;
         let mut window =
             ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
         if opts.ubatch.is_none() && opts.batch_size <= WIDE_BATCH {
@@ -1377,11 +1442,16 @@ impl Engine {
             // prefix they share. See `Commons`.
             .with_n_seq_max(sequences)
             .with_kv_unified(unified)
-            // `n_rs_seq` — llama.cpp's ring of per-token recurrent snapshots,
-            // which makes a hybrid model's cache trimmable and so lets a
-            // rejected draft be undone in place — is deliberately not asked
-            // for. It was built and measured rather than argued about; see
-            // `crate::mtp` for what the measurement said.
+            // `n_rs_seq` — llama.cpp's ring of recurrent states after each of
+            // the last few tokens of a batch — is what lets a hybrid model
+            // undo a rejected draft by trimming. Only asked for when there is
+            // a draft head to reject; it costs a recurrent state per sequence
+            // per entry.
+            .with_n_rs_seq(if drafter.is_some() && !self.rollback_safe {
+                crate::mtp::DRAFT_TOKENS as u32
+            } else {
+                0
+            })
             .with_flash_attention_policy(flash)
             .with_offload_kqv(opts.kv_offload)
             .with_type_k(ggml_type(type_k))
@@ -1445,7 +1515,8 @@ impl Engine {
         // turn failing that way while the log announced 32768 tokens each.
         let opened = context.n_ctx();
         let each = if unified { opened } else { (opened / sequences).max(1) };
-        Ok((context, each, slots))
+
+        Ok((context, each, slots, drafter))
     }
 
     /// What this model's compute scratch will be at `window`, measured on
@@ -1592,7 +1663,7 @@ impl Engine {
         opts: &Resolved,
         want: Slots,
     ) -> Result<(std::sync::Arc<crate::hub::Hub<'_>>, u32), EngineError> {
-        let (context, each, slots) = self.open(opts, want)?;
+        let (context, each, slots, drafter) = self.open(opts, want)?;
         let unified_pool = matches!(want, Slots::UpTo(_)) && sequences_for(slots, want) > 1;
         let commons = matches!(want, Slots::UpTo(_));
         Ok((
@@ -1600,13 +1671,13 @@ impl Engine {
                 crate::hub::Hub::new(
                     context,
                     self.model.n_vocab() as usize,
-                    self.model.n_embd() as usize,
                     slots,
                     unified_pool,
                     commons,
                 )
                 // A count the user set is theirs; unset, it is measured.
-                .with_thread_tuning(opts.threads == 0),
+                .with_thread_tuning(opts.threads == 0)
+                .with_drafter_opt(drafter),
             ),
             each,
         ))
@@ -1618,6 +1689,25 @@ impl Engine {
 }
 
 /// Map our cache type onto llama.cpp's KV cache type.
+/// The vision projector installed beside `model`, and what it weighs.
+///
+/// Zero when the model has none. Read from the directory rather than from a
+/// manifest so every caller — the daemon, the CLI, a test — reserves alike.
+fn projector_beside(model: &Path) -> u64 {
+    let Some(dir) = model.parent() else { return 0 };
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            name.contains("mmproj") && name.ends_with(".gguf")
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Read a numeric GGUF metadata value, if the model declares it.
 fn meta_u32(model: &LlamaModel, key: &str) -> Option<u32> {
     model.meta_val_str(key).ok()?.trim().parse().ok()
@@ -2352,141 +2442,15 @@ impl<'a> Session<'a> {
         unsafe { ozgent_mtmd_sys::llama_cpp_sys_2::llama_model_n_layer_nextn(self.model.as_ptr()) }
     }
 
-    /// Ask the model's own NextN head what comes after the prompt.
-    ///
-    /// The whole feasibility question in one call: turn NextN embeddings on,
-    /// decode the prompt, and see whether a usable row comes back. A drafter
-    /// built on a head that returns nothing would be a great deal of work
-    /// producing zero drafts, so this is answered before any of it is written.
-    ///
-    /// Returns the embedding row's width and the sum of its absolute values —
-    /// a row of zeros links and reads perfectly well while meaning the head
-    /// never ran.
-    pub fn probe_nextn(&mut self, prompt: &str) -> Result<(usize, f32), EngineError> {
-        self.reset();
-
-        let n_embd = self.model.n_embd() as usize;
-        let ptr = self.slot.hub().raw();
-        // Unmasked. llama.cpp's own driver sets the *target* context this way
-        // and reserves `masked` for the draft context: the target has to emit
-        // a hidden state for every prompt position, because those rows are
-        // what the NextN block is then fed. Masked, only the position that
-        // asked for logits produces one, and the probe saw nothing at all.
-        unsafe { crate::nextn::set_enabled(ptr, true, false) };
-        unsafe { crate::nextn::set_head(ptr, 0) };
-
-        let tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
-        self.prefill(&tokens, true)?;
-
-        let row = unsafe { crate::nextn::embedding(ptr, 0, n_embd) };
-        unsafe { crate::nextn::set_enabled(ptr, false, false) };
-        // The cache now holds these tokens and the session has to agree, or
-        // the next generation reasons about a prefix that is not there and
-        // decodes an empty batch: "Decode Error -1: n_tokens == 0".
-        self.cached = tokens;
-
-        match row {
-            Some(v) => Ok((v.len(), v.iter().map(|x| x.abs()).sum())),
-            None => Ok((0, 0.0)),
-        }
-    }
-
-    /// What does the NextN head actually propose?
-    ///
-    /// The second feasibility gate, after [`Session::probe_nextn`] showed the
-    /// head runs at all. A head that runs and proposes nonsense is worse than
-    /// no head: every draft would be rejected and every rejection costs a
-    /// rollback. So this prints what it says before anything is built on it.
-    ///
-    /// Returns the token the *target* would have chosen, and what the head
-    /// proposed to follow it.
-    pub fn probe_mtp_draft(
-        &mut self,
-        prompt: &str,
-        want: usize,
-    ) -> Result<(String, Vec<String>), EngineError> {
-        self.reset();
-
-        let n_embd = self.model.n_embd() as usize;
-        let ptr = self.slot.hub().raw();
-        // Unmasked: the target has to emit a hidden state for the position the
-        // draft will continue from.
-        unsafe { crate::nextn::set_enabled(ptr, true, false) };
-
-        let tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| EngineError::Tokenize(e.to_string()))?;
-        self.prefill(&tokens, true)?;
-
-        // What the target itself would say next, for comparison.
-        let target_next = self.greedy_from_logits()?;
-        // The *last* row, not the first. Unmasked, the target emits a hidden
-        // state for every position in the batch, so row zero belongs to the
-        // first prompt token. Drafting from it produced fluent nonsense —
-        // "Paris-Belstein's 2" after "The capital of France is" — which is
-        // exactly what continuing from the wrong position looks like.
-        let last = tokens.len().saturating_sub(1) as i32;
-        let hidden = unsafe { crate::nextn::embedding(ptr, last, n_embd) }
-            .ok_or_else(|| EngineError::Context("no nextn row after prefill".into()))?;
-
-        let backend = backend()?;
-        let (seq, n_seq_max, unified) =
-            (self.slot.seq(), self.slot.hub().n_seq_max(), self.slot.hub().unified());
-        let mut drafter = self.slot.with_context(|c| {
-            crate::mtp::MtpDrafter::new(self.model, backend, c, self.n_ctx, seq, n_seq_max, unified)
-        })?
-        .ok_or_else(|| EngineError::Context("this model has no nextn head".into()))?;
-
-        let drafted = drafter.propose(target_next, &hidden, self.n_past, want)?;
-        unsafe { crate::nextn::set_enabled(ptr, false, false) };
-        drop(drafter);
-        self.cached = tokens;
-
-        let render = |t: LlamaToken| {
-            self.model.token_text(t)
-        };
-        Ok((render(target_next), drafted.into_iter().map(render).collect()))
-    }
-
-    /// The most likely token from the last decode on this session.
-    ///
-    /// Read at `-1`, which llama.cpp resolves to the last output row. The safe
-    /// wrapper wants the batch index instead, and a prefill requests logits on
-    /// the final prompt token — index 4 of a five-token prompt, not zero —
-    /// so asking it for row zero panics with "logit 0 is not initialized".
-    fn greedy_from_logits(&self) -> Result<LlamaToken, EngineError> {
-        // SAFETY: a decode that requested logits has just completed.
-        let raw = unsafe {
-            ozgent_mtmd_sys::llama_cpp_sys_2::llama_get_logits_ith(self.slot.hub().raw(), -1)
-        };
-        if raw.is_null() {
-            return Err(EngineError::Decode("no logits".into()));
-        }
-        let n_vocab = self.model.n_vocab() as usize;
-        let logits = unsafe { std::slice::from_raw_parts(raw, n_vocab) };
-        let best = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .ok_or_else(|| EngineError::Decode("no logits".into()))?;
-        Ok(LlamaToken(best as i32))
-    }
-
     /// The logits of the last decode on this session, as a row.
     ///
-    /// [`Self::greedy_from_logits`] answers "which token", which is all a
-    /// probe needs. A turn needs the row itself, because the sampler — its
+    /// The row itself rather than a token, because the sampler — its
     /// temperature, its penalties, its grammar — is what turns logits into a
     /// token, and an image prompt deserves the same sampler as a text one.
     ///
-    /// Read at `-1` for the same reason: llama.cpp resolves it to the last
-    /// output row, and a prefill asks for logits on the final prompt token
-    /// rather than on row zero.
+    /// Read at `-1`, which llama.cpp resolves to the last output row. The safe
+    /// wrapper wants the batch index instead, and a prefill requests logits on
+    /// the final prompt token — index 4 of a five-token prompt, not zero.
     fn last_logits_row(&self) -> Result<Vec<f32>, EngineError> {
         // SAFETY: a decode that requested logits has just completed, and the
         // row is copied out before anything else can decode over it.
@@ -2498,17 +2462,6 @@ impl<'a> Session<'a> {
         }
         let n_vocab = self.model.n_vocab() as usize;
         Ok(unsafe { std::slice::from_raw_parts(raw, n_vocab) }.to_vec())
-    }
-
-    /// Turn the NextN head's output on or off for this session.
-    ///
-    /// Drafting from the head needs the target unmasked, which makes it emit a
-    /// hidden state for every position it decodes. That is not free, and the
-    /// drafter has to win back whatever it costs before it is worth wiring in
-    /// — so it is measurable on its own, separately from any drafting.
-    pub fn set_nextn_output(&mut self, on: bool) {
-        // SAFETY: the context is live for the life of the session.
-        unsafe { crate::nextn::set_enabled(self.slot.hub().raw(), on, !on) };
     }
 
     /// Check that a snapshot really can rewind this model mid-generation.
@@ -2793,6 +2746,20 @@ impl<'a> Session<'a> {
         token
     }
 
+    /// Constrain the tool call the model has just begun under `grammar`.
+    ///
+    /// Never fatal: a grammar the model's vocabulary happens to reject should
+    /// cost the constraint, not the whole answer.
+    fn constrain_call(&mut self, grammar: &str) {
+        match self.set_grammar(Some(grammar)) {
+            Ok(()) => {
+                tracing::debug!("tool call started; constraining the body under grammar");
+                self.gate_applied = true;
+            }
+            Err(e) => tracing::warn!("tool grammar rejected; continuing unconstrained: {e}"),
+        }
+    }
+
     /// Decode `tokens` at the current position through the hub, advancing it.
     fn feed(
         &mut self,
@@ -2800,22 +2767,10 @@ impl<'a> Session<'a> {
         pos: i32,
         logits: crate::hub::Logits,
     ) -> Result<crate::hub::Outcome, EngineError> {
-        self.feed_wanting(tokens, pos, logits, false)
-    }
-
-    /// As [`Session::feed`], also bringing back the NextN hidden state of each
-    /// row, which drafting from the model's own head needs.
-    fn feed_wanting(
-        &mut self,
-        tokens: Vec<LlamaToken>,
-        pos: i32,
-        logits: crate::hub::Logits,
-        hidden: bool,
-    ) -> Result<crate::hub::Outcome, EngineError> {
         let n = tokens.len() as i32;
         let out = self
             .slot
-            .run_wanting(tokens, pos, logits, hidden)
+            .run(tokens, pos, logits)
             .map_err(|e| EngineError::Decode(e.to_string()))?;
         self.n_past = pos + n;
         Ok(out)
@@ -3215,15 +3170,24 @@ impl<'a> Session<'a> {
                 if !restored && reuse < self.cached.len() {
                     // Drop everything after the shared prefix; those positions
                     // are about to be occupied by different tokens.
-                    if self.can_trim && !self.slot.trim(reuse as i32).unwrap_or(false) {
-                        // Sliding-window and recurrent caches refuse a partial
-                        // removal. That is a limitation, not an error: drop the
-                        // whole cache and prefill from scratch, and stop relying
-                        // on trimming for the rest of this session.
+                    // Never asked of a hybrid model. Its cache refuses a
+                    // partial removal, except the one the draft ring allows:
+                    // the last token, which llama.cpp then accepts after a
+                    // single-token decode too and restores a state that is
+                    // silently wrong (logits off by up to 8 when measured).
+                    // The ring is only sound straight after the batch whose
+                    // tokens it undoes, which is what drafting uses it for.
+                    let trimmable = self.can_trim && self.rollback_safe;
+                    let trimmed = trimmable && self.slot.trim(reuse as i32).unwrap_or(false);
+                    if trimmable && !trimmed {
+                        // Sliding-window caches refuse a partial removal too.
+                        // That is a limitation, not an error: drop the whole
+                        // cache and prefill from scratch, and stop relying on
+                        // trimming for the rest of this session.
                         tracing::debug!("this cache cannot trim; falling back to a full prefill");
                         self.can_trim = false;
                     }
-                    if !self.can_trim {
+                    if !trimmed {
                         // The trim was refused, so everything resident past the
                         // shared prefix is stuck there and the cache is no use.
                         // A checkpoint is the way back: it was taken before any
@@ -3385,64 +3349,17 @@ impl<'a> Session<'a> {
         // whole sequence state is snapshotted and put back — measured at
         // 0.71 ms on device against a ~17.8 ms token budget, and exact on
         // Qwen3.5, whose cache refuses a partial trim outright.
-        let by_trim = self.rollback_safe && self.can_trim;
-        // The model's own NextN head, when it has one and was asked for.
-        //
-        // Opt-in rather than part of `auto` for now. It drafts where n-grams
-        // cannot — ordinary prose, where they measured exactly zero — and the
-        // hidden states it needs cost nothing (48.4 tok/s against 49.0 with
-        // them on). But it is new, it writes into the cache the target is
-        // using, and the failure mode of getting that wrong is wrong output
-        // rather than an error. It earns `auto` by being measured, not by
-        // being plausible.
-        // Drafting from the model's own head opens a second context over this
-        // one's memory and edits sequence 0 directly, which is only this
-        // session's sequence when this session is the only one.
-        // A drafter belongs to its slot's sequence, so several conversations
-        // may draft at once. What they share is the flag that makes the target
-        // emit hidden states, which belongs to the context — hence a guard
-        // that turns it on for the first and off after the last.
-        let mut nextn_on = None;
-        let mut mtp = if matches!(self.opts.speculative, Speculative::Mtp) && !self.grammar_active {
-            let (seq, n_seq_max, unified) =
-                (self.slot.seq(), self.slot.hub().n_seq_max(), self.slot.hub().unified());
-            match self.slot.with_context(|c| {
-                crate::mtp::MtpDrafter::new(
-                    self.model,
-                    backend()?,
-                    c,
-                    self.n_ctx,
-                    seq,
-                    n_seq_max,
-                    unified,
-                )
-            }) {
-                Ok(Some(d)) => {
-                    // Unmasked, so a hidden state comes back for every position
-                    // the target decodes — including each verified draft.
-                    nextn_on = Some(self.slot.want_nextn());
-                    Some(d)
-                }
-                Ok(None) => {
-                    tracing::info!("this model has no nextn head; drafting from n-grams instead");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!("nextn drafter unavailable: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        // The hidden state of the last confirmed position, which is what the
-        // NextN head continues from. Carried between rounds because the
-        // drafting decision is made at the top of the loop and the state it
-        // needs was produced at the bottom of the previous one.
-        let mut mtp_hidden: Option<Vec<f32>> = None;
+        // The model's own head, when its context has one. It drafts one token
+        // a round from the model's distribution, and a hybrid model's context
+        // was given the recurrent ring that lets a rejection be trimmed. See
+        // `crate::mtp`.
+        let head = self.slot.hub().drafts()
+            && drafter.is_none()
+            && !matches!(self.opts.speculative, Speculative::Off | Speculative::Ngram);
+        let by_trim = (self.rollback_safe || head) && self.can_trim;
         let mut spec_on = !self.grammar_active
             && (drafter.is_some()
-                || mtp.is_some()
+                || head
                 || matches!(self.opts.speculative, Speculative::Ngram | Speculative::Auto));
         // A device-resident snapshot is a list of views into the cache as it
         // stood, and llama.cpp keeps one cached buffer per *context* to hold
@@ -3507,13 +3424,16 @@ impl<'a> Session<'a> {
             self.opts.speculative_tuning.min_acceptance
         };
         // Speculation and grammars cannot coexist (see above), and the gate
-        // exists to install a grammar mid-turn — so it stays inert whenever
-        // drafting is live. Nothing is lost on the models this matters for:
-        // hybrid and recurrent models already have speculation disabled.
+        // exists to install a grammar mid-turn. With n-grams or a draft model
+        // it stays inert whenever drafting is live. The model's own head is
+        // the default wherever it exists, so there the order is reversed: the
+        // gate stays live, and the moment it constrains a call, drafting stops
+        // for the rest of the turn. A call body is a few dozen tokens; the
+        // prose around it is where drafting pays.
         // A caller-set grammar (a forced call, or a retry after a malformed
         // one) already constrains the whole turn; the gate must not swap it
         // out underneath.
-        let mut gate = if spec_on || self.grammar_active {
+        let mut gate = if (spec_on && !head) || self.grammar_active {
             ToolGate::inert()
         } else {
             ToolGate::new(self.tool_grammars.clone())
@@ -3578,17 +3498,9 @@ impl<'a> Session<'a> {
             // The model has just committed to a call, so the body can be
             // constrained from here without forcing the turn to be one.
             if let Some(g) = trigger {
-                // Never fatal: a grammar the model's vocabulary happens to
-                // reject should cost the constraint, not the whole answer.
-                match self.set_grammar(Some(&g)) {
-                    Ok(()) => {
-                        tracing::debug!("tool call started; constraining the body under grammar");
-                        self.gate_applied = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!("tool grammar rejected; continuing unconstrained: {e}")
-                    }
-                }
+                self.constrain_call(&g);
+                // No drafting under a grammar; see `gate` above.
+                spec_on = false;
             }
             if !keep_going {
                 reason = StopReason::Cancelled;
@@ -3633,12 +3545,21 @@ impl<'a> Session<'a> {
             // it quadratic in the length of the turn.
             let spec_started = std::time::Instant::now();
             // Pure overhead when a draft model is doing the proposing.
-            if spec_on && drafter.is_none() {
+            if spec_on && drafter.is_none() && !head {
                 while ngram.len() < self.cached.len() {
                     ngram.push_token(self.cached[ngram.len()].0);
                 }
             }
-            let draft: Vec<LlamaToken> = if spec_on && ngram.worth_drafting(min_acceptance, probe_every) {
+            let draft: Vec<LlamaToken> = if spec_on && head {
+                // Always worth asking: the head lands 70-95% of its guesses,
+                // and breaks even at about a quarter. Nothing when the
+                // window has no room for the guess.
+                if self.n_past + 1 < n_ctx && n_batch > 1 {
+                    self.slot.propose(pending, self.n_past).into_iter().collect()
+                } else {
+                    Vec::new()
+                }
+            } else if spec_on && ngram.worth_drafting(min_acceptance, probe_every) {
                 let room = (n_ctx - self.n_past - 1).max(0) as usize;
                 // The verification batch is the confirmed token plus the
                 // draft, so it must also stay within n_batch.
@@ -3660,30 +3581,7 @@ impl<'a> Session<'a> {
                 let cap = budget
                     .min(room)
                     .min(n_batch.saturating_sub(1));
-                match (mtp.as_mut(), mtp_hidden.as_ref(), drafter.as_mut()) {
-                    // The model's own head. Like a draft model it proposes
-                    // from a distribution rather than from repetition, so it
-                    // needs neither the reach filter nor the probe shortening.
-                    (Some(m), Some(hidden), _) => {
-                        let want = (tuning.draft_tokens as usize)
-                            .min(room)
-                            .min(n_batch.saturating_sub(1));
-                        // Drafted under the hub's lock.
-                        //
-                        // The drafter has a context of its own but shares this
-                        // one's memory — that is what makes it cheap — so its
-                        // decodes write into cells another slot's pass may be
-                        // reading, and nothing else would stop the two
-                        // overlapping. No misbehaviour was traced to it; the
-                        // answer divergence that prompted this turned out to
-                        // be the ordinary float-reduction difference of a
-                        // shared batch, identical with drafting switched off.
-                        // The lock stays because two threads inside one
-                        // cache is a race whether or not it has bitten yet.
-                        let pos = self.n_past;
-                        self.slot.with_context(|_| m.propose(pending, hidden, pos, want))?
-                    }
-                    _ => match drafter.as_mut() {
+                match drafter.as_mut() {
                     // A draft model proposes from the whole distribution rather
                     // than from repetition, so it needs neither the reach
                     // filter nor the probe shortening — both exist to stop
@@ -3701,7 +3599,6 @@ impl<'a> Session<'a> {
                         .into_iter()
                         .map(LlamaToken)
                         .collect(),
-                    },
                 }
             } else {
                 Vec::new()
@@ -3721,9 +3618,7 @@ impl<'a> Session<'a> {
             run.push(pending);
             run.extend_from_slice(&draft);
             // Every position asks for logits, so each draft can be verified.
-            let outcome = self.feed_wanting(run, start, crate::hub::Logits::All, mtp.is_some())?;
-            let hidden_rows = outcome.hidden;
-            let verified = outcome.rows;
+            let verified = self.feed(run, start, crate::hub::Logits::All)?.rows;
             debug_assert_eq!(verified.len(), 1 + draft.len());
 
             // Verify. Row i predicts the token after batch entry i, so a
@@ -3742,7 +3637,9 @@ impl<'a> Session<'a> {
                 if produced >= limit {
                     break;
                 }
-                if !emit(chosen, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?.0 {
+                let (keep_going, trigger) =
+                    emit(chosen, self.model, &mut decoder, &mut gate, &mut think, &mut on_token)?;
+                if !keep_going {
                     reason = StopReason::Cancelled;
                     accepted = i + 1;
                     self.cached.push(chosen);
@@ -3754,7 +3651,18 @@ impl<'a> Session<'a> {
                 stats.drafted_tokens += 1;
                 self.cached.push(chosen);
                 accepted = i + 1;
+                // A call has just begun inside the draft. The grammar goes in
+                // before the next row is sampled, so that token is chosen
+                // under it; later drafts were guessed without it and go.
+                let constrained = trigger.is_some();
+                if let Some(g) = trigger {
+                    self.constrain_call(&g);
+                    spec_on = false;
+                }
                 chosen = self.pick(&verified[i + 1]);
+                if constrained {
+                    break;
+                }
             }
 
             if !draft.is_empty() {
@@ -3763,34 +3671,9 @@ impl<'a> Session<'a> {
                 stats.proposed_drafts += draft.len();
             }
 
-            // The hidden state the next draft continues from, taken before
-            // `settle_draft` disturbs anything. Batch entry 0 is the confirmed
-            // token and 1..=accepted are the drafts that were kept, so the last
-            // confirmed position is exactly `accepted` — and `chosen`, about to
-            // become `pending`, is the token that follows it. Reading any other
-            // row drafts a continuation of the wrong position, which reads as
-            // fluent nonsense rather than as an error.
-            if mtp.is_some() {
-                // Taken from this slot's own rows of the pass. Read off the
-                // context directly it would be whichever row of the shared
-                // batch happened to sit at that index — another conversation's
-                // hidden state, and a draft continuing from a place this one
-                // has never been.
-                mtp_hidden = hidden_rows
-                    .get(accepted)
-                    .filter(|row| !row.is_empty())
-                    .cloned();
-            }
-
             self.settle_draft(snapshot.as_ref(), start, pending, &draft, accepted)?;
             pending = chosen;
         }
-        if mtp.is_some() {
-            // Left on, the next turn's prefill would emit a hidden state per
-            // prompt token for nobody.
-            drop(nextn_on.take());
-        }
-
         if think.spent() > 0 {
             tracing::debug!("reasoning ran {} tokens (budget {think_budget})", think.spent());
         }

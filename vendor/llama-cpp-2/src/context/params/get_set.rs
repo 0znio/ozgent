@@ -145,6 +145,17 @@ impl LlamaContextParams {
         self.context_params.n_rs_seq
     }
 
+    /// Cap the rows of output one micro-batch may request (0 = `n_batch`).
+    ///
+    /// llama.cpp sizes the compute scratch for the worst case, every row of a
+    /// micro-batch producing logits. A context that only ever asks for a few
+    /// rows — a draft head — wastes hundreds of megabytes without this.
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n: u32) -> Self {
+        self.context_params.n_outputs_max = n;
+        self
+    }
+
     /// Set the llama.cpp context type.
     #[must_use]
     pub fn with_context_type(mut self, context_type: LlamaContextType) -> Self {

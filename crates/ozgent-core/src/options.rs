@@ -417,7 +417,12 @@ impl Options {
             // 32k: enough for a long conversation with tool results in it. The
             // engine lowers it to what the model was trained on and to what
             // fits in memory, and says so, so a generous default costs nothing.
-            context_length: self.context_length.unwrap_or(32_768),
+            // Long enough for real work — a document, several tool results,
+            // an agent handing back a transcript — rather than long enough to
+            // be safe. What actually opens is still bounded by the card: the
+            // planner reserves for a window of this size only while it costs
+            // little, and the context is fitted to what the weights leave.
+            context_length: self.context_length.unwrap_or(65_536),
             batch_size: self.batch_size.unwrap_or(512),
             ubatch: self.ubatch,
             // 0 lets llama.cpp pick based on the physical core count.

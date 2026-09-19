@@ -50,10 +50,6 @@ pub struct Work {
     pub pos: i32,
     /// Which rows of logits the caller needs back.
     pub logits: Logits,
-    /// Whether the caller also needs the NextN hidden state of each row it
-    /// asked logits for. Drafting from the model's own head needs them, and
-    /// they can only be read out of the pass that produced them.
-    pub hidden: bool,
 }
 
 /// Which logits a request wants.
@@ -72,8 +68,6 @@ pub enum Logits {
 pub struct Outcome {
     /// One row per token whose logits were asked for, in token order.
     pub rows: Vec<Vec<f32>>,
-    /// The NextN hidden state of each of those rows, when asked for.
-    pub hidden: Vec<Vec<f32>>,
 }
 
 impl Outcome {
@@ -188,7 +182,6 @@ pub struct Hub<'a> {
     woke: Condvar,
     n_batch: usize,
     n_vocab: usize,
-    n_embd: usize,
     slots: u32,
     unified: bool,
     /// Whether a sequence past the conversations holds a shared prefix.
@@ -197,10 +190,12 @@ pub struct Hub<'a> {
     /// allocations can be measured against it.
     free_at_open: Option<u64>,
     decode_measured: std::sync::atomic::AtomicBool,
-    /// How many slots currently want NextN hidden states. The flag that
-    /// produces them belongs to the context, not to a sequence, so it is on
-    /// while anybody wants it and off when the last one is done.
-    nextn: Mutex<usize>,
+    /// The model's own draft head, when it has one and speculation is on.
+    /// Locked after the context whenever both are held. See [`crate::mtp`].
+    drafter: Option<Mutex<crate::mtp::Drafter<'a>>>,
+    /// Draft requests waiting to share a draft decode. See [`Hub::propose`].
+    drafts: Mutex<DraftQueue>,
+    drafts_woke: Condvar,
     commons: Mutex<Commons>,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
@@ -223,7 +218,6 @@ impl<'a> Hub<'a> {
     pub fn new(
         context: LlamaContext<'a>,
         n_vocab: usize,
-        n_embd: usize,
         slots: u32,
         unified: bool,
         has_commons: bool,
@@ -235,13 +229,14 @@ impl<'a> Hub<'a> {
             woke: Condvar::new(),
             n_batch,
             n_vocab,
-            n_embd,
             slots: slots.max(1),
             unified,
             has_commons,
             free_at_open: crate::backend::best_gpu().map(|d| d.memory_free as u64),
             decode_measured: std::sync::atomic::AtomicBool::new(false),
-            nextn: Mutex::new(0),
+            drafter: None,
+            drafts: Mutex::new(DraftQueue::default()),
+            drafts_woke: Condvar::new(),
             commons: Mutex::new(Commons::default()),
             fixed_window: None,
             threads: Mutex::new(None),
@@ -265,6 +260,99 @@ impl<'a> Hub<'a> {
             *self.threads.lock().unwrap() = Some(state);
         }
         self
+    }
+
+    /// Draft with the model's own head. The context is told to emit its
+    /// hidden state at every position from now on, which is what the head is
+    /// fed.
+    pub fn with_drafter(mut self, drafter: crate::mtp::Drafter<'a>) -> Self {
+        let ctx = self.context.get_mut().unwrap();
+        // SAFETY: the context is live and nothing else can be using it yet.
+        unsafe { crate::nextn::set_enabled(ctx.as_ptr(), true, false) };
+        self.drafter = Some(Mutex::new(drafter));
+        self
+    }
+
+    /// [`Hub::with_drafter`], when there is one.
+    pub fn with_drafter_opt(self, drafter: Option<crate::mtp::Drafter<'a>>) -> Self {
+        match drafter {
+            Some(d) => self.with_drafter(d),
+            None => self,
+        }
+    }
+
+    /// Whether drafts come from the model's own head.
+    pub fn drafts(&self) -> bool {
+        self.drafter.is_some()
+    }
+
+    /// The head's guess at the token after `token`, which `seq` is about to
+    /// decode at `pos`.
+    ///
+    /// Gathered like a pass. Conversations sharing a context come out of the
+    /// same pass together and each asks for its draft a moment later, and one
+    /// draft decode for all of them costs what one costs alone: the output
+    /// head is read once either way. Asked one at a time, two conversations
+    /// drafting were 2-5% slower than two not drafting; see `crate::mtp`.
+    pub fn propose(&self, seq: i32, token: LlamaToken, pos: i32) -> Option<LlamaToken> {
+        let drafter = self.drafter.as_ref()?;
+        let id = {
+            let mut q = self.drafts.lock().unwrap();
+            let id = q.next_id;
+            q.next_id += 1;
+            q.waiting.push((id, (seq, token, pos)));
+            self.drafts_woke.notify_all();
+            id
+        };
+        let mut q = self.drafts.lock().unwrap();
+        loop {
+            if let Some(done) = q.ready.remove(&id) {
+                return done;
+            }
+            if !q.driving {
+                break;
+            }
+            q = self.drafts_woke.wait(q).unwrap();
+        }
+        q.driving = true;
+        // Hold the step open for the other conversations still generating,
+        // but only for a sliver of a pass: they arrive within a sampling step
+        // of each other or not this round at all.
+        let running = self.queue.lock().unwrap().running.max(1);
+        let window = {
+            let pass = self.queue.lock().unwrap().pass_secs;
+            Duration::from_secs_f64(pass * DRAFT_WINDOW_SHARE).clamp(MIN_WINDOW, MAX_DRAFT_WINDOW)
+        };
+        let deadline = Instant::now() + window;
+        while q.waiting.len() < running {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            q = self.drafts_woke.wait_timeout(q, deadline - now).unwrap().0;
+        }
+        let taken: Vec<(u64, (i32, LlamaToken, i32))> = std::mem::take(&mut q.waiting);
+        drop(q);
+        let requests: Vec<(i32, LlamaToken, i32)> = taken.iter().map(|(_, r)| *r).collect();
+        let answers = drafter.lock().unwrap().propose(&requests);
+        let mut q = self.drafts.lock().unwrap();
+        let mut mine = None;
+        for ((rid, _), answer) in taken.into_iter().zip(answers) {
+            if rid == id {
+                mine = answer;
+            } else {
+                q.ready.insert(rid, answer);
+            }
+        }
+        q.driving = false;
+        self.drafts_woke.notify_all();
+        mine
+    }
+
+    fn forget_drafts(&self, seq: i32, from: i32) {
+        if let Some(d) = &self.drafter {
+            d.lock().unwrap().forget(seq, from);
+        }
     }
 
     /// Pin the gather window instead of deriving it. Only for measuring what
@@ -313,20 +401,6 @@ impl<'a> Hub<'a> {
 
     pub fn unified(&self) -> bool {
         self.unified
-    }
-
-    /// Ask the context to emit NextN hidden states while the returned guard
-    /// lives. Counted, because the flag is the context's and several slots may
-    /// be drafting at once.
-    pub fn want_nextn(self: &Arc<Self>) -> NextnOn<'a> {
-        let mut n = self.nextn.lock().unwrap();
-        if *n == 0 {
-            // Unmasked: a hidden state for every position decoded, which is
-            // what the verification batch needs.
-            self.with_context(|c| unsafe { crate::nextn::set_enabled(c.as_ptr(), true, false) });
-        }
-        *n += 1;
-        NextnOn { hub: Arc::clone(self) }
     }
 
     /// The sequence that holds the shared prefix, which is the one past the
@@ -415,13 +489,14 @@ impl<'a> Hub<'a> {
         self.with_context(|c| {
             let _ = c.clear_kv_cache_seq(Some(seq as u32), None, None);
         });
+        self.forget_drafts(seq, 0);
         let mut pos = 0i32;
         for chunk in tokens.chunks(self.n_batch) {
             let last = pos as usize + chunk.len() == tokens.len();
             // The final row is asked for so the pass always has an output;
             // nothing reads it.
             let want = if last { Logits::Last } else { Logits::None };
-            let work = Work { seq, tokens: chunk.to_vec(), pos, logits: want, hidden: false };
+            let work = Work { seq, tokens: chunk.to_vec(), pos, logits: want };
             if let Err(e) = self.run(work) {
                 self.filled(Vec::new());
                 return Err(e);
@@ -445,6 +520,11 @@ impl<'a> Hub<'a> {
             ctx.kv_cache_seq_cp(from, seq, None, None)
                 .map_err(|e| HubError::Decode(e.to_string()))
         })?;
+        // The head's cache of the prefix goes with it, or the conversation
+        // drafts against whatever that sequence held before.
+        if let Some(d) = &self.drafter {
+            d.lock().unwrap().copy(from, seq);
+        }
         Ok(n)
     }
 
@@ -671,7 +751,6 @@ impl<'a> Hub<'a> {
         for p in batch {
             let last = p.work.tokens.len().saturating_sub(1);
             let mut mine = Vec::new();
-            let _ = &p.work.hidden;
             for (i, token) in p.work.tokens.iter().enumerate() {
                 let wants = match p.work.logits {
                     Logits::None => false,
@@ -732,6 +811,26 @@ impl<'a> Hub<'a> {
         if let Err(e) = decoded {
             return batch.iter().map(|_| Err(e.to_string())).collect();
         }
+        // The head reads what the model just read, before anything else can
+        // decode over the hidden states it needs.
+        if let Some(d) = &self.drafter {
+            let mut first = 0i32;
+            let runs: Vec<crate::mtp::Absorbed<'_>> = batch
+                .iter()
+                .map(|p| {
+                    let run = crate::mtp::Absorbed {
+                        seq: p.work.seq,
+                        pos: p.work.pos,
+                        tokens: &p.work.tokens,
+                        first,
+                    };
+                    first += p.work.tokens.len() as i32;
+                    run
+                })
+                .collect();
+            // SAFETY: the context is held, and its last decode is this one.
+            unsafe { d.lock().unwrap().absorb(ctx.as_ptr(), &runs) };
+        }
 
         // Copied out rather than borrowed: the caller samples on its own
         // thread, long after this pass has been overwritten by the next one.
@@ -743,8 +842,7 @@ impl<'a> Hub<'a> {
         // there. Anything timing `decode` alone is timing submission.
         let out = rows
             .iter()
-            .zip(batch)
-            .map(|(mine, p)| {
+            .map(|mine| {
                 let rows = mine
                     .iter()
                     .map(|&row| {
@@ -752,23 +850,7 @@ impl<'a> Hub<'a> {
                         slice[..self.n_vocab.min(slice.len())].to_vec()
                     })
                     .collect();
-                // Read here, in the pass that produced them: the hidden states
-                // belong to this decode and the next one overwrites them.
-                // One entry per logits row, in the same order, even where
-                // the head produced nothing: the caller indexes these by the
-                // position it accepted, and dropping a row would shift every
-                // later one onto somebody else's hidden state.
-                let hidden = if p.work.hidden {
-                    mine.iter()
-                        .map(|&row| unsafe {
-                            crate::nextn::embedding(ctx.as_ptr(), row, self.n_embd)
-                                .unwrap_or_default()
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                Ok(Outcome { rows, hidden })
+                Ok(Outcome { rows })
             })
             .collect();
         if decoding {
@@ -800,6 +882,7 @@ impl<'a> Hub<'a> {
                 continue;
             }
             if ctx.clear_kv_cache_seq(Some(seq as u32), None, None).is_ok() {
+                self.forget_drafts(seq, 0);
                 self.evictions[seq as usize].fetch_add(1, Ordering::AcqRel);
                 cleared.push(seq);
             }
@@ -859,22 +942,6 @@ impl ThreadState {
     }
 }
 
-/// Keeps NextN hidden states coming while it lives.
-pub struct NextnOn<'a> {
-    hub: Arc<Hub<'a>>,
-}
-
-impl Drop for NextnOn<'_> {
-    fn drop(&mut self) {
-        let mut n = self.hub.nextn.lock().unwrap();
-        *n = n.saturating_sub(1);
-        if *n == 0 {
-            self.hub
-                .with_context(|c| unsafe { crate::nextn::set_enabled(c.as_ptr(), false, false) });
-        }
-    }
-}
-
 /// The shortest prefix worth holding in a sequence of its own.
 ///
 /// Below this the copy costs more bookkeeping than the prefill it saves.
@@ -918,6 +985,21 @@ fn take_batch(waiting: &mut Vec<Pending>, n_batch: usize) -> Vec<Pending> {
     }
     taken
 }
+
+/// Draft requests from conversations sharing one draft decode.
+#[derive(Default)]
+struct DraftQueue {
+    waiting: Vec<(u64, (i32, LlamaToken, i32))>,
+    ready: HashMap<u64, Option<LlamaToken>>,
+    driving: bool,
+    next_id: u64,
+}
+
+/// What fraction of a pass a draft step waits for the other conversations.
+/// They come out of one pass together and need only sample and detokenise
+/// before asking, so this is far less than the pass's own window.
+const DRAFT_WINDOW_SHARE: f64 = 0.05;
+const MAX_DRAFT_WINDOW: Duration = Duration::from_millis(2);
 
 /// What fraction of a pass the driver will spend waiting for the field.
 ///
@@ -986,21 +1068,9 @@ impl<'a> Slot<'a> {
         pos: i32,
         logits: Logits,
     ) -> Result<Outcome, HubError> {
-        self.run_wanting(tokens, pos, logits, false)
-    }
-
-    /// As [`Slot::run`], also bringing back the NextN hidden state of every
-    /// row whose logits were asked for.
-    pub fn run_wanting(
-        &mut self,
-        tokens: Vec<LlamaToken>,
-        pos: i32,
-        logits: Logits,
-        hidden: bool,
-    ) -> Result<Outcome, HubError> {
         self.resume();
         let started = Instant::now();
-        let out = self.hub.run(Work { seq: self.seq, tokens, pos, logits, hidden });
+        let out = self.hub.run(Work { seq: self.seq, tokens, pos, logits });
         RUN_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
     }
@@ -1032,19 +1102,18 @@ impl<'a> Slot<'a> {
         self.hub.solo()
     }
 
-    /// Ask for NextN hidden states while the guard lives.
-    pub fn want_nextn(&self) -> NextnOn<'a> {
-        self.hub.want_nextn()
-    }
-
     /// Drop positions `from..` from this slot's sequence. False means this
     /// cache cannot drop a partial range, which sliding-window and recurrent
     /// caches cannot.
     pub fn trim(&self, from: i32) -> Result<bool, String> {
-        self.with_context(|c| {
+        let trimmed = self.with_context(|c| {
             c.clear_kv_cache_seq(Some(self.seq as u32), Some(from as u32), None)
                 .map_err(|e| e.to_string())
-        })
+        });
+        if matches!(trimmed, Ok(true)) {
+            self.hub.forget_drafts(self.seq, from);
+        }
+        trimmed
     }
 
     /// Forget everything cached for this slot, leaving the others alone.
@@ -1052,6 +1121,14 @@ impl<'a> Slot<'a> {
         self.hub.with_context(|c| {
             let _ = c.clear_kv_cache_seq(Some(self.seq as u32), None, None);
         });
+        self.hub.forget_drafts(self.seq, 0);
+    }
+
+    /// The head's guess at the token after `token`, about to be decoded at
+    /// `pos`. `None` when this context has no head or it had nothing to go
+    /// on.
+    pub fn propose(&self, token: LlamaToken, pos: i32) -> Option<LlamaToken> {
+        self.hub.propose(self.seq, token, pos)
     }
 }
 
@@ -1073,7 +1150,6 @@ mod tests {
                 tokens: vec![LlamaToken(1); tokens],
                 pos: 0,
                 logits: Logits::Last,
-                hidden: false,
             },
         }
     }

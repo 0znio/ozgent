@@ -647,6 +647,41 @@ pub fn moe_pattern(whole: u32, tensors: u32) -> Option<String> {
 /// GPU entirely.
 pub(crate) const PLANNING_WINDOW: u32 = 8192;
 
+/// The window worth planning for when the weights can spare it, and the
+/// smallest worth stepping down to before giving up on the idea. See
+/// [`Plan::for_model_with`].
+pub(crate) const CONTEXT_TARGET: u32 = 65_536;
+pub(crate) const CONTEXT_FLOOR: u32 = 49_152;
+
+/// The planning window in force, overridable while the floor is measured.
+pub(crate) fn planning_window() -> u32 {
+    std::env::var("OZGENT_PLAN_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PLANNING_WINDOW)
+}
+
+/// The largest window worth planning for, given what each one would leave of
+/// the weights on the card.
+///
+/// `on_card` says how many bytes of weights a plan reserving for that window
+/// keeps; `baseline` is what the 8,192-token floor keeps. Context is only
+/// worth buying while it is nearly free, so a candidate has to keep nine
+/// tenths of the baseline to be taken. See [`Plan::for_model_with`].
+fn affordable_window(asked: u32, on_card: impl Fn(u32) -> u64, baseline: u64) -> u32 {
+    let keep = baseline / 10 * 9;
+    let mut wanted: Vec<u32> = [asked.min(CONTEXT_TARGET), CONTEXT_FLOOR, 32_768, 16_384]
+        .into_iter()
+        .filter(|w| *w > planning_window() && *w <= asked)
+        .collect();
+    wanted.sort_unstable_by(|a, b| b.cmp(a));
+    wanted.dedup();
+    wanted
+        .into_iter()
+        .find(|candidate| on_card(*candidate) >= keep)
+        .unwrap_or_else(planning_window)
+}
+
 impl Plan {
     /// Everything on the GPU, for when there is nothing to weigh up.
     fn wide_open(total_layers: u32, free_bytes: u64) -> Self {
@@ -695,7 +730,6 @@ impl Plan {
         // So the floor is a window worth having rather than the window asked
         // for. Place the weights, then let the context take what is left:
         // layers on the GPU are worth far more than a window nothing will use.
-        let window = opts.context_length.min(PLANNING_WINDOW);
 
         // Which cache type is decided later, and `auto` picks the smallest
         // that fits when memory is tight, down to q4_0. Assuming f16 is not
@@ -722,8 +756,19 @@ impl Plan {
             Some(n) => n,
             None => opts.batch_size.max(crate::engine::WIDE_BATCH),
         };
-        let shape =
-            reserve_shape(planned_batch, layout.n_embd, window, planned_batch.max(opts.batch_size), 0);
+        let overhead_at = |window: u32| {
+            let shape = reserve_shape(
+                planned_batch,
+                layout.n_embd,
+                window,
+                planned_batch.max(opts.batch_size),
+                0,
+            );
+            ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
+                + reserve_for(shape)
+                + decode_reserve()
+                + layout.fixed_gpu_bytes
+        };
         // `decode_reserve` is the memory llama.cpp turns out to want on its
         // first decode — lazily created cuBLAS workspaces and pool growth —
         // and it is charged at context-open time whatever happens here. Left
@@ -732,10 +777,6 @@ impl Plan {
         // 23B MoE with four conversations: the plan left 15 MiB of an 8 GB
         // card free, the 32k window asked for collapsed to 578 tokens, and a
         // turn carrying tool schemas no longer fitted in its own context.
-        let overhead = ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
-            + reserve_for(shape)
-            + decode_reserve()
-            + layout.fixed_gpu_bytes;
         let place = |overhead: u64| {
             resolve_auto(
                 opts.gpu_layers,
@@ -748,7 +789,44 @@ impl Plan {
                 overhead,
             )
         };
-        let (mut layers, mut experts, mut expert_tensors) = place(overhead);
+        // How much of the model a placement leaves on the card, which is what
+        // a longer window is spent out of.
+        let on_card = |layers: u32, experts: u32, tensors: u32| -> u64 {
+            let base = layers.min(layout.layers) as u64 * layout.bytes_per_layer;
+            let evicted = experts.min(layers) as u64 * layout.expert_bytes_per_layer
+                + layout.expert_prefix_bytes(tensors);
+            base.saturating_sub(evicted)
+        };
+
+        // A window worth having, bought with weights when it is cheap.
+        //
+        // Reserving only the floor leaves the window to whatever the weights
+        // happen to leave behind, which on a model near or above the size of
+        // the card is far too little: complex work — tool results, several
+        // agents, a long document — needs tens of thousands of tokens, and a
+        // session that cannot hold them fails at the task however fast it
+        // decodes. So the larger windows are tried first and the first one
+        // that costs less than a tenth of the weights on the card is taken.
+        //
+        // A tenth is the line because context is only worth buying while it
+        // is nearly free. Measured on Qwen3.6-35B-A3B, whose cache is on one
+        // layer in four: reserving for 65,536 tokens moved one expert block
+        // of 41 to the host — 2% of the weights, 1% of the speed — and the
+        // window went from what was left over to the whole 64k. A dense model
+        // whose cache costs gigabytes fails the same test and keeps its
+        // weights.
+        let baseline = place(overhead_at(planning_window()));
+        let floor = affordable_window(opts.context_length, |candidate| {
+            let placed = place(overhead_at(candidate));
+            on_card(placed.0, placed.1, placed.2)
+        }, on_card(baseline.0, baseline.1, baseline.2));
+        let (mut layers, mut experts, mut expert_tensors) = if floor > planning_window() {
+            tracing::debug!("planning for a window of {floor} tokens");
+            place(overhead_at(floor))
+        } else {
+            baseline
+        };
+        let overhead = overhead_at(floor);
         // Evicting any experts brings a cost the first pass could not see:
         // prefill uploads one block's experts to the GPU at a time, into a
         // buffer llama.cpp sizes for the heaviest block. Measured at 331 MiB
@@ -784,6 +862,49 @@ impl Plan {
 #[cfg(test)]
 mod plan_tests {
     use super::*;
+
+    /// Weights left on the card by a plan reserving for `window`, for a model
+    /// whose cache costs `per_token` bytes and whose weights are `weights`.
+    fn spends(weights: u64, per_token: u64, card: u64) -> impl Fn(u32) -> u64 {
+        move |window| {
+            let cache = per_token * window as u64;
+            weights.min(card.saturating_sub(cache))
+        }
+    }
+
+    #[test]
+    fn a_cheap_cache_buys_the_whole_window() {
+        // A hybrid 35B: one layer in four caches, ~12 KB a token, and the
+        // weights have room to spare. 64k costs almost nothing, so it wins.
+        let on_card = spends(6 << 30, 12 * 1024, 8 << 30);
+        let baseline = on_card(PLANNING_WINDOW);
+        assert_eq!(affordable_window(65_536, &on_card, baseline), 65_536);
+    }
+
+    #[test]
+    fn an_expensive_cache_keeps_its_weights() {
+        // A dense model on a full card: every token of window pushes weights
+        // off, so no candidate keeps nine tenths and the floor stands.
+        let on_card = spends(7 << 30, 200 * 1024, 8 << 30);
+        let baseline = on_card(PLANNING_WINDOW);
+        assert_eq!(affordable_window(65_536, &on_card, baseline), PLANNING_WINDOW);
+    }
+
+    #[test]
+    fn it_steps_down_to_what_is_affordable() {
+        // Affordable at 32k, not at 48k or 64k.
+        let on_card = spends(6 << 30, 60 * 1024, 8 << 30);
+        let baseline = on_card(PLANNING_WINDOW);
+        assert_eq!(affordable_window(65_536, &on_card, baseline), 32_768);
+    }
+
+    #[test]
+    fn nobody_plans_for_more_than_was_asked_for() {
+        let on_card = spends(1 << 30, 1024, 8 << 30);
+        let baseline = on_card(PLANNING_WINDOW);
+        assert_eq!(affordable_window(16_384, &on_card, baseline), 16_384);
+        assert_eq!(affordable_window(4096, &on_card, baseline), PLANNING_WINDOW);
+    }
 
     fn plan(layers: u32, total: u32) -> Plan {
         Plan { layers, experts: 0, expert_tensors: 0, total_layers: total, free_bytes: 0 }
