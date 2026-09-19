@@ -736,6 +736,26 @@ async fn model_options(
     }))
 }
 
+/// `body` without the settings that say exactly what would be inherited.
+///
+/// Compared as JSON rather than field by field, so a setting added later is
+/// covered without anybody remembering to add it here. A field the inherited
+/// layer says nothing about is kept: it is an override over ozgent's own
+/// default, which is the one thing a person may well want held still.
+fn without_inherited(
+    body: ozgent_core::Options,
+    inherited: &ozgent_core::Options,
+) -> Result<ozgent_core::Options, serde_json::Error> {
+    let mut mine = serde_json::to_value(&body)?;
+    let theirs = serde_json::to_value(inherited)?;
+    if let (Some(mine_map), Some(theirs_map)) = (mine.as_object_mut(), theirs.as_object()) {
+        mine_map.retain(|key, value| {
+            !matches!(theirs_map.get(key), Some(other) if other == value && !value.is_null())
+        });
+    }
+    serde_json::from_value(mine)
+}
+
 /// A settings object as a person would read it: no null entries, and every
 /// number the shortest decimal that means the same `f32` — the type every
 /// fractional setting is stored as.
@@ -794,6 +814,14 @@ async fn set_model_options(
     let key = found.model.to_string();
 
     let mut config = state.config.lock().unwrap();
+    // A setting that merely repeats what it would inherit is not an override,
+    // and storing it as one pins the value for good: the slider a person
+    // nudged and put back would go on holding that model to a number long
+    // after the default it came from had moved. This is how a 4B ended up
+    // pinned to a 107,008-token window written by an earlier load, which then
+    // outlived every improvement to how the window is chosen.
+    let inherited = config.defaults.clone().merge(&found.manifest.defaults);
+    let body = without_inherited(body, &inherited)?;
     // An empty override layer is removed rather than stored, so the file does
     // not accumulate sections that say nothing. Unset fields serialise as
     // null, so "empty" means nothing but nulls.
@@ -1335,5 +1363,36 @@ mod decimal_tests {
     fn a_settings_object_drops_nulls_and_float_noise() {
         let v = serde_json::json!({ "temperature": 0.20000000298023224f64, "seed": null, "top_k": 20 });
         assert_eq!(super::tidy(v), serde_json::json!({ "temperature": 0.2, "top_k": 20 }));
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use ozgent_core::Options;
+
+    #[test]
+    fn a_setting_that_repeats_the_default_is_not_an_override() {
+        // What pinned a 4B to a 107,008-token window: the value was written
+        // as an override, and from then on every improvement to how the
+        // window is chosen passed that model by.
+        let inherited = Options { context_length: Some(65_536), ..Default::default() };
+        let asked = Options {
+            context_length: Some(65_536),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let kept = super::without_inherited(asked, &inherited).unwrap();
+        assert_eq!(kept.context_length, None, "the window follows the default again");
+        assert_eq!(kept.temperature, Some(0.2), "a real change is still an override");
+    }
+
+    #[test]
+    fn a_setting_the_defaults_say_nothing_about_is_kept() {
+        let kept = super::without_inherited(
+            Options { context_length: Some(8192), ..Default::default() },
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(kept.context_length, Some(8192));
     }
 }
