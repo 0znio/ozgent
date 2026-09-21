@@ -72,7 +72,7 @@ impl Telegram {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Transport(e.without_url().to_string()))?;
+            .map_err(|e| ApiError::Transport(cause(e)))?;
 
         let status = response.status();
         let payload: serde_json::Value = response
@@ -101,6 +101,10 @@ impl Telegram {
     /// Who the token belongs to. The first thing done, so a bad token is a
     /// clear message at startup instead of a poll loop that never yields.
     pub async fn identify(&self) -> anyhow::Result<String> {
+        Ok(self.whoami().await?)
+    }
+
+    async fn whoami(&self) -> Result<String, ApiError> {
         let me = self.call("getMe", serde_json::json!({})).await?;
         let name = me
             .get("username")
@@ -202,6 +206,22 @@ impl ApiError {
         matches!(self, Self::Api { description, .. } if description.contains("message is not modified"))
     }
 
+    /// Whether Telegram said the token is not a bot it knows. The only answer
+    /// to `getMe` that waiting will not fix.
+    fn is_refused_token(&self) -> bool {
+        matches!(self, Self::Api { status: 401 | 404, .. })
+    }
+
+    /// Whether the same request may well succeed if it is simply made again:
+    /// no route, no name resolution, a dropped connection, Telegram itself
+    /// struggling, or being asked to slow down.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Api { status, .. } => *status == 429 || *status >= 500,
+        }
+    }
+
     fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Api { retry_after: Some(s), .. } => Some(Duration::from_secs(*s)),
@@ -232,22 +252,57 @@ pub async fn run(
     rx: UnboundedReceiver<Command>,
 ) -> anyhow::Result<()> {
     let api = std::sync::Arc::new(Telegram::new(token));
-    let who = api.identify().await.map_err(|e| {
-        anyhow::anyhow!(
-            "{e}\n\nTelegram refused the bot token. Get a new one from @BotFather and set it \
-             with `ozgent gateway telegram token`, or on /admin."
-        )
-    })?;
-    let _ = tx.send(Inbound::Ready { who }).await;
+    let who = connect(&api, &tx).await?;
+    let _ = tx.send(Inbound::Ready { who: who.clone() }).await;
 
     let sender = tokio::spawn(send_loop(api.clone(), rx, tx.clone()));
-    let result = poll_loop(api, tx).await;
+    let result = poll_loop(api, tx, who).await;
     sender.abort();
     result
 }
 
+/// Ask Telegram who this bot is, for as long as the network is the problem.
+///
+/// Only a token Telegram does not recognise ends this. Everything else —
+/// above all a boot where ozgent starts before the network does, which failed
+/// the channel three milliseconds in every morning and reported it as a bad
+/// token — is waited out, with the reason on show while it is. Messages sent
+/// meanwhile queue and go out once it connects.
+async fn connect(api: &Telegram, tx: &Sender<Inbound>) -> anyhow::Result<String> {
+    let mut wait = Duration::from_secs(1);
+    let mut said = false;
+    loop {
+        match api.whoami().await {
+            Ok(who) => return Ok(who),
+            Err(e) if e.is_refused_token() => {
+                return Err(anyhow::anyhow!(
+                    "{e}\n\nTelegram refused the bot token. Get a new one from @BotFather and \
+                     set it with `ozgent gateway telegram token`, or on /admin."
+                ));
+            }
+            Err(e) if e.is_transient() => {
+                if !said {
+                    let _ = tx
+                        .send(Inbound::Notice {
+                            text: format!("waiting for the network to reach Telegram ({e})"),
+                        })
+                        .await;
+                    said = true;
+                }
+                tracing::debug!("telegram: not reachable yet, trying again in {}s: {e}", wait.as_secs());
+                tokio::time::sleep(e.retry_after().unwrap_or(wait)).await;
+                wait = (wait * 2).min(Duration::from_secs(30));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Ask for updates forever, and turn each into an [`Inbound`].
-async fn poll_loop(api: std::sync::Arc<Telegram>, tx: Sender<Inbound>) -> anyhow::Result<()> {
+async fn poll_loop(api: std::sync::Arc<Telegram>, tx: Sender<Inbound>, who: String) -> anyhow::Result<()> {
+    // Whether the connection is known to be down, so the admin page can say so
+    // once, and say "connected" again once, rather than at every retry.
+    let mut down = false;
     // `None` asks for whatever is queued; afterwards, one past the last update
     // seen, which is also what acknowledges it so it is not delivered again.
     let mut offset: Option<i64> = None;
@@ -267,6 +322,10 @@ async fn poll_loop(api: std::sync::Arc<Telegram>, tx: Sender<Inbound>) -> anyhow
         let updates = match api.call("getUpdates", body).await {
             Ok(v) => {
                 backoff = Duration::from_secs(1);
+                if down {
+                    down = false;
+                    let _ = tx.send(Inbound::Ready { who: who.clone() }).await;
+                }
                 v
             }
             Err(e) => {
@@ -284,6 +343,12 @@ async fn poll_loop(api: std::sync::Arc<Telegram>, tx: Sender<Inbound>) -> anyhow
                     return Ok(());
                 }
                 tracing::warn!("telegram: {e}");
+                if !down && e.is_transient() {
+                    down = true;
+                    let _ = tx
+                        .send(Inbound::Notice { text: format!("lost the connection to Telegram; retrying ({e})") })
+                        .await;
+                }
                 tokio::time::sleep(e.retry_after().unwrap_or(backoff)).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 continue;
@@ -480,7 +545,7 @@ async fn send_loop(
                 let last = chunks.len().saturating_sub(1);
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     let chunk = render(&chunk, Flavour::TelegramHtml);
-                    match post(&api, &chat, &chunk, None).await {
+                    match post_patiently(&api, &chat, &chunk).await {
                         Ok(id) if i == last => {
                             sent.message.insert(token, id);
                             sent.text.insert(token, chunk);
@@ -660,6 +725,59 @@ async fn edit(
     }
 }
 
+/// A transport failure, said with its cause.
+///
+/// reqwest's own message is "error sending request" whatever happened, and a
+/// log full of that line says nothing about whether the name did not resolve,
+/// the route was down or the connection was reset. The cause is further down
+/// the chain. The URL is dropped first: it carries the bot token.
+fn cause(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut out = e.to_string();
+    let mut next = std::error::Error::source(&e);
+    while let Some(inner) = next {
+        let text = inner.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        next = inner.source();
+    }
+    out
+}
+
+/// How long a new message is kept trying through a network that has gone
+/// away before it is given up on. Long enough to cover a laptop waking, a
+/// router restarting or a boot racing the network; short enough that an
+/// answer does not arrive an hour after the question.
+const DELIVER_FOR: Duration = Duration::from_secs(15 * 60);
+
+/// Post a new message, and keep posting it while the network is the problem.
+///
+/// A reply or a scheduled brief that meets a dropped connection used to be
+/// logged and thrown away, while whoever asked for it had already been told it
+/// was sent. The retry can duplicate a message whose request reached Telegram
+/// and whose answer did not come back; an occasional duplicate is the right
+/// side of that trade.
+async fn post_patiently(
+    api: &Telegram,
+    chat: &str,
+    text: &str,
+) -> Result<i64, ApiError> {
+    let started = std::time::Instant::now();
+    let mut wait = Duration::from_secs(2);
+    loop {
+        match post(api, chat, text, None).await {
+            Err(e) if e.is_transient() && started.elapsed() < DELIVER_FOR => {
+                tracing::warn!("telegram: sending, will retry in {}s: {e}", wait.as_secs());
+                tokio::time::sleep(e.retry_after().unwrap_or(wait)).await;
+                wait = (wait * 2).min(Duration::from_secs(60));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Call a method, waiting once if Telegram asks us to slow down.
 ///
 /// Once, not repeatedly: a second 429 means the sending rate is wrong rather
@@ -700,6 +818,29 @@ fn strip(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_telegram_refusing_the_token_is_final() {
+        // Every morning's failure: the network was not up yet, and that was
+        // reported as a bad token and never retried.
+        let offline = ApiError::Transport("error sending request: dns error".into());
+        assert!(offline.is_transient() && !offline.is_refused_token());
+        let refused = ApiError::Api { status: 401, description: "Unauthorized".into(), retry_after: None };
+        assert!(refused.is_refused_token() && !refused.is_transient());
+        let unknown = ApiError::Api { status: 404, description: "Not Found".into(), retry_after: None };
+        assert!(unknown.is_refused_token());
+    }
+
+    #[test]
+    fn telegram_struggling_or_asking_us_to_slow_down_is_waited_out() {
+        for status in [429, 500, 502, 503] {
+            let e = ApiError::Api { status, description: String::new(), retry_after: None };
+            assert!(e.is_transient(), "{status}");
+            assert!(!e.is_refused_token(), "{status}");
+        }
+        let bad = ApiError::Api { status: 400, description: "chat not found".into(), retry_after: None };
+        assert!(!bad.is_transient(), "a request Telegram rejected will be rejected again");
+    }
     use super::*;
 
     #[test]

@@ -808,7 +808,7 @@ mod tests {
         ozgent_memory::ChannelChat {
             channel: "telegram".into(),
             chat_id: id.into(),
-            conversation_id: 1,
+            conversation_id: Some(1),
             display: display.into(),
             identities: identities.iter().map(|s| s.to_string()).collect(),
             last_seen_at: 0,

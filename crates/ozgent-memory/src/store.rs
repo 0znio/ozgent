@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub struct Store {
     db: Connection,
@@ -39,7 +39,9 @@ pub struct ChannelChat {
     /// The provider's own identifier for the chat, as text: Telegram's is a
     /// 64-bit integer and WhatsApp's is a JID, so neither type fits both.
     pub chat_id: String,
-    pub conversation_id: i64,
+    /// The conversation it continues; `None` after `/new`, until the next
+    /// message starts one.
+    pub conversation_id: Option<i64>,
     /// A human label — the sender's name or number — so `ozgent gateway status`
     /// shows who a chat belongs to rather than an opaque id.
     pub display: String,
@@ -236,6 +238,9 @@ impl Store {
         }
         if current < 10 {
             self.db.execute_batch(SCHEMA_V10)?;
+        }
+        if current < 11 {
+            self.db.execute_batch(SCHEMA_V11)?;
         }
 
         self.db
@@ -448,6 +453,15 @@ impl Store {
                  last_seen_at    = excluded.last_seen_at",
             params![channel, chat_id, conversation_id, display, identities, now()],
         )?;
+        self.db.execute(
+            "INSERT INTO channel_contacts (channel, chat_id, display, identities, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (channel, chat_id) DO UPDATE SET
+                 display      = excluded.display,
+                 identities   = excluded.identities,
+                 last_seen_at = excluded.last_seen_at",
+            params![channel, chat_id, display, identities, now()],
+        )?;
         Ok(())
     }
 
@@ -463,11 +477,18 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Every chat bound on a channel, most recently active first.
+    /// Every chat a channel has ever been reached from, most recently active
+    /// first, with the conversation it continues when it has one.
+    ///
+    /// Starting over does not remove a chat from this list: see
+    /// `SCHEMA_V11` for what went wrong when it did.
     pub fn channel_chats(&self, channel: &str) -> Result<Vec<ChannelChat>, StoreError> {
         let mut stmt = self.db.prepare(
-            "SELECT chat_id, conversation_id, display, identities, last_seen_at
-               FROM channel_chats WHERE channel = ?1 ORDER BY last_seen_at DESC",
+            "SELECT k.chat_id, c.conversation_id, k.display, k.identities, k.last_seen_at
+               FROM channel_contacts k
+               LEFT JOIN channel_chats c ON c.channel = k.channel AND c.chat_id = k.chat_id
+              WHERE k.channel = ?1
+              ORDER BY k.last_seen_at DESC",
         )?;
         let rows = stmt
             .query_map(params![channel], |r| {
@@ -1126,6 +1147,30 @@ const SCHEMA_V10: &str = "
 ALTER TABLE messages ADD COLUMN stats TEXT;
 ";
 
+/// The v11 step: who a channel can reach, apart from which conversation they
+/// are in.
+///
+/// `channel_chats` was both, and each half was deleted for the other's sake.
+/// `/new` removed the row so the next message would start a fresh
+/// conversation, and deleting a conversation in the web interface cascaded to
+/// it — and either one also erased the only record that the person existed, so
+/// their scheduled messages failed with "nobody has messaged ozgent yet" from
+/// someone who had. A contact is never removed by starting over; whether they
+/// are still sent anything is the allow list's business, checked at the moment
+/// of sending.
+const SCHEMA_V11: &str = "
+CREATE TABLE channel_contacts (
+    channel      TEXT    NOT NULL,
+    chat_id      TEXT    NOT NULL,
+    display      TEXT    NOT NULL DEFAULT '',
+    identities   TEXT,
+    last_seen_at INTEGER NOT NULL,
+    PRIMARY KEY (channel, chat_id)
+);
+INSERT OR IGNORE INTO channel_contacts (channel, chat_id, display, identities, last_seen_at)
+    SELECT channel, chat_id, display, identities, last_seen_at FROM channel_chats;
+";
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -1360,7 +1405,26 @@ mod channel_tests {
         s.bind_channel_chat("telegram", "1", c, "", &[]).unwrap();
         s.delete_conversation(c).unwrap();
         assert_eq!(s.channel_conversation("telegram", "1").unwrap(), None);
-        assert!(s.channel_chats("telegram").unwrap().is_empty());
+        // The conversation went; the person did not. Their next scheduled
+        // message still has somewhere to go.
+        let chats = s.channel_chats("telegram").unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].conversation_id, None);
+    }
+
+    #[test]
+    fn starting_over_does_not_forget_the_person() {
+        // `/new` from Telegram used to delete the only record that this person
+        // had ever messaged ozgent, and their morning brief then failed with
+        // "nobody has messaged ozgent on telegram yet".
+        let s = store();
+        let c = s.create_conversation("old thread", None).unwrap();
+        s.bind_channel_chat("telegram", "42", c, "Ada", &["@ada", "42"]).unwrap();
+        assert!(s.unbind_channel_chat("telegram", "42").unwrap());
+        assert_eq!(s.channel_conversation("telegram", "42").unwrap(), None, "a fresh thread next");
+        let chats = s.channel_chats("telegram").unwrap();
+        assert_eq!(chats.len(), 1, "still reachable");
+        assert_eq!(chats[0].identities, vec!["@ada", "42"]);
     }
 
     #[test]
