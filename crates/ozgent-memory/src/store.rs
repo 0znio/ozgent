@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 /// Bumped whenever the schema changes; [`Store::migrate`] steps up to it.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 pub struct Store {
     db: Connection,
@@ -241,6 +241,9 @@ impl Store {
         }
         if current < 11 {
             self.db.execute_batch(SCHEMA_V11)?;
+        }
+        if current < 12 {
+            self.db.execute_batch(SCHEMA_V12)?;
         }
 
         self.db
@@ -1169,6 +1172,17 @@ CREATE TABLE channel_contacts (
 );
 INSERT OR IGNORE INTO channel_contacts (channel, chat_id, display, identities, last_seen_at)
     SELECT channel, chat_id, display, identities, last_seen_at FROM channel_chats;
+";
+
+/// The v12 step: "run it now", as a request of its own.
+///
+/// It used to be written as the job's next fire time, which the runner only
+/// looks at for jobs that are switched on — so Run now on a paused job was
+/// answered "starting" and then did nothing at all, and on a running one it
+/// overwrote the schedule's own time. A request is taken whether or not the
+/// job is on, and leaves its schedule alone.
+const SCHEMA_V12: &str = "
+ALTER TABLE jobs ADD COLUMN run_requested_at INTEGER;
 ";
 
 #[derive(Debug, thiserror::Error)]

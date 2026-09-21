@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
         Some(Command::Daemon { command: None, host, port, options }) => {
             daemon::run(paths, config, &host, port, options.to_options()?).await
         }
-        Some(Command::Scheduler { command }) => scheduler::run(&paths, &config, command),
+        Some(Command::Scheduler { command }) => scheduler::run(&paths, &config, command).await,
         Some(Command::Admin { command }) => setup::admin(&paths, config, command),
         Some(Command::Agent { command }) => agent(&paths, command),
         Some(Command::Mcp) => mcp(&config).await,

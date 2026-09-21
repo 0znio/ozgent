@@ -358,11 +358,12 @@ async fn run_now(
         .job_by_name(&name)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| problem(Problem::NoSuchJob(name.clone())))?;
-    // Made due rather than run here: the scheduler runs jobs one at a time,
+    // Asked for rather than run here: the scheduler runs jobs one at a time,
     // and starting a second one from an HTTP handler would be the one path
-    // that ignores that.
+    // that ignores that. A request of its own, not a fire time — a paused job
+    // runs once and stays paused, and a live one keeps its schedule.
     store
-        .set_next_run(job.id, Some(unix_now()))
+        .request_run(job.id, unix_now())
         .map_err(|e| ApiError::internal(e.to_string()))?;
     // Written, then said out loud. The loop is asleep on a figure worked out
     // before that write, and without this the button did nothing visible
@@ -371,6 +372,7 @@ async fn run_now(
     Ok(Json(serde_json::json!({
         "queued": job.name,
         "hosted": crate::scheduler::hosted(),
+        "paused": !job.enabled,
     })))
 }
 

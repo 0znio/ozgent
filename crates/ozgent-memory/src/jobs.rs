@@ -308,9 +308,12 @@ impl Store {
 
     /// Jobs that are enabled and due at or before `now`, soonest first.
     pub fn due_jobs(&self, now: i64) -> Result<Vec<Job>, StoreError> {
+        // Asked-for runs first — somebody is looking at the page waiting for
+        // one — then whatever the schedule says is due.
         let mut stmt = self.raw().prepare(&format!(
-            "{SELECT} WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1
-             ORDER BY next_run_at ASC"
+            "{SELECT} WHERE run_requested_at IS NOT NULL
+                OR (enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1)
+             ORDER BY run_requested_at IS NULL, next_run_at ASC"
         ))?;
         let rows = stmt.query_map(params![now], read_job)?;
         rows.collect::<Result<_, _>>().map_err(Into::into)
@@ -407,6 +410,37 @@ impl Store {
     ///
     /// Used when the recurrence is re-evaluated — the rule changed, the
     /// process started, a fire was missed — none of which is a run.
+    /// Ask for a job to run as soon as the scheduler can, on or off, without
+    /// touching when it would next run by itself.
+    pub fn request_run(&self, id: i64, at: i64) -> Result<(), StoreError> {
+        self.raw().execute(
+            "UPDATE jobs SET run_requested_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Take a job's run request, if it has one. Taken as the run starts, so a
+    /// second press while it is running asks for another run rather than
+    /// being swallowed by this one.
+    pub fn take_run_request(&self, id: i64) -> Result<bool, StoreError> {
+        let n = self.raw().execute(
+            "UPDATE jobs SET run_requested_at = NULL WHERE id = ?1 AND run_requested_at IS NOT NULL",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether a job has a run asked for and not yet started.
+    pub fn run_requested(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .raw()
+            .query_row("SELECT run_requested_at IS NOT NULL FROM jobs WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(false))
+    }
+
     pub fn set_next_run(&self, id: i64, next: Option<i64>) -> Result<(), StoreError> {
         self.raw().execute(
             "UPDATE jobs SET next_run_at = ?2 WHERE id = ?1",
@@ -558,6 +592,37 @@ mod tests {
         let mut j = NewJob::new(name, "a pre-market brief", "cron 20 9 * * 1,2,3,4,5");
         j.next_run_at = Some(1_000);
         j
+    }
+
+    #[test]
+    fn a_paused_job_asked_to_run_runs_and_stays_paused() {
+        // Run now on a paused job was answered "starting" and then ignored,
+        // because the request was written as a fire time and only switched-on
+        // jobs have their fire times looked at.
+        let s = store();
+        let id = s.create_job(&job("paused")).unwrap();
+        s.update_job(id, &JobEdit { enabled: Some(false), next_run_at: Some(None), ..Default::default() })
+            .unwrap();
+        assert!(s.due_jobs(5_000).unwrap().is_empty(), "paused and not asked for");
+
+        s.request_run(id, 5_000).unwrap();
+        let due = s.due_jobs(5_000).unwrap();
+        assert_eq!(due.len(), 1, "asked for, so it runs");
+        assert!(s.take_run_request(id).unwrap());
+        assert!(!s.take_run_request(id).unwrap(), "taken once");
+        let after = s.get_job(id).unwrap().unwrap();
+        assert!(!after.enabled, "still paused");
+        assert_eq!(after.next_run_at, None, "its schedule was not touched");
+    }
+
+    #[test]
+    fn asking_for_a_run_leaves_the_schedule_alone() {
+        let s = store();
+        let id = s.create_job(&job("on")).unwrap();
+        s.request_run(id, 500).unwrap();
+        assert_eq!(s.get_job(id).unwrap().unwrap().next_run_at, Some(1_000));
+        assert_eq!(s.due_jobs(500).unwrap().len(), 1, "due by request before its time");
+        assert!(s.run_requested(id).unwrap());
     }
 
     #[test]

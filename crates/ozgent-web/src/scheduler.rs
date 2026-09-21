@@ -242,11 +242,14 @@ async fn tick(state: &State) {
         // deleted from a chat while an earlier one in this batch is running,
         // and a brief that arrives after you switched it off is the kind of
         // thing that makes people stop trusting a scheduler.
-        let fresh = {
+        let (fresh, asked) = {
             let store = state.store.lock().unwrap();
-            store.get_job(job.id).ok().flatten()
+            (store.get_job(job.id).ok().flatten(), store.run_requested(job.id).unwrap_or(false))
         };
-        let Some(job) = fresh.filter(|j| j.enabled && j.next_run_at.is_some_and(|at| at <= now))
+        // Somebody pressing Run now wants it run, on or off; the schedule's own
+        // fires only happen to jobs that are on.
+        let Some(job) =
+            fresh.filter(|j| asked || (j.enabled && j.next_run_at.is_some_and(|at| at <= now)))
         else {
             continue;
         };
@@ -288,6 +291,9 @@ pub async fn run(state: &State, job: &Job) {
     let started = unix_now();
     let run_id = {
         let store = state.store.lock().unwrap();
+        // Taken as the run starts, in the same breath as recording it: a
+        // second press while this one runs asks for another run.
+        let _ = store.take_run_request(job.id);
         match store.start_run(job.id, started) {
             Ok(id) => id,
             Err(e) => {

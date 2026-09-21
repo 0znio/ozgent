@@ -19,7 +19,7 @@ use ozgent_schedule::{Change, Deliver, Draft, in_words, summarise, unix_now};
 use crate::cli::SchedulerCommand;
 use crate::setup::{ask, choose, confirm};
 
-pub fn run(paths: &Paths, config: &Config, command: Option<SchedulerCommand>) -> Result<()> {
+pub async fn run(paths: &Paths, config: &Config, command: Option<SchedulerCommand>) -> Result<()> {
     let store = Store::open(paths.root().join("ozgent.db"))
         .context("opening ozgent's database")?;
 
@@ -34,7 +34,7 @@ pub fn run(paths: &Paths, config: &Config, command: Option<SchedulerCommand>) ->
         }
         SchedulerCommand::Pause { job } => enable(&store, &job, false),
         SchedulerCommand::Resume { job } => enable(&store, &job, true),
-        SchedulerCommand::Run { job } => run_now(paths, &store, &job),
+        SchedulerCommand::Run { job } => run_now(paths, &store, &job).await,
         SchedulerCommand::Rm { job, force } => remove(&store, &job, force),
         SchedulerCommand::When { when, timezone } => when_does_it_run(&when.join(" "), timezone),
     }
@@ -366,20 +366,47 @@ fn enable(store: &Store, name: &str, on: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_now(paths: &Paths, store: &Store, name: &str) -> Result<()> {
+async fn run_now(paths: &Paths, store: &Store, name: &str) -> Result<()> {
     let job = find(store, name)?;
-    store.set_next_run(job.id, Some(unix_now()))?;
+    let stays = if job.enabled { "" } else { " It stays paused afterwards." };
+
+    // Through the daemon when it is the one running jobs. Written straight to
+    // the database, a request waits for the scheduler's next look — up to a
+    // minute, which from a terminal reads as a command that did nothing. Asked
+    // over its own API, it starts at once.
     if running(paths) {
-        println!("✓ {} will run within a minute", job.name);
+        if let Some(backend) = crate::backend::Backend::connect().await {
+            let path = format!("/api/scheduler/{}/run", path_segment(&job.name));
+            if backend.post(&path, serde_json::json!({})).await.is_ok() {
+                println!("✓ {} is starting.{stays}", job.name);
+                println!("  ozgent scheduler show {}   to see how it went", job.name);
+                return Ok(());
+            }
+        }
+    }
+
+    store.request_run(job.id, unix_now())?;
+    if running(paths) {
+        println!("✓ {} will start within a minute.{stays}", job.name);
         println!("  ozgent scheduler show {}   to see how it went", job.name);
     } else {
-        // Marked due either way, so it runs the moment something starts. Said
+        // Asked for either way, so it runs the moment something starts. Said
         // plainly, because "queued" with nothing to run it is a lie.
-        println!("✓ {} is due, but nothing is running jobs", job.name);
+        println!("✓ {} is asked for, but nothing is running jobs", job.name);
         println!();
         println!("    ozgent daemon install");
     }
     Ok(())
+}
+
+/// A job name as one segment of a URL path.
+fn path_segment(name: &str) -> String {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 fn remove(store: &Store, name: &str, force: bool) -> Result<()> {

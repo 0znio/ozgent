@@ -286,7 +286,8 @@ async function runNow(name) {
     // indefinitely.
     banner(
       hosted
-        ? `${name} is starting. Its answer goes where the job says.`
+        ? `${name} is starting. Its answer goes where the job says.` +
+            (out.paused ? " It stays paused afterwards." : "")
         : `${name} is due, but nothing is running jobs yet.`,
       hosted ? "" : "bad"
     );
