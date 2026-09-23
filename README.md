@@ -386,8 +386,8 @@ All of it is on the admin page under **Security**:
 The model's own actions are fenced as well. A command it runs goes into a
 **sandbox** — no network unless you allow it, nothing written outside the
 folder you chose, ozgent's own files and your SSH, cloud and browser
-credentials out of reach, other processes invisible, and everything it
-started gone when it times out. A page it fetches can't send it to this
+credentials out of reach, other processes hidden where the system allows
+it, and everything it started gone when it times out. A page it fetches can't send it to this
 machine, your router or a cloud metadata address. Settings that would change
 which program runs are set on the admin page or in the file, never through
 the chat page's API.

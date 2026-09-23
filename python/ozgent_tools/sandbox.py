@@ -27,6 +27,15 @@ What the program gets, in the order it is applied:
 4. **Environment**: only an allowlist of variables survive. Nothing named like
    a key, token or password, no agent sockets, no display, no session bus.
 
+Where unprivileged user namespaces are unavailable (Ubuntu 24.04 restricts
+them through AppArmor by default, and so do many containers), step 1 cannot
+happen. The program then still cannot read another process's environment or
+memory, because Landlock refuses ptrace-level access outside its domain, but
+it can see that other processes exist. Without the network namespace,
+Landlock only covers TCP, so a **seccomp filter** takes over the network: no
+socket but a Unix one can be created (UDP and DNS included), and io_uring,
+which could open sockets around that check, is refused.
+
 Standalone on purpose (standard library only, no package imports): it runs with
 ``-S -E`` so nothing in the environment can put other code in front of it.
 """
@@ -89,6 +98,19 @@ SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0  # ABI 6
 SCOPE_SIGNAL = 1 << 1
 
 RULE_PATH_BENEATH = 1
+
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+SECCOMP_RET_ALLOW = 0x7FFF0000
+SECCOMP_RET_ERRNO = 0x00050000
+EACCES = 13
+AF_UNIX = 1
+
+# (audit arch, socket, io_uring_setup) for the architectures we filter on.
+_SECCOMP_ARCH = {
+    "x86_64": (0xC000003E, 41, 425),
+    "aarch64": (0xC00000B7, 198, 425),
+}
 
 #: Rights that only make sense on a file, as opposed to a directory.
 FILE_RIGHTS = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE | FS_IOCTL_DEV
@@ -239,6 +261,60 @@ def apply_landlock(policy: dict, abi: int) -> None:
         os.close(ruleset)
 
 
+class _SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8), ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(_SockFilter))]
+
+
+def no_network_filter(machine: str) -> list[tuple[int, int, int, int]] | None:
+    """A seccomp program refusing every socket but a Unix one, or None when
+    this architecture is not one we know the syscall numbers for.
+
+    Refuses, with EACCES: `socket()` for any family but AF_UNIX, and
+    `io_uring_setup`, whose ring can create sockets without calling
+    `socket()`. Syscalls from another ABI (32-bit `int 0x80`, x32) are
+    refused outright: their numbers differ, and `socketcall` would pass a
+    check written for this one.
+    """
+    known = _SECCOMP_ARCH.get(machine)
+    if not known:
+        return None
+    arch, sys_socket, sys_io_uring_setup = known
+    ld, jeq, jge, ret = 0x20, 0x15, 0x35, 0x06
+    deny = SECCOMP_RET_ERRNO | EACCES
+    return [
+        (ld, 0, 0, 4),                     # 0: A = arch
+        (jeq, 1, 0, arch),                 # 1: our ABI? to 3
+        (ret, 0, 0, deny),                 # 2
+        (ld, 0, 0, 0),                     # 3: A = syscall number
+        (jge, 0, 1, 0x40000000),           # 4: x32? to 5, else 6
+        (ret, 0, 0, deny),                 # 5
+        (jeq, 0, 1, sys_io_uring_setup),   # 6: to 7, else 8
+        (ret, 0, 0, deny),                 # 7
+        (jeq, 0, 3, sys_socket),           # 8: socket()? to 9, else 12
+        (ld, 0, 0, 16),                    # 9: A = low word of args[0], the family
+        (jeq, 1, 0, AF_UNIX),              # 10: Unix? to 12
+        (ret, 0, 0, deny),                 # 11
+        (ret, 0, 0, SECCOMP_RET_ALLOW),    # 12
+    ]
+
+
+def apply_no_network(machine: str) -> bool:
+    """Install `no_network_filter`. False when it could not be."""
+    program = no_network_filter(machine)
+    if program is None:
+        return False
+    filters = (_SockFilter * len(program))(*[_SockFilter(*i) for i in program])
+    prog = _SockFprog(len(program), filters)
+    _prctl(PR_SET_NO_NEW_PRIVS, 1)
+    if _libc.prctl(PR_SET_SECCOMP, ctypes.c_ulong(SECCOMP_MODE_FILTER), ctypes.byref(prog), 0, 0) != 0:
+        return False
+    return True
+
+
 def _write(path: str, text: str) -> None:
     with open(path, "w") as f:
         f.write(text)
@@ -259,10 +335,28 @@ def enter_namespaces(network: bool) -> bool:
     return True
 
 
-def remount_proc() -> None:
-    """A /proc that shows only this PID namespace. Needs the mount namespace."""
-    _libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_PRIVATE), None)
-    _libc.mount(b"proc", b"/proc", b"proc", ctypes.c_ulong(MS_NOSUID | MS_NODEV | MS_NOEXEC), None)
+def remount_proc() -> bool:
+    """A /proc that shows only this PID namespace. Needs the mount namespace.
+
+    False when it could not be mounted, as where a user namespace is granted
+    but no capabilities come with it; the old /proc then still lists every
+    process, though Landlock keeps their environment and memory unreadable.
+    """
+    if _libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_PRIVATE), None) != 0:
+        return False
+    return _libc.mount(b"proc", b"/proc", b"proc", ctypes.c_ulong(MS_NOSUID | MS_NODEV | MS_NOEXEC), None) == 0
+
+
+def private_proc_available() -> bool:
+    """Whether a command here would get a /proc of its own: namespaces, and a
+    mount inside them. Forks, so call it from a fresh process."""
+    if not enter_namespaces(False):
+        return False
+    child = os.fork()
+    if child == 0:
+        os._exit(0 if remount_proc() else 1)
+    _, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status) == 0
 
 
 def limits(policy: dict) -> None:
@@ -289,7 +383,10 @@ def main() -> int:
         print("ozgent sandbox: this kernel has no Landlock, so the command was not run", file=sys.stderr)
         return 126
 
-    pid_ns = enter_namespaces(bool(policy.get("network")))
+    network = bool(policy.get("network"))
+    # `namespaces: false` is how the tests take the path a kernel without
+    # user namespaces takes; nothing in the tools sets it.
+    pid_ns = enter_namespaces(network) if policy.get("namespaces", True) else False
     if pid_ns:
         # The next child is PID 1 of the new namespace; when it ends, the
         # kernel ends everything it started.
@@ -304,15 +401,17 @@ def main() -> int:
             _prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
         except OSError:
             pass
-        try:
-            remount_proc()
-        except OSError:
-            pass
+        remount_proc()
 
     try:
         limits(policy)
         if abi > 0:
             apply_landlock(policy, abi)
+        if not pid_ns and not network and not apply_no_network(os.uname().machine):
+            if policy.get("require", True):
+                print("ozgent sandbox: this machine can neither isolate the network nor filter it, "
+                      "so the command was not run", file=sys.stderr)
+                return 126
         os.chdir(policy.get("cwd", "/"))
         os.execvpe(argv[0], argv, env)
     except FileNotFoundError:

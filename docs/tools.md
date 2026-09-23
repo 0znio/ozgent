@@ -255,6 +255,15 @@ program:
 - dies with the tool worker, and on a timeout its whole process group is
   killed, so nothing it started carries on.
 
+Some systems don't allow the namespaces: stock Ubuntu 24.04 restricts
+unprivileged user namespaces through AppArmor, and so do many containers.
+There a command runs without them, and two things change. It can see that
+your other processes exist, though Landlock still keeps their environment and
+memory unreadable. And on kernels before 6.12 (Landlock ABI 6) it can signal
+them. The network stays shut either way: a seccomp filter refuses every
+socket but a Unix one, UDP and DNS included, and io_uring with it. A machine
+that can do neither refuses the command.
+
 If the kernel has no Landlock, the command is refused rather than run bare;
 `sandbox = false` in the file is the only way to change that. Landlock's
 network and signal rules need a newer kernel than its file rules, so the

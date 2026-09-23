@@ -97,6 +97,12 @@ async def run_command(
             "this machine cannot sandbox commands (its kernel has no Landlock), so none are run. "
             "An operator who accepts the risk can set [tools.config.permissions] sandbox = false."
         )
+    if proc.returncode == 126 and "ozgent sandbox: this machine can neither isolate the network" in stderr:
+        raise ToolError(
+            "this machine can neither give a command its own network namespace nor filter its "
+            "sockets, so none are run without network access. Allow commands the network "
+            "(shell_network = true), or, accepting the risk, set sandbox = false."
+        )
     return {
         "command": " ".join(argv),
         "exit_code": proc.returncode,

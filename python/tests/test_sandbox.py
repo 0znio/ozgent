@@ -8,7 +8,9 @@ into by text it read.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,9 +21,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ozgent_tools import base, http, sandbox
 from ozgent_tools.builtin import run_command as _registers  # noqa: F401  (registers the tool)
 from ozgent_tools.base import ToolError
-from ozgent_tools.permissions import SECTION, approving, private_allowed, resolve_within
+from ozgent_tools.permissions import SECTION, approving, command_sandbox, private_allowed, resolve_within
 
 HAS_LANDLOCK = sandbox.landlock_abi() > 0
+EXE = sys.executable.rsplit("/", 1)[-1]
+
+
+def _private_proc() -> bool:
+    """Whether a command here gets a /proc of its own. Not on Ubuntu 24.04 by
+    default, which restricts unprivileged user namespaces, nor on most CI."""
+    probe = (
+        f"import sys; sys.path.insert(0, {str(Path(sandbox.__file__).parents[1])!r}); "
+        "from ozgent_tools import sandbox; sys.exit(0 if sandbox.private_proc_available() else 1)"
+    )
+    return subprocess.run([sys.executable, "-c", probe], capture_output=True).returncode == 0
+
+
+HAS_PRIVATE_PROC = _private_proc()
 
 
 def call(name, **kwargs):
@@ -164,10 +180,91 @@ class CommandSandboxTest(unittest.TestCase):
         self.assertNotIn("must-not-leak", out["stdout"])
         self.assertIn("TMPDIR=", out["stdout"])
 
+    @unittest.skipUnless(HAS_PRIVATE_PROC, "commands cannot get a /proc of their own here")
     def test_other_processes_are_invisible(self):
         out = self.run_("ls /proc")
         pids = [p for p in out["stdout"].split() if p.isdigit()]
         self.assertLessEqual(len(pids), 3, pids)
+
+    def test_another_process_is_unreadable(self):
+        # This test's own process holds the secret; its pid is only reachable
+        # when there is no PID namespace, and then Landlock must refuse it.
+        out = self.run_(f"{EXE} -c \"print(open('/proc/{os.getpid()}/environ').read())\"")
+        self.assertNotIn("must-not-leak", out["stdout"])
+
+
+@unittest.skipUnless(HAS_LANDLOCK, "this kernel has no Landlock")
+class WithoutNamespacesTest(unittest.TestCase):
+    """The launcher as it runs where user namespaces are not allowed.
+
+    Taken on any machine by `namespaces: false` in the policy, so the path a
+    stock Ubuntu takes is tested everywhere, not only where it happens.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.dir.name).resolve() / "project"
+        self.root.mkdir()
+        self.tmp = Path(self.dir.name).resolve() / "tmp"
+        self.tmp.mkdir()
+        base.SHARED_CONFIG[SECTION] = {"root": str(self.root), "shell": True}
+        os.environ["OZGENT_TEST_API_KEY"] = "must-not-leak"
+
+    def tearDown(self):
+        base.SHARED_CONFIG.pop(SECTION, None)
+        os.environ.pop("OZGENT_TEST_API_KEY", None)
+        self.dir.cleanup()
+
+    def launch(self, script, **policy):
+        p = command_sandbox(sys.executable, self.root, str(self.tmp))
+        p["namespaces"] = False
+        p.update(policy)
+        return subprocess.run(
+            [sys.executable, "-S", "-E", sandbox.__file__, json.dumps(p), "--", sys.executable, "-c", script],
+            cwd=self.root, env=p["env"], capture_output=True, text=True, timeout=30,
+        )
+
+    def test_no_tcp(self):
+        out = self.launch("import socket; socket.create_connection(('1.1.1.1', 443), timeout=3); print('CONNECTED')")
+        self.assertNotIn("CONNECTED", out.stdout)
+        self.assertNotEqual(out.returncode, 0)
+
+    def test_no_udp(self):
+        # What Landlock alone lets through: a datagram, e.g. a DNS query
+        # carrying data out.
+        out = self.launch("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'x', ('1.1.1.1', 53)); print('SENT')")
+        self.assertNotIn("SENT", out.stdout)
+        self.assertIn("PermissionError", out.stderr)
+
+    def test_no_ipv6_and_no_io_uring(self):
+        out = self.launch("import socket; socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); print('OPENED')")
+        self.assertNotIn("OPENED", out.stdout)
+        # io_uring_setup(entries=1, params=NULL) fails with EACCES from the
+        # filter, EFAULT from a kernel that got as far as reading params.
+        out = self.launch(
+            "import ctypes, os; libc = ctypes.CDLL(None, use_errno=True); "
+            "r = libc.syscall(425, 1, None); print('errno', ctypes.get_errno())"
+        )
+        self.assertIn("errno 13", out.stdout)
+
+    def test_unix_sockets_still_work(self):
+        out = self.launch("import socket; a, b = socket.socketpair(); socket.socket(socket.AF_UNIX); print('OK')")
+        self.assertIn("OK", out.stdout)
+
+    def test_the_network_is_open_when_allowed(self):
+        out = self.launch("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print('OPENED')", network=True)
+        self.assertIn("OPENED", out.stdout)
+
+    def test_another_process_is_unreadable(self):
+        out = self.launch(f"print(open('/proc/{os.getpid()}/environ').read())")
+        self.assertNotIn("must-not-leak", out.stdout)
+        self.assertNotEqual(out.returncode, 0)
+
+    def test_nothing_outside_the_project_is_writable(self):
+        target = Path(self.dir.name).resolve() / "escaped.txt"
+        out = self.launch(f"open({str(target)!r}, 'w').write('x')")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":
