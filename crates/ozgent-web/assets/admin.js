@@ -117,7 +117,7 @@ function stopPolling() {
 }
 
 function openView(name) {
-  if (!["gateway", "models", "account"].includes(name)) name = "gateway";
+  if (!["gateway", "models", "security", "account"].includes(name)) name = "gateway";
   for (const t of document.querySelectorAll(".adm-nav .tab")) {
     t.setAttribute("aria-selected", String(t.dataset.view === name));
   }
@@ -125,7 +125,8 @@ function openView(name) {
   history.replaceState(null, "", `#${name}`);
   stopPolling();
   if (name === "gateway") pollGateway();
-  if (name === "models") openModels();
+  if (name === "models") { openModels(); openEmbedding(); openServer(); }
+  if (name === "security") openSecurity();
 }
 
 for (const t of document.querySelectorAll(".adm-nav .tab")) {
@@ -359,6 +360,7 @@ function wireConfigured(kind, box) {
   q("self-chat").addEventListener("change", (e) => putChannel(kind, { self_chat: e.target.checked }));
   q("groups").addEventListener("change", (e) => putChannel(kind, { groups: e.target.checked }));
   q("approve").addEventListener("change", (e) => putChannel(kind, { approve: e.target.checked }));
+  q("reply-unauthorized").addEventListener("change", (e) => putChannel(kind, { reply_unauthorized: e.target.checked }));
 
   for (const b of q("tools-mode").querySelectorAll("button")) {
     b.addEventListener("click", () => {
@@ -421,6 +423,7 @@ function fillConfigured(kind, box, c) {
   q("self-chat").checked = !!c.self_chat;
   q("groups").checked = !!c.groups;
   q("approve").checked = !!c.approve;
+  q("reply-unauthorized").checked = !!c.reply_unauthorized;
 
   const list = q("allow");
   list.replaceChildren();
@@ -971,3 +974,276 @@ $("pw-form").addEventListener("submit", async (e) => {
 });
 
 boot();
+
+// ================================================================== security
+
+const lines = (id) => $(id).value.split(/\n/).map((s) => s.trim()).filter(Boolean);
+const words = (id) => $(id).value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+
+async function openSecurity() {
+  try {
+    const [net, sb, srv] = await Promise.all([api("/api/admin/access"), api("/api/admin/sandbox"), api("/api/admin/server")]);
+    renderNet(net);
+    renderKeys(net);
+    renderSandbox(sb);
+    $("sb-timeout").value = srv.tool_timeout_seconds;
+    $("sb-calls").value = srv.max_calls_per_turn;
+    $("sb-handoff").checked = srv.handoff;
+  } catch (e) {
+    $("net-note").textContent = e.message;
+  }
+}
+
+function renderNet(n) {
+  $("net-you").textContent = n.you ?? "unknown";
+  for (const r of document.querySelectorAll('input[name="net-mode"]')) r.checked = r.value === n.mode;
+  $("net-allow").value = n.allow.join("\n");
+  $("net-deny").value = n.deny.join("\n");
+  $("net-hosts").value = n.hosts.join("\n");
+  $("net-proxies").value = n.trusted_proxies.join("\n");
+  $("net-rpm").value = n.requests_per_minute;
+  $("net-conns").value = n.max_connections_per_address;
+  $("net-fails").value = n.max_auth_failures;
+  $("net-lock").value = n.lockout_minutes;
+  $("net-body").value = n.max_body_mb;
+  $("net-local-api").checked = n.local_api_open;
+}
+
+async function saveNet(force = false) {
+  const note = $("net-note");
+  const body = {
+    mode: document.querySelector('input[name="net-mode"]:checked')?.value ?? "open",
+    allow: lines("net-allow"),
+    deny: lines("net-deny"),
+    hosts: lines("net-hosts"),
+    trusted_proxies: lines("net-proxies"),
+    requests_per_minute: Number($("net-rpm").value || 0),
+    max_connections_per_address: Number($("net-conns").value || 0),
+    max_auth_failures: Number($("net-fails").value || 0),
+    lockout_minutes: Number($("net-lock").value || 1),
+    max_body_mb: Number($("net-body").value || 1),
+    local_api_open: $("net-local-api").checked,
+    force,
+  };
+  note.textContent = "saving…";
+  try {
+    await api("/api/admin/access", { method: "PUT", body: JSON.stringify(body) });
+    note.textContent = "saved";
+  } catch (e) {
+    if (/refuse your own address/.test(e.message) && confirm(`${e.message}\n\nSave anyway?`)) return saveNet(true);
+    note.textContent = e.message;
+  }
+}
+
+$("net-form").addEventListener("submit", (e) => { e.preventDefault(); saveNet(); });
+
+function renderKeys(n) {
+  const list = $("key-list");
+  list.replaceChildren();
+  if (!n.keys.length) list.append(el("p", "hint", "No keys yet."));
+  for (const k of n.keys) {
+    const row = el("div", `sec-key${k.disabled ? " off" : ""}`);
+    const head = el("div", "sec-key-head");
+    head.append(el("b", null, k.name), el("code", null, `${k.id}…`));
+    if (k.disabled) head.append(el("span", "adm-pill", "disabled"));
+    const scopes = el("div", "hint", k.scopes.map((s) => n.scopes.find((d) => d.name === s)?.describes ?? s).join(" · "));
+    const made = el("div", "hint", k.created ? `created ${new Date(k.created * 1000).toLocaleString()}` : "");
+    const actions = el("div", "adm-actions");
+    const toggle = el("button", "ghost-btn auto", k.disabled ? "Enable" : "Disable");
+    toggle.type = "button";
+    toggle.addEventListener("click", async () => {
+      await api(`/api/admin/keys/${encodeURIComponent(k.id)}`, { method: "PATCH", body: JSON.stringify({ disabled: !k.disabled }) });
+      openSecurity();
+    });
+    const revoke = el("button", "ghost-btn auto danger", "Revoke");
+    revoke.type = "button";
+    revoke.addEventListener("click", async () => {
+      if (!confirm(`Revoke "${k.name}"? Anything using it stops working.`)) return;
+      await api(`/api/admin/keys/${encodeURIComponent(k.id)}`, { method: "DELETE" });
+      openSecurity();
+    });
+    actions.append(toggle, revoke);
+    row.append(head, scopes, made, actions);
+    list.append(row);
+  }
+  const box = $("key-scopes");
+  if (!box.querySelector("input")) {
+    for (const s of n.scopes) {
+      const label = el("label", "check");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = s.name;
+      input.checked = s.name === "inference";
+      label.append(input, document.createTextNode(` ${s.describes}`));
+      box.append(label);
+    }
+  }
+}
+
+$("key-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const scopes = [...$("key-scopes").querySelectorAll("input:checked")].map((i) => i.value);
+  const note = $("key-note");
+  try {
+    const made = await api("/api/admin/keys", { method: "POST", body: JSON.stringify({ name: $("key-name").value, scopes }) });
+    $("key-value").textContent = made.key;
+    $("key-reveal").hidden = false;
+    $("key-name").value = "";
+    note.textContent = "";
+    openSecurity();
+  } catch (err) {
+    note.textContent = err.message;
+  }
+});
+
+$("key-copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("key-value").textContent); $("key-copy").textContent = "Copied"; } catch (_) { /* select it by hand */ }
+});
+$("key-done").addEventListener("click", () => {
+  $("key-value").textContent = "";
+  $("key-reveal").hidden = true;
+  $("key-copy").textContent = "Copy";
+});
+
+function renderSandbox(sb) {
+  $("sb-root").value = sb.root ?? "";
+  $("sb-write").checked = sb.write;
+  $("sb-shell").checked = sb.shell;
+  $("sb-allow").value = sb.shell_allow.join(" ");
+  $("sb-shell-net").checked = sb.shell_network;
+  $("sb-net").checked = sb.network;
+  $("sb-net-allow").value = sb.network_allow.join(" ");
+  $("sb-private").checked = sb.network_private;
+  $("sb-sensitive").checked = sb.allow_sensitive;
+  const mcp = sb.mcp_servers.length ? sb.mcp_servers.join(", ") : "none";
+  const extra = sb.extra_paths.length ? sb.extra_paths.join(", ") : "none";
+  $("sb-fixed").textContent =
+    `Interpreter: ${sb.python}. Extra tool folders: ${extra}. MCP servers: ${mcp}. ` +
+    "Each names a program that runs with your rights, so they change only in config.toml.";
+}
+
+$("sb-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const note = $("sb-note");
+  const root = $("sb-root").value.trim();
+  note.textContent = "saving…";
+  try {
+    await api("/api/admin/sandbox", {
+      method: "PUT",
+      body: JSON.stringify({
+        root: root || null,
+        write: $("sb-write").checked,
+        shell: $("sb-shell").checked,
+        shell_allow: words("sb-allow"),
+        shell_network: $("sb-shell-net").checked,
+        network: $("sb-net").checked,
+        network_allow: words("sb-net-allow"),
+        network_private: $("sb-private").checked,
+        allow_sensitive: $("sb-sensitive").checked,
+      }),
+    });
+    await api("/api/admin/server", {
+      method: "PUT",
+      body: JSON.stringify({
+        tool_timeout_seconds: Number($("sb-timeout").value || 30),
+        max_calls_per_turn: Number($("sb-calls").value || 8),
+        handoff: $("sb-handoff").checked,
+      }),
+    });
+    note.textContent = "saved; tools restarted";
+  } catch (err) {
+    note.textContent = err.message;
+  }
+});
+
+// ================================================================== embeddings
+
+async function openEmbedding() {
+  try {
+    const e = await api("/api/admin/embedding");
+    $("emb-enabled").checked = e.enabled;
+    const sel = $("emb-model");
+    sel.replaceChildren();
+    const auto = document.createElement("option");
+    auto.value = "";
+    auto.textContent = e.installed.length ? `Automatic (${e.installed[0]})` : "Automatic — none installed";
+    sel.append(auto);
+    for (const m of e.installed) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      sel.append(o);
+    }
+    sel.value = e.model ?? "";
+    $("emb-device").value = e.device;
+    $("emb-max").value = e.max_tokens;
+    const s = e.status;
+    let text;
+    if (!e.enabled) text = "Off: memory recalls by keywords.";
+    else if (s.error) text = `Not working: ${s.error}`;
+    else if (s.model) text = `${s.model}, ${s.dimensions} dimensions, on the ${s.device.toUpperCase()}.`;
+    else if (e.chosen) text = `${e.chosen} — loads the first time memory needs it.`;
+    else text = "No embedding model installed: memory recalls by keywords. Get one above — for example Qwen/Qwen3-Embedding-0.6B-GGUF.";
+    if (e.coverage) text += ` ${e.coverage.done} of ${e.coverage.all} messages have vectors.`;
+    if (e.backfilling) text += " Embedding earlier messages now…";
+    $("emb-status").textContent = text;
+  } catch (err) {
+    $("emb-status").textContent = err.message;
+  }
+}
+
+$("emb-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const note = $("emb-note");
+  note.textContent = "saving…";
+  try {
+    await api("/api/admin/embedding", {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled: $("emb-enabled").checked,
+        model: $("emb-model").value || null,
+        device: $("emb-device").value,
+        max_tokens: Number($("emb-max").value || 0),
+      }),
+    });
+    note.textContent = "saved; it reloads on next use";
+    openEmbedding();
+  } catch (err) {
+    note.textContent = err.message;
+  }
+});
+
+$("emb-backfill").addEventListener("click", async () => {
+  await api("/api/admin/embedding/backfill", { method: "POST" });
+  $("emb-note").textContent = "embedding earlier messages in the background";
+  setTimeout(openEmbedding, 1500);
+});
+
+// ================================================================== server
+
+async function openServer() {
+  try {
+    const s = await api("/api/admin/server");
+    $("srv-idle").value = s.idle_unload_minutes;
+    $("srv-parallel").value = s.parallel;
+  } catch (err) {
+    $("srv-note").textContent = err.message;
+  }
+}
+
+$("srv-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const note = $("srv-note");
+  try {
+    await api("/api/admin/server", {
+      method: "PUT",
+      body: JSON.stringify({
+        idle_unload_minutes: Number($("srv-idle").value || 0),
+        parallel: Number($("srv-parallel").value || 1),
+      }),
+    });
+    note.textContent = "saved";
+  } catch (err) {
+    note.textContent = err.message;
+  }
+});

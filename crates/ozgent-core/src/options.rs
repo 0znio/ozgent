@@ -374,6 +374,11 @@ pub struct Options {
     // --- session ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// A response style, by name: one of [`crate::styles::BUILTIN`] or a
+    /// `[styles.<name>]` the user wrote. Added to the system prompt of
+    /// ozgent's own chats; never to an API caller's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingMode>,
     /// How long a reasoning model may think. Ignored when thinking is off.
@@ -400,7 +405,7 @@ impl Options {
             flash_attention, inference_mode, kv_offload, cpu_moe, control_vector, control_strength,
             cache_type_k, cache_type_v, speculative,
             speculative_tuning, prefix_reuse, temperature, top_p, top_k, min_p, repeat_penalty, repeat_last_n,
-            seed, max_tokens, system_prompt, thinking, reasoning_effort, tools,
+            seed, max_tokens, system_prompt, style, thinking, reasoning_effort, tools,
         );
         self
     }
@@ -461,6 +466,7 @@ impl Options {
             // 0 means "until EOS or the context fills".
             max_tokens: self.max_tokens.unwrap_or(0),
             system_prompt: self.system_prompt.clone(),
+            style: self.style.clone(),
             thinking: self.thinking.unwrap_or_default(),
             reasoning_effort: self.reasoning_effort.unwrap_or_default(),
             tools: self.tools.unwrap_or(true),
@@ -516,6 +522,7 @@ impl Resolved {
         self.seed = src.seed;
         self.max_tokens = src.max_tokens;
         self.system_prompt = src.system_prompt.clone();
+        self.style = src.style.clone();
         self.thinking = src.thinking;
         self.reasoning_effort = src.reasoning_effort;
         self.tools = src.tools;
@@ -571,6 +578,7 @@ pub struct Resolved {
     pub seed: Option<u32>,
     pub max_tokens: u32,
     pub system_prompt: Option<String>,
+    pub style: Option<String>,
     pub thinking: ThinkingMode,
     pub reasoning_effort: ReasoningEffort,
     pub tools: bool,
@@ -684,6 +692,7 @@ mod tests {
         changed.seed = Some(4);
         changed.max_tokens = 555;
         changed.system_prompt = Some("be terse".into());
+        changed.style = Some("concise".into());
         changed.thinking = ThinkingMode::Off;
         changed.reasoning_effort = ReasoningEffort::High;
         changed.tools = !base.tools;

@@ -58,12 +58,14 @@ impl ChannelsConfig {
                 tools: self.telegram.tools.as_deref(),
                 stream: self.telegram.stream,
                 approve: self.telegram.approve,
+                reply_unauthorized: self.telegram.reply_unauthorized,
             },
             Kind::WhatsApp => Access {
                 allow: &self.whatsapp.allow,
                 tools: self.whatsapp.tools.as_deref(),
                 stream: self.whatsapp.stream,
                 approve: self.whatsapp.approve,
+                reply_unauthorized: self.whatsapp.reply_unauthorized,
             },
         }
     }
@@ -246,6 +248,8 @@ pub struct Access<'a> {
     pub stream: bool,
     /// Whether a person on this channel may approve a tool call that asks.
     pub approve: bool,
+    /// Whether someone not on the list is told so. See `Telegram::reply_unauthorized`.
+    pub reply_unauthorized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,6 +292,17 @@ pub struct Telegram {
     /// Off, anything your permission rules would ask about is refused on this
     /// channel; only what they allow outright runs.
     pub approve: bool,
+
+    /// Tell someone who is not on the list that they are not, with the id the
+    /// owner would need to add them.
+    ///
+    /// On by default. Silence left people waiting for an answer that was never
+    /// coming, and sending `/start` to a bot that says nothing reads as a bot
+    /// that is broken. The reason it used to be silent — a reply confirms the
+    /// bot is live, and a bot that answers everyone can be used to send
+    /// messages — is handled by rate: one reply per person per few hours, and
+    /// a cap on how many strangers are answered per hour at all.
+    pub reply_unauthorized: bool,
 }
 
 impl Default for Telegram {
@@ -299,6 +314,7 @@ impl Default for Telegram {
             tools: None,
             stream: true,
             approve: true,
+            reply_unauthorized: true,
         }
     }
 }
@@ -320,6 +336,12 @@ pub struct WhatsApp {
 
     /// Let an allowed person approve a tool call that asks first.
     pub approve: bool,
+
+    /// Tell someone who is not on the list that they are not. Off here by
+    /// default: the bridge speaks as *your* WhatsApp account, and an automatic
+    /// reply to every unknown number from your own phone is not something to
+    /// switch on unasked.
+    pub reply_unauthorized: bool,
 
     /// Interpreter used to run the bridge. WhatsApp has no documented protocol
     /// and no Rust client; the bridge is a small Node program driving the same
@@ -360,6 +382,7 @@ impl Default for WhatsApp {
             tools: None,
             stream: true,
             approve: true,
+            reply_unauthorized: false,
             node: "node".into(),
             bridge: None,
             self_chat: false,

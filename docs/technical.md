@@ -14,6 +14,7 @@ Reference models used throughout:
 | Qwen3.5-4B Q4_K_M | dense hybrid, 32 blocks (8 attention, 24 linear) | yes |
 | Qwen3.6-35B-A3B IQ4_XS | MoE hybrid, 40 blocks + 1 NextN, 256 experts, 8 active | experts in RAM |
 | Ternary Bonsai 27B Q2_g64 | dense hybrid, 64 blocks (16 attention, 48 linear), ternary weights | ~56 of 64 blocks |
+| Spark-X2.5-4B Q4_K_M | dense, 36 blocks: 9 full attention, 27 on a 512-token sliding window; 256-wide heads | yes |
 
 ---
 
@@ -205,6 +206,52 @@ The cache is priced only on layers that keep one. A hybrid declares a scalar
 `head_count_kv` and puts its layer pattern in `full_attention_interval`; taken
 at face value that priced all 33 of a 4B's blocks when only 9 cache anything:
 2176 MiB reserved where 550 were needed.
+
+### Sliding-window layers
+
+Some models attend over the whole context on only a few layers and over a
+short sliding window on the rest. Spark-X2.5-4B runs 27 of its 36 layers on a
+512-token window (the GGUF's `<arch>.attention.sliding_window_pattern`, one
+bool per layer). Those layers never look further back than the window, so
+their cache only has to hold it.
+
+llama.cpp's C API defaults to `swa_full = true`, which gives every
+sliding-window layer a cache as long as the whole context (its own `common`
+tools default the other way). ozgent opens every context with
+`swa_full = false` and prices the cache the way llama.cpp will size it: the
+growing cache on the full-attention layers only, plus a fixed window cache of
+`pad256(min(n_ctx, n_swa × n_seq + n_ubatch))` cells on the others
+(`accel::swa_cells`), in the planner and the engine alike. Spark's heads are
+256 wide, twice the usual, so this matters: at 32k, cache plus scratch went
+from 2,800 MiB to 1,106 MiB, and a 64k window that had to fall to a 4-bit
+cache now fits at 8-bit in 1,910 MiB. With four conversations at once, decode
+went from 19.8 to 29.3 tok/s (+48%), because interleaved sequences no longer
+make attention walk a mostly masked full-length cache: one pass at 16k with
+two sequences, 37.1 → 26.7 ms. A single conversation alone is flat (58.4
+against 56.9 tok/s); flash attention already skipped masked tiles when one
+sequence's cells were contiguous.
+
+A window cache recycles cells that have slid out of the window, which makes
+three things that were safe on a full cache unsafe, each silently:
+
+- **Going back a turn.** A trim to an earlier position leaves the window
+  holding cells from after it, or missing ones before it. Measured: logits off
+  by 13.9 and a different top token, with no error. Each checkpoint (§6) now
+  saves the window's own state beside it (`PARTIAL_ONLY`), and a rewind is
+  trim plus restore (`Session::rewind_window`): difference 0.000.
+- **Rejecting a draft.** Trimming a rejected draft is exact only if no other
+  pass ran between the verification and the trim, since another
+  conversation's pass may have recycled the cells. The hub marks a windowed
+  verification as unsettled and holds the next gather until it settles (at
+  most 2 s), with one micro-batch per decode (`n_batch == n_ubatch`).
+- **The shared prefix.** It is lent by `seq_cp`, and shared cells never
+  recycle, so it would slowly fill the window. After it is filled it is
+  compacted (a partial save and restore of its own sequence) down to the live
+  window.
+
+`OZGENT_SWA_FULL=1` restores llama.cpp's default, for comparison;
+`examples/swabench` measures both and, with `SWA_CHECK=1`, checks the rewind
+against a fresh decode.
 
 ### Fitting the window
 
@@ -519,9 +566,47 @@ llama.cpp):
 5.3× faster on a 5,120-wide row (207 vs 1,100 ns), equal to the scalar
 result within float rounding (2.3e-4 relative, over 2,000 random rows).
 
+## 13. Embeddings
+
+Memory recall (`ozgent-memory`) fuses keyword search with vector similarity.
+The daemon serves both `/v1/embeddings` and that recall from one embedding
+model, loaded beside the chat model (`crates/ozgent-llama/src/embed.rs`).
+
+- **As the model was trained.** Qwen3-Embedding pools the last token and
+  expects it to be the end-of-sequence token (`add_eos_token`), and expects
+  queries to carry an instruction line; documents carry none. Neither was
+  done, and texts were tokenised without special tokens. On a test of eight
+  questions over twenty notes with near-miss decoys, the right note came
+  first 7 of 8 times (MRR 0.938); with both it is 8 of 8 (MRR 1.000), with a
+  wider margin over the best wrong note. Recall asks as `Role::Query`, stored
+  messages are `Role::Document`, and the API treats its input as documents.
+- **The whole text.** Texts were cut at 512 tokens. The limit is now the
+  model's own trained window (`embedding.max_tokens`, 0 = that), and the
+  context is opened at a working 8,192 and grown only when a longer text
+  arrives, then released. A long note whose answer was in its last sentence
+  ranked 5th of 21 at 512 tokens and 1st with the whole window. Batches are
+  packed by tokens, not by count.
+- **No logits for a whole long text.** An embeddings context makes llama.cpp
+  reserve an output row, a full vocabulary of floats, for every token in a
+  micro-batch. At 20k tokens that ended with the kernel killing the process.
+  With last-token pooling the text is decoded with embeddings off except for
+  its final micro-batch, which is all the pooled vector reads: cosine
+  1.000000 against a single-pass decode. Micro-batches are capped at 2,048 so
+  attention scratch stays bounded.
+- **Placement.** On automatic, the embedder goes on the GPU only when a chat
+  model is resident and it fits beside it with an 8k cache and the decode
+  reserve; otherwise on the CPU, where it costs about 115–220 ms a short
+  message against 9–13 ms on the card. `embedding.device` pins it.
+- **Off the reply's path.** A stored message is embedded in the background
+  after it is saved, outside the database lock. A question is embedded only
+  when the conversation is longer than the recent window or facts carry
+  vectors, and before the lock is taken. Vectors from another model are not
+  comparable at any width: the model in use is recorded beside the database,
+  and a change clears the vectors and re-embeds the history in batches of 16.
+
 ---
 
-## 13. Downloads
+## 14. Downloads
 
 Model files download as up to several parallel ranges into a preallocated
 `.part` file, with a ledger of finished slices, so an interrupted download
@@ -532,7 +617,7 @@ against its sha256 before being renamed into place.
 
 ---
 
-## 14. Measured results
+## 15. Measured results
 
 Through the daemon, the path the web UI, terminal and API all use:
 
@@ -543,6 +628,8 @@ Through the daemon, the path the web UI, terminal and API all use:
 | Qwen3.6-35B decode | 22.9 tok/s | 27.9 tok/s | llama-bench 26.4 |
 | Qwen3.6-35B follow-up, first token | 5–10 s | ~1–2 s | |
 | Ternary Bonsai 27B | did not load | 12.4 tok/s | llama-bench 9.0 (same split) |
+| Spark-X2.5-4B, four conversations | 19.8 tok/s | 29.3 tok/s | |
+| Spark-X2.5-4B, cache + scratch at 32k | 2,800 MiB | 1,106 MiB | |
 
 With the model's own draft head (§9), on the GGUFs that carry one:
 

@@ -103,11 +103,49 @@ function storedTheme() {
 
 // ------------------------------------------------------------- utilities
 
-async function api(path, options = {}) {
+// The local token proves a request comes from this machine's own page. A
+// page served to another machine has none and relies on the admin session,
+// with `x-ozgent-admin` as the header a cross-site form cannot add.
+let localToken = document.querySelector('meta[name="ozgent-token"]')?.content ?? "";
+
+function authHeaders() {
+  return localToken ? { "x-ozgent-token": localToken, "x-ozgent-admin": "1" } : { "x-ozgent-admin": "1" };
+}
+
+// A daemon restart issues a new token and leaves this tab holding the old
+// one. Read the current one from a fresh copy of the page rather than make
+// the person reload.
+async function refreshToken() {
+  if (!localToken) return false;
+  try {
+    const html = await (await fetch(location.pathname, { cache: "no-store" })).text();
+    const fresh = html.match(/name="ozgent-token" content="([^"]*)"/)?.[1] ?? "";
+    if (!fresh || fresh === localToken) return false;
+    localToken = fresh;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// A turn is a stream and cannot be replayed once sent, so check the token
+// with a cheap request first and pick up a new one if the daemon restarted.
+async function ensureToken() {
+  const res = await fetch("/api/tools/active", { headers: authHeaders() }).catch(() => null);
+  if (res && res.status === 401) await refreshToken();
+}
+
+async function api(path, options = {}, retried = false) {
   const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
     ...options,
+    headers: { "content-type": "application/json", ...authHeaders(), ...(options.headers ?? {}) },
   });
+  if (res.status === 401 && !retried && (await refreshToken())) return api(path, options, true);
+  if (res.status === 401 && !localToken) {
+    // Another machine, not signed in: the sign-in lives on /admin.
+    location.href = "/admin";
+    throw new Error("sign in at /admin first");
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).error ?? detail; } catch (_) { /* keep statusText */ }
@@ -1874,6 +1912,7 @@ function asDataUrl(file) {
 
 async function send(text) {
   if ((!text.trim() && !state.files.length) || state.streaming) return;
+  if (text.trim().startsWith("/") && !state.files.length && (await runSlash(text.trim()))) return;
   if (!state.conversation) await startConversation();
 
   // Only images go to the model: everything else needs a tool to read it, and
@@ -1915,9 +1954,10 @@ async function send(text) {
   // scope there.
   let pending = null;
   try {
+    if (localToken) await ensureToken();
     const res = await fetch("/api/chat", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders() },
       signal: controller.signal,
       body: JSON.stringify({
         conversation: state.conversation,
@@ -2275,6 +2315,18 @@ async function openRoute() {
 /// the internals sit behind one fold with automatic as the answer.
 const MODEL_GROUPS = [
   {
+    title: "Style and persona",
+    note: "How this model answers in your chats — the web page, the terminal and the messaging channels. API callers bring their own system prompt and are not affected.",
+    rows: [
+      { key: "style", label: "Response style", kind: "select",
+        options: () => [["", "None — the model's own manner"], ...styleList.map((st) => [st.name, st.title])],
+        hint: "Concise, detailed, ADHD-friendly and more. Make your own with New style in the Style menu at the top of the page." },
+      { key: "system_prompt", label: "Persona and instructions", kind: "text",
+        placeholder: "e.g. You are my Rust code reviewer. Be direct, point to the line, and suggest the fix.",
+        hint: "Sent before every conversation with this model." },
+    ],
+  },
+  {
     title: "Response style",
     presets: true,
     rows: [
@@ -2348,6 +2400,13 @@ const MODEL_GROUPS = [
 
 /// Response-style presets. "Model default" clears them, so the model's own
 /// recommended values apply.
+/// Response styles, built-in and custom, from /api/styles.
+let styleList = [];
+
+async function loadStyles() {
+  try { styleList = (await api("/api/styles")).styles; } catch (_) { styleList = []; }
+}
+
 const STYLE_PRESETS = [
   ["Precise", { temperature: 0.2, top_p: 0.9, top_k: 20, min_p: 0.05 }],
   ["Model default", null],
@@ -2590,6 +2649,11 @@ function paramRow(spec) {
       const hit = spec.keywords.find(([o]) => String(o) === String(v));
       return hit ? hit[1] : `${v} layers`;
     }
+    if (spec.kind === "select") {
+      const hit = spec.options().find(([o]) => String(o) === String(v ?? ""));
+      return hit ? hit[1].split(" — ")[0] : String(v);
+    }
+    if (spec.kind === "text") return v ? `${String(v).length} characters` : "none";
     if (spec.zero && Number(v) === 0) return spec.zero;
     return `${tidyNumber(v, spec.step)}${spec.unit ? ` ${spec.unit}` : ""}`;
   };
@@ -2643,6 +2707,28 @@ function paramRow(spec) {
     row.append(wrap);
   } else if (spec.kind === "choice") {
     row.append(segments(spec.options, value, (v) => set(v), spec.label));
+  } else if (spec.kind === "select") {
+    const select = document.createElement("select");
+    select.className = "select";
+    select.setAttribute("aria-label", spec.label);
+    for (const [v, t] of spec.options()) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = t;
+      select.append(o);
+    }
+    select.value = value ?? "";
+    select.addEventListener("change", () => set(select.value || null));
+    row.append(select);
+  } else if (spec.kind === "text") {
+    const area = document.createElement("textarea");
+    area.className = "text-input ptext";
+    area.rows = 4;
+    area.value = value ?? "";
+    area.placeholder = spec.placeholder ?? "";
+    area.setAttribute("aria-label", spec.label);
+    area.addEventListener("input", () => set(area.value.trim() ? area.value : null));
+    row.append(area);
   } else if (spec.kind === "auto-number") {
     const isNumber = value !== undefined && value !== null && /^\d+$/.test(String(value));
     const options = [...spec.keywords, ["__n", "Custom"]];
@@ -2953,6 +3039,7 @@ async function openSettings() {
 
   const model = el.model.value;
   if (model && !el.model.disabled) {
+    await loadStyles();
     settingsCache.options = await api(`/api/models/${encodeURIComponent(model)}/options`);
     renderParams(settingsCache.options);
   } else {
@@ -3027,6 +3114,7 @@ async function loadModels() {
   // An embedding model cannot chat. It stays installed and listed in Models,
   // but offering it here made it the model the page opened on.
   const chat = models.filter((m) => !m.embedding);
+  state.modelInfo = new Map(chat.map((m) => [m.alias || m.reference, m]));
   for (const m of chat) {
     const opt = document.createElement("option");
     opt.value = m.alias || m.reference;
@@ -3050,7 +3138,490 @@ async function loadModels() {
   // happened before and is still the right fallback.
   const preferred = el.model.querySelector("option[data-default]");
   if (preferred) el.model.value = preferred.value;
+  syncModelControls();
   return models;
+}
+
+// ------------------------------------------------------------ pickers
+
+// The top bar's three choices, drawn by us rather than by the platform.
+//
+// A native <select> only styles its closed box; the open list is the
+// operating system's, which is why the three looked stock. Each <select>
+// stays in the page, hidden, as the one source of truth — every handler
+// that reads `.value` or listens for `change` keeps working — and a picker
+// draws it: an eyebrow saying what the control is, the value in the face
+// that fits it (mono for a model, sans for a mode), and a list whose rows
+// say what tells the choices apart.
+
+function sizeText(bytes) {
+  if (!bytes) return "";
+  const gb = bytes / 1e9;
+  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+}
+
+function contextText(n) {
+  if (!n) return "";
+  if (n >= 1 << 20) return `${+(n / (1 << 20)).toFixed(1)}M context`;
+  return n >= 1024 ? `${Math.round(n / 1024)}k context` : `${n} context`;
+}
+
+/// What each picker shows for an option: a title, a detail line, a group.
+const PICKERS = {
+  model: {
+    label: "Model",
+    mono: true,
+    filter: 6,
+    describe(o) {
+      const m = state.modelInfo?.get(o.value);
+      if (!m) return { title: o.textContent };
+      const facts = [m.quantization, sizeText(m.size_bytes), contextText(m.context_train), m.vision ? "sees images" : ""]
+        .filter(Boolean);
+      return { title: o.value, detail: facts.join(" · "), note: m.alias ? m.reference : "" };
+    },
+  },
+  thinking: {
+    label: "Reasoning",
+    describe(o) {
+      const words = {
+        auto: ["Auto", "Thinks first when the model decides it helps"],
+        on: ["On", "Always reasons before answering — slower, more careful"],
+        off: ["Off", "Answers straight away"],
+      }[o.value] ?? [o.textContent, ""];
+      return { title: words[0], detail: words[1] };
+    },
+  },
+  style: {
+    label: "Style",
+    describe(o) {
+      if (!o.value) return { title: "Default", detail: "The model's own manner", group: "" };
+      const st = styleList.find((x) => x.name === o.value);
+      const [head, tail] = (st?.title ?? o.value).split(" — ");
+      const about = tail ?? (st?.prompt ? st.prompt.slice(0, 70) + (st.prompt.length > 70 ? "…" : "") : "");
+      return {
+        title: head,
+        detail: about.charAt(0).toUpperCase() + about.slice(1),
+        group: st?.custom ? "Yours" : "Built in",
+      };
+    },
+    action: { label: "New style", run: () => openStyleEditor() },
+    edit: (value) => {
+      const st = styleList.find((x) => x.name === value);
+      return st?.custom ? () => openStyleEditor(st) : null;
+    },
+  },
+};
+
+function icon(name, cls = "ic") {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("class", cls);
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(ns, "use");
+  use.setAttribute("href", `#${name}`);
+  svg.append(use);
+  return svg;
+}
+
+/// Replace a <select>'s look with a picker. Returns a function that redraws
+/// the closed control from the select's current value.
+function picker(select, spec) {
+  select.classList.add("pk-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+
+  const wrap = document.createElement("div");
+  wrap.className = `pk pk-for-${select.id}`;
+  select.after(wrap);
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "pk-trigger";
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-expanded", "false");
+  const eyebrow = document.createElement("span");
+  eyebrow.className = "pk-eyebrow";
+  eyebrow.textContent = spec.label;
+  const value = document.createElement("span");
+  value.className = `pk-value${spec.mono ? " pk-mono" : ""}`;
+  button.append(eyebrow, value, icon("i-caret", "ic pk-chev"));
+  wrap.append(button);
+
+  let menu = null;
+  let active = -1;
+  let rows = [];
+
+  const paint = () => {
+    const chosen = select.selectedOptions[0];
+    const d = chosen ? spec.describe(chosen) : { title: "—" };
+    value.textContent = d.title;
+    button.title = `${spec.label}: ${d.title}${d.detail ? ` — ${d.detail}` : ""}`;
+    button.setAttribute("aria-label", button.title);
+    button.disabled = select.disabled;
+    wrap.hidden = select.hidden;
+  };
+
+  const close = (focus = true) => {
+    if (!menu) return;
+    menu.remove();
+    menu = null;
+    button.setAttribute("aria-expanded", "false");
+    document.removeEventListener("pointerdown", outside, true);
+    if (focus) button.focus();
+  };
+  const outside = (e) => { if (!wrap.contains(e.target)) close(false); };
+
+  const choose = (v) => {
+    if (select.value !== v) {
+      select.value = v;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    paint();
+    close();
+  };
+
+  const highlight = (i) => {
+    const visible = rows.filter((r) => !r.hidden);
+    if (!visible.length) { active = -1; return; }
+    active = (i + visible.length) % visible.length;
+    rows.forEach((r) => r.classList.remove("pk-active"));
+    visible[active].classList.add("pk-active");
+    visible[active].scrollIntoView({ block: "nearest" });
+  };
+
+  const open = () => {
+    if (menu || select.disabled) return;
+    menu = document.createElement("div");
+    menu.className = "pk-menu";
+    menu.setAttribute("role", "listbox");
+    menu.setAttribute("aria-label", spec.label);
+    const options = [...select.options].filter((o) => o.value !== "" || spec === PICKERS.style);
+    let filterInput = null;
+    if (spec.filter && options.length > spec.filter) {
+      filterInput = document.createElement("input");
+      filterInput.className = "pk-filter";
+      filterInput.placeholder = `Find a ${spec.label.toLowerCase()}`;
+      filterInput.setAttribute("aria-label", filterInput.placeholder);
+      menu.append(filterInput);
+    }
+    const list = document.createElement("div");
+    list.className = "pk-list";
+    rows = [];
+    let lastGroup;
+    for (const o of options) {
+      const d = spec.describe(o);
+      if (d.group !== undefined && d.group !== lastGroup && d.group) {
+        const g = document.createElement("div");
+        g.className = "pk-group";
+        g.textContent = d.group;
+        list.append(g);
+      }
+      lastGroup = d.group;
+      const row = document.createElement("div");
+      row.className = "pk-row";
+      row.setAttribute("role", "option");
+      row.dataset.value = o.value;
+      const selected = o.value === select.value;
+      row.setAttribute("aria-selected", String(selected));
+      const text = document.createElement("div");
+      text.className = "pk-text";
+      const title = document.createElement("div");
+      title.className = `pk-title${spec.mono ? " pk-mono" : ""}`;
+      title.textContent = d.title;
+      text.append(title);
+      if (d.detail || d.note) {
+        const detail = document.createElement("div");
+        detail.className = "pk-detail";
+        detail.textContent = [d.detail, d.note].filter(Boolean).join(" · ");
+        text.append(detail);
+      }
+      const mark = icon("i-check", "ic pk-check");
+      row.append(text, mark);
+      const edit = spec.edit?.(o.value);
+      if (edit) {
+        const pen = document.createElement("button");
+        pen.type = "button";
+        pen.className = "pk-edit";
+        pen.title = `Edit ${d.title}`;
+        pen.setAttribute("aria-label", pen.title);
+        pen.append(icon("i-edit", "ic"));
+        pen.addEventListener("click", (e) => { e.stopPropagation(); close(false); edit(); });
+        row.append(pen);
+      }
+      row.addEventListener("click", () => choose(o.value));
+      row.addEventListener("pointermove", () => {
+        const visible = rows.filter((r) => !r.hidden);
+        const i = visible.indexOf(row);
+        if (i !== active) highlight(i);
+      });
+      rows.push(row);
+      list.append(row);
+    }
+    menu.append(list);
+    if (spec.action) {
+      const act = document.createElement("button");
+      act.type = "button";
+      act.className = "pk-action";
+      act.append(icon("i-plus", "ic"), document.createTextNode(spec.action.label));
+      act.addEventListener("click", () => { close(false); spec.action.run(); });
+      menu.append(act);
+    }
+    wrap.append(menu);
+    // Opened from a picker near the right edge, the menu would run off the
+    // screen: slide it back in, keeping a gutter on either side.
+    const edge = document.documentElement.clientWidth - 8;
+    const box = menu.getBoundingClientRect();
+    if (box.right > edge) menu.style.left = `${Math.max(8 - box.left, edge - box.right)}px`;
+    button.setAttribute("aria-expanded", "true");
+    const current = rows.findIndex((r) => r.dataset.value === select.value);
+    highlight(Math.max(0, current));
+    document.addEventListener("pointerdown", outside, true);
+    if (filterInput) {
+      filterInput.addEventListener("input", () => {
+        const q = filterInput.value.toLowerCase();
+        for (const r of rows) r.hidden = q && !r.textContent.toLowerCase().includes(q);
+        highlight(0);
+      });
+      filterInput.addEventListener("keydown", keys);
+      filterInput.focus();
+    } else {
+      menu.tabIndex = -1;
+      menu.addEventListener("keydown", keys);
+      menu.focus();
+    }
+  };
+
+  let typed = "";
+  let typedAt = 0;
+  function keys(e) {
+    const visible = rows.filter((r) => !r.hidden);
+    if (e.key === "ArrowDown") { e.preventDefault(); highlight(active + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); highlight(active - 1); }
+    else if (e.key === "Home") { e.preventDefault(); highlight(0); }
+    else if (e.key === "End") { e.preventDefault(); highlight(visible.length - 1); }
+    else if (e.key === "Enter") { e.preventDefault(); if (visible[active]) choose(visible[active].dataset.value); }
+    else if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "Tab") { close(false); }
+    else if (e.key.length === 1 && !e.target.classList.contains("pk-filter")) {
+      // Type-ahead: the first row starting with what was typed.
+      const now = Date.now();
+      typed = now - typedAt > 700 ? e.key.toLowerCase() : typed + e.key.toLowerCase();
+      typedAt = now;
+      const i = visible.findIndex((r) => r.textContent.toLowerCase().startsWith(typed));
+      if (i >= 0) highlight(i);
+    }
+  }
+
+  button.addEventListener("click", () => (menu ? close() : open()));
+  button.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); open(); }
+  });
+  select.addEventListener("change", paint);
+  // Code elsewhere sets `.value` or refills the options without an event;
+  // watching both keeps the closed control honest.
+  new MutationObserver(paint).observe(select, { childList: true, subtree: true, attributes: true });
+  let shown = select.value;
+  setInterval(() => { if (select.value !== shown) { shown = select.value; paint(); } }, 400);
+  paint();
+  return paint;
+}
+
+const repaint = {};
+for (const id of ["model", "thinking", "style"]) {
+  const select = $(id);
+  if (select) repaint[id] = picker(select, PICKERS[id]);
+}
+
+// ------------------------------------------------------------ style editor
+
+/// Make a style, or change or delete one of yours. `existing` is a style
+/// from /api/styles, or nothing for a new one.
+let editingStyle = null;
+
+function openStyleEditor(existing = null) {
+  editingStyle = existing;
+  const dialog = $("style-editor");
+  $("st-title").textContent = existing ? `Edit “${existing.name}”` : "New style";
+  $("st-name").value = existing?.name ?? "";
+  $("st-name").readOnly = Boolean(existing);
+  const label = existing && existing.title !== existing.name ? existing.title : "";
+  $("st-label").value = label;
+  $("st-prompt").value = existing?.prompt ?? "";
+  $("st-save").textContent = existing ? "Save" : "Create and use";
+  $("st-delete").hidden = !existing;
+  $("st-error").hidden = true;
+  if (el.model.disabled) {
+    $("st-error").textContent = "Install a model first: a style is used by a model.";
+    $("st-error").hidden = false;
+  }
+  dialog.showModal();
+  (existing ? $("st-prompt") : $("st-name")).focus();
+}
+
+function closeStyleEditor() {
+  $("style-editor").close();
+  editingStyle = null;
+}
+
+$("st-close").addEventListener("click", closeStyleEditor);
+$("st-cancel").addEventListener("click", closeStyleEditor);
+// Lowercase and hyphenate as it is typed, so the name is always one the
+// server accepts.
+$("st-name").addEventListener("input", (e) => {
+  const clean = e.target.value.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+  if (clean !== e.target.value) e.target.value = clean;
+});
+
+$("st-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("st-name").value.trim();
+  const prompt = $("st-prompt").value.trim();
+  const error = $("st-error");
+  error.hidden = true;
+  if (!name || !prompt) {
+    error.textContent = "A style needs a name and an instruction.";
+    error.hidden = false;
+    return;
+  }
+  try {
+    await api(`/api/styles/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ title: $("st-label").value.trim(), prompt }),
+    });
+    // A new style is one the person wants to use now.
+    if (!editingStyle && !el.model.disabled) await patchModel({ style: name });
+    closeStyleEditor();
+    await syncModelControls();
+  } catch (err) {
+    error.textContent = err.message;
+    error.hidden = false;
+  }
+});
+
+$("st-delete").addEventListener("click", async () => {
+  const st = editingStyle;
+  if (!st || !confirm(`Delete the “${st.name}” style? Models using it go back to their own manner.`)) return;
+  try {
+    await api(`/api/styles/${encodeURIComponent(st.name)}`, { method: "DELETE" });
+    closeStyleEditor();
+    await syncModelControls();
+  } catch (err) {
+    $("st-error").textContent = err.message;
+    $("st-error").hidden = false;
+  }
+});
+
+// ------------------------------------------------ effort, style, persona
+
+/// Show the selected model's style in the top bar. Effort lives in the
+/// quick panel beside the message box.
+async function syncModelControls() {
+  const model = el.model.value;
+  const style = $("style");
+  if (!model || el.model.disabled) {
+    style.hidden = true;
+    return;
+  }
+  style.hidden = false;
+  try {
+    await loadStyles();
+    const data = await api(`/api/models/${encodeURIComponent(model)}/options`);
+    style.replaceChildren();
+    for (const [v, t] of [["", "Style: default"], ...styleList.map((st) => [st.name, `Style: ${st.name}`])]) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = t;
+      style.append(o);
+    }
+    style.value = data.effective.style ?? "";
+  } catch (_) { /* the controls keep their last values */ }
+}
+
+/// Change some of this model's settings, leaving the rest.
+async function patchModel(fields) {
+  await api(`/api/models/${encodeURIComponent(el.model.value)}/options`, {
+    method: "PATCH",
+    body: JSON.stringify(fields),
+  });
+}
+
+$("style").addEventListener("change", async (e) => {
+  try { await patchModel({ style: e.target.value || null }); } catch (err) { el.stat.textContent = err.message; }
+});
+
+/// A line in the thread from ozgent itself, not the model.
+function localNote(text) {
+  const box = document.createElement("div");
+  box.className = "msg local-note";
+  const p = document.createElement("p");
+  p.className = "note";
+  p.textContent = text;
+  box.append(p);
+  el.thread.append(box);
+  box.scrollIntoView({ block: "end" });
+}
+
+/// Commands typed in the message box, answered here rather than sent to the
+/// model. Unknown words go to the model as written: "/etc/hosts" is a question.
+async function runSlash(text) {
+  const [word, ...rest] = text.slice(1).split(/\s+/);
+  const arg = rest.join(" ").trim();
+  const model = el.model.value;
+  const cmd = word.toLowerCase();
+  if (!["style", "styles", "persona", "system", "effort", "commands"].includes(cmd)) return false;
+  if (!model || el.model.disabled) {
+    localNote("Install a model first.");
+    return true;
+  }
+  try {
+    if (cmd === "commands") {
+      localNote("/style [name|off|new <name> <instruction>|rm <name>] · /persona [text|clear] · /effort low|medium|high");
+    } else if (cmd === "style" || cmd === "styles") {
+      await loadStyles();
+      const [sub, name, ...words] = arg.split(/\s+/);
+      if (!arg) {
+        const data = await api(`/api/models/${encodeURIComponent(model)}/options`);
+        const now = data.effective.style;
+        localNote(`Style for ${model}: ${now ?? "default"}. Available: ${styleList.map((st) => st.name).join(", ")}. /style <name> to choose, /style off to clear, /style new <name> <instruction> to make one.`);
+      } else if (sub === "new" && name && words.length) {
+        await api(`/api/styles/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify({ prompt: words.join(" ") }) });
+        await patchModel({ style: name });
+        localNote(`Made style "${name}" and switched ${model} to it.`);
+      } else if ((sub === "rm" || sub === "delete") && name) {
+        await api(`/api/styles/${encodeURIComponent(name)}`, { method: "DELETE" });
+        localNote(`Removed style "${name}".`);
+      } else if (["off", "none", "default"].includes(sub)) {
+        await patchModel({ style: null });
+        localNote(`${model} answers in its own manner again.`);
+      } else {
+        await patchModel({ style: arg });
+        localNote(`${model} now answers in the "${arg}" style.`);
+      }
+      syncModelControls();
+    } else if (cmd === "persona" || cmd === "system") {
+      if (!arg) {
+        const data = await api(`/api/models/${encodeURIComponent(model)}/options`);
+        localNote(data.effective.system_prompt ? `Persona for ${model}: ${data.effective.system_prompt}` : `${model} has no persona. /persona <text> sets one.`);
+      } else if (["clear", "off", "none"].includes(arg.toLowerCase())) {
+        await patchModel({ system_prompt: null });
+        localNote(`Cleared the persona for ${model}.`);
+      } else {
+        await patchModel({ system_prompt: arg });
+        localNote(`Persona for ${model} set. It applies from the next message.`);
+      }
+    } else if (cmd === "effort") {
+      if (!["low", "medium", "high"].includes(arg.toLowerCase())) {
+        const data = await api(`/api/models/${encodeURIComponent(model)}/options`);
+        localNote(`Effort is ${data.effective.reasoning_effort}. /effort low, medium or high.`);
+      } else {
+        await patchModel({ reasoning_effort: arg.toLowerCase() });
+        localNote(`${model} thinks with ${arg.toLowerCase()} effort now.`);
+      }
+    }
+  } catch (err) {
+    localNote(err.message);
+  }
+  return true;
 }
 
 // ----------------------------------------------------------------- models
@@ -3394,6 +3965,7 @@ $("recall-form").addEventListener("submit", (e) => {
 // Reloading parameters when the model changes keeps the panel honest: the
 // values shown always belong to the model that would actually answer.
 el.model.addEventListener("change", async () => {
+  syncModelControls();
   // The quick panel too, and for a sharper reason: it stays open across a
   // model change, so it would go on showing the previous model's numbers
   // while Apply wrote them to that model — the one no longer selected.

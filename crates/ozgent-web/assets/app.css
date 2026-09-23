@@ -2461,3 +2461,220 @@ a.ghost-btn { text-decoration: none; }
 .edit-acts .spacer { flex: 1; }
 .edit-acts .hint { font-size: var(--t-micro); color: var(--ink-faint); }
 .edit-acts .ghost-btn { width: auto; }
+
+/* ---------------------------------------------------------------- security */
+.sec-card { display: flex; flex-direction: column; gap: var(--s3); margin-bottom: var(--s4); }
+.sec-card h2 { margin: 0; font-size: 17px; }
+.sec-list { width: 100%; min-width: 260px; font-family: var(--mono); font-size: 13px; resize: vertical; }
+.sec-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: var(--s2) var(--s3); width: 100%; }
+.sec-keys { display: flex; flex-direction: column; gap: var(--s2); }
+.sec-key { border: 1px solid var(--line); border-radius: 8px; padding: var(--s2) var(--s3); display: flex; flex-direction: column; gap: 4px; }
+.sec-key.off { opacity: 0.6; }
+.sec-key-head { display: flex; gap: var(--s2); align-items: baseline; flex-wrap: wrap; }
+.sec-newkey { display: flex; flex-direction: column; gap: var(--s2); border-top: 1px solid var(--line); padding-top: var(--s3); }
+.sec-scopes { border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.sec-scopes legend { font-size: 13px; color: var(--ink-soft); margin-bottom: 4px; }
+.sec-reveal { border: 1px solid var(--line); border-radius: 8px; padding: var(--s3); }
+.sec-reveal code { display: block; word-break: break-all; user-select: all; font-size: 13px; padding: var(--s2) 0; }
+.radio, .check { display: flex; gap: 8px; align-items: baseline; font-size: 14px; }
+.ghost-btn.danger { color: var(--danger); }
+
+/* ---------------------------------------------------------- style & persona */
+.ptext { width: 100%; min-height: 5.5em; resize: vertical; font: inherit; font-size: 14px; }
+.msg.local-note { padding: 4px 0; }
+.msg.local-note .note { color: var(--ink-soft); font-size: 13px; margin: 0; }
+
+/* ------------------------------------------------------------- pickers
+   The top bar's choices. The native <select> stays, hidden, as the value;
+   this is how it is seen. An eyebrow names the control so three of them in
+   a row need no labels beside them; the value is mono when it is a machine
+   fact (a model) and sans when it is a mode. No amber: choosing is not state
+   that is happening. */
+.pk-native {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  opacity: 0; pointer-events: none;
+  overflow: hidden;
+}
+.pk { position: relative; min-width: 0; }
+.pk-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  max-width: 100%;
+  height: 32px;
+  padding: 0 var(--s2) 0 var(--s3);
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color var(--fast) var(--ease), background var(--fast) var(--ease);
+}
+.pk-trigger:hover { border-color: var(--ink-faint); }
+.pk-trigger[aria-expanded="true"] { border-color: var(--ink-soft); background: var(--raised); }
+.pk-trigger:focus-visible { outline: 2px solid var(--ink-soft); outline-offset: 2px; }
+.pk-trigger:disabled { opacity: .55; cursor: default; }
+.pk-eyebrow {
+  font-family: var(--sans);
+  font-size: var(--t-micro);
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  flex: none;
+}
+.pk-value {
+  font-family: var(--sans);
+  font-size: var(--t-small);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.pk-mono { font-family: var(--mono); font-weight: 400; }
+.pk-chev {
+  width: 14px; height: 14px;
+  color: var(--ink-faint);
+  flex: none;
+  transition: transform var(--fast) var(--ease);
+}
+.pk-trigger[aria-expanded="true"] .pk-chev { transform: rotate(180deg); }
+
+.pk-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  width: max-content;
+  min-width: max(100%, 240px);
+  max-width: min(380px, calc(100vw - 32px));
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lift);
+  padding: var(--s1);
+  outline: none;
+  animation: pk-in var(--fast) var(--ease);
+}
+@keyframes pk-in { from { opacity: 0; transform: translateY(-3px); } }
+@media (prefers-reduced-motion: reduce) {
+  .pk-menu { animation: none; }
+  .pk-chev, .pk-trigger { transition: none; }
+}
+.pk-list { max-height: min(60vh, 420px); overflow-y: auto; }
+.pk-filter {
+  width: 100%;
+  margin: 0 0 var(--s1);
+  padding: 7px var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--t-small);
+}
+.pk-filter:focus { outline: none; border-color: var(--ink-soft); }
+.pk-group {
+  padding: var(--s2) var(--s3) var(--s1);
+  font-size: var(--t-micro);
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.pk-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 7px var(--s3);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.pk-row.pk-active { background: var(--panel); }
+.pk-text { min-width: 0; flex: 1; }
+.pk-title { font-size: var(--t-small); font-weight: 500; color: var(--ink); }
+.pk-title.pk-mono { font-weight: 400; }
+.pk-detail {
+  margin-top: 2px;
+  font-size: var(--t-micro);
+  color: var(--ink-soft);
+  line-height: 1.35;
+}
+.pk-check { width: 15px; height: 15px; flex: none; color: var(--ink); visibility: hidden; }
+.pk-row[aria-selected="true"] .pk-check { visibility: visible; }
+.pk-foot {
+  margin-top: var(--s1);
+  padding: var(--s2) var(--s3) var(--s1);
+  border-top: 1px solid var(--line-soft);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  font-family: var(--mono);
+}
+@media (max-width: 720px) {
+  .pk-eyebrow { display: none; }
+  .pk-trigger { padding: 0 6px 0 var(--s2); }
+  .pk-value { max-width: 36vw; }
+}
+
+.pk-edit {
+  display: grid; place-items: center;
+  width: 26px; height: 26px; flex: none;
+  border: 0; border-radius: var(--radius-sm);
+  background: none; color: var(--ink-faint); cursor: pointer;
+}
+.pk-edit .ic { width: 15px; height: 15px; }
+.pk-edit:hover, .pk-edit:focus-visible { color: var(--ink); background: var(--line-soft); outline: none; }
+.pk-action {
+  display: flex; align-items: center; gap: var(--s2);
+  width: 100%;
+  margin-top: var(--s1);
+  padding: 9px var(--s3);
+  border: 0; border-top: 1px solid var(--line-soft);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  background: none; color: var(--ink);
+  font: inherit; font-size: var(--t-small); font-weight: 500;
+  text-align: left; cursor: pointer;
+}
+.pk-action .ic { width: 15px; height: 15px; color: var(--ink-soft); }
+.pk-action:hover, .pk-action:focus-visible { background: var(--panel); outline: none; }
+
+/* ------------------------------------------------------------ style editor */
+.st-dialog {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg);
+  color: var(--ink);
+  padding: 0;
+  width: min(520px, 94vw);
+}
+.st-dialog::backdrop { background: rgba(0, 0, 0, .45); }
+.st-body { display: flex; flex-direction: column; gap: var(--s4); padding: 0 20px 4px; }
+.st-field { display: flex; flex-direction: column; gap: 6px; font-size: var(--t-small); color: var(--ink-soft); }
+.st-field > span { font-weight: 600; color: var(--ink); }
+.st-field .text-input { font-size: 14px; padding: 8px 11px; }
+.st-optional { font-style: normal; font-weight: 400; color: var(--ink-faint); margin-left: 4px; }
+.st-mono { font-family: var(--mono); }
+.st-prompt { resize: vertical; min-height: 6.5em; font: inherit; font-size: 14px; line-height: 1.45; }
+.st-actions { display: flex; align-items: center; gap: var(--s2); padding: 16px 20px; }
+.st-delete { color: var(--danger); }
+
+/* A narrow top bar: the model name is the one worth truncating; a mode reads
+   in a word and must not be cut to its first letter. */
+@media (max-width: 720px) {
+  /* Takes the row's spare width before the spacer does. */
+  .pk-for-model { flex: 10 1 auto; }
+  .pk-for-model .pk-trigger { width: 100%; }
+  .pk-for-model .pk-value { max-width: none; }
+  .pk-for-thinking, .pk-for-style { flex: none; }
+  .pk-for-thinking .pk-value, .pk-for-style .pk-value { max-width: 22vw; }
+  /* The gauge held 88px of the row while still invisible, which is what
+     squeezed the model name to a few letters. Before a turn it takes no
+     room; after one it is a short track and the tokens used, the total
+     being on the tooltip. */
+  .gauge:not(.live) { display: none; }
+  .gauge .track { width: 28px; }
+  #gauge-total { display: none; }
+}

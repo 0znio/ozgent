@@ -33,6 +33,9 @@ pub const BUDGET: Budget = Budget {
 
 /// One question, from whichever surface asked it.
 pub struct Turn {
+    /// A persona for this conversation only, in place of the model's saved
+    /// one: what `ozgent chat --system` means.
+    pub system: Option<String>,
     pub conversation: i64,
     pub model: String,
     pub message: String,
@@ -132,6 +135,22 @@ fn stamp_user_messages(messages: &mut [ozgent_memory::StoredMessage]) {
 /// phone that went into a tunnel — lose the delivery but not the answer.
 pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Event>> {
     let messages = {
+    // The question's vector, computed before the store is locked and only when
+    // there is something older than the recent window to search. With a real
+    // embedding model this is a forward pass — cheap on the GPU, not on the
+    // CPU — and a short conversation has nothing to recall anyway.
+    let query_vector = {
+        let wants = {
+            let store = state.store.lock().unwrap();
+            store.message_count(turn.conversation).unwrap_or(0) as usize > BUDGET.recent_messages
+                || !store
+                    .embeddings_in_conversation(OwnerKind::Fact, turn.conversation)
+                    .unwrap_or_default()
+                    .is_empty()
+        };
+        if wants { state.embedder.embed_query(&turn.message) } else { Vec::new() }
+    };
+
         let store = state.store.lock().unwrap();
 
         // Name the conversation after its first line, so every list of
@@ -171,14 +190,30 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             let _ = store.set_message_media(id, &stored);
         }
 
-        store.put_embedding(OwnerKind::Message, id, &state.embedder.embed(&turn.message))?;
+        // Stored in the background, so the reply does not wait for it.
+        crate::memory::embed_later(state, id, turn.message.clone());
 
         let assembled = ContextBuilder::new(&store, &state.embedder)
             .with_budget(BUDGET)
+            .with_query_vector(query_vector)
             .build(turn.conversation, &turn.message)?;
 
         let config = state.config.lock().unwrap();
-        let system = system_prompt(config.ui.date_awareness, turn.caller.as_ref());
+        // The model's persona and response style, then ozgent's own lines.
+        // Per model, and stable from turn to turn, so the cached prompt
+        // prefix survives; changing either costs one re-read.
+        let persona = {
+            let key = ozgent_core::resolve(&state.paths, &turn.model)
+                .map(|f| f.model.to_string())
+                .unwrap_or_else(|_| turn.model.clone());
+            let options = config.options_for(&key);
+            let persona = turn.system.as_deref().or(options.system_prompt.as_deref());
+            ozgent_core::styles::compose(persona, options.style.as_deref(), &config.styles)
+        };
+        let system = match (persona, system_prompt(config.ui.date_awareness, turn.caller.as_ref())) {
+            (Some(p), Some(ours)) => Some(format!("{p}\n\n{ours}")),
+            (p, ours) => p.or(ours),
+        };
         let mut assembled = assembled;
         if config.ui.date_awareness {
             stamp_user_messages(&mut assembled.recent);
@@ -221,6 +256,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
         .worker
         .submit(Request {
             can_ask: turn.can_ask,
+            grant: None,
             model: turn.model,
             messages,
             thinking: turn.thinking,
@@ -424,8 +460,7 @@ fn relay(
                 if let Some(stats) = &stats {
                     let _ = store.set_message_stats(id, &stats.to_string());
                 }
-                let _ =
-                    store.put_embedding(OwnerKind::Message, id, &state.embedder.embed(answer.trim()));
+                crate::memory::embed_later(&state, id, answer.trim().to_string());
             }
             Err(e) => tracing::error!("persisting the reply: {e}"),
         }

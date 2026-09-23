@@ -302,9 +302,11 @@ pub fn stop_reason(stop: &str) -> &'static str {
 pub async fn messages(
     AxumState(state): AxumState<State>,
     axum::Extension(key): axum::Extension<ApiKey>,
+    caller: Option<axum::Extension<crate::access::Caller>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AnthropicError> {
+    let grant = caller.and_then(|c| c.0.grant());
     if !crate::openai::authorise_key(&headers, &key) {
         return Err(AnthropicError {
             status: StatusCode::UNAUTHORIZED,
@@ -332,7 +334,12 @@ pub async fn messages(
             _ => String::new(),
         })
         .unwrap_or_default();
-    let resolved = crate::agents::resolve(&state, &request.model, &latest, request.ozgent_agents.unwrap_or(true))
+    let wants_tools = request.ozgent_tools == Some(true) || request.native_tools.is_some();
+    if let Err(e) = crate::openai::check_scopes(grant.as_ref(), &request.model, wants_tools) {
+        return Err(AnthropicError { status: e.status, kind: "permission_error", message: e.message });
+    }
+    let agents_on = request.ozgent_agents.unwrap_or(true) && grant.as_ref().is_none_or(|g| g.agents);
+    let resolved = crate::agents::resolve(&state, &request.model, &latest, agents_on)
         .map_err(|r| match r {
             crate::agents::Refusal::NotFound(m) => AnthropicError::not_found(m),
             crate::agents::Refusal::BadRequest(m) => AnthropicError::invalid(m),
@@ -354,6 +361,7 @@ pub async fn messages(
         .worker
         .submit(Request {
             can_ask: false,
+            grant: grant.clone(),
             model: resolved.model.model.to_string(),
             messages,
             thinking: Some(mode),

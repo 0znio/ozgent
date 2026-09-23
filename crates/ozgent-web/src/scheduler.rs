@@ -498,6 +498,7 @@ async fn ask(state: &State, conversation: i64, job: &Job, question: &str) -> Res
     let mut events = crate::turn::start(
         state,
         crate::turn::Turn {
+            system: None,
             conversation,
             model,
             message: question.to_string(),
@@ -613,6 +614,7 @@ async fn worth_sending(
             overrides: None,
             images: Vec::new(),
             can_ask: false,
+            grant: None,
             agents: Vec::new(),
             tools_off: Vec::new(),
             handoff: Vec::new(),

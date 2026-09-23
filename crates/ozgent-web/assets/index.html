@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="ozgent-token" content="">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>ozgent</title>
@@ -11,14 +12,8 @@
        paint. Deferred to app.js it would land a frame later, as a flash of the
        other theme. The page used to carry a hard-coded data-theme="dark" here,
        which made the light palette unreachable however the desktop was set. -->
-  <script>
-    try {
-      var saved = localStorage.getItem("ozgent-theme");
-      if (saved === "light" || saved === "dark") {
-        document.documentElement.setAttribute("data-theme", saved);
-      }
-    } catch (e) { /* private browsing; fall back to the system preference */ }
-  </script>
+  <!-- External, not inline: the pages allow scripts from this server only. -->
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -109,6 +104,10 @@
   <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
     <path d="M5 5h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-7l-4 3v-3H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z"/>
   </symbol>
+  <!-- A chevron pointing down: what a closed list opens toward. -->
+  <symbol id="i-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 9l6 6 6-6"/>
+  </symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
     <path d="m9 6 6 6-6 6"/>
   </symbol>
@@ -193,6 +192,8 @@
         <option value="on">Reasoning: on</option>
         <option value="off">Reasoning: off</option>
       </select>
+      <select id="style" class="select" aria-label="Response style"
+              title="How this model shapes its answers; /style in the message box does the same"></select>
       <span class="spacer"></span>
       <span class="stat" id="stat"></span>
       <!-- A local-first program should never be the only thing that can read
@@ -302,6 +303,43 @@
   <img id="lightbox-img" alt="">
 </div>
 
+
+<!-- Making or changing a response style. -->
+<dialog id="style-editor" class="st-dialog" aria-labelledby="st-title">
+  <form method="dialog" id="st-form" class="st-form">
+    <div class="settings-head">
+      <h2 id="st-title">New style</h2>
+      <button type="button" class="icon-btn" id="st-close" aria-label="Close">
+        <svg class="ic"><use href="#i-close"></use></svg>
+      </button>
+    </div>
+    <div class="st-body">
+      <label class="st-field">
+        <span>Name</span>
+        <input type="text" class="text-input st-mono" id="st-name" maxlength="40" required
+               pattern="[a-z0-9\-]+" placeholder="pirate" autocomplete="off" spellcheck="false">
+        <small class="hint">Lowercase letters, digits and hyphens. It is what the Style menu and <code>/style</code> in the terminal call it.</small>
+      </label>
+      <label class="st-field">
+        <span>Label <em class="st-optional">optional</em></span>
+        <input type="text" class="text-input" id="st-label" maxlength="80" placeholder="Pirate — talks like one, still accurate">
+      </label>
+      <label class="st-field">
+        <span>Instruction</span>
+        <textarea class="text-input st-prompt" id="st-prompt" rows="5" maxlength="4000" required
+                  placeholder="Answer like a pirate captain: salty, cheerful, and still completely correct."></textarea>
+        <small class="hint">Added to the model's instructions in your chats. Describe how answers should read, not what they are about.</small>
+      </label>
+      <p class="error" id="st-error" hidden></p>
+    </div>
+    <div class="st-actions">
+      <button type="button" class="ghost-btn auto st-delete" id="st-delete" hidden>Delete style</button>
+      <span class="spacer"></span>
+      <button type="button" class="ghost-btn auto" id="st-cancel">Cancel</button>
+      <button type="submit" class="primary-btn" id="st-save">Create and use</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="settings" class="settings">
   <div class="settings-head">

@@ -21,7 +21,7 @@
 //! that chat had. See [`ozgent_schedule::tools`].
 
 use axum::extract::{Path, State as AxumState};
-use axum::response::{Html, IntoResponse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ozgent_core::schedule::Recur;
@@ -46,8 +46,8 @@ pub fn router(state: State) -> Router {
         .with_state(state)
 }
 
-async fn page() -> Html<&'static str> {
-    Html(include_str!("../assets/scheduler.html"))
+async fn page(AxumState(state): AxumState<State>, request: axum::extract::Request) -> axum::response::Response {
+    crate::access::page(&state, &request, include_str!("../assets/scheduler.html"))
 }
 
 async fn script() -> impl IntoResponse {

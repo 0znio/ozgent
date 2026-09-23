@@ -4,13 +4,16 @@
 //! store the terminal client uses, so a conversation started in one shows up
 //! in the other.
 
+pub mod access;
 pub mod admin;
+mod admin_access;
 pub mod agents;
 pub mod anthropic;
 pub mod api;
 pub mod history;
 pub mod hub;
 pub mod media;
+pub mod memory;
 pub mod openai;
 pub mod permission;
 pub mod pool;
@@ -50,17 +53,36 @@ pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::R
     // Jobs run in whichever process gets the lock. Starting it here means
     // `ozgent web` is usually that process, which is what people leave running.
     scheduler::start(&state);
+    // Old messages get vectors from the current embedding model, a batch at
+    // a time. After a minute, so a server that was started to answer one
+    // question answers it first.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            memory::backfill(&state);
+        });
+    }
     let app = api::router(state.clone())
         .merge(admin::router(state.clone()))
         .merge(scheduler_api::router(state.clone()))
         .merge(history::router(state.clone()))
-        .merge(openai::router(state, openai::ApiKey(None)))
+        .merge(openai::router(state.clone(), openai::ApiKey(None)))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit(&state)))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), access::guard))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
         anyhow::anyhow!("cannot bind {addr}: {e}. Is another ozgent web already running?")
     })?;
+    // `tap_io` does nothing but lets axum hand handlers the peer address.
+    let listener = axum::serve::ListenerExt::tap_io(access::GuardedListener::new(listener, state.clone()), |_| {});
+    // Only now, with the port held: a server that failed to bind must not
+    // replace the token of the one that is running.
+    let token = access::issue_token(&state.paths.local_token_file())
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", state.paths.local_token_file().display()))?;
+    let _ = state.local_token.set(token);
 
     // Under a service manager stdout is the journal, and a banner addressed to
     // somebody at a keyboard — "press ctrl-c to stop" — is noise in it that is
@@ -94,9 +116,9 @@ pub async fn serve_with(state: state::State, host: &str, port: u16) -> anyhow::R
             None => println!("  same network:  no network address found; is this machine offline?"),
         }
         println!();
-        println!("  There is no password. Anyone who can reach that address can read");
-        println!("  your conversations and change settings. `--host 127.0.0.1` keeps it");
-        println!("  to this machine.");
+        println!("  Other machines sign in with the admin password (`ozgent admin setup`),");
+        println!("  and programs need an API key from the admin page. Who may connect at");
+        println!("  all is set there too, under Access.");
     }
     println!();
     println!("press ctrl-c to stop");
@@ -134,21 +156,37 @@ pub async fn serve_api(
     cli: ozgent_core::Options,
 ) -> anyhow::Result<()> {
     let state = state::App::new(paths, config, cli).await?;
-    let app = openai::router(state, openai::ApiKey(api_key.clone()))
+    if let Some(k) = &api_key {
+        state.shield.set_legacy_key(k.clone());
+    }
+    // The same checks as the web server: addresses, rate, host, origin, keys.
+    // Keys created on the admin page work here too.
+    let app = openai::router(state.clone(), openai::ApiKey(None))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit(&state)))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), access::guard))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
         anyhow::anyhow!("cannot bind {addr}: {e}. Is another ozgent already using that port?")
     })?;
+    // `tap_io` does nothing but lets axum hand handlers the peer address.
+    let listener = axum::serve::ListenerExt::tap_io(access::GuardedListener::new(listener, state.clone()), |_| {});
 
     println!("ozgent API on http://{addr}/v1");
     if api_key.is_some() {
         println!("a bearer token is required");
     } else if host != "127.0.0.1" && host != "localhost" {
-        println!("warning: bound beyond loopback with no --api-key; anyone who can reach this port can use your models");
+        println!("callers on other machines need an API key from the admin page (or --api-key)");
     }
     println!("press ctrl-c to stop");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
+}
+
+/// The largest request body accepted, from `[web.access] max_body_mb`. Read
+/// at start: the limit is a property of the router.
+fn body_limit(state: &state::State) -> usize {
+    let mb = state.config.lock().unwrap_or_else(|e| e.into_inner()).web.access.max_body_mb.max(1);
+    mb as usize * 1024 * 1024
 }

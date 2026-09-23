@@ -3,7 +3,7 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use futures_util::stream::Stream;
@@ -25,6 +25,7 @@ pub fn router(state: State) -> Router {
         .route("/media/{name}", get(media_file))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
+        .route("/theme.js", get(theme))
         .route("/favicon.ico", get(favicon))
         .route("/logo.png", get(logo))
         .route("/api/models", get(models))
@@ -33,7 +34,9 @@ pub fn router(state: State) -> Router {
         .route("/api/conversations/{id}", patch(rename_conversation))
         .route("/api/conversations/{id}/messages", get(messages))
         .route("/api/settings", get(get_settings).put(put_settings))
-        .route("/api/models/{model}/options", get(model_options).put(set_model_options))
+        .route("/api/models/{model}/options", get(model_options).put(set_model_options).patch(patch_model_options))
+        .route("/api/styles", get(list_styles))
+        .route("/api/styles/{name}", axum::routing::put(save_style).delete(delete_style))
         .route("/api/tools", get(tools).put(set_tool_config))
         .route("/api/tools/active", get(active_tools))
         .route("/api/permissions", get(get_permissions).put(put_permissions))
@@ -50,8 +53,12 @@ pub fn router(state: State) -> Router {
 
 // ------------------------------------------------------------------ assets
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../assets/index.html"))
+async fn index(AxumState(state): AxumState<State>, request: axum::extract::Request) -> Response {
+    crate::access::page(&state, &request, include_str!("../assets/index.html"))
+}
+
+async fn theme() -> impl IntoResponse {
+    ([("content-type", "text/javascript; charset=utf-8")], include_str!("../assets/theme.js"))
 }
 
 async fn css() -> impl IntoResponse {
@@ -586,19 +593,94 @@ fn public(config: &ozgent_core::Config) -> ozgent_core::Config {
     c
 }
 
-async fn get_settings(AxumState(state): AxumState<State>) -> Json<ozgent_core::Config> {
-    Json(public(&state.config.lock().unwrap()))
+/// What a secret reads as over the API. Sent back unchanged, it means "keep
+/// what is there".
+const REDACTED: &str = "••••••••";
+
+/// Whether a config key names a secret.
+fn secret_key(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["key", "token", "secret", "password"].iter().any(|s| n.contains(s))
+}
+
+/// Mask every secret in a config, however deeply a tool's settings nest it.
+///
+/// A tool's own section is opaque here — `[tools.config.web_search.tavily]
+/// api_key` is only a key because of its name — so they are found by name.
+/// Before this, `GET /api/settings` returned the search provider's key to
+/// anyone who could reach the port.
+fn redact(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if secret_key(k) && v.as_str().is_some_and(|s| !s.is_empty()) {
+                    *v = REDACTED.into();
+                } else {
+                    redact(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+        _ => {}
+    }
+}
+
+/// Put back every secret the page returned masked, from the config in force.
+fn unredact(value: &mut serde_json::Value, current: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                let here = current.get(k).unwrap_or(&serde_json::Value::Null);
+                if v.as_str() == Some(REDACTED) {
+                    *v = here.clone();
+                } else {
+                    unredact(v, here);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, v) in items.iter_mut().enumerate() {
+                unredact(v, current.get(i).unwrap_or(&serde_json::Value::Null));
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn get_settings(AxumState(state): AxumState<State>) -> ApiResult<Json<serde_json::Value>> {
+    let mut value = serde_json::to_value(public(&state.config.lock().unwrap()))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    redact(&mut value);
+    Ok(Json(value))
 }
 
 async fn put_settings(
     AxumState(state): AxumState<State>,
-    Json(mut body): Json<ozgent_core::Config>,
+    Json(mut raw): Json<serde_json::Value>,
 ) -> ApiResult<StatusCode> {
-    {
-        // Whatever the page sent for these is ignored; the server's own stand.
-        let current = state.config.lock().unwrap();
-        body.channels = current.channels.clone();
-        body.web = current.web.clone();
+    let current = state.config.lock().unwrap().clone();
+    let current_value = serde_json::to_value(&current).map_err(|e| ApiError::internal(e.to_string()))?;
+    unredact(&mut raw, &current_value);
+    let mut body: ozgent_core::Config =
+        serde_json::from_value(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // Whatever the page sent for these is ignored; the server's own stand.
+    body.channels = current.channels.clone();
+    body.web = current.web.clone();
+    // And for everything that decides what code runs on this machine, or
+    // where from: the interpreter, the directories tools load from, the MCP
+    // servers it starts, and what a tool may touch once running. Writable
+    // here, any of them turned a request into a program of the caller's
+    // choosing. They change on the admin page or in the file.
+    body.mcp = current.mcp.clone();
+    body.tools.python = current.tools.python.clone();
+    body.tools.extra_paths = current.tools.extra_paths.clone();
+    match current.tools.config.get("permissions") {
+        Some(p) => {
+            body.tools.config.insert("permissions".into(), p.clone());
+        }
+        None => {
+            body.tools.config.remove("permissions");
+        }
     }
     body.save(&state.paths)?;
     *state.config.lock().unwrap() = body;
@@ -628,6 +710,9 @@ struct ChatRequest {
     /// Attached images, as `data:` URLs or bare base64.
     #[serde(default)]
     images: Vec<String>,
+    /// A persona for this conversation only; see `turn::Turn::system`.
+    #[serde(default)]
+    system: Option<String>,
     /// Tools switched off in the composer's tools tray, by name.
     #[serde(default)]
     tools_off: Vec<String>,
@@ -659,6 +744,7 @@ async fn chat(
     let events = crate::turn::start(
         &state,
         crate::turn::Turn {
+            system: body.system.clone().filter(|s| !s.trim().is_empty()),
             conversation: body.conversation,
             model: body.model,
             message: body.message,
@@ -802,6 +888,7 @@ fn resolved_view(r: &ozgent_core::options::Resolved) -> serde_json::Value {
         "prefix_reuse": format!("{:?}", r.prefix_reuse).to_lowercase(),
         "tools": r.tools,
         "system_prompt": r.system_prompt,
+        "style": r.style,
     })
 }
 
@@ -810,7 +897,41 @@ async fn set_model_options(
     Path(model): Path<String>,
     Json(body): Json<ozgent_core::Options>,
 ) -> ApiResult<StatusCode> {
+    store_model_options(&state, &model, body)
+}
+
+/// Change some of a model's settings and leave the rest: `{"style":
+/// "concise"}` sets one, `{"system_prompt": null}` clears one. What a slash
+/// command needs, where the settings page sends the whole set.
+async fn patch_model_options(
+    AxumState(state): AxumState<State>,
+    Path(model): Path<String>,
+    Json(patch): Json<serde_json::Map<String, serde_json::Value>>,
+) -> ApiResult<StatusCode> {
     let found = ozgent_core::resolve(&state.paths, &model)?;
+    let current = state.config.lock().unwrap().models.get(&found.model.to_string()).cloned().unwrap_or_default();
+    let mut value = serde_json::to_value(current)?;
+    let object = value.as_object_mut().ok_or_else(|| ApiError::internal("options are not an object"))?;
+    for (k, v) in patch {
+        if v.is_null() {
+            object.remove(&k);
+        } else {
+            object.insert(k, v);
+        }
+    }
+    if let Some(style) = object.get("style").and_then(|v| v.as_str()) {
+        let custom = state.config.lock().unwrap().styles.clone();
+        if ozgent_core::styles::find(&custom, style).is_none() {
+            return Err(ApiError::bad_request(format!("no style called {style:?}")));
+        }
+        object.insert("style".into(), ozgent_core::styles::normalise_name(style).into());
+    }
+    let body: ozgent_core::Options = serde_json::from_value(value).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    store_model_options(&state, &model, body)
+}
+
+fn store_model_options(state: &State, model: &str, body: ozgent_core::Options) -> ApiResult<StatusCode> {
+    let found = ozgent_core::resolve(&state.paths, model)?;
     let key = found.model.to_string();
 
     let mut config = state.config.lock().unwrap();
@@ -1020,7 +1141,7 @@ async fn set_tool_config(
 ///
 /// A failure leaves the previous host in place rather than none at all: tools
 /// that were working should not stop because a new setting was rejected.
-async fn restart_tools(state: &State, config: ozgent_core::Config) {
+pub(crate) async fn restart_tools(state: &State, config: ozgent_core::Config) {
     // Each guard is bound and dropped before the next await: held across one,
     // the handler's future stops being `Send` and axum will not take it.
     let previous = if config.tools.enabled {
@@ -1395,4 +1516,83 @@ mod override_tests {
         .unwrap();
         assert_eq!(kept.context_length, Some(8192));
     }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn secrets_are_masked_going_out_and_kept_coming_back() {
+        let current = serde_json::json!({
+            "tools": { "config": { "web_search": { "tavily": { "api_key": "tvly-real" } } } },
+            "ui": { "markdown": true },
+        });
+        let mut shown = current.clone();
+        redact(&mut shown);
+        assert_eq!(shown["tools"]["config"]["web_search"]["tavily"]["api_key"], REDACTED);
+        assert!(!shown.to_string().contains("tvly-real"));
+        // The page sends the mask back unchanged, with its own edit.
+        shown["ui"]["markdown"] = false.into();
+        unredact(&mut shown, &current);
+        assert_eq!(shown["tools"]["config"]["web_search"]["tavily"]["api_key"], "tvly-real");
+        assert_eq!(shown["ui"]["markdown"], false);
+        // A new value is a new value.
+        let mut replaced = current.clone();
+        replaced["tools"]["config"]["web_search"]["tavily"]["api_key"] = "tvly-new".into();
+        unredact(&mut replaced, &current);
+        assert_eq!(replaced["tools"]["config"]["web_search"]["tavily"]["api_key"], "tvly-new");
+    }
+}
+
+// ---------------------------------------------------------------- styles
+
+/// Every response style, built-in and custom.
+async fn list_styles(AxumState(state): AxumState<State>) -> Json<serde_json::Value> {
+    let custom = state.config.lock().unwrap().styles.clone();
+    Json(serde_json::json!({ "styles": ozgent_core::styles::all(&custom) }))
+}
+
+#[derive(Deserialize)]
+struct StyleBody {
+    #[serde(default)]
+    title: String,
+    prompt: String,
+}
+
+/// Create or change a custom style.
+async fn save_style(
+    AxumState(state): AxumState<State>,
+    Path(name): Path<String>,
+    Json(body): Json<StyleBody>,
+) -> ApiResult<StatusCode> {
+    let name = ozgent_core::styles::normalise_name(&name);
+    ozgent_core::styles::valid_custom_name(&name).map_err(ApiError::bad_request)?;
+    let prompt = body.prompt.trim().to_string();
+    if prompt.is_empty() || prompt.chars().count() > 4000 {
+        return Err(ApiError::bad_request("a style's instruction is 1 to 4000 characters"));
+    }
+    let mut config = state.config.lock().unwrap();
+    config.styles.insert(name, ozgent_core::styles::CustomStyle { title: body.title.trim().to_string(), prompt });
+    config.save(&state.paths)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a custom style, and stop any model using it.
+async fn delete_style(AxumState(state): AxumState<State>, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    let name = ozgent_core::styles::normalise_name(&name);
+    let mut config = state.config.lock().unwrap();
+    if config.styles.remove(&name).is_none() {
+        return Err(ApiError::not_found(format!("no custom style called {name:?}")));
+    }
+    if config.defaults.style.as_deref() == Some(name.as_str()) {
+        config.defaults.style = None;
+    }
+    for options in config.models.values_mut() {
+        if options.style.as_deref() == Some(name.as_str()) {
+            options.style = None;
+        }
+    }
+    config.save(&state.paths)?;
+    Ok(StatusCode::NO_CONTENT)
 }

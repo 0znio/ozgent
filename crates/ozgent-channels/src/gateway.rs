@@ -117,6 +117,48 @@ struct Shared {
     running: Mutex<HashMap<Key, tokio::task::AbortHandle>>,
     /// The current pairing code. Single use: replaced the moment it works.
     pairing: Mutex<String>,
+    /// When each stranger was last told they are not allowed, and how many
+    /// were told in the last hour. See [`Strangers`].
+    strangers: Mutex<Strangers>,
+}
+
+/// Rate for telling strangers they are not on the list.
+///
+/// One reply per person per [`Strangers::QUIET`], so someone who keeps
+/// writing is not answered every time; and no more than
+/// [`Strangers::PER_HOUR`] replies an hour in total, so a flood of new
+/// accounts cannot turn the bot into a way of sending messages.
+#[derive(Default)]
+struct Strangers {
+    last: HashMap<(Kind, String), std::time::Instant>,
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl Strangers {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+    const PER_HOUR: usize = 30;
+
+    /// Whether to reply to `who` now; records the reply if so.
+    fn allow(&mut self, kind: Kind, who: &str) -> bool {
+        let now = std::time::Instant::now();
+        let hour = std::time::Duration::from_secs(3600);
+        while self.recent.front().is_some_and(|t| now.duration_since(*t) >= hour) {
+            self.recent.pop_front();
+        }
+        if self.last.len() > 10_000 {
+            self.last.retain(|_, t| now.duration_since(*t) < Self::QUIET);
+        }
+        let key = (kind, who.to_string());
+        if self.last.get(&key).is_some_and(|t| now.duration_since(*t) < Self::QUIET) {
+            return false;
+        }
+        if self.recent.len() >= Self::PER_HOUR {
+            return false;
+        }
+        self.last.insert(key, now);
+        self.recent.push_back(now);
+        true
+    }
 }
 
 /// The running gateway. Cheap to clone; every clone is the same gateway.
@@ -146,6 +188,7 @@ pub fn start(app: State, paths: Paths, mode: Mode) -> Gateway {
         waiting: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
         pairing: Mutex::new(pairing_code()),
+        strangers: Mutex::new(Strangers::default()),
     });
     let gateway = Gateway { shared };
 
@@ -874,14 +917,26 @@ pub fn admits_message(config: &Config, kind: Kind, msg: &Msg) -> bool {
 /// Answer an unadmitted sender: only ever about pairing.
 async fn offer_pairing(shared: &Arc<Shared>, kind: Kind, msg: &Msg) {
     let Directive::Pair(code) = parse(&msg.text) else {
-        // Deliberately quiet. Anyone can message a bot handle, and a reply to
-        // every stranger both confirms the bot is live and makes it a way to
-        // send mail from someone else's machine.
         tracing::info!(
-            "{kind}: ignoring a message from {} ({}), who is not allowed",
+            "{kind}: a message from {} ({}), who is not allowed",
             msg.name,
             msg.sender_id
         );
+        // Told, rather than left waiting for an answer that never comes — at
+        // a rate that stops this being a way to send messages. See
+        // `Strangers`. Never in a group: a stranger's message there is not
+        // addressed to the bot.
+        let reply = snapshot(&shared.app).channels.access(kind).reply_unauthorized
+            && !msg.group
+            && shared.strangers.lock().unwrap().allow(kind, &msg.sender_id);
+        if reply {
+            let channel = match kind {
+                Kind::Telegram => "Telegram",
+                Kind::WhatsApp => "WhatsApp",
+            };
+            let text = crate::command::not_allowed(channel, &msg.sender_id, msg.handle.as_deref());
+            say(shared, kind, &msg.chat, &text).await;
+        }
         return;
     };
 
@@ -1007,6 +1062,16 @@ async fn chat_task(
             Directive::Help => {
                 let model = model_for(&snapshot(&shared.app)).unwrap_or_else(|| "none".into());
                 say(&shared, kind, &chat, &help(&model)).await;
+            }
+            Directive::Start => {
+                let config = snapshot(&shared.app);
+                let model = model_for(&config).unwrap_or_else(|| "none".into());
+                // Only promised where it works: tools on, and `schedule` not
+                // withheld from this channel.
+                let schedule = config.tools.enabled
+                    && !config.tools.disabled.iter().any(|t| t == "schedule")
+                    && config.channels.access(kind).tools.is_none_or(|l| l.iter().any(|t| t == "schedule"));
+                say(&shared, kind, &chat, &crate::command::welcome(&model, schedule)).await;
             }
             Directive::New => {
                 // Scoped tightly: the guard is not `Send`, and holding it
@@ -1169,6 +1234,7 @@ async fn turn_for(shared: Arc<Shared>, kind: Kind, chat: String, msg: Msg) {
     let started = turn::start(
         &shared.app,
         Turn {
+            system: None,
             conversation,
             model,
             message: msg.text.clone(),
@@ -1317,6 +1383,19 @@ async fn say(shared: &Arc<Shared>, kind: Kind, chat: &str, markdown: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strangers_are_told_once_and_not_in_bulk() {
+        let mut s = Strangers::default();
+        assert!(s.allow(Kind::Telegram, "111"));
+        // Writing again does not get another reply for hours.
+        assert!(!s.allow(Kind::Telegram, "111"));
+        // The same id on another channel is another person.
+        assert!(s.allow(Kind::WhatsApp, "111"));
+        // And a flood of new accounts runs into the hourly cap.
+        let told = (0..100).filter(|i| s.allow(Kind::Telegram, &format!("n{i}"))).count();
+        assert_eq!(told, Strangers::PER_HOUR - 2);
+    }
+
     use super::*;
 
     fn msg(handle: Option<&str>, name: &str) -> Msg {

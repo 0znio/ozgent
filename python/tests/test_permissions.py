@@ -252,6 +252,56 @@ class ApprovalAtTheMomentOfTheCall(unittest.TestCase):
         self.assertEqual(refused, "refused")
 
 
+class OzgentsOwnHomeIsOffLimits(unittest.TestCase):
+    """No tool may touch ozgent's own home, whatever it is allowed otherwise."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.dir.name).resolve()
+        self.home = self.root / "ozgent"
+        (self.home / "configs").mkdir(parents=True)
+        (self.home / "configs" / "config.toml").write_text("secret = 1\n")
+        (self.root / "notes.txt").write_text("fine\n")
+        base.SHARED_CONFIG[SECTION] = {"root": str(self.root), "write": True,
+                                       "shell": True, "shell_allow": ["cat"]}
+        os.environ["OZGENT_PROTECTED"] = str(self.home)
+
+    def tearDown(self):
+        os.environ.pop("OZGENT_PROTECTED", None)
+        base.SHARED_CONFIG.pop(SECTION, None)
+        self.dir.cleanup()
+
+    def test_reading_the_configuration_is_refused(self):
+        with self.assertRaises(ToolError) as e:
+            resolve_within("ozgent/configs/config.toml", "read_file")
+        self.assertIn("even with approval", str(e.exception))
+
+    def test_approval_does_not_open_it(self):
+        with approving(True):
+            with self.assertRaises(ToolError):
+                resolve_within(str(self.home / "configs" / "access.toml"), "write_file")
+            with self.assertRaises(ToolError):
+                call("write_file", path="ozgent/tools/evil.py", content="import os\n")
+        self.assertFalse((self.home / "tools" / "evil.py").exists())
+
+    def test_a_symlink_into_it_is_refused(self):
+        os.symlink(self.home / "configs", self.root / "innocent")
+        with self.assertRaises(ToolError):
+            resolve_within("innocent/config.toml", "read_file")
+
+    def test_the_rest_of_the_root_still_works(self):
+        self.assertEqual(resolve_within("notes.txt", "read_file"), self.root / "notes.txt")
+
+    def test_a_command_naming_a_path_inside_is_refused_even_approved(self):
+        for command in ("cat ozgent/configs/config.toml", f"cat {self.home}/configs/config.toml",
+                        "cat --file=ozgent/configs/config.toml"):
+            with self.assertRaises(ToolError, msg=command):
+                check_command(command)
+            with approving(True), self.assertRaises(ToolError, msg=command):
+                check_command(command)
+        self.assertEqual(check_command("cat notes.txt"), ["cat", "notes.txt"])
+
+
 class ApprovalReachesEveryActingTool(unittest.TestCase):
     """The bug class: a tool that checks the permission flag itself.
 

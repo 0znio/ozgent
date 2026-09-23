@@ -42,6 +42,12 @@ pub struct HostConfig {
     pub tool_config: Value,
     /// Per-call wall-clock budget.
     pub timeout: Duration,
+    /// Directories no tool may read, list or write, whatever it is allowed
+    /// otherwise: ozgent's own home, where its keys, its access rules, its
+    /// database and its tools live, and any other directory tools load from.
+    /// A tool that could write there could change who is allowed in, or
+    /// install code that runs at the next start.
+    pub protected: Vec<PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -53,6 +59,7 @@ impl Default for HostConfig {
             disabled: Vec::new(),
             tool_config: json!({}),
             timeout: Duration::from_secs(30),
+            protected: Vec::new(),
         }
     }
 }
@@ -65,6 +72,8 @@ impl HostConfig {
     ) -> Result<Self, HostError> {
         let mut tool_paths = vec![paths.tools_dir()];
         tool_paths.extend(cfg.extra_paths.iter().cloned());
+        let mut protected = vec![paths.root().to_path_buf()];
+        protected.extend(cfg.extra_paths.iter().cloned());
 
         Ok(Self {
             python: cfg.python.clone(),
@@ -75,6 +84,7 @@ impl HostConfig {
                 cfg.config.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             )),
             timeout: Duration::from_secs(cfg.timeout_seconds),
+            protected,
         })
     }
 }
@@ -147,6 +157,10 @@ impl ToolHost {
             .env("PYTHONPATH", prepend_pythonpath(&cfg.runtime_path))
             // Without this the worker's stderr arrives in unhelpful bursts.
             .env("PYTHONUNBUFFERED", "1")
+            .env(
+                "OZGENT_PROTECTED",
+                std::env::join_paths(&cfg.protected).unwrap_or_default(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

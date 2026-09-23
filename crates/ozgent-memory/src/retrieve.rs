@@ -43,11 +43,38 @@ pub struct Retriever<'a> {
     embedder: &'a dyn Embedder,
     /// How many candidates each retriever contributes before fusion.
     pub candidates: usize,
+    /// Messages the caller already has, which are not worth a vector search.
+    exclude: std::collections::HashSet<i64>,
+    /// The query's vector, computed at most once per search and only when
+    /// there is something to compare it with. With a real embedding model
+    /// that is a forward pass: it was being paid twice per turn, once for
+    /// facts and once for messages, whether or not either had any vectors.
+    query_vec: std::cell::OnceCell<Vec<f32>>,
 }
 
 impl<'a> Retriever<'a> {
     pub fn new(store: &'a Store, embedder: &'a dyn Embedder) -> Self {
-        Self { store, embedder, candidates: 40 }
+        Self {
+            store,
+            embedder,
+            candidates: 40,
+            exclude: Default::default(),
+            query_vec: Default::default(),
+        }
+    }
+
+    /// Use a query vector computed beforehand — outside a lock, say. An empty
+    /// one means "no vector search".
+    pub fn with_query_vector(self, vector: Vec<f32>) -> Self {
+        let _ = self.query_vec.set(vector);
+        self
+    }
+
+    /// Leave these messages out of the vector search: the caller is showing
+    /// them anyway. When nothing is left, the query is never embedded.
+    pub fn excluding(mut self, ids: impl IntoIterator<Item = i64>) -> Self {
+        self.exclude = ids.into_iter().collect();
+        self
     }
 
     /// Search a conversation's messages and visible facts.
@@ -118,16 +145,27 @@ impl<'a> Retriever<'a> {
         query: &str,
         kind: OwnerKind,
     ) -> Result<Vec<i64>, StoreError> {
-        let q = self.embedder.embed(query);
+        let stored: Vec<(i64, Vec<f32>)> = self
+            .store
+            .embeddings_in_conversation(kind, conversation_id)?
+            .into_iter()
+            .filter(|(id, _)| kind != OwnerKind::Message || !self.exclude.contains(id))
+            .collect();
+        if stored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let q = self.query_vec.get_or_init(|| self.embedder.embed_query(query));
         if q.iter().all(|x| *x == 0.0) {
             return Ok(Vec::new());
         }
 
-        let mut scored: Vec<(i64, f32)> = self
-            .store
-            .embeddings_in_conversation(kind, conversation_id)?
+        // Vectors from another model — a different width — cannot be
+        // compared, and are skipped rather than scored as zero; the
+        // background backfill re-embeds them.
+        let mut scored: Vec<(i64, f32)> = stored
             .into_iter()
-            .map(|(id, v)| (id, cosine(&q, &v)))
+            .filter(|(_, v)| v.len() == q.len())
+            .map(|(id, v)| (id, cosine(q, &v)))
             .filter(|(_, s)| *s > 0.0)
             .collect();
 

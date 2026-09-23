@@ -10,6 +10,15 @@ pub trait Embedder: Send + Sync {
 
     fn embed(&self, text: &str) -> Vec<f32>;
 
+    /// Embed something being *searched for*, as opposed to something stored.
+    ///
+    /// Retrieval-trained models are asymmetric — a query carries an
+    /// instruction a stored text does not — so the two are different calls.
+    /// Symmetric by default, which is right for the lexical fallback.
+    fn embed_query(&self, text: &str) -> Vec<f32> {
+        self.embed(text)
+    }
+
     /// Embed a batch. Overridden by backends where batching is cheaper.
     fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
         texts.iter().map(|t| self.embed(t)).collect()
@@ -27,6 +36,10 @@ impl<T: Embedder + ?Sized> Embedder for Box<T> {
 
     fn embed(&self, text: &str) -> Vec<f32> {
         (**self).embed(text)
+    }
+
+    fn embed_query(&self, text: &str) -> Vec<f32> {
+        (**self).embed_query(text)
     }
 
     fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {

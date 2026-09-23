@@ -17,6 +17,8 @@ pub enum Directive {
     /// Ordinary text to answer. Carries the message with any leading
     /// whitespace removed and nothing else changed.
     Ask(String),
+    /// The first thing a Telegram client sends. A welcome, not the command list.
+    Start,
     Help,
     /// Forget this chat's conversation and start a new one.
     New,
@@ -50,7 +52,8 @@ pub fn parse(text: &str) -> Directive {
     let rest = parts.next().unwrap_or("").trim().to_string();
 
     match word.as_str() {
-        "help" | "start" | "?" => Directive::Help,
+        "start" => Directive::Start,
+        "help" | "?" => Directive::Help,
         "new" | "reset" | "clear" => Directive::New,
         "model" => Directive::Model((!rest.is_empty()).then_some(rest)),
         "whoami" | "id" => Directive::Whoami,
@@ -64,6 +67,46 @@ pub fn parse(text: &str) -> Directive {
         w if w.contains('/') => Directive::Ask(text.to_string()),
         other => Directive::Unknown(other.to_string()),
     }
+}
+
+/// The reply to `/start` for someone who is allowed: what this is, and what
+/// to do first. `schedule` says whether this chat may use the schedule tool,
+/// so nothing is promised that the operator has withheld.
+pub fn welcome(model: &str, schedule: bool) -> String {
+    let scheduling = if schedule {
+        "\n**Messages on a schedule.** Ask in your own words — *\"every weekday at 8:30, send me the \
+         top news\"*, *\"remind me tomorrow at 6 pm to call Sam\"* — and I will send them here \
+         when the time comes. I will ask you to confirm first. *\"What have I scheduled?\"* shows \
+         them, and you can pause, change or cancel any of them the same way.\n"
+    } else {
+        ""
+    };
+    format!(
+        "Hi, I'm **ozgent** — an assistant running on its owner's own computer, answering with \
+         `{model}`.\n\
+         \n\
+         **Just send a message.** I keep this conversation, so you can refer back to it.\n\
+         {scheduling}\
+         \n\
+         - `/new` — start a fresh conversation\n\
+         - `/tools` — what I can use here\n\
+         - `/stop` — stop what I am writing\n\
+         - `/help` — everything else"
+    )
+}
+
+/// What someone not on the allowlist is told, instead of nothing.
+///
+/// Plain text, no markdown: it goes to a stranger, and should read the same in
+/// every client. It names the id the owner needs, so there is something to
+/// do other than wait.
+pub fn not_allowed(channel: &str, id: &str, handle: Option<&str>) -> String {
+    let handle = handle.filter(|h| !h.is_empty()).map(|h| format!(" ({h})")).unwrap_or_default();
+    format!(
+        "Sorry, you are not authorized to use this bot, so it will not answer your messages.\n\n\
+         If you know the person who runs it, send them your {channel} id: {id}{handle}. They can \
+         add you, or give you a pairing code to send here as /pair CODE."
+    )
 }
 
 /// The reply to `/help`, as markdown.
@@ -87,6 +130,21 @@ pub fn help(model: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_welcome_promises_scheduling_only_where_it_works() {
+        let on = welcome("m:q4", true);
+        assert!(on.contains("schedule") && on.contains("m:q4"), "{on}");
+        let off = welcome("m:q4", false);
+        assert!(!off.to_lowercase().contains("schedule"), "{off}");
+    }
+
+    #[test]
+    fn a_stranger_is_told_what_to_do() {
+        let t = not_allowed("Telegram", "123456", Some("@sam"));
+        assert!(t.contains("not authorized") && t.contains("123456") && t.contains("@sam") && t.contains("/pair"));
+        assert!(!not_allowed("Telegram", "1", None).contains("()"));
+    }
+
     use super::*;
 
     #[test]
@@ -101,7 +159,8 @@ mod tests {
         assert_eq!(parse("/reset"), Directive::New);
         assert_eq!(parse("/CLEAR"), Directive::New);
         assert_eq!(parse("/help"), Directive::Help);
-        assert_eq!(parse("/start"), Directive::Help);
+        // A welcome, not the command list: /start is what a new client sends.
+        assert_eq!(parse("/start"), Directive::Start);
         assert_eq!(parse("/stop"), Directive::Stop);
         assert_eq!(parse("/whoami"), Directive::Whoami);
         assert_eq!(parse("/tools"), Directive::Tools);

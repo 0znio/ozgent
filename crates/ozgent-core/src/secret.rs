@@ -70,6 +70,27 @@ pub fn random_token(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Every API key begins with this, so a leaked one is recognisable in a log
+/// or a repository, and so the server can tell a key from a password.
+pub const KEY_PREFIX: &str = "ozk_";
+
+/// A new API key: the key to hand over once, its public id, and the digest to
+/// store. 256 bits from the operating system's generator.
+pub fn new_api_key() -> (String, String, String) {
+    let key = format!("{KEY_PREFIX}{}", random_token(32));
+    let id = key[..KEY_PREFIX.len() + 8].to_string();
+    let digest = key_digest(&key);
+    (key, id, digest)
+}
+
+/// What is stored for an API key: hex SHA-256. A key is 256 random bits, so
+/// there is nothing to stretch; the hash only has to stop a copied config
+/// file from being a key.
+pub fn key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Compare two secrets without leaking where they first differ.
 pub fn same(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());

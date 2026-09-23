@@ -44,6 +44,11 @@ pub struct Config {
 
     pub embedding: EmbeddingConfig,
 
+    /// Response styles the user wrote, by name, beside the built-ins. See
+    /// [`crate::styles`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub styles: BTreeMap<String, crate::styles::CustomStyle>,
+
     /// The web interface.
     pub web: WebConfig,
 }
@@ -79,6 +84,11 @@ pub struct WebConfig {
     /// never shortens anybody's window.
     #[serde(default = "default_parallel")]
     pub parallel: u32,
+    /// Who may reach the server and what an API key allows. See
+    /// [`crate::access`]. Under `[web]` so that nothing reachable without the
+    /// admin password can change it.
+    #[serde(default)]
+    pub access: crate::access::AccessConfig,
 }
 
 fn default_parallel() -> u32 {
@@ -95,6 +105,7 @@ impl Default for WebConfig {
             admin_password_hash: None,
             idle_unload_minutes: default_idle_unload(),
             parallel: default_parallel(),
+            access: Default::default(),
         }
     }
 }
@@ -122,13 +133,45 @@ impl WebConfig {
 /// Separate from the chat model on purpose: pooling a chat model's hidden
 /// states produces vectors that look plausible and cluster badly, so ozgent
 /// would rather have none than pretend.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// An installed model, as `name:tag` or an alias. `None` disables
-    /// embeddings and the memory layer falls back to lexical matching.
+    /// Off, memory recalls by keywords alone and `/v1/embeddings` refuses.
+    pub enabled: bool,
+    /// An installed model, as `name:tag` or an alias. Unset, the first
+    /// installed embedding model is used — installing one is the request to
+    /// use it, and memory silently staying lexical beside an installed model
+    /// was the failure this default exists to prevent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Where the embedding model runs. `auto` uses the GPU only when it fits
+    /// above what the chat model already holds and needs for its next decode;
+    /// otherwise the CPU, which is 10-20x slower per text but takes nothing
+    /// from the chat model.
+    pub device: EmbedDevice,
+    /// Longest text embedded whole, in tokens. `0` — the default — is the
+    /// whole window the model was trained on (32,768 for Qwen3-Embedding);
+    /// a number caps it lower. Memory truncates past it; `/v1/embeddings`
+    /// refuses, as OpenAI does. Only texts that need it pay for it: an 8k
+    /// context is kept ready, and a longer one is made for the call and
+    /// released, on the GPU only if it fits beside what is already there.
+    pub max_tokens: u32,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self { enabled: true, model: None, device: EmbedDevice::Auto, max_tokens: 0 }
+    }
+}
+
+/// Where the embedding model runs. See [`EmbeddingConfig::device`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbedDevice {
+    #[default]
+    Auto,
+    Gpu,
+    Cpu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

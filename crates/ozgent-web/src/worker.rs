@@ -28,6 +28,9 @@ pub enum Job {
     /// Embed texts and send the vectors straight back.
     Embed {
         texts: Vec<String>,
+        role: ozgent_llama::embed::Role,
+        /// Refuse a text longer than the embedder takes, rather than cut it.
+        strict: bool,
         reply: std::sync::mpsc::Sender<Result<Vec<Vec<f32>>, String>>,
     },
     /// Drop the loaded model and free its VRAM.
@@ -64,6 +67,11 @@ pub struct Request {
     /// question. True for the web interface, false for the OpenAI API, where
     /// the caller is a program.
     pub can_ask: bool,
+    /// What an API caller's key allows, or `None` for this machine's owner,
+    /// whom the tool policy alone governs. A key caps which effects may run at
+    /// all and stands in for the question the policy would have asked about
+    /// the effects it grants. See [`ozgent_core::access::Grant`].
+    pub grant: Option<ozgent_core::access::Grant>,
     /// Agents the message called by name, in order. Empty for an ordinary
     /// turn. When set, each runs in turn with its own instructions, tools and
     /// rules, and their reports are the reply.
@@ -188,6 +196,27 @@ pub struct Worker {
     context: Context,
 }
 
+/// What the embedding model is doing, for the admin page and the memory
+/// layer. Written by the embedding thread when it loads.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct EmbedStatus {
+    /// The model in use, as `name:tag`, once loaded.
+    pub model: Option<String>,
+    pub dimensions: usize,
+    /// `gpu` or `cpu`.
+    pub device: Option<&'static str>,
+    /// Why the last load failed, if it did.
+    pub error: Option<String>,
+}
+
+static EMBED_STATUS: std::sync::Mutex<EmbedStatus> =
+    std::sync::Mutex::new(EmbedStatus { model: None, dimensions: 0, device: None, error: None });
+
+/// The embedding model's current state.
+pub fn embed_status() -> EmbedStatus {
+    EMBED_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The projector type, aliased so the lifetime stays readable in signatures.
 pub type LoadedProjector<'a> = ozgent_llama::mtmd::Projector<'a>;
 
@@ -279,10 +308,41 @@ impl Worker {
     /// Embed texts. Synchronous: there is nothing to stream, and the caller
     /// wants the vectors or an error rather than a channel.
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_as(ozgent_llama::embed::Role::Document, texts)
+    }
+
+    /// As [`Worker::embed`], refusing any text longer than the model takes —
+    /// for API callers, who are owed an error rather than a vector of half
+    /// their document.
+    pub fn embed_strict(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         let (tx, rx) = channel();
-        self.send(EMBED_KEY, Job::Embed { texts, reply: tx })
+        let job = Job::Embed { texts, role: ozgent_llama::embed::Role::Document, strict: true, reply: tx };
+        self.send(EMBED_KEY, job).map_err(str::to_string)?;
+        rx.recv().map_err(|_| "the embedding thread stopped".to_string())?
+    }
+
+    /// Embed texts as queries or as documents; see
+    /// [`ozgent_llama::embed::Role`]. Blocks until the vectors are back.
+    pub fn embed_as(&self, role: ozgent_llama::embed::Role, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let (tx, rx) = channel();
+        self.send(EMBED_KEY, Job::Embed { texts, role, strict: false, reply: tx })
             .map_err(str::to_string)?;
         rx.recv().map_err(|_| "the embedding thread stopped".to_string())?
+    }
+
+    /// The embedding model that would be used, as `name:tag`, whether or not
+    /// it is loaded yet. `None` when embeddings are off or none is installed.
+    pub fn embedding_model(&self) -> Option<String> {
+        choose_embedding_model(&self.context.paths, &snapshot(&self.context.config)).ok().map(|(r, _)| r)
+    }
+
+    /// Drop the embedding model, so its next use loads it under the current
+    /// settings — a different model, device or window.
+    pub fn reload_embedder(&self) {
+        if let Some(tx) = self.pool.get(EMBED_KEY) {
+            let _ = tx.send(Job::Unload);
+        }
+        *EMBED_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = EmbedStatus::default();
     }
 
     /// Drop every loaded model and free its VRAM.
@@ -335,7 +395,7 @@ impl Worker {
             .name(name)
             .spawn(move || {
                 if embedding {
-                    run_embeddings(context, rx);
+                    run_embeddings(context, rx, &member);
                 } else {
                     run_model(context, rx, &member);
                 }
@@ -408,12 +468,15 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
             // Embeddings have their own thread; one arriving here is a caller
             // that has not been updated, and answering it is cheaper than
             // failing it.
-            Ok(Job::Embed { texts, reply }) => {
+            Ok(Job::Embed { texts, role, strict, reply }) => {
                 let _ = reply.send(serve_embeddings(
                     &context.paths,
                     &snapshot(&context.config),
                     &mut embedder,
                     texts,
+                    role,
+                    strict,
+                    Some(member),
                 ));
             }
             Ok(Job::Unload) => return,
@@ -455,17 +518,26 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
 /// Separate because it is a separate model: held inside a chat model's loop it
 /// was dropped and reloaded every time that model changed, which is a load of
 /// its own for every switch.
-fn run_embeddings(context: Context, rx: Receiver<Job>) {
+fn run_embeddings(context: Context, rx: Receiver<Job>, member: &crate::pool::Membership) {
     let mut embedder: Option<ozgent_llama::embed::Embedder> = None;
     while let Ok(job) = rx.recv() {
         match job {
-            Job::Embed { texts, reply } => {
-                let _ = reply.send(serve_embeddings(
+            Job::Embed { texts, role, strict, reply } => {
+                // Marked busy while it works and recently used afterwards, so
+                // eviction takes it in its proper turn rather than always
+                // first — and never in the middle of a batch.
+                member.working(true);
+                let result = serve_embeddings(
                     &context.paths,
                     &snapshot(&context.config),
                     &mut embedder,
                     texts,
-                ));
+                    role,
+                    strict,
+                    Some(member),
+                );
+                member.working(false);
+                let _ = reply.send(result);
             }
             Job::Unload => return,
             // Not this thread's work. Answered rather than dropped so the
@@ -1079,8 +1151,8 @@ fn serve_model(
                     }
                     queued = Some(request);
                 }
-                Job::Embed { texts, reply } => {
-                    let _ = reply.send(serve_embeddings(paths, &snapshot(shared), embedder, texts));
+                Job::Embed { texts, role, strict, reply } => {
+                    let _ = reply.send(serve_embeddings(paths, &snapshot(shared), embedder, texts, role, strict, None));
                 }
                 // Unloading means returning so the engine is dropped with the
                 // scope.
@@ -1153,35 +1225,113 @@ fn serve_embeddings(
     config: &Config,
     slot: &mut Option<ozgent_llama::embed::Embedder>,
     texts: Vec<String>,
+    role: ozgent_llama::embed::Role,
+    strict: bool,
+    member: Option<&crate::pool::Membership>,
 ) -> Result<Vec<Vec<f32>>, String> {
+    if !config.embedding.enabled {
+        return Err("embeddings are switched off ([embedding] enabled = false)".into());
+    }
     if slot.is_none() {
-        *slot = Some(load_embedder(paths, config)?);
+        // Planned and loaded under the pool's loading lock, so it cannot
+        // read the same free memory a chat model is being placed into.
+        let _guard = member.map(|m| m.loading());
+        let beside_a_chat_model = member.is_some_and(|m| m.others_resident());
+        match load_embedder(paths, config, beside_a_chat_model) {
+            Ok((embedder, reference, device)) => {
+                *EMBED_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = EmbedStatus {
+                    model: Some(reference),
+                    dimensions: embedder.dimensions(),
+                    device: Some(device),
+                    error: None,
+                };
+                *slot = Some(embedder);
+            }
+            Err(e) => {
+                EMBED_STATUS.lock().unwrap_or_else(|e| e.into_inner()).error = Some(e.clone());
+                return Err(e);
+            }
+        }
     }
     let embedder = slot.as_ref().expect("just loaded");
-    embedder.embed_batch(&texts).map_err(|e| e.to_string())
+    if strict {
+        if let Err(t) = embedder.check_lengths(role, &texts) {
+            return Err(format!(
+                "input {} is {} tokens; this embedding model can take at most {} per input right now \
+                 ([embedding] max_tokens caps it; on the GPU, free memory does too), so split the text",
+                t.index, t.tokens, t.limit
+            ));
+        }
+    }
+    embedder.embed_as(role, &texts).map_err(|e| e.to_string())
 }
 
-/// Load the configured embedding model, once.
+/// The embedding model to use: the configured one, or the first installed.
+pub(crate) fn choose_embedding_model(
+    paths: &Paths,
+    config: &Config,
+) -> Result<(String, ozgent_core::Installed), String> {
+    if !config.embedding.enabled {
+        return Err("embeddings are switched off".into());
+    }
+    if let Some(name) = config.embedding.model.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        let found = ozgent_core::resolve(paths, name).map_err(|e| format!("embedding model {name:?}: {e}"))?;
+        return Ok((found.model.to_string(), found));
+    }
+    ozgent_core::installed(paths)
+        .into_iter()
+        .find(|m| ozgent_llama::layout::is_embedding(&m.manifest.primary_weights(&m.dir)))
+        .map(|m| (m.model.to_string(), m))
+        .ok_or_else(embedding_unavailable)
+}
+
+/// Load the embedding model, once, where it fits. Returns it, its name, and
+/// where it went.
 ///
-/// Lazily, because most sessions never ask for an embedding and the model is
-/// another half-gigabyte of VRAM that a chat has better uses for.
+/// Lazily, because a session that never recalls anything never pays for it.
+/// On the GPU only when it fits above everything a resident chat model holds
+/// *and* what that model still needs for its next decode — the memory
+/// llama.cpp allocates lazily and aborts the whole process without.
 fn load_embedder(
     paths: &Paths,
     config: &Config,
-) -> Result<ozgent_llama::embed::Embedder, String> {
-    let Some(name) = config.embedding.model.as_deref() else {
-        return Err(embedding_unavailable());
-    };
-    let found = ozgent_core::resolve(paths, name)
-        .map_err(|e| format!("embedding model {name:?}: {e}"))?;
+    beside_a_chat_model: bool,
+) -> Result<(ozgent_llama::embed::Embedder, String, &'static str), String> {
+    use ozgent_core::config::EmbedDevice;
+    let (reference, found) = choose_embedding_model(paths, config)?;
     let weights = found.manifest.primary_weights(&found.dir);
-    ozgent_llama::embed::Embedder::load(&weights, 99)
-        .map_err(|e| format!("loading embedding model {name:?}: {e}"))
+    let size = std::fs::metadata(&weights).map(|m| m.len()).unwrap_or(0);
+    let gpu = match config.embedding.device {
+        EmbedDevice::Gpu => true,
+        EmbedDevice::Cpu => false,
+        // Only into room a chat model has already left. Loaded first, it
+        // would take memory the next chat model is planned against, and a
+        // chat model losing a few layers is not a squeeze bad enough for the
+        // pool to evict anything to get them back.
+        EmbedDevice::Auto if !beside_a_chat_model => false,
+        EmbedDevice::Auto => {
+            // Weights, a context of eight 512-token lanes and its scratch,
+            // and the decode reserve left untouched for whoever else is here.
+            // The working context's cache (8k tokens, about 60 KB a token at
+            // 8 bits for a 0.6B model); longer contexts are checked against
+            // free memory when they are needed.
+            let cache = ozgent_llama::embed::WORKING_TOKENS as u64 * (64 << 10);
+            let need = size + size / 10 + cache + (256 << 20) + ozgent_llama::backend::decode_reserve();
+            ozgent_llama::backend::best_gpu()
+                .filter(|d| d.is_gpu())
+                .is_some_and(|d| d.memory_free as u64 >= need)
+        }
+    };
+    let embedder = ozgent_llama::embed::Embedder::load_with(&weights, if gpu { 99 } else { 0 }, config.embedding.max_tokens)
+        .map_err(|e| format!("loading embedding model {reference:?}: {e}"))?;
+    let device = if gpu { "gpu" } else { "cpu" };
+    tracing::info!("embedding model {reference}: {} dimensions, on the {device}", embedder.dimensions());
+    Ok((embedder, reference, device))
 }
 
 fn embedding_unavailable() -> String {
-    "no embedding model is configured. Install one and set \
-     [embedding] model = \"<name>\" in config.toml"
+    "no embedding model is installed. Get one on the admin page (Models), for example \
+     Qwen3-Embedding-0.6B"
         .to_string()
 }
 
@@ -1220,6 +1370,22 @@ fn permit(
             None => policy.permissions.verdict(&call.name, effect, &grants),
         }
     };
+    // A key's scopes come first: a caller without the scope for this effect
+    // is refused whatever the policy would allow. With it, a question the
+    // policy would ask is answered by the key — the operator decided when
+    // issuing it. Never as `by_user`: that flag tells the tool a person saw
+    // this exact call, which lifts limits (a command allowlist, a root) that
+    // a standing grant must not.
+    if let Some(grant) = &request.grant {
+        if !grant.permits(effect) {
+            tracing::info!("key {}: refused {} ({effect:?} is not in its scopes)", grant.key, call.name);
+            return None;
+        }
+        match verdict {
+            Verdict::Deny => return None,
+            Verdict::Allow { .. } | Verdict::Ask => return Some(false),
+        }
+    }
     match verdict {
         Verdict::Allow { by_user } => return Some(by_user),
         Verdict::Deny => return None,
@@ -2822,6 +2988,7 @@ mod tests {
         Request {
             // No stream is being watched in a test.
             can_ask: false,
+            grant: None,
             model: model.into(),
             messages: Vec::new(),
             thinking: None,

@@ -15,19 +15,53 @@ software written for either works unchanged: set its base URL to
 interface is up, point other programs at its port instead.
 
 `ozgent serve` binds loopback only. `--host 0.0.0.0` exposes it to the
-network, which you should pair with `--api-key`.
+network; callers from elsewhere then need a key.
 
 ## Authentication
 
-None by default. With `ozgent serve --api-key SECRET` (or `$OZGENT_API_KEY`),
-every `/v1` request must carry it, in either client's spelling:
+Every request, on either port, is checked in this order. A refusal says which
+step refused it.
 
-```
-Authorization: Bearer SECRET
-x-api-key: SECRET
-```
+1. **The address.** `[web.access]` `mode` is `open` (everyone except `deny`)
+   or `allowlist` (only `allow`, plus this machine). Rules are IPv4 or IPv6
+   addresses or CIDR ranges; an IPv4 client seen as `::ffff:a.b.c.d` is
+   matched as IPv4. A refused address is dropped at `accept`. Behind a reverse
+   proxy, list it in `trusted_proxies` and the right-most address in
+   `X-Forwarded-For` that is not itself a trusted proxy is the client; nobody
+   else's forwarding header is believed. → `403`
+2. **The rate.** `requests_per_minute` per address (this machine is exempt),
+   and `max_auth_failures` bad keys lock an address out for
+   `lockout_minutes`. → `429` with `Retry-After`
+3. **The name.** `Host` must be `localhost`, a bare IP address, or a name in
+   `hosts`. This is what stops a web page reaching the server through a domain
+   its owner points at your machine. → `421`
+4. **The origin.** A browser request that changes something must come from
+   this server's own pages. → `403`
+5. **The caller.**
 
-A missing or wrong token is `401`.
+| caller | how | may use |
+|---|---|---|
+| a program on this machine | nothing, while `local_api_open` is on (the default) | `/v1`, as the owner |
+| this machine's own page | the local token, sent as `x-ozgent-token` (the page is given it; the terminal reads `~/ozgent/run/local-token`, mode 600) | everything but `/api/admin/*` |
+| another machine's browser | the admin session cookie, with `x-ozgent-admin: 1` on writes | everything |
+| a program with a key | `Authorization: Bearer ozk_…` or `x-api-key: ozk_…` | `/v1`, within the key's scopes |
+
+Keys are made on the admin page (or `POST /api/admin/keys`), shown once, and
+stored as a SHA-256. Their scopes:
+
+| scope | allows |
+|---|---|
+| `inference` | the models, with the caller's own tools; embeddings |
+| `tools` | ozgent's own tools whose effect is *read* |
+| `tools_write` | also tools that change files or data |
+| `tools_execute` | also tools that run programs — still in the sandbox, and only if `[tools.config.permissions] shell` allows |
+| `agents` | `@agents` |
+
+A key's scopes stand in for the question the tool policy would ask; they never
+lift a `deny`. A request outside them is `403` with `permission_error`.
+`ozgent serve --api-key SECRET` still works: that one key has every scope.
+
+A missing or wrong key is `401`.
 
 ## Errors
 
@@ -220,8 +254,23 @@ otherwise the sampling fields are the same.
 { "model": "Qwen3-Embedding-0.6B", "input": ["hello world", "goodbye world"] }
 ```
 
-`input` is a string or an array of strings. Returns one vector per input in
-OpenAI's shape. An empty input is a `400`.
+`input` is a string or an array of up to 2,048 strings. Returns one
+unit-length vector per input in OpenAI's shape, and `model` names the model
+that made them.
+
+| field | |
+|---|---|
+| `model` | an installed embedding model, or anything else — an OpenAI name like `text-embedding-3-small` gets the configured embedding model. Naming a *chat* model is a `400`. |
+| `encoding_format` | `float` (default) or `base64` — little-endian f32, as OpenAI's SDKs expect |
+| `dimensions` | keep the first N dimensions and renormalise, for Matryoshka-trained models such as Qwen3-Embedding |
+
+Each input is embedded whole up to the model's trained window (32,768 tokens
+for Qwen3-Embedding), or `[embedding] max_tokens` if that is lower. A longer
+input is a `400` naming the limit, as OpenAI does, never a vector of its first
+half. On the GPU a long input also has to fit in the memory free at the time.
+
+Token arrays, and empty strings, are a `400`. With no embedding model
+installed, or `[embedding] enabled = false`, the answer is a `400` saying so.
 
 ## `GET /v1/models`, `GET /v1/models/{model}`
 
@@ -355,8 +404,12 @@ Served by `ozgent web`. These are what the browser interface talks to. They are
 **not OpenAI-compatible and not a stable API** — they change with the UI. Use
 `/v1` for anything you want to keep working.
 
-No authentication, except for the `/admin` routes below. `ozgent web` binds
-`0.0.0.0` by default so a phone on the same network can reach it;
+They belong to whoever owns the machine, so an API key does not open them.
+The page carries the owner's local token (see [Authentication](#authentication));
+from another device, sign in at `/admin` first and the session cookie
+covers them too. Anything else gets `401`. The `/api/admin/*` and `/api/hub/*`
+routes, and deleting a model, always need the admin session. `ozgent web`
+binds `0.0.0.0` by default so a phone on the same network can reach it;
 `--host 127.0.0.1` keeps it to this machine.
 
 All bodies are JSON. Failures are `{"error": "..."}` with `400` when the
@@ -497,10 +550,44 @@ different questions:
 `limits` is read from the GGUF header, so a slider cannot be dragged past what
 the model was trained for.
 
+`effective` includes `style` and `system_prompt` — the model's response style
+and persona; see *Styles* below.
+
 ### `PUT /api/models/{model}/options`
 
 Body is an `Options` object — the same keys as `[models."name:tag"]` in
-`config.toml`. Only the keys you send are changed; `null` clears one.
+`config.toml` — and it **replaces** the model's overrides. A value equal to
+what the model would inherit is dropped rather than stored.
+
+### `PATCH /api/models/{model}/options`
+
+Change some keys and leave the rest: `{"style": "concise"}` sets one,
+`{"system_prompt": null}` clears one. An unknown style is a `400`. This is
+what `/style`, `/persona` and `/effort` use.
+
+## Styles
+
+A model's **style** shapes how it answers, and its **persona**
+(`system_prompt`) is standing instructions; both go into the system prompt of
+ozgent's own chats — web, terminal, channels — and never into a `/v1` request.
+
+### `GET /api/styles`
+
+```json
+{ "styles": [
+  { "name": "concise", "title": "Concise — short answers, no padding", "prompt": "Answer concisely…", "custom": false },
+  { "name": "pirate", "title": "Pirate", "prompt": "Answer like a pirate…", "custom": true } ] }
+```
+
+Built in: `concise`, `detailed`, `to-the-point`, `adhd`, `beginner`, `expert`,
+`casual`, `formal`, `tutor`.
+
+### `PUT /api/styles/{name}` · `DELETE /api/styles/{name}`
+
+`{"title": "optional label", "prompt": "the instruction"}` makes or changes a
+custom style, kept as `[styles.<name>]` in `config.toml`. Names are lowercase
+letters, digits and hyphens and cannot be a built-in's. Deleting one clears it
+from every model using it.
 
 ## Conversations
 
@@ -773,12 +860,17 @@ The whole `config.toml`, as JSON.
 
 `PUT` **replaces** it — send the document you got from `GET` with your edits,
 not a fragment, or everything you left out goes back to its default. It saves
-to disk and drops the loaded model, so the next turn picks up the new settings.
-`204` on success.
+to disk; the next turn picks up the new settings. `204` on success.
 
-Handle with care: this is the same document that holds your provider keys and
-your MCP servers. `[channels]` and `[web]` are left out of `GET` and ignored in
-`PUT`: they belong to `/admin`, and this endpoint has no password.
+Secrets are masked. Any string under a key containing `key`, `token`,
+`secret` or `password` reads as `••••••••`, and sending that mask back keeps
+the stored value.
+
+Some settings are never changed here, whatever `PUT` sends: `[channels]` and
+`[web]` (the gateway, who may connect, API keys), `[mcp]`, the tool
+interpreter and extra tool folders, and `[tools.config.permissions]`. Each
+decides what program runs or who may reach this machine, so they change on
+`/admin`, behind its password, or in the file.
 
 ---
 
@@ -816,7 +908,33 @@ browser out and lifts the lock.
 | `POST /api/admin/gateway/{channel}/restart` | reconnect, clearing a failure |
 | `POST /api/admin/gateway/pairing` | a new pairing code |
 
+Each channel also takes `reply_unauthorized`: tell someone who is not on the
+list that they are not, with the id you would need — at most once per person
+every six hours, and to thirty people an hour at most. On by default for
+Telegram, off for WhatsApp.
+
 Changes apply to the running channels at once; there is nothing to restart.
+
+### Security
+
+| | |
+|---|---|
+| `GET /api/admin/access` | the `[web.access]` rules, the keys (id, name, scopes, created, disabled — never the key or its hash), the scopes there are, and `you`: the address this request came from |
+| `PUT /api/admin/access` | any of `mode`, `allow`, `deny`, `trusted_proxies`, `hosts`, `local_api_open`, `requests_per_minute`, `max_connections_per_address`, `max_body_mb`, `max_auth_failures`, `lockout_minutes`. A rule that does not parse is a `400`; a change that would refuse your own address is a `409` unless `"force": true` |
+| `POST /api/admin/keys` | `{"name", "scopes": [...]}` → `{"key", "id", ...}`. The key is in this response and nowhere else |
+| `PATCH /api/admin/keys/{id}` | any of `name`, `scopes`, `disabled` |
+| `DELETE /api/admin/keys/{id}` | revoke |
+| `GET /api/admin/sandbox` | what tools may touch: `root`, `write`, `shell`, `shell_allow`, `shell_network`, `network`, `network_allow`, `network_private`, `allow_sensitive`; and, read-only, the interpreter, extra tool folders and MCP servers — each a program that runs as you, so changed only in `config.toml` |
+| `PUT /api/admin/sandbox` | any of the editable ones; the tool host restarts to take them |
+
+### Models and memory
+
+| | |
+|---|---|
+| `GET /api/admin/embedding` | `enabled`, `model` (`null` is automatic), `device` (`auto`, `gpu`, `cpu`), `max_tokens` (`0` is the model's own window), the installed embedding models, `status` (model, dimensions, where it runs, last error), `coverage` (messages with vectors, of all), `backfilling` |
+| `PUT /api/admin/embedding` | any of `enabled`, `model`, `device`, `max_tokens`; the model reloads on its next use and earlier messages are re-embedded in the background |
+| `POST /api/admin/embedding/backfill` | embed every message still missing a vector from the current model |
+| `GET /api/admin/server` · `PUT /api/admin/server` | `idle_unload_minutes`, `parallel` (conversations per model at once, from the next load), `tool_timeout_seconds`, `max_calls_per_turn`, `handoff` |
 
 ---
 

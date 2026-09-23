@@ -166,7 +166,17 @@ shell         = false              # run commands
 shell_allow   = ["git", "cargo"]   # and only these programs
 network       = true               # fetch pages by URL
 network_allow = []                 # empty means any host
+network_private = false            # fetch_url may reach this machine and your LAN
+shell_network = false              # commands may use the network
+shell_read    = []                 # more folders a command may read
+allow_sensitive = false            # file tools and commands may read credentials
+sandbox       = true               # refuse to run a command unsandboxed
 ```
+
+All but `shell_read` and `sandbox` are also on `/admin` under
+**Security → Tool sandbox**. The chat
+page's settings API cannot change them, nor `tools.python` or `[mcp]`, which
+decide which program runs.
 
 `root` defaults to the directory ozgent was started in — the least surprising
 boundary, since a model asked about "this project" should not reach the rest of
@@ -227,8 +237,42 @@ something else — otherwise an allowed program could introduce a disallowed one
 permits `example.com` and `docs.example.com`, and refuses `notexample.com`.
 Only `http` and `https` are fetchable; `file://` is not.
 
-These are the properties the tests in `python/tests/test_permissions.py` pin
-down. They are the tests worth reading before changing any of this: everything
+**Commands run in a sandbox.** Being allowed to run `git` or `python` is not
+the same as being allowed to do anything with them, so every command starts
+inside a small launcher (`ozgent_tools/sandbox.py`) that, before it runs the
+program:
+
+- gives it its own user, mount, PID and network namespaces, so it sees no
+  other process and, unless `shell_network` is on, has no network at all;
+- adds Landlock rules: it may read the system's programs and libraries and
+  the folder it runs in, write only in that folder and a private temporary
+  one, and reach nothing under ozgent's own home or your credential folders
+  (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, browser profiles and so on) even
+  where those sit inside the folder;
+- hands it a clean environment, so API keys in ozgent's own environment never
+  reach it;
+- turns off core dumps and caps any file it writes at 2 GB;
+- dies with the tool worker, and on a timeout its whole process group is
+  killed, so nothing it started carries on.
+
+If the kernel has no Landlock, the command is refused rather than run bare;
+`sandbox = false` in the file is the only way to change that. Landlock's
+network and signal rules need a newer kernel than its file rules, so the
+namespaces carry those parts on older kernels.
+
+**Credentials are refused to the file tools too**, even with approval, unless
+`allow_sensitive = true`.
+
+**`fetch_url` cannot be pointed back at you.** A page can tell the model to
+fetch `http://127.0.0.1:7333/api/settings`, your router, or a cloud metadata
+address. Every address a host resolves to is checked before connecting and
+again after, every redirect is followed by hand and checked the same way, and
+addresses that smuggle a private IPv4 inside an IPv6 one (mapped, 6to4,
+Teredo, NAT64) count as private. Hosts in `network_allow` may be private;
+`network_private = true` allows them all.
+
+These are the properties the tests in `python/tests/test_permissions.py` and
+`python/tests/test_sandbox.py` pin down. They are the tests worth reading before changing any of this: everything
 else in the tool layer fails visibly, while a permission check that is subtly
 wrong fails by letting the model do something you never agreed to.
 

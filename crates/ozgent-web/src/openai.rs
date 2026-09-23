@@ -47,10 +47,10 @@ pub fn router(state: State, key: ApiKey) -> Router {
 // ------------------------------------------------------------------ errors
 
 /// OpenAI's error envelope, so a client's own error handling still fires.
-struct ApiError {
-    status: StatusCode,
-    kind: &'static str,
-    message: String,
+pub(crate) struct ApiError {
+    pub(crate) status: StatusCode,
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
 }
 
 /// Classify a worker failure by whose fault it is.
@@ -98,6 +98,28 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// Refuse what a key's scopes do not cover, before any work is done.
+///
+/// The owner (`None`) is not limited here; the tool policy governs them.
+pub(crate) fn check_scopes(
+    grant: Option<&ozgent_core::access::Grant>,
+    model: &str,
+    wants_tools: bool,
+) -> Result<(), ApiError> {
+    let Some(g) = grant else { return Ok(()) };
+    let forbidden = |m: &str| ApiError { status: StatusCode::FORBIDDEN, kind: "permission_error", message: m.into() };
+    if !g.inference {
+        return Err(forbidden("this API key may not use the models (it lacks the `inference` scope)"));
+    }
+    if wants_tools && !g.tools {
+        return Err(forbidden("this API key may not use ozgent's tools (it lacks the `tools` scope)"));
+    }
+    if model.starts_with('@') && !g.agents {
+        return Err(forbidden("this API key may not use ozgent's agents (it lacks the `agents` scope)"));
+    }
+    Ok(())
+}
 
 pub(crate) fn authorise_key(headers: &HeaderMap, key: &ApiKey) -> bool {
     authorise(headers, key).is_ok()
@@ -599,10 +621,14 @@ pub fn finish_reason(stop: &str) -> &'static str {
 async fn chat_completions(
     AxumState(state): AxumState<State>,
     axum::Extension(key): axum::Extension<ApiKey>,
+    caller: Option<axum::Extension<crate::access::Caller>>,
     headers: HeaderMap,
     Json(request): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     authorise(&headers, &key)?;
+    let grant = caller.and_then(|c| c.0.grant());
+    let wants_tools = request.ozgent_tools == Some(true) || request.native_tools.is_some();
+    check_scopes(grant.as_ref(), &request.model, wants_tools)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
@@ -617,7 +643,10 @@ async fn chat_completions(
     // by design, and a grammar would stop it calling its tools. So mentions
     // are not looked for when a schema is asked for, and choosing an agent
     // *as the model* with one is refused below.
-    let agents_on = request.ozgent_agents.unwrap_or(true) && request.response_format.is_none();
+    let agents_on = request.ozgent_agents.unwrap_or(true)
+        && request.response_format.is_none()
+        // A key without the agents scope simply has none to mention.
+        && grant.as_ref().is_none_or(|g| g.agents);
     let resolved = crate::agents::resolve(&state, &request.model, &latest, agents_on)
         .map_err(refusal)?;
     let found = resolved.model;
@@ -661,6 +690,7 @@ async fn chat_completions(
         .submit(Request {
             // An OpenAI client is a program; it cannot consent for a person.
             can_ask: false,
+            grant: grant.clone(),
             model: found.model.to_string(),
             messages: to_messages(&request),
             // A reasoning model opens with `<think>`, which no schema admits —
@@ -714,6 +744,7 @@ fn refusal(r: crate::agents::Refusal) -> ApiError {
 async fn completions(
     state: AxumState<State>,
     key: axum::Extension<ApiKey>,
+    caller: Option<axum::Extension<crate::access::Caller>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
@@ -725,7 +756,7 @@ async fn completions(
     as_chat["messages"] = serde_json::json!([{ "role": "user", "content": prompt }]);
     let request: ChatRequest = serde_json::from_value(as_chat)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    chat_completions(state, key, headers, Json(request)).await
+    chat_completions(state, key, caller, headers, Json(request)).await
 }
 
 /// `/v1/embeddings`.
@@ -742,38 +773,92 @@ async fn embeddings(
 ) -> Result<Response, ApiError> {
     authorise(&headers, &key)?;
 
-    let inputs = match body.get("input") {
+    let inputs: Vec<String> = match body.get("input") {
         Some(serde_json::Value::String(s)) => vec![s.clone()],
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .map(|i| i.as_str().unwrap_or_default().to_string())
-            .collect(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::String(s) => out.push(s.clone()),
+                    // Token arrays are OpenAI's tokenizer's ids, which mean
+                    // nothing to this model's. Saying so beats embedding "".
+                    _ => {
+                        return Err(ApiError::bad_request(
+                            "input must be a string or an array of strings; token arrays are not supported",
+                        ));
+                    }
+                }
+            }
+            out
+        }
         _ => return Err(ApiError::bad_request("input is required")),
     };
-    if inputs.iter().all(|i| i.trim().is_empty()) {
-        return Err(ApiError::bad_request("input is empty"));
+    if inputs.is_empty() || inputs.iter().any(|i| i.trim().is_empty()) {
+        return Err(ApiError::bad_request("input cannot contain an empty string"));
+    }
+    if inputs.len() > MAX_EMBED_INPUTS {
+        return Err(ApiError::bad_request(format!("at most {MAX_EMBED_INPUTS} inputs per request")));
     }
 
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string();
+    // The model a client names. An OpenAI name (text-embedding-3-small) is a
+    // client that cannot be told otherwise and gets the embedding model; a
+    // *chat* model here is a mistake worth reporting, since pooling a chat
+    // model's states gives vectors that look fine and compare badly.
+    let asked = body.get("model").and_then(|m| m.as_str()).unwrap_or_default().trim().to_string();
+    if !asked.is_empty() {
+        if let Ok(found) = ozgent_core::resolve(&state.paths, &asked) {
+            let weights = found.manifest.primary_weights(&found.dir);
+            if !ozgent_llama::layout::is_embedding(&weights) {
+                return Err(ApiError::bad_request(format!(
+                    "{asked} is a chat model, not an embedding model; name an embedding model or leave model empty"
+                )));
+            }
+        }
+    }
+    let dimensions = body.get("dimensions").and_then(|d| d.as_u64()).map(|d| d as usize);
+    if dimensions == Some(0) {
+        return Err(ApiError::bad_request("dimensions must be at least 1"));
+    }
+    let base64 = match body.get("encoding_format").and_then(|f| f.as_str()) {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => return Err(ApiError::bad_request(format!("encoding_format {other:?} is not float or base64"))),
+    };
 
-    let vectors = state
-        .worker
-        .embed(inputs.clone())
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // Off the async runtime: a first request loads the model, which takes
+    // seconds, and a blocked runtime thread stalls every other request.
+    let worker = state.worker.clone();
+    let texts = inputs.clone();
+    let vectors = tokio::task::spawn_blocking(move || worker.embed_strict(texts))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(ApiError::bad_request)?;
 
     let data: Vec<serde_json::Value> = vectors
-        .iter()
+        .into_iter()
         .enumerate()
-        .map(|(i, v)| serde_json::json!({ "object": "embedding", "index": i, "embedding": v }))
+        .map(|(i, mut v)| {
+            // Matryoshka-trained models (Qwen3-Embedding, text-embedding-3)
+            // keep their meaning in the leading dimensions; truncated, the
+            // vector is renormalised so cosine still works.
+            if let Some(d) = dimensions.filter(|d| *d < v.len()) {
+                v.truncate(d);
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > f32::EPSILON {
+                    v.iter_mut().for_each(|x| *x /= norm);
+                }
+            }
+            let embedding = if base64 {
+                serde_json::Value::String(f32_base64(&v))
+            } else {
+                serde_json::json!(v)
+            };
+            serde_json::json!({ "object": "embedding", "index": i, "embedding": embedding })
+        })
         .collect();
-    // Token accounting is approximate here: embedding happens on the inference
-    // thread and the tokeniser is not reachable from this side, so a rough
-    // count is better than a fabricated exact one.
-    let approx_tokens: usize = inputs.iter().map(|i| i.split_whitespace().count()).sum();
+    // Approximate: the tokenizer lives on the embedding thread.
+    let approx_tokens: usize = inputs.iter().map(|i| i.chars().count().div_ceil(4)).sum();
+    let model = crate::worker::embed_status().model.unwrap_or(asked);
 
     Ok(Json(serde_json::json!({
         "object": "list",
@@ -782,6 +867,24 @@ async fn embeddings(
         "usage": { "prompt_tokens": approx_tokens, "total_tokens": approx_tokens },
     }))
     .into_response())
+}
+
+/// Inputs per `/v1/embeddings` request, as OpenAI allows.
+const MAX_EMBED_INPUTS: usize = 2048;
+
+/// A vector as OpenAI's `base64` encoding: little-endian f32s, base64.
+fn f32_base64(v: &[f32]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// Everything ozgent measured about a turn./// Everything ozgent measured about a turn.
@@ -1402,5 +1505,16 @@ mod tests {
         assert_eq!(msgs[1].role, ozgent_core::Role::System, "developer is a system role");
         assert_eq!(msgs[2].role, ozgent_core::Role::Assistant);
         assert_eq!(msgs[3].role, ozgent_core::Role::User);
+    }
+}
+
+#[cfg(test)]
+mod embedding_format_tests {
+    #[test]
+    fn base64_matches_the_standard_encoding() {
+        // 1.0f32 is 00 00 80 3F little-endian; "AACAPw==" is its base64.
+        assert_eq!(super::f32_base64(&[1.0]), "AACAPw==");
+        assert_eq!(super::f32_base64(&[1.0, -2.5]), "AACAPwAAIMA=");
+        assert_eq!(super::f32_base64(&[]), "");
     }
 }

@@ -818,6 +818,41 @@ impl Store {
     // --------------------------------------------------------- embeddings
 
     /// Store a vector for a message or fact, replacing any previous one.
+    /// Messages anywhere whose vector is missing or of another width, oldest
+    /// first — what the background backfill works through after an embedding
+    /// model is installed or changed.
+    pub fn messages_needing_embeddings(&self, dim: usize, limit: usize) -> Result<Vec<(i64, String)>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT m.id, m.content FROM messages m
+             LEFT JOIN embeddings e ON e.owner_kind = 'message' AND e.owner_id = m.id
+             WHERE (e.owner_id IS NULL OR e.dim != ?1)
+               AND m.role IN ('user', 'assistant') AND length(trim(m.content)) > 0
+             ORDER BY m.id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![dim as i64, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// How many messages have a vector of width `dim`, and how many could.
+    pub fn embedding_coverage(&self, dim: usize) -> Result<(i64, i64), StoreError> {
+        let done: i64 = self.db.query_row(
+            "SELECT count(*) FROM embeddings WHERE owner_kind = 'message' AND dim = ?1",
+            params![dim as i64],
+            |r| r.get(0),
+        )?;
+        let all: i64 = self.db.query_row(
+            "SELECT count(*) FROM messages WHERE role IN ('user', 'assistant') AND length(trim(content)) > 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((done, all))
+    }
+
+    /// Forget every vector: they belong to a model no longer in use.
+    pub fn clear_embeddings(&self) -> Result<usize, StoreError> {
+        Ok(self.db.execute("DELETE FROM embeddings", [])?)
+    }
+
     pub fn put_embedding(
         &self,
         kind: OwnerKind,

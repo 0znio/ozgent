@@ -61,6 +61,32 @@ impl Backend {
             .unwrap_or_else(|| "http://127.0.0.1:7333".into())
     }
 
+    /// Credentials for a request, read fresh each time: a daemon that
+    /// restarted has issued a new local token, and a client that cached the
+    /// old one would fail until it was restarted too.
+    ///
+    /// The local token proves this user on this machine, and is only ever
+    /// sent to this machine. `$OZGENT_API_KEY` is for a daemon elsewhere.
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut rb = rb;
+        if let Ok(key) = std::env::var("OZGENT_API_KEY") {
+            if !key.trim().is_empty() {
+                rb = rb.bearer_auth(key.trim());
+            }
+        }
+        if is_local(&self.base) {
+            let token = ozgent_core::Paths::discover()
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p.local_token_file()).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
+            if let Some(t) = token {
+                rb = rb.header("x-ozgent-token", t);
+            }
+        }
+        rb
+    }
+
     fn at(base: &str) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
@@ -131,7 +157,9 @@ impl Backend {
     pub async fn get(&self, path: &str) -> Result<serde_json::Value> {
         let res = self
             .http
-            .get(format!("{}{path}", self.base))
+            .get(format!("{}{path}", self.base));
+        let res = self
+            .auth(res)
             .timeout(Duration::from_secs(30))
             .send()
             .await?;
@@ -141,7 +169,9 @@ impl Backend {
     pub async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let res = self
             .http
-            .post(format!("{}{path}", self.base))
+            .post(format!("{}{path}", self.base));
+        let res = self
+            .auth(res)
             .timeout(Duration::from_secs(30))
             .json(&body)
             .send()
@@ -149,13 +179,12 @@ impl Backend {
         read(res).await
     }
 
-    /// Kept beside `post` and `delete` so the client covers the API's verbs;
-    /// the settings pages a terminal does not have are what use them.
-    #[allow(dead_code)]
     pub async fn put(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let res = self
             .http
-            .put(format!("{}{path}", self.base))
+            .put(format!("{}{path}", self.base));
+        let res = self
+            .auth(res)
             .timeout(Duration::from_secs(30))
             .json(&body)
             .send()
@@ -163,11 +192,26 @@ impl Backend {
         read(res).await
     }
 
-    #[allow(dead_code)]
+    /// Change some fields of a resource and leave the rest.
+    pub async fn patch(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        let res = self
+            .http
+            .patch(format!("{}{path}", self.base));
+        let res = self
+            .auth(res)
+            .timeout(Duration::from_secs(30))
+            .json(&body)
+            .send()
+            .await?;
+        read(res).await
+    }
+
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {
         let res = self
             .http
-            .delete(format!("{}{path}", self.base))
+            .delete(format!("{}{path}", self.base));
+        let res = self
+            .auth(res)
             .timeout(Duration::from_secs(30))
             .send()
             .await?;
@@ -182,7 +226,9 @@ impl Backend {
     pub async fn chat(&self, request: serde_json::Value) -> Result<Stream> {
         let res = self
             .http
-            .post(format!("{}/api/chat", self.base))
+            .post(format!("{}/api/chat", self.base));
+        let res = self
+            .auth(res)
             .json(&request)
             .send()
             .await
@@ -204,7 +250,9 @@ impl Backend {
     pub async fn complete(&self, request: serde_json::Value) -> Result<Stream> {
         let res = self
             .http
-            .post(format!("{}/v1/chat/completions", self.base))
+            .post(format!("{}/v1/chat/completions", self.base));
+        let res = self
+            .auth(res)
             .json(&request)
             .send()
             .await

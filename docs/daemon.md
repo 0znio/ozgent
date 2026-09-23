@@ -141,8 +141,10 @@ http://localhost:7333/v1         OpenAI- and Anthropic-compatible API
 ```
 
 It binds `127.0.0.1` by default — this machine only. To reach it from a phone on
-the same network, install it with `--host 0.0.0.0`, and read the warning in
-[settings](settings.md) first: there is no password on anything but `/admin`.
+the same network, install it with `--host 0.0.0.0`. Another device then signs
+in at `/admin` with the admin password before it can chat, and programs need
+an API key. Who may connect at all, by IPv4 or IPv6 address or range, is set
+on `/admin` under **Security** — see [api.md](api.md#authentication).
 
 ## What it is doing
 

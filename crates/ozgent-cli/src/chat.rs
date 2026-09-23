@@ -53,6 +53,9 @@ pub struct Chat<'a> {
     /// Reasoning mode for the next turn. Sent with each request rather than
     /// held on a session, because there is no session here to hold it.
     thinking: Option<ThinkingMode>,
+    /// `--system` / `--system-file`: a persona for this session only, sent
+    /// with every turn. The model's saved persona (`/persona`) stays as it is.
+    system: Option<String>,
 }
 
 /// Start a chat.
@@ -108,6 +111,7 @@ pub async fn run(
         config: config.clone(),
         last_reply: String::new(),
         thinking: None,
+        system: options.to_options()?.system_prompt,
     };
     chat.banner();
     let outcome = chat.repl().await.map(|_| ());
@@ -282,6 +286,7 @@ impl<'a> Chat<'a> {
             }),
             "tools": self.config.tools.enabled,
             "images": images,
+            "system": self.system,
         });
 
         let events = self.backend.chat(request).await?;
@@ -852,6 +857,119 @@ impl<'a> Chat<'a> {
     }
 
     /// Point a tool at a provider, e.g. `/tools web_search brave`.
+    /// The options path for the model in use.
+    fn options_path(&self) -> String {
+        let model: String = self.model.to_string();
+        let mut encoded = String::new();
+        for b in model.bytes() {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                encoded.push(b as char);
+            } else {
+                encoded.push_str(&format!("%{b:02X}"));
+            }
+        }
+        format!("/api/models/{encoded}/options")
+    }
+
+    /// `/style`: list, choose, clear, make or remove a response style. Kept
+    /// on the daemon, per model, so the web page and every channel agree.
+    async fn style(&mut self, arg: &str) {
+        let mut words = arg.split_whitespace();
+        let sub = words.next().unwrap_or("");
+        let reply = match sub {
+            "" => match (self.backend.get("/api/styles").await, self.backend.get(&self.options_path()).await) {
+                (Ok(list), Ok(opts)) => {
+                    let now = opts["effective"]["style"].as_str().unwrap_or("default").to_string();
+                    let mut lines = vec![format!("style for {}: {now}", self.model)];
+                    for st in list["styles"].as_array().cloned().unwrap_or_default() {
+                        let name = st["name"].as_str().unwrap_or("?");
+                        let title = st["title"].as_str().unwrap_or("");
+                        let mark = if name == now { "●" } else { " " };
+                        lines.push(format!("  {mark} {name:<14} {title}"));
+                    }
+                    lines.push("/style <name> · /style off · /style new <name> <instruction> · /style rm <name>".into());
+                    lines.join("\n")
+                }
+                (Err(e), _) | (_, Err(e)) => format!("could not ask the daemon: {e}"),
+            },
+            "new" => {
+                let name = words.next().unwrap_or("");
+                let prompt: Vec<&str> = words.collect();
+                if name.is_empty() || prompt.is_empty() {
+                    "usage: /style new <name> <instruction>".into()
+                } else {
+                    let path = format!("/api/styles/{name}");
+                    match self.backend.put(&path, serde_json::json!({ "prompt": prompt.join(" ") })).await {
+                        Ok(_) => match self.backend.patch(&self.options_path(), serde_json::json!({ "style": name })).await {
+                            Ok(_) => format!("made style {name} and switched {} to it", self.model),
+                            Err(e) => format!("made style {name}, but could not switch to it: {e}"),
+                        },
+                        Err(e) => e.to_string(),
+                    }
+                }
+            }
+            "rm" | "delete" => match words.next() {
+                Some(name) => match self.backend.delete(&format!("/api/styles/{name}")).await {
+                    Ok(_) => format!("removed style {name}"),
+                    Err(e) => e.to_string(),
+                },
+                None => "usage: /style rm <name>".into(),
+            },
+            "off" | "none" | "default" => match self.backend.patch(&self.options_path(), serde_json::json!({ "style": null })).await {
+                Ok(_) => format!("{} answers in its own manner again", self.model),
+                Err(e) => e.to_string(),
+            },
+            name => match self.backend.patch(&self.options_path(), serde_json::json!({ "style": name })).await {
+                Ok(_) => format!("{} now answers in the {name} style", self.model),
+                Err(e) => e.to_string(),
+            },
+        };
+        self.ui.say(self.theme.style(Style::dim(), &reply));
+    }
+
+    /// `/persona`: the model's standing instructions, sent before every chat.
+    async fn persona(&mut self, arg: &str) {
+        let reply = match arg.trim() {
+            "" => match self.backend.get(&self.options_path()).await {
+                Ok(opts) => match opts["effective"]["system_prompt"].as_str() {
+                    Some(p) => format!("persona for {}:\n{p}", self.model),
+                    None => format!("{} has no persona. /persona <text> sets one", self.model),
+                },
+                Err(e) => format!("could not ask the daemon: {e}"),
+            },
+            "clear" | "off" | "none" => match self.backend.patch(&self.options_path(), serde_json::json!({ "system_prompt": null })).await {
+                Ok(_) => format!("cleared the persona for {}", self.model),
+                Err(e) => e.to_string(),
+            },
+            text => match self.backend.patch(&self.options_path(), serde_json::json!({ "system_prompt": text })).await {
+                Ok(_) => format!("persona for {} set; it applies from the next message", self.model),
+                Err(e) => e.to_string(),
+            },
+        };
+        self.ui.say(self.theme.style(Style::dim(), &reply));
+    }
+
+    /// `/effort`: how long a thinking model may reason, for this model.
+    async fn effort(&mut self, arg: &str) {
+        let level = arg.trim().to_ascii_lowercase();
+        let reply = if !["low", "medium", "high"].contains(&level.as_str()) {
+            match self.backend.get(&self.options_path()).await {
+                Ok(opts) => format!(
+                    "effort for {}: {} · /effort low, medium or high",
+                    self.model,
+                    opts["effective"]["reasoning_effort"].as_str().unwrap_or("medium")
+                ),
+                Err(e) => format!("could not ask the daemon: {e}"),
+            }
+        } else {
+            match self.backend.patch(&self.options_path(), serde_json::json!({ "reasoning_effort": level })).await {
+                Ok(_) => format!("{} thinks with {level} effort now", self.model),
+                Err(e) => e.to_string(),
+            }
+        };
+        self.ui.say(self.theme.style(Style::dim(), &reply));
+    }
+
     fn configure_tool(&mut self, arg: &str) -> Result<()> {
         // A clone, not a borrow of `self.theme`: writing to the screen
         // takes `&mut self`, and a closure holding the theme would block it.
@@ -955,12 +1073,9 @@ impl<'a> Chat<'a> {
 
             // These are the model's settings, and the model is the daemon's.
             // Writing them here would change a copy nothing reads.
-            "/effort" | "/system" => {
-                self.ui.say(dim(
-                    "that is a model setting now that the terminal is a client. \
-                     Set it in config.toml, or on the web interface's settings page.",
-                ));
-            }
+            "/style" | "/styles" => self.style(arg).await,
+            "/persona" | "/system" => self.persona(arg).await,
+            "/effort" => self.effort(arg).await,
 
             "/remember" => {
                 if arg.is_empty() {
@@ -1297,7 +1412,8 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/conv", "past conversations · <n> reopen · rm <n> delete"),
     ("/think", "on, off or auto — show or suppress reasoning"),
     ("/effort", "low, medium or high — how long the model may reason"),
-    ("/system", "set the system prompt"),
+    ("/style", "how answers are shaped · <name> · off · new <name> <instruction> · rm <name>"),
+    ("/persona", "this model's standing instructions · <text> · clear"),
     ("/remember", "pin a fact for this and future chats"),
     ("/memory", "what is remembered"),
     ("/models", "list models, or switch to one"),
@@ -1341,8 +1457,10 @@ const HELP: &str = "\
 /conv              list past conversations
 /conv <n>          reopen one · /conv rm <n> delete · /conv prune drop empties
 /think on|off|auto show or suppress reasoning
-/effort low|med|high how long the model may reason
-/system <text>     set the system prompt
+/effort low|medium|high  how long this model may reason
+/style [name]      how this model shapes answers: concise, detailed, adhd…
+/style new <name> <instruction>   make one · /style rm <name> · /style off
+/persona [text]    this model's standing instructions · /persona clear (also /system)
 /remember <fact>   pin a fact for this and future chats
 /memory            what is remembered
 /models [name]     list models, or switch to one
@@ -1444,7 +1562,7 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/remember", "/memory", "/tools", "/stats", "/default", "/permissions"] {
+        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/style", "/persona", "/remember", "/memory", "/tools", "/stats", "/default", "/permissions"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
         }
     }

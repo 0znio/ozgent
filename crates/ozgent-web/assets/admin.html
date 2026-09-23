@@ -8,14 +8,8 @@
   <title>ozgent admin</title>
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/logo.png">
-  <script>
-    try {
-      var saved = localStorage.getItem("ozgent-theme");
-      if (saved === "light" || saved === "dark") {
-        document.documentElement.setAttribute("data-theme", saved);
-      }
-    } catch (e) { /* private browsing; fall back to the system preference */ }
-  </script>
+  <!-- External, not inline: the pages allow scripts from this server only. -->
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body class="adm">
@@ -73,6 +67,7 @@
     <nav class="adm-nav" role="tablist" aria-label="Sections">
       <button type="button" class="tab" role="tab" data-view="gateway" aria-selected="true">Gateway</button>
       <button type="button" class="tab" role="tab" data-view="models" aria-selected="false">Models</button>
+      <button type="button" class="tab" role="tab" data-view="security" aria-selected="false">Security</button>
       <button type="button" class="tab" role="tab" data-view="account" aria-selected="false">Password</button>
     </nav>
     <span class="spacer"></span>
@@ -218,6 +213,10 @@
             <span class="switch"><input type="checkbox" data-role="approve"><span class="track"></span></span>
             <span>Let people here approve a tool that asks first — writing a file, running a command. Off: anything that would ask is refused.</span>
           </label>
+          <label class="adm-check">
+            <span class="switch"><input type="checkbox" data-role="reply-unauthorized"><span class="track"></span></span>
+            <span>Tell people who are not on the list that they are not, with the id you would need to add them. At most once every few hours per person.</span>
+          </label>
           <label class="adm-check" data-role="groups-row" hidden>
             <span class="switch"><input type="checkbox" data-role="groups"><span class="track"></span></span>
             <span>Answer in group chats. Anyone allowed can then steer ozgent where the whole group sees it.</span>
@@ -309,6 +308,203 @@
       <h3 class="sub">Installed</h3>
       <div class="md-installed" id="md-installed"></div>
     </div>
+
+    <form class="adm-card sec-card" id="emb-form">
+      <h2>Memory embeddings</h2>
+      <p class="hint">The model that lets memory recall an earlier message by meaning, not only by its words — and that answers <code>/v1/embeddings</code>.</p>
+      <p class="hint" id="emb-status">—</p>
+      <div class="adm-row">
+        <div class="adm-row-label">Embeddings</div>
+        <div class="adm-row-body"><label class="check"><input type="checkbox" id="emb-enabled"> On (off: memory recalls by keywords only)</label></div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Model</div>
+        <div class="adm-row-body"><select class="select" id="emb-model"></select></div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Runs on</div>
+        <div class="adm-row-body">
+          <select class="select" id="emb-device">
+            <option value="auto">Automatic — the GPU when a chat model has left room, else the CPU</option>
+            <option value="gpu">GPU — fastest, takes VRAM from chat models</option>
+            <option value="cpu">CPU — 10–20× slower per text, takes no VRAM</option>
+          </select>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Longest text</div>
+        <div class="adm-row-body">
+          <input type="number" min="0" step="1024" class="text-input" id="emb-max">
+          <span class="hint inline">Tokens per text embedded whole. 0 is the model's own window (32,768 for Qwen3-Embedding). Only longer texts pay for it, when they arrive; on the GPU only if it fits.</span>
+        </div>
+      </div>
+      <div class="adm-actions">
+        <button type="submit" class="primary-btn">Save</button>
+        <button type="button" class="ghost-btn auto" id="emb-backfill">Re-embed earlier messages</button>
+        <span class="hint inline" id="emb-note"></span>
+      </div>
+    </form>
+
+    <form class="adm-card sec-card" id="srv-form">
+      <h2>Running models</h2>
+      <div class="adm-row">
+        <div class="adm-row-label">Unload when idle</div>
+        <div class="adm-row-body">
+          <input type="number" min="0" class="text-input" id="srv-idle">
+          <span class="hint inline">Minutes without a request before a model's memory is given back. 0 keeps it loaded.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Conversations at once</div>
+        <div class="adm-row-body">
+          <input type="number" min="1" max="16" class="text-input" id="srv-parallel">
+          <span class="hint inline">Per model, sharing one context window. Takes effect when a model next loads.</span>
+        </div>
+      </div>
+      <div class="adm-actions">
+        <button type="submit" class="primary-btn">Save</button>
+        <span class="hint inline" id="srv-note"></span>
+      </div>
+    </form>
+  </section>
+
+  <!-- ------------------------------------------------------------ security -->
+  <section class="adm-view" id="view-security" hidden>
+    <div class="adm-head">
+      <h1>Security</h1>
+      <p class="adm-lede">Who may connect, which programs may use the API and for what, and what tools may touch on this machine.</p>
+    </div>
+
+    <form class="adm-card sec-card" id="net-form">
+      <h2>Connections</h2>
+      <p class="hint">You are connecting from <code id="net-you">—</code>. This machine is always let in unless you deny it by address.</p>
+      <div class="adm-row">
+        <div class="adm-row-label">Who may connect</div>
+        <div class="adm-row-body">
+          <label class="radio"><input type="radio" name="net-mode" value="open"> Everyone, except the addresses denied below</label>
+          <label class="radio"><input type="radio" name="net-mode" value="allowlist"> Only the addresses allowed below</label>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Allow</div>
+        <div class="adm-row-body">
+          <textarea class="text-input sec-list" id="net-allow" rows="3" spellcheck="false" placeholder="192.168.1.0/24&#10;2001:db8::/32"></textarea>
+          <span class="hint inline">One address or range per line, IPv4 or IPv6. Used only in "only the addresses allowed" mode.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Deny</div>
+        <div class="adm-row-body">
+          <textarea class="text-input sec-list" id="net-deny" rows="3" spellcheck="false" placeholder="203.0.113.7&#10;2001:db8:bad::/48"></textarea>
+          <span class="hint inline">Always refused, in either mode, before anything else.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Host names</div>
+        <div class="adm-row-body">
+          <textarea class="text-input sec-list" id="net-hosts" rows="2" spellcheck="false" placeholder="ozgent.lan"></textarea>
+          <span class="hint inline">Names this server answers to besides <code>localhost</code> and bare addresses — a LAN name, or what a reverse proxy forwards. Any other name is refused, which is what stops a web page from reaching this server through a domain it points here.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Trusted proxies</div>
+        <div class="adm-row-body">
+          <textarea class="text-input sec-list" id="net-proxies" rows="2" spellcheck="false" placeholder="10.0.0.2"></textarea>
+          <span class="hint inline">Only these may say, in <code>X-Forwarded-For</code>, who a request is really from.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Limits</div>
+        <div class="adm-row-body sec-grid">
+          <label class="adm-field"><span>Requests per minute, per address</span><input type="number" min="0" class="text-input" id="net-rpm"></label>
+          <label class="adm-field"><span>Connections at once, per address</span><input type="number" min="0" class="text-input" id="net-conns"></label>
+          <label class="adm-field"><span>Bad keys before lockout</span><input type="number" min="0" class="text-input" id="net-fails"></label>
+          <label class="adm-field"><span>Lockout, minutes</span><input type="number" min="1" class="text-input" id="net-lock"></label>
+          <label class="adm-field"><span>Largest request, MB</span><input type="number" min="1" class="text-input" id="net-body"></label>
+          <span class="hint inline">0 means no limit. This machine is not rate-limited. The request size applies after a restart.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Local programs</div>
+        <div class="adm-row-body">
+          <label class="check"><input type="checkbox" id="net-local-api"> Programs on this machine may use <code>/v1</code> without a key</label>
+        </div>
+      </div>
+      <div class="adm-actions">
+        <button type="submit" class="primary-btn">Save</button>
+        <span class="hint inline" id="net-note"></span>
+      </div>
+    </form>
+
+    <div class="adm-card sec-card">
+      <h2>API keys</h2>
+      <p class="hint">For programs on other machines, or here when local programs need a key. OpenAI clients send it as a bearer token, Anthropic clients as <code>x-api-key</code>.</p>
+      <div id="key-list" class="sec-keys"></div>
+      <form id="key-form" class="sec-newkey">
+        <label class="adm-field"><span>New key's name</span><input type="text" class="text-input" id="key-name" maxlength="80" placeholder="laptop script" required></label>
+        <fieldset class="sec-scopes" id="key-scopes"><legend>It may</legend></fieldset>
+        <div class="adm-actions"><button type="submit" class="primary-btn">Create key</button><span class="hint inline" id="key-note"></span></div>
+      </form>
+      <div class="sec-reveal" id="key-reveal" hidden>
+        <p><b>Copy this key now.</b> It is not stored and will not be shown again.</p>
+        <code id="key-value"></code>
+        <div class="adm-actions"><button type="button" class="ghost-btn auto" id="key-copy">Copy</button><button type="button" class="ghost-btn auto" id="key-done">Done</button></div>
+      </div>
+    </div>
+
+    <form class="adm-card sec-card" id="sb-form">
+      <h2>Tool sandbox</h2>
+      <p class="hint">What ozgent's tools may touch once they run. Commands run in a sandbox that confines them to the folder below and cannot reach ozgent's own files, SSH or cloud credentials, or the network unless allowed here.</p>
+      <div class="adm-row">
+        <div class="adm-row-label">Folder</div>
+        <div class="adm-row-body">
+          <input type="text" class="text-input" id="sb-root" spellcheck="false" placeholder="/home/you/projects">
+          <span class="hint inline">Every file tool and command is confined to it. Empty: the folder the server was started in.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Files</div>
+        <div class="adm-row-body"><label class="check"><input type="checkbox" id="sb-write"> Tools may create and change files there</label></div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Commands</div>
+        <div class="adm-row-body">
+          <label class="check"><input type="checkbox" id="sb-shell"> Tools may run commands</label>
+          <input type="text" class="text-input" id="sb-allow" spellcheck="false" placeholder="git cargo ls">
+          <span class="hint inline">Only these programs, space separated. A program that runs other programs (<code>python</code>, <code>bash</code>, <code>make</code>) can run anything inside the sandbox.</span>
+          <label class="check"><input type="checkbox" id="sb-shell-net"> Commands may use the network</label>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Web</div>
+        <div class="adm-row-body">
+          <label class="check"><input type="checkbox" id="sb-net"> Tools may fetch pages</label>
+          <input type="text" class="text-input" id="sb-net-allow" spellcheck="false" placeholder="empty: any public site">
+          <label class="check"><input type="checkbox" id="sb-private"> Including this machine and the local network</label>
+          <span class="hint inline">Off, a page the model reads cannot send it to your router, this server, or a cloud metadata address.</span>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Credentials</div>
+        <div class="adm-row-body"><label class="check"><input type="checkbox" id="sb-sensitive"> Tools may read SSH keys, cloud and browser credentials (not recommended)</label></div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Limits</div>
+        <div class="adm-row-body sec-grid">
+          <label class="adm-field"><span>Seconds a tool may run</span><input type="number" min="1" max="3600" class="text-input" id="sb-timeout"></label>
+          <label class="adm-field"><span>Tool calls per reply</span><input type="number" min="1" max="64" class="text-input" id="sb-calls"></label>
+          <label class="check"><input type="checkbox" id="sb-handoff"> The model may hand a request to an @agent by itself</label>
+        </div>
+      </div>
+      <div class="adm-row">
+        <div class="adm-row-label">Set in the file</div>
+        <div class="adm-row-body"><span class="hint inline" id="sb-fixed"></span></div>
+      </div>
+      <div class="adm-actions">
+        <button type="submit" class="primary-btn">Save</button>
+        <span class="hint inline" id="sb-note"></span>
+      </div>
+    </form>
   </section>
 
   <!-- ------------------------------------------------------------ account -->

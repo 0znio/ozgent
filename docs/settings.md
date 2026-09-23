@@ -34,7 +34,7 @@ worse than saying so.
 
 | flag | `/config` key | `config.toml` | what it does |
 |---|---|---|---|
-| `--ctx`, `-c`, `--context` | `ctx` | `context_length` | context length in tokens; 32k unless set, then lowered to what the model was trained on and what fits in memory |
+| `--ctx`, `-c`, `--context` | `ctx` | `context_length` | context length in tokens; 64k unless set, then lowered to what the model was trained on and what fits in memory |
 | `--temperature`, `-t`, `--temp` | `temperature` | `temperature` | lower is more focused |
 | `--top-p` | `top_p` | `top_p` | nucleus sampling |
 | `--top-k` | `top_k` | `top_k` | consider only the K likeliest; 0 disables |
@@ -45,6 +45,8 @@ worse than saying so.
 | `--think` / `--no-think` | `thinking` | `thinking` | `auto`, `on`, `off` |
 | `--effort` | `effort` | `reasoning_effort` | `low`, `medium`, `high` |
 | `--no-tools` | `tools` | `tools` | whether the model may call tools |
+| `--system` | `/persona` | `system_prompt` | the model's persona: standing instructions for your chats |
+| — | `/style` | `style` | response style: `concise`, `detailed`, `to-the-point`, `adhd`, `beginner`, `expert`, `casual`, `formal`, `tutor`, or one of your `[styles.<name>]` |
 | `--inference-mode` | `mode` | `inference_mode` | `gpu`, `gpu_ram`, or `ram` |
 | `--no-kv-offload` | `kv` | `kv_offload` | keep the KV cache in RAM, not VRAM |
 | `--cpu-moe[=N]`, `--cmoe` | — | `cpu_moe` | keep a mixture-of-experts model's routed experts in system RAM |
@@ -68,6 +70,43 @@ ozgent default --clear      go back to naming one each time
 
 It is also Settings → General in the web interface, and `default_model` in
 `config.toml`. All four are the same value.
+
+## Memory embeddings
+
+```toml
+[embedding]
+enabled = true        # off: memory recalls by keywords alone
+# model = "Qwen3-Embedding-0.6B:F16"   # unset: the installed embedding model
+device = "auto"       # auto, gpu or cpu
+max_tokens = 0        # 0: the model's own window; a number caps it
+```
+
+`auto` puts the embedding model on the GPU only when a chat model is already
+loaded and there is room above it and the memory its next decode needs;
+otherwise on the CPU, where it takes nothing from a chat model. An 8k context
+is kept ready; a longer text gets a context of its own size for that call,
+released afterwards. All of it is on the admin page, under Models.
+
+## Response styles
+
+```toml
+[models."Qwen3.5-4B:Q4_K_M"]
+style = "adhd"
+system_prompt = "You review Rust. Be direct."
+
+[styles.pirate]
+title = "Pirate — salty but correct"
+prompt = "Answer like a cheerful pirate captain, and stay completely correct."
+```
+
+Set them from the web page's Style menu or the model settings, or with
+`/style` and `/persona` in the terminal.
+
+## Who may connect
+
+`[web.access]` holds the IP allow and deny lists, trusted proxies, extra host
+names, rate limits and API keys. Set it on the admin page under Security;
+[api.md](api.md#authentication) says what each part does.
 
 ## The web interface and the admin page
 

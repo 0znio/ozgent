@@ -165,9 +165,28 @@ too. Signing Telegram out forgets the token here; revoke it with @BotFather
 
 When the gateway runs it has a **pairing code** — shown on `/admin` and when
 `ozgent gateway` starts. Someone not on the list can send `/pair CODE` to the
-bot and be added. The code works once and changes after it is used. It is the
-only thing ozgent answers for someone not on the list; everyone else is
-ignored, deliberately, since replying to strangers confirms the bot is live.
+bot and be added. The code works once and changes after it is used.
+
+### What someone not on the list sees
+
+On Telegram, someone who isn't on the list is told so, instead of being left
+waiting for an answer that will never come:
+
+> Sorry, you are not authorized to use this bot, so it will not answer your
+> messages. If you know the person who runs it, send them your telegram id:
+> 123456789 (@them). They can add you, or give you a pairing code to send
+> here as /pair CODE.
+
+That gives them the id you need to add them. It is sent at most once per
+person every six hours, and to no more than 30 strangers an hour in total, so
+nobody can use the bot to send messages. Turn it off under the channel's
+**Approvals** on `/admin` ("Tell people who are not on the list…"), or with
+`reply_unauthorized = false` under `[channels.telegram]`. WhatsApp answers from your own number, so there it is
+off by default and strangers are ignored.
+
+Someone on the list who sends `/start` gets a short welcome: what the bot is,
+which model answers, the commands, and, when the scheduler is on, how to ask
+for messages on a schedule.
 
 ## Running it
 
@@ -196,6 +215,7 @@ Anything that is not one of these is a question.
 
 | | |
 |---|---|
+| `/start` | a welcome: what it is, the commands, and how to schedule messages |
 | `/help` | what it can do, and which model is answering |
 | `/new` | forget this thread and start fresh — the old one stays in the web interface |
 | `/model` | which model is answering; `/model <name>` to change it |

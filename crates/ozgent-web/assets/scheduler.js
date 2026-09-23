@@ -6,11 +6,20 @@
 
 const $ = (id) => document.getElementById(id);
 
+// This machine's page carries the local token; on another machine the admin
+// session stands in for it, with the header a cross-site form cannot add.
+const localToken = document.querySelector('meta[name="ozgent-token"]')?.content ?? "";
+
 async function api(path, options = {}) {
+  const auth = localToken ? { "x-ozgent-token": localToken } : {};
   const res = await fetch(path, {
     ...options,
-    headers: { "content-type": "application/json", ...(options.headers ?? {}) },
+    headers: { "content-type": "application/json", "x-ozgent-admin": "1", ...auth, ...(options.headers ?? {}) },
   });
+  if (res.status === 401 && !localToken) {
+    location.href = "/admin";
+    throw new Error("sign in at /admin first");
+  }
   const text = await res.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = null; }

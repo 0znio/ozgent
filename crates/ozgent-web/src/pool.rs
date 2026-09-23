@@ -146,6 +146,18 @@ impl Membership {
         (guard, second)
     }
 
+    /// Take the loading lock without making room: for a load that must fit
+    /// around what is resident rather than push it out — the embedding model,
+    /// which is never worth evicting a chat model for.
+    pub fn loading(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.pool.loading.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether any model other than this one is loaded.
+    pub fn others_resident(&self) -> bool {
+        self.pool.names().iter().any(|n| n != &self.key)
+    }
+
     /// Deregister this model. Called when its thread stops.
     pub fn leave(&self) {
         self.pool.remove(&self.key, self.id);

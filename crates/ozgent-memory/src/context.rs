@@ -136,11 +136,20 @@ pub struct ContextBuilder<'a> {
     store: &'a Store,
     embedder: &'a dyn Embedder,
     pub budget: Budget,
+    /// The query's vector, when the caller embedded it beforehand.
+    query_vector: Option<Vec<f32>>,
 }
 
 impl<'a> ContextBuilder<'a> {
     pub fn new(store: &'a Store, embedder: &'a dyn Embedder) -> Self {
-        Self { store, embedder, budget: Budget::default() }
+        Self { store, embedder, budget: Budget::default(), query_vector: None }
+    }
+
+    /// Use a vector for the query computed beforehand, so the builder does
+    /// not embed it while the caller holds the store. Empty: keywords only.
+    pub fn with_query_vector(mut self, vector: Vec<f32>) -> Self {
+        self.query_vector = Some(vector);
+        self
     }
 
     pub fn with_budget(mut self, budget: Budget) -> Self {
@@ -187,7 +196,12 @@ impl<'a> ContextBuilder<'a> {
         let in_window: std::collections::HashSet<i64> =
             ctx.recent.iter().map(|m| m.id).collect();
 
-        let retriever = Retriever::new(self.store, self.embedder);
+        // What the window already shows is not searched for again, and a
+        // conversation that fits in the window costs no query embedding.
+        let mut retriever = Retriever::new(self.store, self.embedder).excluding(in_window.iter().copied());
+        if let Some(v) = &self.query_vector {
+            retriever = retriever.with_query_vector(v.clone());
+        }
         let hits = retriever.search(conversation_id, query, self.budget.max_retrieved * 3)?;
 
         for hit in hits {

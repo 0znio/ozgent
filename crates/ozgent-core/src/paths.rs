@@ -85,6 +85,13 @@ impl Paths {
         self.root.join("scheduler")
     }
 
+    /// The token that proves a request comes from this user on this machine:
+    /// the one the local page carries and the terminal client reads. Written
+    /// by the server that holds the port, owner-only.
+    pub fn local_token_file(&self) -> PathBuf {
+        self.root.join("run").join("local-token")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }

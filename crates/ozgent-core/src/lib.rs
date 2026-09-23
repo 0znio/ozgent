@@ -3,6 +3,7 @@
 //! processes, so every other crate can depend on it freely.
 
 pub mod accel;
+pub mod access;
 pub mod reserve;
 pub mod agents;
 pub mod channels;
@@ -17,6 +18,7 @@ pub mod permission;
 pub mod registry;
 pub mod schedule;
 pub mod secret;
+pub mod styles;
 pub mod tokens;
 pub mod zone;
 

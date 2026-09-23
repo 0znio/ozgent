@@ -2,20 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="ozgent-token" content="">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
   <title>ozgent scheduler</title>
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/logo.png">
-  <script>
-    try {
-      var saved = localStorage.getItem("ozgent-theme");
-      if (saved === "light" || saved === "dark") {
-        document.documentElement.setAttribute("data-theme", saved);
-      }
-    } catch (e) { /* private browsing; fall back to the system preference */ }
-  </script>
+  <!-- External, not inline: the pages allow scripts from this server only. -->
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body class="adm">

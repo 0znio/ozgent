@@ -1,7 +1,7 @@
 //! Shared server state.
 
 use ozgent_core::{Config, Paths};
-use ozgent_memory::{HashingEmbedder, Store};
+use ozgent_memory::Store;
 use std::sync::{Arc, Mutex};
 
 use crate::worker::{Permissions, SharedConfig, SharedTools, Tools, Worker};
@@ -65,7 +65,8 @@ pub struct App {
     /// the inference thread, which asks, and the handlers, which answer.
     pub permissions: Permissions,
     pub store: Mutex<Store>,
-    pub embedder: HashingEmbedder,
+    /// The memory layer's embedder: the embedding model when there is one.
+    pub embedder: crate::memory::MemoryEmbedder,
     pub worker: Worker,
     /// Model downloads started from the browser. They belong to the server,
     /// so closing the tab that started one does not stop it.
@@ -75,6 +76,12 @@ pub struct App {
     pub gateway: std::sync::OnceLock<Arc<dyn crate::admin::GatewayControl>>,
     /// Admin sessions and failed sign-ins.
     pub admin: crate::admin::Guard,
+    /// Proof that a request comes from this user on this machine. Issued by
+    /// the process that binds the port, once it has, so a second server that
+    /// fails to start cannot replace the running one's.
+    pub local_token: std::sync::OnceLock<String>,
+    /// Rate limits, lockouts and connection counts; see [`crate::access`].
+    pub shield: crate::access::Shield,
     watching: std::sync::atomic::AtomicBool,
 }
 
@@ -164,6 +171,7 @@ impl App {
         cli: ozgent_core::Options,
     ) -> anyhow::Result<State> {
         let store = Store::open(paths.root().join("ozgent.db"))?;
+        harden_home(&paths);
 
         // Attachments are kept for a month; sweeping at startup avoids a timer
         // and a local server is restarted often enough for that to be enough.
@@ -210,11 +218,13 @@ impl App {
             permissions,
             tools,
             store: Mutex::new(store),
-            embedder: HashingEmbedder::default(),
+            embedder: crate::memory::MemoryEmbedder::new(worker.clone()),
             worker,
             pulls: Default::default(),
             gateway: std::sync::OnceLock::new(),
             admin: Default::default(),
+            local_token: std::sync::OnceLock::new(),
+            shield: Default::default(),
             watching: Default::default(),
         }))
     }
@@ -258,4 +268,35 @@ pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools
         runtime: tokio::runtime::Handle::current(),
         scheduler,
     })
+}
+
+/// Make what ozgent keeps private to its user.
+///
+/// The database holds every conversation and was created world-readable; the
+/// channel directory holds a logged-in WhatsApp session. On a machine with
+/// other accounts either is someone else's to read. The models and the root
+/// itself are left alone: a model directory is sometimes shared on purpose.
+/// Best effort — a file that cannot be changed is not a reason not to start.
+fn harden_home(paths: &Paths) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: std::path::PathBuf, mode: u32| {
+            if let Ok(meta) = std::fs::metadata(&p) {
+                if meta.permissions().mode() & 0o777 != mode {
+                    if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)) {
+                        tracing::warn!("could not make {} private: {e}", p.display());
+                    }
+                }
+            }
+        };
+        for name in ["ozgent.db", "ozgent.db-wal", "ozgent.db-shm"] {
+            set(paths.root().join(name), 0o600);
+        }
+        set(paths.configs_dir(), 0o700);
+        set(paths.channels_dir(), 0o700);
+        set(paths.agents_dir(), 0o700);
+    }
+    #[cfg(not(unix))]
+    let _ = paths;
 }

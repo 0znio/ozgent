@@ -260,6 +260,11 @@ fn clear_cookie() -> String {
 /// The address a request came from; loopback when the server was built
 /// without connection info (tests).
 fn peer(request: &Request) -> IpAddr {
+    // Behind a trusted proxy the guard has already worked out who this is;
+    // counting failures against the proxy would lock everyone out at once.
+    if let Some(ip) = request.extensions().get::<crate::access::ClientIp>() {
+        return ip.0;
+    }
     request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -269,7 +274,7 @@ fn peer(request: &Request) -> IpAddr {
 
 /// Whether a request carries a live session. Used by the gate and by the
 /// page, which shows the sign-in form otherwise.
-fn signed_in(state: &State, headers: &HeaderMap) -> bool {
+pub(crate) fn signed_in(state: &State, headers: &HeaderMap) -> bool {
     let (Some(hash), Some(token)) = (current_hash(state), cookie_token(headers)) else {
         return false;
     };
@@ -296,7 +301,7 @@ async fn gate(AxumState(state): AxumState<State>, request: Request, next: Next) 
 const NOT_SET_UP: &str =
     "the admin page has no password yet. On this machine, run: ozgent admin setup";
 
-fn fail(status: StatusCode, message: impl std::fmt::Display) -> Response {
+pub(crate) fn fail(status: StatusCode, message: impl std::fmt::Display) -> Response {
     (status, Json(serde_json::json!({ "error": message.to_string() }))).into_response()
 }
 
@@ -322,6 +327,16 @@ pub fn router(state: State) -> Router {
         .route("/api/admin/models/upload", put(upload))
         .route("/api/admin/models/import", post(import_upload))
         .route("/api/admin/models/default", post(make_default))
+        .route("/api/admin/access", get(crate::admin_access::access_view).put(crate::admin_access::access_update))
+        .route("/api/admin/keys", post(crate::admin_access::key_create))
+        .route(
+            "/api/admin/keys/{id}",
+            axum::routing::patch(crate::admin_access::key_update).delete(crate::admin_access::key_delete),
+        )
+        .route("/api/admin/sandbox", get(crate::admin_access::sandbox_view).put(crate::admin_access::sandbox_update))
+        .route("/api/admin/embedding", get(crate::admin_access::embedding_view).put(crate::admin_access::embedding_update))
+        .route("/api/admin/embedding/backfill", post(crate::admin_access::embedding_backfill))
+        .route("/api/admin/server", get(crate::admin_access::server_view).put(crate::admin_access::server_update))
         .route_layer(middleware::from_fn_with_state(state.clone(), gate));
 
     Router::new()
@@ -546,6 +561,7 @@ async fn gateway_view(AxumState(state): AxumState<State>) -> Response {
             "tools": c.telegram.tools,
             "approve": c.telegram.approve,
             "stream": c.telegram.stream,
+            "reply_unauthorized": c.telegram.reply_unauthorized,
         },
         "whatsapp": {
             "runtime": view.whatsapp,
@@ -554,6 +570,7 @@ async fn gateway_view(AxumState(state): AxumState<State>) -> Response {
             "tools": c.whatsapp.tools,
             "approve": c.whatsapp.approve,
             "stream": c.whatsapp.stream,
+            "reply_unauthorized": c.whatsapp.reply_unauthorized,
             "self_chat": c.whatsapp.self_chat,
             "groups": c.whatsapp.groups,
         },
@@ -612,6 +629,7 @@ struct ChannelSettings {
     #[serde(default, with = "double_option")]
     tools: Option<Option<Vec<String>>>,
     approve: Option<bool>,
+    reply_unauthorized: Option<bool>,
     stream: Option<bool>,
     self_chat: Option<bool>,
     groups: Option<bool>,
@@ -671,6 +689,12 @@ async fn channel_settings(
                 Kind::WhatsApp => ch.whatsapp.stream = on,
             }
         }
+        if let Some(on) = body.reply_unauthorized {
+            match kind {
+                Kind::Telegram => ch.telegram.reply_unauthorized = on,
+                Kind::WhatsApp => ch.whatsapp.reply_unauthorized = on,
+            }
+        }
         if let Some(on) = body.self_chat {
             ch.whatsapp.self_chat = on;
         }
@@ -681,7 +705,7 @@ async fn channel_settings(
 }
 
 /// Change the configuration, save it, and let the gateway catch up.
-fn save(state: &State, change: impl FnOnce(&mut ozgent_core::Config)) -> Response {
+pub(crate) fn save(state: &State, change: impl FnOnce(&mut ozgent_core::Config)) -> Response {
     let saved = {
         let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         change(&mut config);

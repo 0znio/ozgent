@@ -7,7 +7,9 @@ otherwise, so a fresh ozgent install needs no pip step to search the web.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json as _json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,6 +62,158 @@ class HttpError(Exception):
         self.body = body
 
 
+# ------------------------------------------------------------------ SSRF guard
+#
+# A tool fetches whatever URL the model names, and the model reads web pages.
+# A page can therefore send it anywhere the worker can reach: this server's own
+# API on 127.0.0.1, a router's admin page, a printer, a cloud metadata address
+# that hands out credentials. So every hop of every request must land on a
+# public address, unless the operator has allowed private ones — checked when
+# the name is resolved, again on every redirect, and once more against the
+# address the connection actually reached, which closes the gap a DNS answer
+# that changes between the check and the connect (rebinding) would leave.
+
+#: Redirects followed before giving up.
+MAX_REDIRECTS = 8
+
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def is_public(ip: str) -> bool:
+    """Whether `ip` is an address on the public internet.
+
+    IPv4 carried inside IPv6 — mapped, 6to4, Teredo, NAT64 — is judged by the
+    IPv4 address it carries, or ``::ffff:127.0.0.1`` would pass as global.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return is_public(str(addr.ipv4_mapped))
+        if addr.sixtofour is not None:
+            return is_public(str(addr.sixtofour))
+        if addr.teredo is not None:
+            return is_public(str(addr.teredo[1]))
+        if addr in _NAT64:
+            return is_public(str(ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)))
+    return addr.is_global and not addr.is_multicast
+
+
+def _private_allowed(host: str) -> bool:
+    from .permissions import private_allowed  # imported late: permissions imports tool config
+
+    try:
+        return private_allowed(host)
+    except Exception:  # noqa: BLE001 - outside a tool call there is no config: stay strict
+        return False
+
+
+def _refusal(host: str, ip: str) -> HttpError:
+    return HttpError(
+        0,
+        f"{host} is at {ip}, which is this machine or a private network. Tools may not fetch "
+        "from there unless the host is listed in [tools.config.permissions] network_allow, "
+        "or network_private = true.",
+    )
+
+
+async def check_url(url: str) -> None:
+    """Refuse `url` unless it is http(s) to a public address."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HttpError(0, f"{parsed.scheme or 'that'!r} is not a URL scheme this can fetch")
+    host = parsed.hostname or ""
+    if not host:
+        raise HttpError(0, f"{url!r} has no host")
+    if _private_allowed(host):
+        return
+    try:
+        ipaddress.ip_address(host)
+        literal = [host]
+    except ValueError:
+        literal = []
+    if literal:
+        addresses = literal
+    else:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise HttpError(0, f"cannot resolve {host}: {exc}") from exc
+        addresses = sorted({info[4][0] for info in infos})
+    for ip in addresses:
+        if not is_public(ip):
+            raise _refusal(host, ip)
+
+
+def _check_url_blocking(url: str) -> None:
+    asyncio.run(check_url(url))
+
+
+def _check_peer(resp: Any, url: str) -> None:
+    """Refuse a response from a non-public address, whatever DNS said first."""
+    stream = resp.extensions.get("network_stream")
+    peer = stream.get_extra_info("server_addr") if stream is not None else None
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if peer and not is_public(str(peer[0])) and not _private_allowed(host):
+        raise _refusal(host, str(peer[0]))
+
+
+async def _send(client: Any, method: str, url: str, headers: dict[str, str], body: bytes | None) -> Any:
+    """Send a request, following redirects by hand so each hop is checked.
+
+    Returns an open streaming response; the caller reads and closes it.
+    """
+    for _ in range(MAX_REDIRECTS + 1):
+        await check_url(url)
+        request = client.build_request(method, url, headers=headers, content=body)
+        resp = await client.send(request, stream=True)
+        try:
+            _check_peer(resp, url)
+        except HttpError:
+            await resp.aclose()
+            raise
+        if not resp.is_redirect:
+            return resp
+        location = resp.headers.get("location", "")
+        await resp.aclose()
+        if not location:
+            raise HttpError(resp.status_code, "a redirect with no location")
+        url = urllib.parse.urljoin(url, location)
+        # 303, and 301/302 after a POST, become a GET, as browsers do.
+        if resp.status_code == 303 or (resp.status_code in (301, 302) and method != "GET"):
+            method, body = "GET", None
+    raise HttpError(0, f"more than {MAX_REDIRECTS} redirects")
+
+
+async def _read_capped(resp: Any, limit: int) -> bytes:
+    """The body, stopping at `limit` rather than downloading what follows it."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in resp.aiter_bytes():
+        chunks.append(chunk)
+        size += len(chunk)
+        if size >= limit:
+            break
+    return b"".join(chunks)[:limit]
+
+
+class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib's redirect handler, checking each hop the same way."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        try:
+            _check_url_blocking(newurl)
+        except HttpError as exc:
+            raise urllib.error.URLError(str(exc)) from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_GuardedRedirects)
+
+
 async def request(
     url: str,
     *,
@@ -86,12 +240,18 @@ async def request(
         hdrs["Content-Type"] = "application/x-www-form-urlencoded"
 
     if _HAS_HTTPX:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.request(method, url, headers=hdrs, content=body)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resp = await _send(client, method, url, hdrs, body)
+            try:
+                raw = await _read_capped(resp, MAX_BYTES)
+            finally:
+                await resp.aclose()
+            text = raw.decode(resp.encoding or "utf-8", errors="replace")
             if resp.status_code >= 400:
-                raise HttpError(resp.status_code, f"HTTP {resp.status_code}", resp.text[:500])
-            return resp.text
+                raise HttpError(resp.status_code, f"HTTP {resp.status_code}", text[:500])
+            return text
 
+    await check_url(url)
     return await asyncio.to_thread(_blocking_request, url, method, hdrs, body, timeout)
 
 
@@ -100,9 +260,9 @@ def _blocking_request(
 ) -> str:
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read().decode(charset, errors="replace")
+            return resp.read(MAX_BYTES).decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
         raise HttpError(exc.code, f"HTTP {exc.code}", detail) from exc
@@ -189,15 +349,18 @@ async def fetch_page(
 async def _fetch_once(url: str, hdrs: dict[str, str], timeout: float) -> Page:
     if _HAS_HTTPX:
         async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True, verify=True
+            timeout=timeout, follow_redirects=False, verify=True
         ) as client:
-            resp = await client.get(url, headers=hdrs)
-            body = resp.content[:MAX_BYTES]
+            resp = await _send(client, "GET", url, hdrs, None)
+            try:
+                body = await _read_capped(resp, MAX_BYTES)
+            finally:
+                await resp.aclose()
             if resp.status_code >= 400:
                 raise HttpError(
                     resp.status_code,
                     f"HTTP {resp.status_code} {resp.reason_phrase}".strip(),
-                    resp.text[:500],
+                    body[:500].decode("utf-8", errors="replace"),
                 )
             return Page(
                 url=str(resp.url),
@@ -207,6 +370,7 @@ async def _fetch_once(url: str, hdrs: dict[str, str], timeout: float) -> Page:
                 encoding=resp.charset_encoding or "",
             )
 
+    await check_url(url)
     return await asyncio.to_thread(_blocking_fetch, url, hdrs, timeout)
 
 
@@ -216,7 +380,7 @@ def _blocking_fetch(url: str, hdrs: dict[str, str], timeout: float) -> Page:
     plain["Accept-Encoding"] = "identity"
     req = urllib.request.Request(url, headers=plain, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return Page(
                 url=resp.geturl(),
                 status=resp.status,
