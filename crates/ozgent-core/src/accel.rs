@@ -206,18 +206,45 @@ pub fn fit_context(elements_per_token: u64, requested: u32, t: CacheType, budget
 
 /// How many elements per token each half of the cache holds, and how wide a
 /// single head is in each — which llama.cpp needs to divide by the block size.
+///
+/// `k` and `v` are the layers whose cache grows with the window. A model with
+/// sliding-window layers keeps a second cache for them, and that one does not
+/// grow: llama.cpp sizes it once, from the window and the sequence count (see
+/// [`swa_cells`]), so it is carried here as a fixed number of cells rather
+/// than folded into the per-token figure. Zero for every model without one,
+/// which leaves them priced exactly as before.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvShape {
     pub k: u64,
     pub v: u64,
     pub k_len: u32,
     pub v_len: u32,
+    /// Elements per cell across the sliding-window layers, each half.
+    pub swa_k: u64,
+    pub swa_v: u64,
+    /// Cells the sliding-window cache holds whatever the window. Clamped to
+    /// the window itself, as llama.cpp does; `u32::MAX` prices a full-size
+    /// sliding-window cache, which is what `swa_full` allocates.
+    pub swa_cells: u32,
 }
 
 impl KvShape {
     pub fn new(n_layer: u32, n_head_kv: u32, k_len: u32, v_len: u32) -> Self {
         let per = n_layer as u64 * n_head_kv as u64;
-        Self { k: per * k_len as u64, v: per * v_len as u64, k_len, v_len }
+        Self { k: per * k_len as u64, v: per * v_len as u64, k_len, v_len, ..Self::default() }
+    }
+
+    /// The same shape with `swa_layers` of its layers on a sliding window of
+    /// `cells` cells. Those layers leave the growing figure and become a
+    /// fixed one.
+    pub fn with_window(self, n_layer: u32, swa_layers: u32, n_head_kv: u32, cells: u32) -> Self {
+        let swa_layers = swa_layers.min(n_layer);
+        if swa_layers == 0 {
+            return self;
+        }
+        let full = Self::new(n_layer - swa_layers, n_head_kv, self.k_len, self.v_len);
+        let swa = Self::new(swa_layers, n_head_kv, self.k_len, self.v_len);
+        Self { swa_k: swa.k, swa_v: swa.v, swa_cells: cells, ..full }
     }
 
     /// Both halves together, for callers that size against a single type.
@@ -227,8 +254,30 @@ impl KvShape {
 
     /// Bytes at `n_ctx` tokens, with each half stored its own way.
     pub fn bytes(self, n_ctx: u32, split: KvSplit) -> u64 {
-        kv_bytes(self.k, n_ctx, split.k) + kv_bytes(self.v, n_ctx, split.v)
+        kv_bytes(self.k, n_ctx, split.k) + kv_bytes(self.v, n_ctx, split.v) + self.window_bytes(n_ctx, split)
     }
+
+    /// The sliding-window cache at `n_ctx` tokens: never more than the window
+    /// asked for, never more than its own fixed size.
+    pub fn window_bytes(self, n_ctx: u32, split: KvSplit) -> u64 {
+        let cells = n_ctx.min(self.swa_cells);
+        kv_bytes(self.swa_k, cells, split.k) + kv_bytes(self.swa_v, cells, split.v)
+    }
+}
+
+/// Cells llama.cpp gives a sliding-window cache that is not full-size.
+///
+/// Its own rule, from `llama_kv_cache_iswa`: one window per sequence when
+/// they share a pool (one per stream otherwise, each stream its own cache),
+/// plus a micro-batch of room for the tokens being written, padded to 256 and
+/// never more than the window itself. `n_ctx` is the whole context, as the
+/// rest of this module counts it.
+pub fn swa_cells(n_swa: u32, n_ctx: u32, n_seq: u32, unified: bool, n_ubatch: u32) -> u32 {
+    let n_seq = n_seq.max(1);
+    let (per_stream_ctx, windows, streams) =
+        if unified { (n_ctx, n_seq, 1) } else { (n_ctx / n_seq, 1, n_seq) };
+    let want = n_swa.saturating_mul(windows).saturating_add(n_ubatch).min(per_stream_ctx);
+    want.div_ceil(256).saturating_mul(256).saturating_mul(streams)
 }
 
 /// How each half of the cache is stored. They are not the same question.
@@ -447,6 +496,10 @@ pub fn fit_context_split(shape: KvShape, requested: u32, split: KvSplit, budget:
     if per_token <= 0.0 {
         return requested;
     }
+    // A sliding-window cache is paid for before the first growing token. It
+    // is charged at the window asked for, the most it can be, so the fit
+    // below stays conservative when the window comes out smaller.
+    let budget = budget.saturating_sub(shape.window_bytes(requested, split));
     let affordable = (budget as f64 / per_token) as u64;
     let affordable = u32::try_from(affordable).unwrap_or(u32::MAX).min(requested);
     (affordable / CONTEXT_GRAIN * CONTEXT_GRAIN).max(MIN_CONTEXT)
@@ -718,6 +771,51 @@ mod tests {
     #[test]
     fn the_two_halves_sum_to_what_one_number_used_to_say() {
         assert_eq!(qwen_shape().total(), qwen_elements());
+    }
+
+    /// Spark-X2.5-4B: 36 layers, 27 on a 512-token window, 4 KV heads of 256.
+    fn spark_shape(cells: u32) -> KvShape {
+        KvShape::new(36, 4, 256, 256).with_window(36, 27, 4, cells)
+    }
+
+    #[test]
+    fn the_window_cache_is_sized_the_way_llama_cpp_sizes_it() {
+        // Pooled: a window per sequence plus a micro-batch, padded to 256.
+        // The daemon's shape — four conversations and the commons, 1024 wide.
+        assert_eq!(swa_cells(512, 65_536, 5, true, 1024), 3584);
+        // Never more than the context.
+        assert_eq!(swa_cells(512, 2048, 5, true, 1024), 2048);
+        // One session, the default micro-batch: 1024 cells.
+        assert_eq!(swa_cells(512, 32_768, 1, true, 512), 1024);
+        // Divided: each stream a window of its own.
+        assert_eq!(swa_cells(512, 32_768, 4, false, 512), 4 * 1024);
+    }
+
+    #[test]
+    fn only_full_attention_layers_grow_with_the_window() {
+        let q8 = KvSplit::uniform(CacheType::Q8_0);
+        let dense = KvShape::new(36, 4, 256, 256);
+        let spark = spark_shape(3584);
+        // 9 of 36 layers grow.
+        assert_eq!(spark.total() * 4, dense.total());
+        // At 64k the windowed cache is under a third of the full-size one,
+        // and it is the fixed part that makes up the difference from a quarter.
+        let (d, w) = (dense.bytes(65_536, q8), spark.bytes(65_536, q8));
+        assert!(w * 3 < d, "{w} vs {d}");
+        assert_eq!(w - dense.bytes(65_536, q8) / 4, spark.window_bytes(65_536, q8));
+        // A shape with no window prices exactly as before.
+        assert_eq!(dense.with_window(36, 0, 4, 3584), dense);
+    }
+
+    #[test]
+    fn the_window_comes_off_the_budget_before_any_token() {
+        let q8 = KvSplit::uniform(CacheType::Q8_0);
+        let spark = spark_shape(3584);
+        let budget = spark.bytes(40_960, q8);
+        let fitted = fit_context_split(spark, 65_536, q8, budget);
+        // Charged at the window asked for, so never more than what fits.
+        assert!(spark.bytes(fitted, q8) <= budget, "{fitted}");
+        assert!(fitted >= 36_864, "{fitted}");
     }
 
     #[test]

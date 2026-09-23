@@ -95,6 +95,19 @@ fn backend() -> Result<&'static LlamaBackend, EngineError> {
     .ok_or(EngineError::BackendInit)
 }
 
+/// A model's sliding-window layers, as the engine prices them.
+#[derive(Debug, Clone, Copy)]
+struct SlidingWindow {
+    /// The window, in positions.
+    n_swa: u32,
+    /// Layers on it, from the file; zero when the file does not say.
+    layers: u32,
+    /// Layers keeping any cache at all, and their KV heads — what
+    /// `KvShape::with_window` splits.
+    caching: u32,
+    n_head_kv: u32,
+}
+
 /// Loaded weights, shared by every session.
 pub struct Engine {
     model: LlamaModel,
@@ -141,7 +154,15 @@ pub struct Engine {
     /// so it can never be reused — which is why the checkpoint stops short.
     gen_prompt_tokens: usize,
     /// KV elements stored per token across all layers, for cache sizing.
+    ///
+    /// On a model with sliding-window layers this is the full-attention part
+    /// only; the window cache is added per context by [`Engine::kv_shape_for`],
+    /// because its size depends on how many sequences share the context.
     kv_shape: ozgent_core::accel::KvShape,
+    /// Sliding-window layers the file names, and the window, when llama.cpp
+    /// will give them the small cache. `None` for every other model. See
+    /// [`Engine::windowed`].
+    window: Option<SlidingWindow>,
     /// On-disk size of the weights, used as the denominator when deciding
     /// whether KV traffic dominates weight traffic.
     weight_bytes: u64,
@@ -290,6 +311,7 @@ impl Engine {
                     tokens: chunk.to_vec(),
                     pos,
                     logits: crate::hub::Logits::Last,
+                    settle: false,
                 })
                 .map_err(|e| EngineError::Decode(e.to_string()))?;
             pos += chunk.len() as i32;
@@ -312,6 +334,7 @@ impl Engine {
                         tokens,
                         pos,
                         logits: crate::hub::Logits::All,
+                        settle: false,
                     })
                     .map_err(|e| EngineError::Decode(e.to_string()))?;
                 times.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -526,6 +549,19 @@ impl Engine {
         }
         let kv_shape =
             ozgent_core::accel::KvShape::new(caching, model.n_head_kv(), k_len, v_len);
+        // llama.cpp's word on whether the model slides at all, and the file's
+        // on which layers. A model whose pattern the file does not spell out
+        // still gets the small cache — llama.cpp knows its layers — but is
+        // priced as though every layer grew, which over-reserves and is safe.
+        // SAFETY: the model outlives the call.
+        let n_swa = unsafe { ozgent_mtmd_sys::llama_cpp_sys_2::llama_model_n_swa(model.as_ptr()) }.max(0) as u32;
+        let window = (n_swa > 0 && !crate::backend::swa_full_forced()).then(|| {
+            let layers = crate::layout::read(path)
+                .filter(|l| l.swa_window == n_swa)
+                .map_or(0, |l| l.swa_layers);
+            tracing::debug!("{layers} of {n_layer} layers keep a {n_swa}-token sliding window");
+            SlidingWindow { n_swa, layers, caching, n_head_kv: model.n_head_kv() }
+        });
         let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
         // Speculative decoding rejects drafts by discarding the KV entries
@@ -587,6 +623,7 @@ impl Engine {
             jinja,
             n_layer,
             rollback_safe,
+            window,
             mtp: mtp && unsafe { sys::llama_model_n_layer_nextn(model.as_ptr()) } > 0,
             kv_shape,
             weight_bytes,
@@ -594,6 +631,30 @@ impl Engine {
             template,
             model,
         })
+    }
+
+    /// Whether this model's sliding-window layers keep only their window.
+    ///
+    /// They do whenever the model has any: ozgent asks llama.cpp for the small
+    /// cache (`swa_full = false`, llama.cpp's own tools' default) rather than
+    /// the full-size one its C API defaults to. On Spark-X2.5 that is 27 of 36
+    /// layers holding a few thousand cells instead of the whole window.
+    ///
+    /// What it costs is that a cell leaves the cache once it falls out of its
+    /// window, so going *back* in a sequence is only safe straight after the
+    /// pass that wrote what is being removed. Draft rollback is exactly that
+    /// (see [`crate::hub::Hub::windowed`]); going back a turn is not, and uses
+    /// a saved window instead (see `Session::rewind_window`).
+    pub fn windowed(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// The cache's shape for a context of `n_seq` sequences, pooled or not,
+    /// taking micro-batches of up to `n_ubatch` tokens.
+    fn kv_shape_for(&self, n_seq: u32, unified: bool, n_ubatch: u32) -> ozgent_core::accel::KvShape {
+        let Some(w) = self.window.filter(|w| w.layers > 0) else { return self.kv_shape };
+        let cells = ozgent_core::accel::swa_cells(w.n_swa, u32::MAX, n_seq, unified, n_ubatch);
+        self.kv_shape.with_window(w.caching, w.layers, w.n_head_kv, cells)
     }
 
     /// Whether a rejected draft can be undone by trimming the cache.
@@ -919,6 +980,7 @@ impl Engine {
         mut shape: ozgent_core::reserve::Shape,
         narrow_to: Option<u32>,
         floor: u32,
+        kv_shape: ozgent_core::accel::KvShape,
     ) -> Result<LlamaContext<'_>, EngineError> {
         let mut window = requested;
         // The retreat bisects rather than stepping by a fixed ratio.
@@ -1032,7 +1094,7 @@ impl Engine {
                     {
                         before
                             .saturating_sub(after)
-                            .saturating_sub(self.kv_shape.bytes(window, split))
+                            .saturating_sub(kv_shape.bytes(window, split))
                     } else {
                         0
                     };
@@ -1060,13 +1122,13 @@ impl Engine {
                     // plan that put the weights down had underestimated.
                     if window < floor {
                         let free = before.unwrap_or(0);
-                        let needed = self.kv_shape.bytes(floor, split)
+                        let needed = kv_shape.bytes(floor, split)
                             + measured
                             + crate::backend::decode_reserve();
                         let short_by = needed.saturating_sub(free).max(
-                            self.kv_shape
+                            kv_shape
                                 .bytes(floor, split)
-                                .saturating_sub(self.kv_shape.bytes(window, split)),
+                                .saturating_sub(kv_shape.bytes(window, split)),
                         );
                         drop(context);
                         return Err(EngineError::WindowBelowFloor { opened: window, floor, short_by });
@@ -1120,7 +1182,7 @@ impl Engine {
                         // the card does, instead of giving up on a placement
                         // that was simply a little too full.
                         if let Some(free) = crate::backend::best_gpu().map(|d| d.memory_free as u64) {
-                            let needed = self.kv_shape.bytes(floor, split)
+                            let needed = kv_shape.bytes(floor, split)
                                 + crate::backend::reserve_for(shape)
                                 + crate::backend::decode_reserve();
                             if needed > free {
@@ -1228,6 +1290,13 @@ impl Engine {
         let host = ozgent_core::accel::available_host_memory();
         let sequences = sequences_for(slots, want);
         let unified = matches!(want, Slots::UpTo(_)) && sequences > 1;
+        // Priced at the widest micro-batch this open may choose, since the
+        // sliding-window cache keeps a micro-batch of room.
+        let kv_shape = self.kv_shape_for(
+            sequences,
+            unified,
+            opts.ubatch.unwrap_or(opts.batch_size.max(WIDE_BATCH)),
+        );
         let total_window = if unified { requested } else { requested.saturating_mul(sequences) };
         // Scratch and budget for one candidate micro-batch. Both are wanted
         // twice below, once per candidate, so they are computed together.
@@ -1272,7 +1341,7 @@ impl Engine {
         let any_pair = crate::backend::flash_takes_any_kv_pair();
         let split = match (opts.cache_type_k, opts.cache_type_v) {
             (CacheType::Auto, CacheType::Auto) => ozgent_core::accel::choose_kv_split_for(
-                self.kv_shape,
+                kv_shape,
                 requested,
                 self.weight_bytes,
                 budget,
@@ -1291,13 +1360,13 @@ impl Engine {
         let split = if ozgent_core::accel::kv_split_allowed_for(
             split,
             opts.flash_attention,
-            self.kv_shape,
+            kv_shape,
             any_pair,
         ) {
             split
         } else {
             let safe = ozgent_core::accel::choose_kv_split_for(
-                self.kv_shape,
+                kv_shape,
                 requested,
                 self.weight_bytes,
                 budget,
@@ -1365,11 +1434,11 @@ impl Engine {
         let mut n_batch = opts.batch_size;
         let mut budget = budget;
         let mut window =
-            ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, budget);
+            ozgent_core::accel::fit_context_split(kv_shape, requested, split, budget);
         if opts.ubatch.is_none() && opts.batch_size <= WIDE_BATCH {
             let (_, wide_budget) = weigh(Some(WIDE_BATCH), WIDE_BATCH, requested);
             let wide_window =
-                ozgent_core::accel::fit_context_split(self.kv_shape, requested, split, wide_budget);
+                ozgent_core::accel::fit_context_split(kv_shape, requested, split, wide_budget);
             if wide_window >= window {
                 tracing::debug!("micro-batch {WIDE_BATCH} fits without shortening the window");
                 (ubatch, n_batch, budget, window) =
@@ -1386,9 +1455,15 @@ impl Engine {
             self.staging_bytes,
         );
         let requested = window;
-        let asked = opts.context_length.min(self.n_ctx_train.max(512)).saturating_mul(slots);
+        // What was asked for, in the same units as `requested`: a pooled
+        // context is one window shared by every slot, a divided one a window
+        // each. Multiplying a pooled window by the slot count made this warn
+        // on every load of the daemon — "context 65536 needs 10368 MiB ... so
+        // the window is 65536" — about a cache nobody had asked for.
+        let asked = opts.context_length.min(self.n_ctx_train.max(512));
+        let asked = if unified { asked } else { asked.saturating_mul(sequences) };
         if requested < asked {
-            let wanted = self.kv_shape.bytes(asked, split) / (1024 * 1024);
+            let wanted = kv_shape.bytes(asked, split) / (1024 * 1024);
             let where_ = if opts.kv_offload { "vram" } else { "system ram" };
             tracing::warn!(
                 "context {} needs {wanted} MiB of {k:?} K / {v:?} V kv cache; only {} MiB \
@@ -1403,7 +1478,7 @@ impl Engine {
             // buys nothing and costs the token rate.
             if opts.kv_offload
                 && ozgent_core::accel::fit_context_split(
-                    self.kv_shape,
+                    kv_shape,
                     asked,
                     split,
                     ozgent_core::accel::kv_budget(0, host, 0, self.n_layer),
@@ -1419,7 +1494,7 @@ impl Engine {
                 "kv cache: {:?} K / {:?} V ({} MiB at {requested} ctx, {} MiB free)",
                 type_k,
                 type_v,
-                self.kv_shape.bytes(requested, split) / (1024 * 1024),
+                kv_shape.bytes(requested, split) / (1024 * 1024),
                 free / (1024 * 1024),
             );
         }
@@ -1452,6 +1527,9 @@ impl Engine {
             // prefix they share. See `Commons`.
             .with_n_seq_max(sequences)
             .with_kv_unified(unified)
+            // The small sliding-window cache; see `Engine::windowed`. No effect
+            // on a model without sliding-window layers.
+            .with_swa_full(crate::backend::swa_full_forced())
             // `n_rs_seq` — llama.cpp's ring of recurrent states after each of
             // the last few tokens of a batch — is what lets a hybrid model
             // undo a rejected draft by trimming. Only asked for when there is
@@ -1491,7 +1569,7 @@ impl Engine {
             .saturating_mul(if unified { 1 } else { sequences })
             .min(requested);
         let mut context =
-            self.open_context(backend, params, requested, split, shape, narrow_to, floor)?;
+            self.open_context(backend, params, requested, split, shape, narrow_to, floor, kv_shape)?;
 
         // Steering belongs to the context, not the turn: installed once here,
         // it shapes every generation until the session ends. Loading it lazily
@@ -1583,6 +1661,9 @@ impl Engine {
                         .with_n_outputs_max(outputs_max(sequences))
                         .with_n_seq_max(sequences)
                         .with_kv_unified(unified)
+                        // The small sliding-window cache; see `Engine::windowed`. No effect
+                        // on a model without sliding-window layers.
+                        .with_swa_full(crate::backend::swa_full_forced())
                         .with_flash_attention_policy(flash)
                                     .with_offload_kqv(opts.kv_offload)
                         .with_type_k(ggml_type(CacheType::Q8_0))
@@ -1655,6 +1736,7 @@ impl Engine {
             grammar_active: false,
             can_trim: true,
             rollback_safe: self.rollback_safe,
+            windowed: self.windowed(),
             gen_prompt_tokens: self.gen_prompt_tokens,
             media_dirty: false,
             host_expert_bytes: self.cpu_moe_layers as u64 * self.expert_bytes_per_layer,
@@ -1691,7 +1773,8 @@ impl Engine {
                 )
                 // A count the user set is theirs; unset, it is measured.
                 .with_thread_tuning(opts.threads == 0)
-                .with_drafter_opt(drafter),
+                .with_drafter_opt(drafter)
+                .windowed(self.windowed()),
             ),
             each,
         ))
@@ -2115,6 +2198,10 @@ struct PromptCheckpoint {
     /// Exactly the tokens the saved state was built from.
     tokens: Vec<LlamaToken>,
     state: SeqState,
+    /// The sliding-window part alone, on a windowed model: what a rewind to
+    /// this boundary needs when the full-attention cells are still resident.
+    /// See `Session::rewind_window`.
+    window: Option<SeqState>,
     /// What the copy costs, so a set of them can be held to a budget.
     bytes: usize,
     /// When it was last saved or restored, for eviction.
@@ -2194,6 +2281,9 @@ pub struct Session<'a> {
     /// Mirrors [`Engine`]'s flag: false when the model keeps state that draft
     /// rejection cannot roll back, making speculation unsafe.
     rollback_safe: bool,
+    /// Mirrors [`Engine::windowed`]: the cache recycles cells that leave a
+    /// sliding window, so going back a turn cannot be a trim.
+    windowed: bool,
     /// Set after a turn that evaluated images: the cache then holds embeddings
     /// no token sequence describes, so it must be rebuilt before the next turn.
     media_dirty: bool,
@@ -2350,9 +2440,15 @@ impl<'a> Session<'a> {
         match self.snapshot(false, false) {
             Ok(state) => {
                 let tick = self.checkpoint_tick;
+                // Tens of megabytes where the whole state is hundreds: just
+                // the window, which is all a rewind within this conversation
+                // has to put back.
+                let window = if self.windowed { self.snapshot(true, false).ok() } else { None };
+                let bytes = bytes + window.as_ref().map_or(0, |w| w.byte_len());
                 self.checkpoints.push(PromptCheckpoint {
                     tokens: tokens.to_vec(),
                     state,
+                    window,
                     bytes,
                     used: tick,
                 });
@@ -2430,6 +2526,68 @@ impl<'a> Session<'a> {
         let saved: Vec<&[LlamaToken]> =
             self.checkpoints.iter().map(|c| c.tokens.as_slice()).collect();
         best_prefix_match(&saved, tokens)
+    }
+
+    /// Go back to a saved boundary inside the conversation the cache holds,
+    /// on a sliding-window model. Returns how many tokens are then resident.
+    ///
+    /// A trim cannot do this here. The full-attention cells before the
+    /// boundary are all still resident, but the sliding-window cache recycled
+    /// cells as the conversation moved past them, and those are the last
+    /// `n_swa` positions before the boundary — exactly what the next token
+    /// attends over. The trim would succeed and the model would read a hole.
+    ///
+    /// So the full-attention cache is trimmed, which is always sound, and the
+    /// window is put back from the checkpoint: a few tens of megabytes,
+    /// against the hundreds a whole-state restore moves. llama.cpp's server
+    /// does the same with its context checkpoints.
+    fn rewind_window(&mut self, tokens: &[LlamaToken], reuse: usize) -> Option<usize> {
+        if matches!(self.reuse, PrefixReuse::Off) {
+            return None;
+        }
+        // A prefix of the new prompt *and* of what is resident, so every cell
+        // before it is really there, and no longer than the shared prefix.
+        let index = self
+            .checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.window.is_some()
+                    && c.tokens.len() <= reuse
+                    && tokens.starts_with(&c.tokens)
+                    && self.cached.starts_with(&c.tokens)
+            })
+            .max_by_key(|(_, c)| c.tokens.len())
+            .map(|(i, _)| i)?;
+        let n = self.checkpoints[index].tokens.len();
+        if !self.slot.trim(n as i32).unwrap_or(false) {
+            return None;
+        }
+        let mut checkpoint = self.checkpoints.remove(index);
+        // Present by the filter above.
+        let restored = match checkpoint.window.as_ref() {
+            Some(window) => self.restore(window),
+            None => Err(EngineError::State("no saved window".into())),
+        };
+        self.checkpoint_tick += 1;
+        checkpoint.used = self.checkpoint_tick;
+        self.checkpoints.push(checkpoint);
+        match restored {
+            Ok(()) => {
+                self.n_past = n as i32;
+                self.cached.truncate(n);
+                tracing::debug!("rewound to a saved window at {n} tokens");
+                Some(n)
+            }
+            Err(e) => {
+                // Trimmed but not restored: the window is in an unknown state.
+                tracing::debug!("window restore failed: {e}");
+                self.slot.clear();
+                self.cached.clear();
+                self.n_past = 0;
+                None
+            }
+        }
     }
 
     /// Put the cache back to a saved prompt boundary. Returns how many tokens
@@ -2795,11 +2953,26 @@ impl<'a> Session<'a> {
         pos: i32,
         logits: crate::hub::Logits,
     ) -> Result<crate::hub::Outcome, EngineError> {
+        self.feed_as(tokens, pos, logits, false)
+    }
+
+    /// As [`Session::feed`], saying whether the batch carries drafts this
+    /// session may take back once the pass returns — which a sliding-window
+    /// hub must know; see [`crate::hub::Hub::windowed`].
+    fn feed_as(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: crate::hub::Logits,
+        drafts: bool,
+    ) -> Result<crate::hub::Outcome, EngineError> {
         let n = tokens.len() as i32;
-        let out = self
-            .slot
-            .run(tokens, pos, logits)
-            .map_err(|e| EngineError::Decode(e.to_string()))?;
+        let run = if drafts {
+            self.slot.run_drafts(tokens, pos, logits)
+        } else {
+            self.slot.run(tokens, pos, logits)
+        };
+        let out = run.map_err(|e| EngineError::Decode(e.to_string()))?;
         self.n_past = pos + n;
         Ok(out)
     }
@@ -2876,7 +3049,10 @@ impl<'a> Session<'a> {
     ) -> Result<(), EngineError> {
         match snapshot {
             // Everything was accepted: the state already reflects it.
-            Some(_) if accepted == draft.len() => Ok(()),
+            Some(_) if accepted == draft.len() => {
+                self.slot.settle();
+                Ok(())
+            }
             Some(state) => {
                 self.restore(state)?;
                 self.n_past = start;
@@ -2904,6 +3080,8 @@ impl<'a> Session<'a> {
     ) -> Result<(), EngineError> {
         let valid = start + 1 + accepted as i32;
         if valid >= self.n_past {
+            // Every draft stood; nothing to take back.
+            self.slot.settle();
             return Ok(());
         }
         if self.slot.trim(valid).unwrap_or(false) {
@@ -3195,6 +3373,14 @@ impl<'a> Session<'a> {
                     }
                 }
 
+                // A sliding-window cache goes back through a saved window, not
+                // a trim; see `rewind_window`.
+                if !restored && reuse < self.cached.len() && self.windowed {
+                    if let Some(n) = self.rewind_window(&tokens, reuse) {
+                        reuse = n;
+                        restored = true;
+                    }
+                }
                 if !restored && reuse < self.cached.len() {
                     // Drop everything after the shared prefix; those positions
                     // are about to be occupied by different tokens.
@@ -3205,7 +3391,7 @@ impl<'a> Session<'a> {
                     // silently wrong (logits off by up to 8 when measured).
                     // The ring is only sound straight after the batch whose
                     // tokens it undoes, which is what drafting uses it for.
-                    let trimmable = self.can_trim && self.rollback_safe;
+                    let trimmable = self.can_trim && self.rollback_safe && !self.windowed;
                     let trimmed = trimmable && self.slot.trim(reuse as i32).unwrap_or(false);
                     if trimmable && !trimmed {
                         // Sliding-window caches refuse a partial removal too.
@@ -3646,7 +3832,7 @@ impl<'a> Session<'a> {
             run.push(pending);
             run.extend_from_slice(&draft);
             // Every position asks for logits, so each draft can be verified.
-            let verified = self.feed(run, start, crate::hub::Logits::All)?.rows;
+            let verified = self.feed_as(run, start, crate::hub::Logits::All, !draft.is_empty())?.rows;
             debug_assert_eq!(verified.len(), 1 + draft.len());
 
             // Verify. Row i predicts the token after batch entry i, so a

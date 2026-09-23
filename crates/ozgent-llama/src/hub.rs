@@ -50,6 +50,9 @@ pub struct Work {
     pub pos: i32,
     /// Which rows of logits the caller needs back.
     pub logits: Logits,
+    /// Tokens the caller may take back straight after this pass — drafts
+    /// being verified. See [`Hub::with_window`] for why that has to be said.
+    pub settle: bool,
 }
 
 /// Which logits a request wants.
@@ -143,6 +146,13 @@ struct Queue {
     /// Which sequences those are. Their cache is in use this instant and may
     /// not be taken to make room; see [`Hub::make_room`].
     live: std::collections::HashSet<i32>,
+    /// Sequences that have just verified drafts and not yet taken back the
+    /// rejected ones. No pass may run while any are here, on a sliding-window
+    /// cache; see [`Hub::windowed`].
+    unsettled: std::collections::HashSet<i32>,
+    /// Sequences a pass ran past while they were unsettled. Their window may
+    /// have lost cells a trim would need, so their next trim is refused.
+    tainted: std::collections::HashSet<i32>,
 }
 
 /// The prefix every conversation on this hub begins with, held once.
@@ -199,6 +209,10 @@ pub struct Hub<'a> {
     commons: Mutex<Commons>,
     /// Set only when a measurement wants the window held still.
     fixed_window: Option<Duration>,
+    /// Whether the cache keeps only a sliding window for some layers, and so
+    /// recycles cells a trim could otherwise have kept. See
+    /// [`Hub::windowed`].
+    windowed: bool,
     /// Chooses the CPU thread count for decode passes, when nobody set one.
     /// See [`crate::threads`].
     threads: Mutex<Option<ThreadState>>,
@@ -239,9 +253,48 @@ impl<'a> Hub<'a> {
             drafts_woke: Condvar::new(),
             commons: Mutex::new(Commons::default()),
             fixed_window: None,
+            windowed: false,
             threads: Mutex::new(None),
             // One past the conversations, for the commons.
             evictions: (0..=slots.max(1)).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Say that this context's cache keeps only a sliding window for some of
+    /// its layers.
+    ///
+    /// Such a cache recycles a cell as soon as it falls out of its
+    /// sequence's window, and it judges that against the sequence's newest
+    /// position *at the moment of the pass*. A draft verified at `p..p+k` moves
+    /// that position forward by `k`, and a pass run before the rejected drafts
+    /// are trimmed may reuse cells the sequence needs again once they are:
+    /// the trim then succeeds, and the next token attends over a hole. Nothing
+    /// fails; the output is just wrong.
+    ///
+    /// The pass that verifies the drafts cannot do this — it chose its cells
+    /// before writing them — so the only unsafe moment is between that pass
+    /// and the trim. On such a hub no pass starts while a verified sequence
+    /// is still deciding. The wait is the sampling of one token, which the
+    /// driver was already waiting on to fill the batch.
+    pub fn windowed(mut self, on: bool) -> Self {
+        self.windowed = on;
+        self
+    }
+
+    /// Whether this context's cache keeps a sliding window. See
+    /// [`Hub::windowed`].
+    pub fn is_windowed(&self) -> bool {
+        self.windowed
+    }
+
+    /// Mark `seq` as done with its last verified drafts.
+    fn settle(&self, seq: i32) {
+        if !self.windowed {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if q.unsettled.remove(&seq) {
+            self.woke.notify_all();
         }
     }
 
@@ -496,15 +549,45 @@ impl<'a> Hub<'a> {
             // The final row is asked for so the pass always has an output;
             // nothing reads it.
             let want = if last { Logits::Last } else { Logits::None };
-            let work = Work { seq, tokens: chunk.to_vec(), pos, logits: want };
+            let work = Work { seq, tokens: chunk.to_vec(), pos, logits: want, settle: false };
             if let Err(e) = self.run(work) {
                 self.filled(Vec::new());
                 return Err(e);
             }
             pos += chunk.len() as i32;
         }
+        if self.windowed {
+            self.compact_window(seq);
+        }
         self.filled(tokens.to_vec());
         Ok(())
+    }
+
+    /// Keep only the live window of `seq`'s sliding-window cells.
+    ///
+    /// The commons is lent by `seq_cp`, which shares cells, and a shared cell
+    /// is never recycled. Left as it was filled, a 2,858-token commons would
+    /// pin 2,858 sliding-window cells for as long as anyone holds a copy — in
+    /// a cache llama.cpp sized for one window per sequence, which is a few
+    /// hundred. The next conversation to grow would find no cell to write
+    /// into.
+    ///
+    /// llama.cpp has no call that removes cells from the sliding-window cache
+    /// alone, but restoring a sequence's window-only state does exactly that
+    /// as a side effect: it drops every sliding-window cell the sequence held
+    /// and writes back the ones still inside its window. The full-attention
+    /// cells are not touched.
+    fn compact_window(&self, seq: i32) {
+        use llama_cpp_2::context::session::LlamaStateSeqFlags;
+        let done = self.with_context(|c| {
+            let state = c.state_seq_get(seq, LlamaStateSeqFlags::PARTIAL_ONLY)?;
+            c.state_seq_set(&state, seq)
+        });
+        if let Err(e) = done {
+            // Not fatal: the commons works either way, it only pins more of
+            // the window cache than it should.
+            tracing::warn!("could not trim the shared prefix to its window: {e}");
+        }
     }
 
     /// Hand a copy of the shared prefix to `seq`, which must hold nothing.
@@ -670,6 +753,11 @@ impl<'a> Hub<'a> {
             q.pass_secs = if q.pass_secs <= 0.0 { took } else { q.pass_secs * 0.8 + took * 0.2 };
             q.spent += took;
             for (p, result) in batch.into_iter().zip(results) {
+                // Marked here, under the lock the next pass must take, so no
+                // pass can slip in between this one and the mark.
+                if self.windowed && p.work.settle && result.is_ok() {
+                    q.unsettled.insert(p.work.seq);
+                }
                 q.ready.insert(p.id, result);
             }
             self.woke.notify_all();
@@ -703,6 +791,26 @@ impl<'a> Hub<'a> {
         let mut q = self.queue.lock().unwrap();
         if q.waiting.is_empty() {
             return q;
+        }
+        // Before anything else: a sliding-window cache may not run a pass
+        // while a sequence has drafts it may yet take back. See
+        // [`Hub::windowed`]. Bounded, so a caller that vanishes between
+        // verifying and trimming costs a pause rather than a hang — and its
+        // next trim is refused, so it rebuilds rather than trusting a window
+        // the pass may have eaten into.
+        if self.windowed && !q.unsettled.is_empty() {
+            let deadline = Instant::now() + UNSETTLED_WAIT;
+            while !q.unsettled.is_empty() {
+                let now = Instant::now();
+                if now >= deadline {
+                    let late: Vec<i32> = q.unsettled.drain().collect();
+                    tracing::warn!("sequences {late:?} did not settle their drafts in time; their next trim will rebuild");
+                    q.tainted.extend(late);
+                    break;
+                }
+                let (guard, _) = self.woke.wait_timeout(q, deadline - now).unwrap();
+                q = guard;
+            }
         }
         let opened = Instant::now();
         let deadline = opened + self.window(&q);
@@ -1012,6 +1120,13 @@ const WINDOW_SHARE: f64 = 0.5;
 const MIN_WINDOW: Duration = Duration::from_micros(250);
 const MAX_WINDOW: Duration = Duration::from_millis(20);
 
+/// How long a sliding-window hub waits for verified sequences to settle
+/// before running a pass anyway. Settling is the sampling of one token —
+/// microseconds to a few milliseconds — so this is only ever reached by a
+/// caller that stopped between verifying and trimming, and it is made
+/// correct rather than fast: those sequences are tainted and rebuild.
+const UNSETTLED_WAIT: Duration = Duration::from_secs(2);
+
 /// One conversation's claim on a hub.
 ///
 /// Counted as running while it is generating, so the driver knows to wait for
@@ -1051,6 +1166,7 @@ impl<'a> Slot<'a> {
 
     /// Say that this slot has stopped asking, so nobody waits for it.
     pub fn park(&mut self) {
+        self.hub.settle(self.seq);
         if self.running {
             self.running = false;
             let mut q = self.hub.queue.lock().unwrap();
@@ -1068,9 +1184,34 @@ impl<'a> Slot<'a> {
         pos: i32,
         logits: Logits,
     ) -> Result<Outcome, HubError> {
+        self.run_as(tokens, pos, logits, false)
+    }
+
+    /// Decode drafts to verify them: tokens this slot may take back with
+    /// [`Slot::trim`] as soon as the pass returns. It must trim, run again, or
+    /// clear before the hub will run another pass; see [`Hub::windowed`].
+    pub fn run_drafts(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: Logits,
+    ) -> Result<Outcome, HubError> {
+        self.run_as(tokens, pos, logits, true)
+    }
+
+    fn run_as(
+        &mut self,
+        tokens: Vec<LlamaToken>,
+        pos: i32,
+        logits: Logits,
+        settle: bool,
+    ) -> Result<Outcome, HubError> {
         self.resume();
+        // Asking for another pass means whatever the last one verified has
+        // been decided on.
+        self.hub.settle(self.seq);
         let started = Instant::now();
-        let out = self.hub.run(Work { seq: self.seq, tokens, pos, logits });
+        let out = self.hub.run(Work { seq: self.seq, tokens, pos, logits, settle });
         RUN_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
     }
@@ -1102,14 +1243,28 @@ impl<'a> Slot<'a> {
         self.hub.solo()
     }
 
+    /// Say that this slot keeps every draft its last pass verified, so the
+    /// hub need not wait for a trim. See [`Hub::windowed`].
+    pub fn settle(&self) {
+        self.hub.settle(self.seq);
+    }
+
     /// Drop positions `from..` from this slot's sequence. False means this
     /// cache cannot drop a partial range, which sliding-window and recurrent
     /// caches cannot.
     pub fn trim(&self, from: i32) -> Result<bool, String> {
+        // A pass ran past this sequence while it was deciding; its window may
+        // be missing cells this trim would need. Refusing sends the caller
+        // down the path every cache that cannot trim takes.
+        if self.hub.windowed && self.hub.queue.lock().unwrap().tainted.remove(&self.seq) {
+            self.hub.settle(self.seq);
+            return Ok(false);
+        }
         let trimmed = self.with_context(|c| {
             c.clear_kv_cache_seq(Some(self.seq as u32), Some(from as u32), None)
                 .map_err(|e| e.to_string())
         });
+        self.hub.settle(self.seq);
         if matches!(trimmed, Ok(true)) {
             self.hub.forget_drafts(self.seq, from);
         }
@@ -1121,6 +1276,10 @@ impl<'a> Slot<'a> {
         self.hub.with_context(|c| {
             let _ = c.clear_kv_cache_seq(Some(self.seq as u32), None, None);
         });
+        if self.hub.windowed {
+            self.hub.queue.lock().unwrap().tainted.remove(&self.seq);
+        }
+        self.hub.settle(self.seq);
         self.hub.forget_drafts(self.seq, 0);
     }
 
@@ -1150,6 +1309,7 @@ mod tests {
                 tokens: vec![LlamaToken(1); tokens],
                 pos: 0,
                 logits: Logits::Last,
+                settle: false,
             },
         }
     }

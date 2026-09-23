@@ -66,6 +66,15 @@ pub struct Layout {
     /// head the model carries for speculating with itself. Zero on most
     /// models. See [`crate::mtp`].
     pub nextn_layers: u32,
+    /// Blocks that attend over a sliding window rather than the whole
+    /// context, and how wide that window is. Their cache stops growing at the
+    /// window, so they are left out of [`Layout::kv_elements_per_token`] and
+    /// priced as a fixed cost instead. Zero on a model without them, and on
+    /// one whose pattern the file does not spell out. See [`sliding_window`].
+    pub swa_layers: u32,
+    pub swa_window: u32,
+    /// KV elements per cell across those blocks: the fixed cache's width.
+    pub swa_elements_per_token: u64,
 }
 
 /// The routed-expert tensors, in the order eviction spends them.
@@ -104,7 +113,10 @@ pub fn read(path: &Path) -> Option<Layout> {
     }
     let mut layout = scan(gguf);
     if let Some(l) = layout.as_mut() {
-        l.kv_elements_per_token = kv_elements(gguf, l.layers);
+        (l.swa_layers, l.swa_window) = string_key(gguf, "general.architecture")
+            .map(|arch| sliding_window(gguf, &arch, l.layers))
+            .unwrap_or((0, 0));
+        (l.kv_elements_per_token, l.swa_elements_per_token) = kv_elements(gguf, l.layers);
         l.caching_layers = string_key(gguf, "general.architecture")
             .map(|arch| caching_layers(gguf, &arch, l.layers))
             .unwrap_or(l.layers);
@@ -213,6 +225,9 @@ fn scan(gguf: *mut sys::gguf_context) -> Option<Layout> {
         n_embd: 0,
         context_train: 0,
         nextn_layers: 0,
+        swa_layers: 0,
+        swa_window: 0,
+        swa_elements_per_token: 0,
     })
 }
 
@@ -231,8 +246,11 @@ fn context_train(gguf: *mut sys::gguf_context) -> u32 {
 /// Not derivable from `n_embd / n_head`: Qwen3.5 has 16 heads over an
 /// embedding width of 2560, giving 160, while its true key length is 256 —
 /// which would mis-size the cache by 60%.
-fn kv_elements(gguf: *mut sys::gguf_context, layers: u32) -> u64 {
-    let Some(arch) = string_key(gguf, "general.architecture") else { return 0 };
+///
+/// Returns the growing figure and, separately, the per-cell width of the
+/// sliding-window layers (zero on a model without them).
+fn kv_elements(gguf: *mut sys::gguf_context, layers: u32) -> (u64, u64) {
+    let Some(arch) = string_key(gguf, "general.architecture") else { return (0, 0) };
     let heads_kv = u32_values(gguf, &format!("{arch}.attention.head_count_kv"));
     let embd = u32_key(gguf, &format!("{arch}.embedding_length")).unwrap_or(0);
     let heads = u32_key(gguf, &format!("{arch}.attention.head_count")).unwrap_or(0);
@@ -249,7 +267,43 @@ fn kv_elements(gguf: *mut sys::gguf_context, layers: u32) -> u64 {
     // [`caching_layers`] — on a model that interleaves linear attention this
     // is a quarter of them, and pricing all of them over-reserves by 4x.
     let caching = caching_layers(gguf, &arch, layers);
-    fold_kv(caching, &heads_kv, k, v)
+    // Sliding-window layers cache too, but only up to their window, so they
+    // are no part of a per-token figure either. Only taken off a model that
+    // is not also recurrent-hybrid: no architecture mixes the two today, and
+    // guessing how their patterns overlap could price a layer at nothing.
+    let (swa, _) = sliding_window(gguf, &arch, layers);
+    if swa > 0 && caching == layers && heads_kv.len() <= 1 {
+        return (fold_kv(layers - swa, &heads_kv, k, v), fold_kv(swa, &heads_kv, k, v));
+    }
+    (fold_kv(caching, &heads_kv, k, v), 0)
+}
+
+/// How many blocks attend over a sliding window, and how wide it is.
+///
+/// Hybrid in a different sense from [`caching_layers`]: every block keeps a
+/// KV cache, but on the sliding-window ones it only ever needs the last
+/// `n_swa` positions. Spark-X2.5 runs 27 of its 36 blocks on a 512-token
+/// window, so pricing them at the full context — which is what llama.cpp
+/// also *allocated*, with its `swa_full` default — made a 4B's cache larger
+/// than a dense 8B's.
+///
+/// Only an explicit per-layer pattern is read, as llama.cpp reads it
+/// (`true` = sliding window). Architectures that hard-code their pattern
+/// (Gemma 2/3) or give it as a period are left at zero, which prices every
+/// layer as growing: more than they need, never less.
+pub fn sliding_window(gguf: *mut sys::gguf_context, arch: &str, layers: u32) -> (u32, u32) {
+    let n_swa = u32_key(gguf, &format!("{arch}.attention.sliding_window")).unwrap_or(0);
+    if n_swa == 0 {
+        return (0, 0);
+    }
+    let pattern = bool_values(gguf, &format!("{arch}.attention.sliding_window_pattern"));
+    // The pattern covers the main stack; appended prediction blocks, if any,
+    // are full attention.
+    if pattern.is_empty() || pattern.len() > layers as usize {
+        return (0, 0);
+    }
+    let swa = pattern.iter().filter(|&&b| b).count() as u32;
+    if swa == 0 { (0, 0) } else { (swa, n_swa) }
 }
 
 /// Whether this model uses multi-head latent attention, by llama.cpp's own
@@ -403,6 +457,24 @@ fn u32_values(gguf: *mut sys::gguf_context, key: &str) -> Vec<u32> {
     // above, and lives in the gguf context the caller still holds.
     let raw = unsafe { std::slice::from_raw_parts(data, n) };
     raw.iter().map(|&e| u32::try_from(e).unwrap_or(0)).collect()
+}
+
+/// Read an array of booleans, or nothing for a missing key or another type.
+fn bool_values(gguf: *mut sys::gguf_context, key: &str) -> Vec<bool> {
+    let Some(index) = find(gguf, key) else { return Vec::new() };
+    if unsafe { sys::gguf_get_kv_type(gguf, index) } != sys::GGUF_TYPE_ARRAY
+        || unsafe { sys::gguf_get_arr_type(gguf, index) } != sys::GGUF_TYPE_BOOL
+    {
+        return Vec::new();
+    }
+    let n = unsafe { sys::gguf_get_arr_n(gguf, index) };
+    let data = unsafe { sys::gguf_get_arr_data(gguf, index) } as *const u8;
+    if n == 0 || data.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: GGUF stores a bool as one byte; the array is `n` of them, type
+    // checked above, and lives in the gguf context the caller still holds.
+    unsafe { std::slice::from_raw_parts(data, n) }.iter().map(|&b| b != 0).collect()
 }
 
 fn scalar_u32(gguf: *mut sys::gguf_context, index: i64) -> Option<u32> {

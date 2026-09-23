@@ -653,6 +653,16 @@ pub(crate) const PLANNING_WINDOW: u32 = 8192;
 pub(crate) const CONTEXT_TARGET: u32 = 65_536;
 pub(crate) const CONTEXT_FLOOR: u32 = 49_152;
 
+/// Whether a full-size sliding-window cache is forced, which is how models
+/// with sliding-window layers ran before ozgent asked for the small one.
+///
+/// For measurement only: `OZGENT_SWA_FULL=1` puts back the old allocation so
+/// the two can be compared inside one process, where this laptop's run-to-run
+/// drift cannot decide the answer.
+pub fn swa_full_forced() -> bool {
+    std::env::var("OZGENT_SWA_FULL").is_ok_and(|v| v == "1")
+}
+
 /// The planning window in force, overridable while the floor is measured.
 pub(crate) fn planning_window() -> u32 {
     std::env::var("OZGENT_PLAN_WINDOW")
@@ -756,6 +766,20 @@ impl Plan {
             Some(n) => n,
             None => opts.batch_size.max(crate::engine::WIDE_BATCH),
         };
+        // Sliding-window layers hold a cache of fixed size beside the growing
+        // one: a window per conversation and a micro-batch of room, which
+        // `Engine::open` asks llama.cpp for whenever the model has them. It
+        // is charged here the way llama.cpp will size it, or — when a
+        // full-size one is forced for measurement — at the whole window,
+        // which is what every model paid before.
+        let (growing, window_cells) = if layout.swa_layers == 0 {
+            (layout.kv_elements_per_token, None)
+        } else if swa_full_forced() {
+            (layout.kv_elements_per_token + layout.swa_elements_per_token, None)
+        } else {
+            let unified = sequences > 1;
+            (layout.kv_elements_per_token, Some((unified, sequences.max(1))))
+        };
         let overhead_at = |window: u32| {
             let shape = reserve_shape(
                 planned_batch,
@@ -764,7 +788,12 @@ impl Plan {
                 planned_batch.max(opts.batch_size),
                 0,
             );
-            ozgent_core::accel::kv_bytes(layout.kv_elements_per_token, window, assumed)
+            let fixed = window_cells.map_or(0, |(unified, n_seq)| {
+                let cells = ozgent_core::accel::swa_cells(layout.swa_window, window, n_seq, unified, planned_batch);
+                ozgent_core::accel::kv_bytes(layout.swa_elements_per_token, cells, assumed)
+            });
+            ozgent_core::accel::kv_bytes(growing, window, assumed)
+                + fixed
                 + reserve_for(shape)
                 + decode_reserve()
                 + layout.fixed_gpu_bytes
