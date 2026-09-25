@@ -383,6 +383,36 @@ def _short_tmp(name: str) -> Path:
     return tmp
 
 
+def env_folders(env: dict[str, str], homes: Path) -> list[str]:
+    """The existing paths named by an MCP server's environment values, that
+    it may read.
+
+    Never ``/`` or a home folder as a whole, nothing inside ozgent's own
+    directories but the MCP homes under ``homes``, and no credential folder:
+    an environment value is a setting someone typed, not a decision to open
+    ozgent's keys to a program they downloaded.
+    """
+    in_homes = lambda path: path.is_relative_to(homes) and path != homes
+    out: list[str] = []
+    for value in env.values():
+        value = value.strip()
+        if not value.startswith(("/", "~/")) or os.pathsep in value:
+            continue
+        try:
+            path = Path(value).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not path.exists() or path in (Path("/"), Path.home()) or path.parent == Path("/home"):
+            continue
+        if any(path.is_relative_to(s) for s in sensitive_dirs()):
+            continue
+        # Inside ozgent's own home only where MCP servers are kept.
+        if any(path.is_relative_to(p) for p in protected_dirs()) and not in_homes(path):
+            continue
+        out.append(str(path))
+    return out
+
+
 def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env: dict[str, str]) -> dict[str, Any]:
     """The sandbox an MCP server runs in: see ``ozgent_tools/sandbox.py``.
 
@@ -410,6 +440,7 @@ def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env:
     read = system_view()
     read += [os.path.expanduser(p) for p in HOME_TOOLCHAINS if os.path.exists(os.path.expanduser(p))]
     found = shutil.which(program)
+    homes = base.parent.resolve()
     if found:
         real = Path(found).resolve()
         read.append(str(real.parent))
@@ -417,6 +448,15 @@ def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env:
         # `<prefix>/lib`. Only when it is a bin directory, never `/`.
         if real.parent.name == "bin" and real.parent.parent != Path("/"):
             read.append(str(real.parent.parent))
+        # A package unpacked into ~/ozgent/mcp/<dir>, where MCP servers are
+        # kept: all of it, not only the folder the program sits in. Built
+        # programs sit in `release/` beside the browser or data they start.
+        if real.is_relative_to(homes) and real != homes:
+            read.append(str(homes / real.relative_to(homes).parts[0]))
+    # Folders the server is told about in its own environment —
+    # `GHOSTFOX_HOME=/opt/ghostfox` — are where it will look, so it may read
+    # them. Read only: writing is what `folders` is for.
+    read += env_folders(env, homes)
     folders = [str(Path(f).expanduser()) for f in folders]
     run_env = clean_env(str(tmp))
     run_env.update({k: v for k, v in os.environ.items() if k in MCP_ENV_KEEP})

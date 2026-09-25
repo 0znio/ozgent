@@ -401,3 +401,55 @@ class DeclaredEffects(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpServerReadsTest(unittest.TestCase):
+    """What an MCP server may read beyond the system: its package and the
+    folders its environment names — never ozgent's keys or credentials."""
+
+    def setUp(self) -> None:
+        from ozgent_tools import permissions
+        self.permissions = permissions
+        self.dir = tempfile.TemporaryDirectory()
+        root = Path(self.dir.name).resolve()
+        self.ozgent = root / "ozgent"
+        self.homes = self.ozgent / "mcp"
+        self.package = self.homes / "ghostfox"
+        (self.package / "release").mkdir(parents=True)
+        (self.package / "browser").mkdir()
+        (self.ozgent / "configs").mkdir(parents=True)
+        self.program = self.package / "release" / "server"
+        self.program.write_text("#!/bin/sh\n")
+        self.program.chmod(0o755)
+        self.saved = os.environ.get("OZGENT_PROTECTED")
+        os.environ["OZGENT_PROTECTED"] = str(self.ozgent)
+
+    def tearDown(self) -> None:
+        if self.saved is None:
+            os.environ.pop("OZGENT_PROTECTED", None)
+        else:
+            os.environ["OZGENT_PROTECTED"] = self.saved
+        self.dir.cleanup()
+
+    def policy(self, env: dict[str, str]) -> dict:
+        return self.permissions.mcp_sandbox(str(self.program), str(self.homes / "ghostcloak"), [], True, env)
+
+    def test_a_package_under_the_mcp_folder_is_readable_whole(self) -> None:
+        self.assertIn(str(self.package), self.policy({})["read"])
+
+    def test_a_folder_named_in_the_environment_is_readable(self) -> None:
+        read = self.policy({"GHOSTFOX_HOME": str(self.package / "browser")})["read"]
+        self.assertIn(str(self.package / "browser"), read)
+
+    def test_the_environment_cannot_open_ozgents_own_files(self) -> None:
+        read = self.policy({
+            "A": str(self.ozgent / "configs"),
+            "B": str(self.ozgent),
+            "C": str(self.homes),
+            "D": "/",
+            "E": str(Path.home()),
+            "F": "not a path",
+            "G": str(self.package / "missing"),
+        })["read"]
+        for shut in (self.ozgent / "configs", self.ozgent, self.homes, Path("/"), Path.home(), self.package / "missing"):
+            self.assertNotIn(str(shut), read, shut)
