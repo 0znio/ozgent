@@ -67,6 +67,7 @@
     <nav class="adm-nav" role="tablist" aria-label="Sections">
       <button type="button" class="tab" role="tab" data-view="gateway" aria-selected="true">Gateway</button>
       <button type="button" class="tab" role="tab" data-view="models" aria-selected="false">Models</button>
+      <button type="button" class="tab" role="tab" data-view="mcp" aria-selected="false">MCP</button>
       <button type="button" class="tab" role="tab" data-view="security" aria-selected="false">Security</button>
       <button type="button" class="tab" role="tab" data-view="account" aria-selected="false">Password</button>
     </nav>
@@ -507,6 +508,33 @@
     </form>
   </section>
 
+  <!-- ---------------------------------------------------------------- mcp -->
+  <section class="adm-view" id="view-mcp" hidden>
+    <div class="adm-head">
+      <h1>MCP servers</h1>
+      <p class="adm-lede">Programs and services that give the model more tools, over the Model Context Protocol. A server's tools ask before they run unless you allow them here, and a program installed from here runs in a sandbox.</p>
+    </div>
+
+    <article class="adm-card adm-channel">
+      <header class="adm-ch-head">
+        <h2>Use MCP servers</h2>
+        <span class="adm-pill" id="mcp-pill">off</span>
+        <span class="spacer"></span>
+        <button type="button" class="ghost-btn auto" id="mcp-reconnect">Reconnect</button>
+        <label class="switch" data-tip="Connect to the servers below">
+          <input type="checkbox" id="mcp-enabled" aria-label="Use MCP servers"><span class="track"></span>
+        </label>
+      </header>
+      <p class="adm-detail" id="mcp-detail" hidden></p>
+      <div class="adm-actions">
+        <button type="button" class="primary-btn" id="mcp-add">Add a server</button>
+        <span class="hint inline" id="mcp-runtimes"></span>
+      </div>
+    </article>
+
+    <div class="adm-channels" id="mcp-servers"></div>
+  </section>
+
   <!-- ------------------------------------------------------------ account -->
   <section class="adm-view" id="view-account" hidden>
     <div class="adm-head">
@@ -531,5 +559,109 @@
 </div>
 
 <script type="module" src="/admin.js"></script>
+<dialog class="st-dialog mcp-dialog" id="mcp-dialog" aria-labelledby="mcp-dialog-title">
+  <form method="dialog" class="mcp-dialog-form" id="mcp-dialog-form">
+    <header class="settings-head mcp-dialog-head">
+      <h2 id="mcp-dialog-title">Add an MCP server</h2>
+      <div class="adm-seg" role="radiogroup" aria-label="How to add it" id="mcp-way">
+        <button type="button" role="radio" aria-checked="true" data-way="registry">MCP Registry</button>
+        <button type="button" role="radio" aria-checked="false" data-way="package">npm or PyPI</button>
+        <button type="button" role="radio" aria-checked="false" data-way="manual">Command or URL</button>
+        <button type="button" role="radio" aria-checked="false" data-way="json">Paste JSON</button>
+      </div>
+    </header>
+
+    <div class="st-body">
+      <!-- The registry: search, pick, fill in. -->
+      <div data-panel="registry">
+        <div class="adm-inline">
+          <input type="search" class="text-input" id="mcp-search" placeholder="Search the MCP Registry: github, filesystem, weather…" autocomplete="off" spellcheck="false">
+          <button type="button" class="ghost-btn auto" id="mcp-search-go">Search</button>
+        </div>
+        <p class="hint mcp-warn">Anyone can publish to the registry. Check a server's source before you install it.</p>
+        <div class="mcp-results" id="mcp-results"></div>
+        <button type="button" class="ghost-btn auto" id="mcp-more" hidden>More results</button>
+        <div class="mcp-pick" id="mcp-pick" hidden>
+          <button type="button" class="adm-back-link link-btn" id="mcp-back">← Back to results</button>
+          <div class="mcp-pick-head" id="mcp-pick-head"></div>
+          <label class="st-field" id="mcp-option-row"><span>How to run it</span><select class="select" id="mcp-option"></select></label>
+          <p class="hint" id="mcp-option-why" hidden></p>
+          <div class="mcp-inputs" id="mcp-inputs"></div>
+        </div>
+      </div>
+
+      <!-- A package by name. -->
+      <div data-panel="package" hidden>
+        <div class="mcp-grid">
+          <label class="st-field"><span>From</span>
+            <select class="select" id="mcp-pkg-kind"><option value="npm">npm (runs with npx)</option><option value="pypi">PyPI (runs with uvx)</option></select></label>
+          <label class="st-field"><span>Package</span><input type="text" class="text-input st-mono" id="mcp-pkg-name" placeholder="@modelcontextprotocol/server-filesystem" spellcheck="false"></label>
+          <label class="st-field"><span>Version <em class="st-optional">optional</em></span><input type="text" class="text-input st-mono" id="mcp-pkg-version" placeholder="latest" spellcheck="false"></label>
+        </div>
+        <label class="st-field"><span>Arguments <em class="st-optional">one per line</em></span><textarea class="text-input st-mono mcp-lines" id="mcp-pkg-args" rows="2" spellcheck="false" placeholder="/home/you/notes"></textarea></label>
+        <label class="st-field"><span>Environment <em class="st-optional">NAME=value, one per line</em></span><textarea class="text-input st-mono mcp-lines" id="mcp-pkg-env" rows="2" spellcheck="false" placeholder="GITHUB_TOKEN=…"></textarea></label>
+      </div>
+
+      <!-- Anything else: a command, or a URL. -->
+      <div data-panel="manual" hidden>
+        <div class="adm-seg" role="radiogroup" aria-label="Reached by" id="mcp-manual-kind">
+          <button type="button" role="radio" aria-checked="true" data-kind="command">A program here</button>
+          <button type="button" role="radio" aria-checked="false" data-kind="url">A URL</button>
+        </div>
+        <div data-kind-panel="command">
+          <label class="st-field"><span>Command</span><input type="text" class="text-input st-mono" id="mcp-cmd" placeholder="npx" spellcheck="false"></label>
+          <label class="st-field"><span>Arguments <em class="st-optional">one per line</em></span><textarea class="text-input st-mono mcp-lines" id="mcp-cmd-args" rows="3" spellcheck="false" placeholder="-y&#10;@modelcontextprotocol/server-everything"></textarea></label>
+          <label class="st-field"><span>Environment <em class="st-optional">NAME=value, one per line</em></span><textarea class="text-input st-mono mcp-lines" id="mcp-cmd-env" rows="2" spellcheck="false"></textarea></label>
+        </div>
+        <div data-kind-panel="url" hidden>
+          <label class="st-field"><span>URL</span><input type="url" class="text-input st-mono" id="mcp-url" placeholder="https://example.com/mcp" spellcheck="false"></label>
+          <label class="st-field"><span>Headers <em class="st-optional">Name: value, one per line</em></span><textarea class="text-input st-mono mcp-lines" id="mcp-url-headers" rows="2" spellcheck="false" placeholder="Authorization: Bearer …"></textarea></label>
+        </div>
+      </div>
+
+      <!-- Another client's settings, pasted as they are. -->
+      <div data-panel="json" hidden>
+        <label class="st-field"><span>MCP settings as JSON</span>
+          <textarea class="text-input st-mono mcp-json" id="mcp-json" rows="10" spellcheck="false" placeholder='{
+  "mcpServers": {
+    "camofox": {
+      "command": "npx",
+      "args": ["-y", "camofox-mcp@latest"],
+      "env": { "CAMOFOX_URL": "http://localhost:9377" }
+    }
+  }
+}'></textarea>
+          <small class="hint">Paste the block a server's instructions give for Claude Desktop, VS Code or Cursor, with <code>mcpServers</code> or <code>servers</code>. Several servers at once is fine.</small>
+        </label>
+      </div>
+
+      <!-- For every way in. -->
+      <div class="mcp-common" id="mcp-common">
+        <label class="st-field"><span>Name</span><input type="text" class="text-input st-mono" id="mcp-name" maxlength="32" pattern="[A-Za-z0-9_\-]+" placeholder="files" spellcheck="false">
+          <small class="hint">Its tools are named after it: <code id="mcp-name-eg">files_read_file</code>.</small></label>
+        <div class="mcp-sandbox" id="mcp-sandbox-box">
+          <label class="adm-check"><span class="switch"><input type="checkbox" id="mcp-sandbox" checked><span class="track"></span></span>
+            <span><b>Run it in the sandbox.</b> It gets a home of its own and can't read your files, credentials or other programs. Recommended for anything you didn't write.</span></label>
+          <label class="adm-check"><span class="switch"><input type="checkbox" id="mcp-network" checked><span class="track"></span></span>
+            <span>It may use the network. Most need it, if only to download the package.</span></label>
+          <label class="st-field"><span>Folders it may use <em class="st-optional">one per line</em></span><textarea class="text-input st-mono mcp-lines" id="mcp-folders" rows="2" spellcheck="false" placeholder="~/notes"></textarea></label>
+        </div>
+      </div>
+
+      <div class="mcp-review" id="mcp-review" hidden>
+        <span class="mcp-review-k">Will run</span>
+        <code id="mcp-review-cmd"></code>
+      </div>
+      <p class="error" id="mcp-error" hidden></p>
+    </div>
+
+    <footer class="st-actions">
+      <span class="spacer"></span>
+      <button type="button" class="ghost-btn auto" id="mcp-cancel">Cancel</button>
+      <button type="button" class="ghost-btn auto" id="mcp-check">Review</button>
+      <button type="button" class="primary-btn" id="mcp-save" disabled>Add server</button>
+    </footer>
+  </form>
+</dialog>
 </body>
 </html>

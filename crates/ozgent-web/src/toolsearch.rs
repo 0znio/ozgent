@@ -1,0 +1,754 @@
+//! Tools described on request, found with `find_tools`.
+//!
+//! Every tool described to the model up front costs context before anyone
+//! has said anything, and past a point it costs accuracy too: with over a
+//! hundred MCP tools the descriptions took 38,896 tokens of a 64k window, and
+//! a 4B model fumbled its first call. Published results agree — models pick
+//! the right tool more often from a few candidates than from a long list.
+//!
+//! So past a budget, the tools of MCP servers are not described up front.
+//! The model gets one tool, `find_tools`, whose description names each such
+//! server and what it does; calling it returns the full description of the
+//! best matches, and those can then be called by name.
+//!
+//! **The prompt's head never changes because of this.** ozgent serves a
+//! conversation from its cache as long as the start of the prompt is the
+//! same, and the tool descriptions sit at the start: narrowing the list per
+//! turn would re-read the whole conversation every turn (docs/tools.md
+//! measures it). Here the head is fixed — ozgent's own tools, the servers set
+//! to load always, and `find_tools` — and what the model looks up arrives as
+//! a tool result, at the end, where it costs nothing to what is cached.
+
+use std::collections::{BTreeMap, HashMap};
+
+use ozgent_core::mcp::Load;
+use ozgent_core::{Config, ToolSpec};
+use serde_json::{Value, json};
+
+use crate::worker::Tools;
+
+pub const FIND_TOOLS: &str = "find_tools";
+
+/// Tool descriptions, in tokens, carried up front before MCP servers set to
+/// load automatically are moved behind `find_tools`. Roughly ozgent's own
+/// tools and a server or two: under it, nothing changes.
+pub const BUDGET_TOKENS: usize = 4000;
+
+/// How many tools one search returns in full.
+const RESULTS: usize = 6;
+
+/// The tools a turn describes up front, and the ones it can call.
+pub struct Split {
+    /// In the prompt: rendered by the template or the preamble.
+    pub declared: Vec<ToolSpec>,
+    /// Callable but described only on request.
+    pub deferred: Vec<ToolSpec>,
+}
+
+/// A rough token count for a tool's description: its JSON, a character in
+/// four. Close enough to decide whether a list is large.
+pub fn tokens(spec: &ToolSpec) -> usize {
+    (spec.name.len() + spec.description.len() + spec.input_schema.to_string().len()) / 4
+}
+
+fn server_of(tools: &Tools, name: &str) -> Option<String> {
+    tools.host.source_of(name).and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
+}
+
+/// Decide what this turn describes up front.
+pub fn split(offered: Vec<ToolSpec>, tools: &Tools, config: &Config) -> Split {
+    let total: usize = offered.iter().map(tokens).sum();
+    let over = total > BUDGET_TOKENS;
+    let mut declared = Vec::new();
+    let mut deferred = Vec::new();
+    for spec in offered {
+        let load = server_of(tools, &spec.name)
+            .and_then(|s| config.mcp.servers.get(&s).map(|srv| srv.load));
+        let defer = match load {
+            // ozgent's own tools, the scheduler, a caller's: always up front.
+            None => false,
+            Some(Load::Always) => false,
+            Some(Load::OnRequest) => true,
+            Some(Load::Auto) => over,
+        };
+        if defer { deferred.push(spec) } else { declared.push(spec) }
+    }
+    if !deferred.is_empty() {
+        declared.push(find_tools_spec(&deferred, tools, config));
+    }
+    Split { declared, deferred }
+}
+
+/// How much of `find_tools`' description the directory of tools described on
+/// request may take, in tokens. It is in the prompt's head, paid once and
+/// cached, but it is window a conversation cannot use.
+pub const DIRECTORY_TOKENS: usize = 4000;
+
+/// `find_tools`, whose description is a directory of every tool described on
+/// request, as detailed as fits in [`DIRECTORY_TOKENS`]:
+///
+/// 1. each tool's exact name and what it does, in one line;
+/// 2. else each server, what it is, and its tools' names;
+/// 3. else each server and what it is;
+/// 4. else the servers' names.
+///
+/// The model chooses tools well from names and purposes — measured, a 4B
+/// picked the right one of 129 in every case from the first form — and badly
+/// from a summary it had to guess names from. What costs context is the
+/// parameters: 119 tools' full descriptions were ~36,000 tokens, the first
+/// form ~2,300. Past a few hundred tools even that does not fit, and the
+/// lookup made for each message (see [`lookup`]) does the choosing; the
+/// directory is then there so the model knows what exists to ask for.
+/// Built from the tools alone, in a fixed order, so it is the same every turn.
+pub fn find_tools_spec(deferred: &[ToolSpec], tools: &Tools, config: &Config) -> ToolSpec {
+    let mut by_server: BTreeMap<String, Vec<&ToolSpec>> = BTreeMap::new();
+    for spec in deferred {
+        by_server.entry(server_of(tools, &spec.name).unwrap_or_default()).or_default().push(spec);
+    }
+    for specs in by_server.values_mut() {
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    let about = |server: &str| {
+        config
+            .mcp
+            .servers
+            .get(server)
+            .and_then(|s| s.description.clone())
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| format!(" — {}", one_line(&d)))
+            .unwrap_or_default()
+    };
+    let directory = directory(&by_server, &about);
+    ToolSpec {
+        name: FIND_TOOLS.to_string(),
+        description: format!(
+            "More tools, listed here without their parameters. To use one, call find_tools with what \
+             you need to do (or its name) to get its parameters, then call it by name. These are real \
+             tools you can call:\n{directory}"
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "What you need to do, or a tool's name from the list." },
+                "server": { "type": "string", "description": "Only this server's tools. Optional." }
+            },
+            "required": ["query"]
+        }),
+        output_schema: None,
+        effect: ozgent_core::permission::Effect::Read,
+    }
+}
+
+/// The most detailed directory that fits [`DIRECTORY_TOKENS`].
+fn directory(by_server: &BTreeMap<String, Vec<&ToolSpec>>, about: &dyn Fn(&str) -> String) -> String {
+    let fits = |text: &str| text.len() / 4 <= DIRECTORY_TOKENS;
+    let tools_named = |specs: &[&ToolSpec], server: &str| {
+        specs.iter().map(|s| s.name.strip_prefix(&format!("{server}_")).unwrap_or(&s.name).to_string()).collect::<Vec<_>>()
+    };
+    let every_tool: String = by_server
+        .iter()
+        .flat_map(|(server, specs)| {
+            std::iter::once(format!("{server}{}:", about(server)))
+                .chain(specs.iter().map(|s| format!("  {}: {}", s.name, one_line(&s.description))))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if fits(&every_tool) {
+        return every_tool;
+    }
+    // Names without the server's prefix, which the header gives once.
+    let with_names: String = by_server
+        .iter()
+        .map(|(server, specs)| {
+            format!("{server}{} — tools {server}_…: {}", about(server), tools_named(specs, server).join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if fits(&with_names) {
+        return with_names;
+    }
+    let servers: String = by_server
+        .iter()
+        .map(|(server, specs)| format!("{server} ({} tools){}", specs.len(), about(server)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if fits(&servers) {
+        return servers;
+    }
+    let total: usize = by_server.values().map(Vec::len).sum();
+    let mut names = String::new();
+    let mut shown = 0;
+    for (server, specs) in by_server {
+        let item = format!("{server} ({}), ", specs.len());
+        if !fits(&format!("{names}{item}")) {
+            break;
+        }
+        names.push_str(&item);
+        shown += 1;
+    }
+    let rest = by_server.len() - shown;
+    let tail = if rest > 0 { format!(" and {rest} more servers") } else { String::new() };
+    format!("{total} tools from these servers: {}{tail}", names.trim_end_matches(", "))
+}
+
+/// The first sentence of a description, at most fourteen words.
+fn one_line(description: &str) -> String {
+    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = text
+        .char_indices()
+        .find(|(i, c)| matches!(c, '.' | '!' | '?') && text[i + 1..].starts_with(' '))
+        .map(|(i, _)| &text[..i])
+        .unwrap_or(&text);
+    let words: Vec<&str> = first.split(' ').collect();
+    if words.len() > 14 { format!("{}…", words[..14].join(" ")) } else { first.trim_end_matches('.').to_string() }
+}
+
+/// A call to a tool described on request whose schema asks for parameters
+/// it did not give: the answer is its full description, so the model can
+/// call it again properly instead of the server failing on it.
+pub fn missing_parameters(spec: &ToolSpec, arguments: &Value) -> Option<Value> {
+    let required = spec.input_schema.get("required")?.as_array()?;
+    let missing: Vec<&str> = required
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|r| arguments.get(*r).is_none_or(Value::is_null))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "error": format!("missing required parameters: {}. Call {} again with its parameters below.", missing.join(", "), spec.name),
+        "name": spec.name,
+        "description": spec.description,
+        "parameters": spec.input_schema,
+    }))
+}
+
+fn words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.split(|c: char| !c.is_alphanumeric()) {
+        if raw.is_empty() {
+            continue;
+        }
+        // camelCase and snake_case both split into words.
+        let mut word = String::new();
+        let mut last_lower = false;
+        for c in raw.chars() {
+            if c.is_uppercase() && last_lower && !word.is_empty() {
+                out.push(std::mem::take(&mut word));
+            }
+            last_lower = c.is_lowercase();
+            word.extend(c.to_lowercase());
+        }
+        if !word.is_empty() {
+            out.push(word);
+        }
+    }
+    out.into_iter().filter(|w| w.len() > 1 && !STOP.contains(&w.as_str())).map(|w| stem(&w)).collect()
+}
+
+const STOP: &[&str] = &[
+    "the", "and", "for", "with", "from", "into", "this", "that", "use", "using", "you", "your", "can",
+    "will", "are", "was", "its", "not", "all", "any", "one", "get", "of", "to", "in", "on", "or", "an", "is",
+    "it", "be", "by", "as", "at", "if", "me", "my", "do", "need", "want", "please",
+];
+
+/// Crude, but it makes the forms people write meet the forms descriptions
+/// use: "files"/"file", "reading"/"read", "created"/"create"/"creating",
+/// "directories"/"directory".
+fn stem(w: &str) -> String {
+    let mut base = w.to_string();
+    if let Some(b) = base.strip_suffix("ies").filter(|b| b.len() >= 2) {
+        base = format!("{b}y");
+    } else if ["sses", "xes", "ches", "shes", "zes"].iter().any(|s| base.ends_with(s)) {
+        base.truncate(base.len() - 2);
+    } else if base.ends_with('s') && !base.ends_with("ss") && base.len() > 3 {
+        base.pop();
+    } else if let Some(b) = base.strip_suffix("ing").filter(|b| b.len() >= 3) {
+        base = b.to_string();
+    } else if let Some(b) = base.strip_suffix("ed").filter(|b| b.len() >= 3) {
+        base = b.to_string();
+    }
+    // A final e comes and goes with the suffix ("create", "creat-ing").
+    if base.len() > 3 && base.ends_with('e') {
+        base.pop();
+    }
+    base
+}
+
+/// Words people use for what tool descriptions call something else. Only
+/// for the query: a description says "directory", a person says "folder".
+const SYNONYMS: &[(&str, &[&str])] = &[
+    ("folder", &["directory"]),
+    ("directory", &["folder"]),
+    ("site", &["page", "url", "web"]),
+    ("website", &["page", "url", "web"]),
+    ("webpage", &["page", "url", "web"]),
+    ("page", &["url", "web"]),
+    ("link", &["url", "href"]),
+    ("open", &["navigate", "browse"]),
+    ("visit", &["navigate", "browse"]),
+    ("go", &["navigate"]),
+    ("browse", &["navigate"]),
+    ("video", &["youtube"]),
+    ("transcript", &["caption", "subtitle"]),
+    ("picture", &["screenshot", "image"]),
+    ("image", &["screenshot"]),
+    ("rss", &["feed"]),
+    ("feed", &["rss"]),
+    ("clock", &["time"]),
+    ("timezone", &["zone", "time"]),
+    ("stock", &["price", "quote", "ticker"]),
+    ("delete", &["remove"]),
+    ("remove", &["delete"]),
+    ("make", &["create"]),
+    ("new", &["create"]),
+    ("look", &["search", "find"]),
+];
+
+fn expand(query: &[String]) -> Vec<String> {
+    let mut out = query.to_vec();
+    for w in query {
+        if let Some((_, more)) = SYNONYMS.iter().find(|(k, _)| stem(k) == *w) {
+            for m in *more {
+                let m = stem(m);
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn document(spec: &ToolSpec) -> Vec<String> {
+    let mut text = format!("{} {} {}", spec.name, spec.name, spec.description);
+    if let Some(props) = spec.input_schema.get("properties").and_then(Value::as_object) {
+        for (key, p) in props {
+            text.push(' ');
+            text.push_str(key);
+            if let Some(d) = p.get("description").and_then(Value::as_str) {
+                text.push(' ');
+                text.push_str(d);
+            }
+        }
+    }
+    words(&text)
+}
+
+/// The deferred tools best matching `query`, best first. `server_of` names
+/// the MCP server a tool comes from, for the optional filter.
+pub fn search<'a>(
+    deferred: &'a [ToolSpec],
+    server_of: impl Fn(&str) -> Option<String>,
+    query: &str,
+    server: Option<&str>,
+) -> Vec<&'a ToolSpec> {
+    let query = clean_query(query);
+    let pool: Vec<&ToolSpec> = deferred
+        .iter()
+        .filter(|s| server.is_none_or(|want| server_of(&s.name).as_deref() == Some(want)))
+        .collect();
+    if words(&query).is_empty() {
+        return pool.into_iter().take(RESULTS).collect();
+    }
+    let mut found = ranked(&pool, &server_of, &|_| String::new(), &query);
+    found.truncate(RESULTS);
+    found
+}
+
+/// Tools ranked for `query` by keywords (BM25) and by meaning (the embedding
+/// model, when one is installed), the two lists fused by reciprocal rank, as
+/// ozgent's memory recall does.
+///
+/// Measured on 2,797 tools from 308 MCP servers (the MCP-Zero set) with 260
+/// requests written by a model, the right tool was among the first three
+/// for 52% of requests by keywords, 57% by meaning and 62% fused; a fitting
+/// tool, judged, more often still (docs/tools.md has the table). Routing to a
+/// server first, as MCP-Zero does, did worse at every size: servers overlap,
+/// and a request's words name a server's topic more often than its tools.
+fn ranked<'a>(
+    pool: &[&'a ToolSpec],
+    server_of: &dyn Fn(&str) -> Option<String>,
+    about: &dyn Fn(&str) -> String,
+    query: &str,
+) -> Vec<&'a ToolSpec> {
+    // Each ranking takes part with its first fifty; past that a match adds
+    // noise, not recall.
+    const DEPTH: usize = 50;
+    let keyword = scored_pool(pool, server_of, about, query);
+    let meaning = semantic(pool, query).unwrap_or_default();
+    let mut fused: HashMap<&str, (f64, &ToolSpec)> = HashMap::new();
+    for (rank, (_, spec)) in keyword.iter().filter(|(score, _)| *score > 0.0).take(DEPTH).enumerate() {
+        fused.entry(spec.name.as_str()).or_insert((0.0, spec)).0 += 1.0 / (60.0 + rank as f64);
+    }
+    for (rank, (_, spec)) in meaning.iter().take(DEPTH).enumerate() {
+        fused.entry(spec.name.as_str()).or_insert((0.0, spec)).0 += 1.0 / (60.0 + rank as f64);
+    }
+    let mut ranked: Vec<(f64, &ToolSpec)> = fused.into_values().collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+    ranked.into_iter().map(|(_, s)| s).collect()
+}
+
+/// What a lookup made for a message found.
+pub struct Lookup<'a> {
+    /// Described in full: callable at once.
+    pub full: Vec<&'a ToolSpec>,
+    /// Named, with what they do: the next candidates, one line each.
+    pub related: Vec<&'a ToolSpec>,
+}
+
+/// For a message, before the model sees it: the tools most likely to serve
+/// it.
+///
+/// Made for every message that has words to search by, not only those that
+/// seem to need a tool. Whether a message needs one cannot be read from the
+/// scores: with a thousand tools, "write me a haiku" matched a poetry tool as
+/// well as real requests matched theirs (the no-tool messages' best scores
+/// overlapped the requests' by keywords and by meaning alike). What it costs
+/// a message that needs nothing is a few hundred tokens at the end of the
+/// prompt, and measured, the answers to such messages did not change.
+///
+/// The first few come in full; the next ones by name and purpose, so a right
+/// tool ranked fifth is still in front of the model — it chose well from
+/// names and purposes — and costs a line rather than a schema.
+pub fn lookup<'a>(
+    deferred: &'a [ToolSpec],
+    server_of: impl Fn(&str) -> Option<String>,
+    about: impl Fn(&str) -> String,
+    message: &str,
+) -> Lookup<'a> {
+    let query = clean_query(message);
+    if words(&query).is_empty() {
+        return Lookup { full: Vec::new(), related: Vec::new() };
+    }
+    let pool: Vec<&ToolSpec> = deferred.iter().collect();
+    let mut found = ranked(&pool, &server_of, &about, &query);
+    found.truncate(LOOKUP_FULL + LOOKUP_RELATED);
+    let related = found.split_off(found.len().min(LOOKUP_FULL));
+    tracing::info!(
+        "tool lookup {query:?}: {} (then {})",
+        found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "),
+        related.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+    );
+    Lookup { full: found, related }
+}
+
+/// How many tools a lookup describes in full, and how many more it names.
+const LOOKUP_FULL: usize = 3;
+const LOOKUP_RELATED: usize = 7;
+
+/// A message as a search: without the time stamp ozgent puts on it, links,
+/// paths and quoted code, which match everything and mean nothing here.
+pub fn clean_query(message: &str) -> String {
+    let mut out = Vec::new();
+    for token in message.split_whitespace() {
+        let t = token.trim_matches(|c: char| "()[]{}<>\"'`,.;:!?".contains(c));
+        let is_stamp = t.chars().all(|c| c.is_ascii_digit() || c == ':') && t.contains(':');
+        let is_link = t.contains("://") || t.starts_with("www.");
+        let is_path = t.starts_with('/') || t.starts_with("~/") || t.matches('/').count() >= 2;
+        if !(is_stamp || is_link || is_path) {
+            out.push(token);
+        }
+    }
+    out.join(" ")
+}
+
+/// Tool descriptions' vectors, by the text embedded, so each is embedded once
+/// per install rather than per message.
+static VECTORS: std::sync::Mutex<Option<HashMap<String, Vec<f32>>>> = std::sync::Mutex::new(None);
+
+fn tool_text(spec: &ToolSpec) -> String {
+    let words = spec.name.replace('_', " ");
+    format!("{words}: {}", spec.description.chars().take(600).collect::<String>())
+}
+
+/// Tools ranked by meaning, or `None` without an embedding model.
+fn semantic<'a>(pool: &[&'a ToolSpec], query: &str) -> Option<Vec<(f32, &'a ToolSpec)>> {
+    let embedder = crate::worker::tool_embedder()?;
+    let texts: Vec<String> = pool.iter().map(|s| tool_text(s)).collect();
+    let missing: Vec<String> = {
+        let cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+        texts.iter().filter(|t| cache.as_ref().is_none_or(|c| !c.contains_key(*t))).cloned().collect()
+    };
+    if !missing.is_empty() {
+        let vectors = embedder.embed_as(ozgent_llama::embed::Role::Document, missing.clone()).ok()?;
+        let mut cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = cache.get_or_insert_with(HashMap::new);
+        for (t, v) in missing.into_iter().zip(vectors) {
+            map.insert(t, v);
+        }
+    }
+    let q = embedder.embed_as(ozgent_llama::embed::Role::ToolQuery, vec![query.to_string()]).ok()?.pop()?;
+    let cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.as_ref()?;
+    let mut ranked: Vec<(f32, &ToolSpec)> = pool
+        .iter()
+        .zip(&texts)
+        .filter_map(|(s, t)| map.get(t).map(|v| (cosine(&q, v), *s)))
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Some(ranked)
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+}
+
+fn scored_pool<'a>(
+    pool: &[&'a ToolSpec],
+    server_of: &dyn Fn(&str) -> Option<String>,
+    about: &dyn Fn(&str) -> String,
+    query: &str,
+) -> Vec<(f64, &'a ToolSpec)> {
+    let owned: Vec<ToolSpec> = pool.iter().map(|s| (*s).clone()).collect();
+    let ranked = scored(&owned, server_of, about, query, None);
+    ranked
+        .into_iter()
+        .filter_map(|(score, s)| pool.iter().find(|p| p.name == s.name).map(|p| (score, *p)))
+        .collect()
+}
+
+fn scored<'a>(
+    deferred: &'a [ToolSpec],
+    server_of: &dyn Fn(&str) -> Option<String>,
+    about: &dyn Fn(&str) -> String,
+    query: &str,
+    server: Option<&str>,
+) -> Vec<(f64, &'a ToolSpec)> {
+    let pool: Vec<&ToolSpec> = deferred
+        .iter()
+        .filter(|s| server.is_none_or(|want| server_of(&s.name).as_deref() == Some(want)))
+        .collect();
+    let q = expand(&words(query));
+    if q.is_empty() {
+        return pool.into_iter().map(|s| (0.0, s)).collect();
+    }
+    let docs: Vec<Vec<String>> = pool
+        .iter()
+        .map(|s| {
+            let mut d = document(s);
+            if let Some(server) = server_of(&s.name) {
+                d.extend(words(&about(&server)));
+            }
+            d
+        })
+        .collect();
+    let n = docs.len().max(1) as f64;
+    let avg = docs.iter().map(Vec::len).sum::<usize>() as f64 / n;
+    let mut df: HashMap<&str, usize> = HashMap::new();
+    for d in &docs {
+        let mut seen: Vec<&str> = d.iter().map(String::as_str).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        for w in seen {
+            *df.entry(w).or_default() += 1;
+        }
+    }
+    let (k1, b) = (1.2, 0.75);
+    let mut scored: Vec<(f64, usize)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let len = d.len() as f64;
+            let score: f64 = q
+                .iter()
+                .map(|term| {
+                    let tf = d.iter().filter(|w| *w == term).count() as f64;
+                    if tf == 0.0 {
+                        return 0.0;
+                    }
+                    let n_t = *df.get(term.as_str()).unwrap_or(&0) as f64;
+                    let idf = ((n - n_t + 0.5) / (n_t + 0.5) + 1.0).ln();
+                    idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * len / avg.max(1.0)))
+                })
+                .sum();
+            (score, i)
+        })
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(score, i)| (score, pool[i])).collect()
+}
+
+/// A call to a tool that does not exist, as a search: the words of the
+/// invented name and of the arguments' names and short values.
+/// `github_create_issue {"title": …}` finds `github_issue_write`.
+pub fn guess_as_query(name: &str, arguments: &Value) -> String {
+    let mut parts = vec![name.replace(['_', '-', '.'], " ")];
+    if let Some(args) = arguments.as_object() {
+        for (key, value) in args {
+            parts.push(key.replace('_', " "));
+            if let Some(v) = value.as_str().filter(|v| v.len() <= 60) {
+                parts.push(v.to_string());
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+/// The answer to a call to a tool that does not exist: the closest real
+/// ones, in full, so the next round can call one of them properly.
+pub fn not_a_tool(found: &[&ToolSpec]) -> String {
+    if found.is_empty() {
+        return "there is no tool by that name. Use find_tools to look for one.".into();
+    }
+    let answer = json!(found
+        .iter()
+        .map(|s| json!({ "name": s.name, "description": s.description, "parameters": s.input_schema }))
+        .collect::<Vec<_>>());
+    format!("there is no tool by that name. The closest ones, which you can call by their exact name:\n{answer}")
+}
+
+/// What `find_tools` answers: the matches in full, as the model would have
+/// seen them up front, and any further candidates by name and purpose.
+pub fn answer(found: &[&ToolSpec], related: &[&ToolSpec], query: &str) -> Value {
+    if found.is_empty() {
+        return json!({
+            "found": [],
+            "note": format!("No tool matches {query:?}. Try other words, or name the server."),
+        });
+    }
+    let mut answer = json!({
+        "found": found.iter().map(|s| json!({
+            "name": s.name,
+            "description": s.description,
+            "parameters": s.input_schema,
+        })).collect::<Vec<_>>(),
+        "note": "Call any of these by name now, with arguments matching its parameters.",
+    });
+    if !related.is_empty() {
+        answer["also"] = json!(related.iter().map(|s| format!("{}: {}", s.name, one_line(&s.description))).collect::<Vec<_>>());
+        answer["note"] = json!(
+            "Call any of these by name now, with arguments matching its parameters. The tools under \"also\" \
+             can be called too; find_tools gives their parameters."
+        );
+    }
+    answer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(name: &str, description: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: None,
+            effect: ozgent_core::permission::Effect::Unknown,
+        }
+    }
+
+    #[test]
+    fn words_split_names_and_stem() {
+        assert_eq!(words("files_read_text_file"), ["fil", "read", "text", "fil"]);
+        assert_eq!(words("getCurrentTime in Tokyo"), ["current", "tim", "tokyo"]);
+        for (a, b) in [("create", "created"), ("create", "creating"), ("directory", "directories"), ("search", "searches")] {
+            assert_eq!(stem(a), stem(b), "{a} / {b}");
+        }
+    }
+
+    fn rank(pool: &[ToolSpec], query: &str) -> Vec<String> {
+        let server = |n: &str| n.split('_').next().map(str::to_string);
+        search(pool, server, query, None).into_iter().map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn the_right_tool_ranks_first_on_plain_words() {
+        let pool = vec![
+            spec("time_convert_time", "Convert time between timezones."),
+            spec("time_get_current_time", "Get current time in a specific timezone."),
+            spec("fetch_fetch_robots", "Fetch and parse the robots.txt for a given origin."),
+            spec("files_list_directory", "Get a detailed listing of all files and directories in a specified path."),
+            spec("camofox_create_tab", "Create a new browser tab and optionally navigate to a URL."),
+        ];
+        assert_eq!(rank(&pool, "what are the robots rules of a site")[0], "fetch_fetch_robots");
+        assert_eq!(rank(&pool, "list the files in a directory")[0], "files_list_directory");
+        assert_eq!(rank(&pool, "open a new browser tab")[0], "camofox_create_tab");
+        assert_eq!(rank(&pool, "the current time in Tokyo")[0], "time_get_current_time");
+        let server = |n: &str| n.split('_').next().map(str::to_string);
+        let only = search(&pool, server, "", Some("time"));
+        assert_eq!(only.len(), 2, "an empty query lists one server's tools");
+    }
+
+    #[test]
+    fn a_query_loses_stamps_links_and_paths() {
+        assert_eq!(
+            clean_query("[01:46] List the files in /home/me/notes and read https://example.com/a, please"),
+            "List the files in and read please"
+        );
+    }
+
+    #[test]
+    fn one_line_keeps_the_first_sentence_within_fourteen_words() {
+        assert_eq!(one_line("Get current time. Then more."), "Get current time");
+        assert_eq!(one_line("Read v1.2 files.\n  Details."), "Read v1.2 files");
+        let long = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen";
+        assert!(one_line(long).ends_with("fourteen…"));
+    }
+
+    #[test]
+    fn missing_parameters_are_answered_with_the_schema() {
+        let mut s = spec("files_read_file", "Read a file.");
+        s.input_schema = json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]});
+        let answer = missing_parameters(&s, &json!({})).expect("path is missing");
+        assert!(answer["error"].as_str().unwrap().contains("path"));
+        assert_eq!(answer["parameters"]["required"][0], "path");
+        assert!(missing_parameters(&s, &json!({"path": "/a"})).is_none());
+        assert!(missing_parameters(&s, &json!({"path": null})).is_some());
+    }
+
+    #[test]
+    fn the_directory_shrinks_to_fit() {
+        let many: Vec<ToolSpec> = (0..40)
+            .flat_map(|s| {
+                (0..25).map(move |t| {
+                    spec(&format!("srv{s}_tool{t}"), "Does a fairly specific thing to a fairly specific kind of record.")
+                })
+            })
+            .collect();
+        fn group(specs: &[ToolSpec]) -> BTreeMap<String, Vec<&ToolSpec>> {
+            let mut by: BTreeMap<String, Vec<&ToolSpec>> = BTreeMap::new();
+            for s in specs {
+                by.entry(s.name.split('_').next().unwrap().to_string()).or_default().push(s);
+            }
+            by
+        }
+        let none = |_: &str| String::new();
+        let small = directory(&group(&many[..20]), &none);
+        assert!(small.contains("srv0_tool3: Does a fairly"), "few tools: each one described");
+        let big = directory(&group(&many), &none);
+        assert!(big.len() / 4 <= DIRECTORY_TOKENS);
+        assert!(big.contains("srv39"), "every server still named: {}", &big[..200]);
+        assert!(!big.contains("Does a fairly"), "a thousand tools: no per-tool descriptions");
+    }
+
+    #[test]
+    fn an_invented_call_searches_by_its_name_and_arguments() {
+        let q = guess_as_query("github_create_issue", &json!({"title": "Crash on start", "body": "x".repeat(200)}));
+        assert_eq!(q, "github create issue body title Crash on start");
+        let pool = vec![
+            spec("github_issue_write", "Create or update an issue in a GitHub repository."),
+            spec("time_get_current_time", "Get current time in a specific timezone."),
+        ];
+        assert_eq!(rank(&pool, &q)[0], "github_issue_write");
+        assert!(not_a_tool(&[&pool[0]]).contains("github_issue_write"));
+    }
+
+    #[test]
+    fn the_answer_carries_full_descriptions() {
+        let s = spec("time_get_current_time", "Get current time.");
+        let a = answer(&[&s], &[], "time");
+        assert_eq!(a["found"][0]["name"], "time_get_current_time");
+        assert!(a["found"][0]["parameters"].is_object());
+        assert!(answer(&[], &[], "zzz")["note"].as_str().unwrap().contains("No tool"));
+    }
+}

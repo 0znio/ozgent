@@ -10,6 +10,8 @@ parsing.
 """
 
 import json
+import os
+import socket
 import sys
 import time
 
@@ -54,6 +56,43 @@ TOOLS_PAGE_TWO = [
 ]
 
 
+# Listed only when asked for, so the tests that count tools are unaffected:
+# what a hostile server would try, for the sandbox tests to watch fail.
+PROBE = {
+    "name": "probe",
+    "description": "Try to read, write, connect and look at the environment.",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+
+
+def attempt(action):
+    try:
+        return f"ok: {action()}"
+    except Exception as exc:  # noqa: BLE001 - reported, not handled
+        return f"refused: {type(exc).__name__}"
+
+
+def probe(arguments):
+    out = {}
+    for path in arguments.get("read", []):
+        out[f"read {path}"] = attempt(lambda p=path: open(p).read()[:40])
+    for path in arguments.get("write", []):
+        out[f"write {path}"] = attempt(lambda p=path: open(p, "w").write("x"))
+    for host, port in arguments.get("connect", []):
+        out[f"connect {host}:{port}"] = attempt(lambda h=host, p=port: socket.create_connection((h, p), timeout=3) and "connected")
+    for host, port in arguments.get("udp", []):
+        out[f"udp {host}:{port}"] = attempt(
+            lambda h=host, p=port: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", (h, p)))
+    for path in arguments.get("unix", []):
+        out[f"unix {path}"] = attempt(lambda p=path: socket.socket(socket.AF_UNIX).connect(p) or "connected")
+    for path in arguments.get("list", []):
+        out[f"list {path}"] = attempt(lambda p=path: len(os.listdir(p)))
+    for name in arguments.get("env", []):
+        out[f"env {name}"] = os.environ.get(name, "<unset>")
+    out["home"] = os.environ.get("HOME", "")
+    return out
+
+
 def reply(id_, result):
     send({"jsonrpc": "2.0", "id": id_, "result": result})
 
@@ -88,6 +127,8 @@ def call(id_, params):
         reply(id_, {"content": []})
     elif name == "wipe":
         reply(id_, {"content": [{"type": "text", "text": "wiped"}]})
+    elif name == "probe":
+        reply(id_, {"content": [{"type": "text", "text": "probed"}], "structuredContent": probe(arguments)})
     else:
         error(id_, -32602, f"no tool called {name}")
 
@@ -128,7 +169,8 @@ def main():
             if cursor is None:
                 reply(id_, {"tools": TOOLS_PAGE_ONE, "nextCursor": "page2"})
             else:
-                reply(id_, {"tools": TOOLS_PAGE_TWO})
+                extra = [PROBE] if os.environ.get("FIXTURE_PROBE") == "1" else []
+                reply(id_, {"tools": TOOLS_PAGE_TWO + extra})
         elif method == "tools/call":
             call(id_, message.get("params") or {})
         else:

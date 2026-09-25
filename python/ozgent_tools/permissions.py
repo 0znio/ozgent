@@ -293,10 +293,35 @@ def check_host(url: str) -> str:
 # ------------------------------------------------------------ command sandbox
 
 #: Readable and executable: where programs, libraries and their data live.
-SYSTEM_READ = (
-    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/etc",
-    "/nix", "/snap", "/proc", "/sys/devices/system/cpu", "/sys/fs/cgroup",
+#: What a sandboxed program never reads, even with the rest of the system open
+#: to it: people's homes, shared scratch space other programs leave things in,
+#: the session's runtime folder (its sockets and keyrings), mail, mounts and
+#: devices (the few it may use are in ``DEVICES``). ozgent's own home and the
+#: credential folders are shut separately, wherever they are.
+#:
+#: Everything else is readable, because programs look in more places than
+#: any list anticipates: Chromium probes /sys, DNS on Ubuntu goes through
+#: /etc/resolv.conf into /run, a tool installed in /usr/local or /var/lib is
+#: somewhere. An allowlist broke each of those in turn; what needs protecting
+#: is the short list below, not the system's own files.
+PRIVATE = (
+    "/home", "/root", "/tmp", "/var/tmp", "/var/mail", "/var/spool", "/run/user",
+    "/dev", "/mnt", "/media", "/srv", "/lost+found",
 )
+
+#: Covered by an empty private mount, where the sandbox has a mount
+#: namespace. Landlock stops reading the files in these, but not connecting
+#: to the sockets in them — the session's D-Bus, keyring and agents — which
+#: would be a way out.
+HIDE = ("/run/user", "/run/dbus", "/var/tmp")
+
+
+def system_view() -> list[str]:
+    """The system as a sandboxed program may read it: everything but PRIVATE."""
+    from .sandbox import grants_except
+
+    return grants_except("/", [p for p in PRIVATE if os.path.lexists(p)])
+
 
 #: Toolchains people keep in their home directory, read-only.
 HOME_TOOLCHAINS = (
@@ -326,13 +351,110 @@ def clean_env(tmp: str) -> dict[str, str]:
     return env
 
 
+#: Passed to an MCP server as well, when set: a server that downloads its
+#: package, or calls an API, needs to get through the same proxy.
+MCP_ENV_KEEP = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+)
+
+
+def _short_tmp(name: str) -> Path:
+    """A private temporary folder for one server, with a short path.
+
+    For when its home is too deep: a Unix socket's path is limited to 108
+    bytes, and Chromium, among others, makes its sockets in ``TMPDIR`` —
+    under a deep home it failed with "socket path too long". The same folder
+    each start, unless something else already holds that name.
+    """
+    import stat
+    import tempfile
+
+    uid = os.getuid()
+    tmp = Path(tempfile.gettempdir()) / f"ozgent-mcp-{uid}-{name}"
+    try:
+        tmp.mkdir(mode=0o700)
+    except FileExistsError:
+        st = tmp.lstat()
+        # Someone else's, or a symlink planted to point writes elsewhere.
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            return Path(tempfile.mkdtemp(prefix=f"ozgent-mcp-{name}-"))
+        os.chmod(tmp, 0o700)
+    return tmp
+
+
+def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env: dict[str, str]) -> dict[str, Any]:
+    """The sandbox an MCP server runs in: see ``ozgent_tools/sandbox.py``.
+
+    A server gets a home of its own and lives in it: ``HOME``, its caches
+    and the npm and uv package caches all point there, so a package it
+    downloads cannot touch the ones the user's own tools run from, and what
+    it reads under ``~`` is its own. It may write only there and in
+    ``folders``; it reads the system, the usual toolchains and the program's
+    own installation; ozgent's home and credential folders stay shut. The
+    network is open unless ``network`` is false, because most servers are
+    fetched on first run and many are API clients.
+    """
+    base = Path(home)
+    for d in (base, base / ".cache", base / ".config", base / ".local" / "share"):
+        d.mkdir(parents=True, exist_ok=True)
+    # Everything a server keeps lives in its home, so removing
+    # ~/ozgent/mcp removes it all. The one exception is a temporary folder
+    # whose path would be too long for a Unix socket (108 bytes, and
+    # Chromium adds about 45): then a short private one under the system's.
+    tmp = base / "tmp"
+    if len(str(tmp)) > 60:
+        tmp = _short_tmp(base.name)
+    else:
+        tmp.mkdir(exist_ok=True)
+    read = system_view()
+    read += [os.path.expanduser(p) for p in HOME_TOOLCHAINS if os.path.exists(os.path.expanduser(p))]
+    found = shutil.which(program)
+    if found:
+        real = Path(found).resolve()
+        read.append(str(real.parent))
+        # The program's own installation: `<prefix>/bin/uvx` also reads
+        # `<prefix>/lib`. Only when it is a bin directory, never `/`.
+        if real.parent.name == "bin" and real.parent.parent != Path("/"):
+            read.append(str(real.parent.parent))
+    folders = [str(Path(f).expanduser()) for f in folders]
+    run_env = clean_env(str(tmp))
+    run_env.update({k: v for k, v in os.environ.items() if k in MCP_ENV_KEEP})
+    run_env.update({
+        "HOME": str(base),
+        "XDG_CACHE_HOME": str(base / ".cache"),
+        "XDG_CONFIG_HOME": str(base / ".config"),
+        "XDG_DATA_HOME": str(base / ".local" / "share"),
+        "npm_config_cache": str(base / ".cache" / "npm"),
+        "UV_CACHE_DIR": str(base / ".cache" / "uv"),
+        # A server is not a terminal; colour codes would corrupt nothing on
+        # stdout here, but they fill the log with noise.
+        "TERM": "dumb",
+    })
+    run_env.update(env)
+    return {
+        "cwd": str(base),
+        "read": read,
+        "write": [str(base), str(tmp)] + folders,
+        "devices": list(DEVICES),
+        "protected": [str(p) for p in protected_dirs() + sensitive_dirs()],
+        "network": bool(network),
+        "require": True,
+        "env": run_env,
+        # A /tmp of its own where there is a mount namespace, used as TMPDIR
+        # instead of the one in its home; and the session's sockets hidden.
+        "private_tmp": True,
+        "hide": list(HIDE),
+    }
+
+
 def command_sandbox(program: str, cwd: Path, tmp: str) -> dict[str, Any]:
     """The sandbox a command runs in: see ``ozgent_tools/sandbox.py``.
 
     Decided here, with every other permission, so a tool never reads the
     flags for itself.
     """
-    read = [p for p in SYSTEM_READ if os.path.exists(p)]
+    read = system_view()
     read += [os.path.expanduser(p) for p in HOME_TOOLCHAINS if os.path.exists(os.path.expanduser(p))]
     # A virtualenv's interpreter and its libraries.
     read += sorted({sys.prefix, sys.base_prefix})
@@ -350,5 +472,7 @@ def command_sandbox(program: str, cwd: Path, tmp: str) -> dict[str, Any]:
         "network": bool(perms().get("shell_network", False)),
         # Off only by an operator's explicit choice in the file.
         "require": bool(perms().get("sandbox", True)),
+        # Its temporary folder is under the system's /tmp, so that one stays.
+        "hide": list(HIDE),
         "env": clean_env(tmp),
     }

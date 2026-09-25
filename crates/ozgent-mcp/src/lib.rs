@@ -13,9 +13,13 @@
 //! they are ignored unless the operator marks the server trusted; see
 //! [`protocol::effect_of`].
 
+pub mod import;
 pub mod protocol;
+pub mod registry;
+pub mod sandbox;
 pub mod server;
 pub mod transport;
 
 pub use protocol::{Failure, Listed, PROTOCOL_VERSION, ServerInfo};
-pub use server::{ConnectError, Server, connect_all};
+pub use sandbox::Launcher;
+pub use server::{ConnectError, Server, State, Status, ToolStatus, connect_all, connect_all_with, problems};

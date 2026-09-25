@@ -794,7 +794,7 @@ Answers a `permission` event. This is what unblocks the engine.
 { "id": "early-write_file", "choice": "once" }
 ```
 
-`choice` is one of `once`, `session`, `always`, `deny`, `deny_always`. `204`
+`choice` is one of `once`, `session`, `always`, `always_server` (every tool of the MCP server the tool comes from), `deny`, `deny_always`. `204`
 when it landed, `404` when nothing was waiting for it — answered twice, or
 after the wait ran out.
 
@@ -813,24 +813,38 @@ strand the engine.
   "search_provider": "brave" }
 ```
 
-`available` includes tools from MCP servers, named `<server>_<tool>`.
+`available` includes tools from MCP servers, named `<server>_<tool>`, each
+with `"source": "mcp:<server>"`. They are read from the servers already
+running, not started again for the page.
 
 ### `GET /api/tools/active`
 
 The tools the running host has, cheaply — for the composer's tray:
-`[{"name", "label"?, "description", "effect", "rule"}]`. Includes
-`ask_agent` when the model may hand requests to agents.
+`[{"name", "label"?, "description", "effect", "rule", "server"?}]`, where
+`server` names the MCP server a tool comes from. Includes `ask_agent` when the
+model may hand requests to agents.
+
+### `GET /api/mcp`
+
+The MCP servers and how they are doing, for the web page's tray and the
+terminal's `/mcp`: `{"enabled", "tools_enabled", "reconnecting", "servers":
+[{"name", "description", "enabled", "used", "sandboxed", "state", "error", "tools"}]}`,
+where `used` is false for a server left out of the chats (`[tools] mcp_off`).
+No settings: those are on the admin routes.
 
 ### `PUT /api/tools`
 
 ```json
 { "enabled": true, "search_provider": "brave", "api_key": "…",
-  "disabled": ["run_command"] }
+  "disabled": ["run_command"], "mcp_off": ["github"] }
 ```
 
-Every field optional. Changing any of them restarts the Python worker, so the
-change takes effect on the next turn rather than the next restart. Keys are
-written to `config.toml` and never returned by `GET`.
+Every field optional. `disabled` leaves single tools out of every turn,
+ozgent's own and MCP servers' alike; `mcp_off` leaves out every tool of the
+named MCP servers, which keep running. A change to what the tool worker
+reads (`enabled`, `disabled`, the search provider or key) restarts it, so it
+takes effect on the next turn rather than the next restart; `mcp_off` needs
+no restart. Keys are written to `config.toml` and never returned by `GET`.
 
 ## Memory
 
@@ -924,8 +938,27 @@ Changes apply to the running channels at once; there is nothing to restart.
 | `POST /api/admin/keys` | `{"name", "scopes": [...]}` → `{"key", "id", ...}`. The key is in this response and nowhere else |
 | `PATCH /api/admin/keys/{id}` | any of `name`, `scopes`, `disabled` |
 | `DELETE /api/admin/keys/{id}` | revoke |
-| `GET /api/admin/sandbox` | what tools may touch: `root`, `write`, `shell`, `shell_allow`, `shell_network`, `network`, `network_allow`, `network_private`, `allow_sensitive`; and, read-only, the interpreter, extra tool folders and MCP servers — each a program that runs as you, so changed only in `config.toml` |
+| `GET /api/admin/sandbox` | what tools may touch: `root`, `write`, `shell`, `shell_allow`, `shell_network`, `network`, `network_allow`, `network_private`, `allow_sensitive`; and, read-only, the interpreter and extra tool folders — each a program that runs as you, so changed only in `config.toml` — and the MCP servers' names (they have a section of their own below) |
 | `PUT /api/admin/sandbox` | any of the editable ones; the tool host restarts to take them |
+
+### MCP servers
+
+Behind the admin password, because adding a server is running a program. The
+environment and headers a server is configured with are returned by name only
+(`"env": ["GITHUB_TOKEN"]`); a change sends only what changes. Every change
+reconnects the servers in the background and returns at once: poll `GET` for
+`reconnecting` and each server's `status`.
+
+| | |
+|---|---|
+| `GET /api/admin/mcp` | `enabled`, `tools_enabled`, `reconnecting`, `runtimes` (`npx`, `uvx`, `docker`, `sandbox` available here), and `servers`: each with its settings (`command`, `args`, `url`, `env` and `headers` names, `sandbox`, `network`, `folders`, `trust_hints`, `timeout_seconds`, `only`, `source`, `description`, `load`, and `server_rule`: the rule set for all its tools, if any), its `status` (`state`: `connected`, `failed`, `disabled` or `off`; `error`; the last lines of its `log`; `server` name and version) and its `tools` (`name`, `remote`, `description`, `effect`, `offered`, the `rule` in force and its `own_rule`) |
+| `PUT /api/admin/mcp` | `{"enabled": bool}`: use MCP servers at all |
+| `POST /api/admin/mcp/reconnect` | reconnect every server |
+| `POST /api/admin/mcp/servers` | add one by hand: `{"name", "kind": "command"\|"url"\|"npm"\|"pypi", "command"?, "args"?, "url"?, "package"?, "version"?, "env"?, "headers"?, "sandbox"? (default on), "network"?, "folders"?, "trust_hints"?, "preview"?}`. With `"preview": true` nothing is saved and the answer is `{"preview": "npx -y …", "sandbox"}`: the exact command |
+| `PATCH /api/admin/mcp/servers/{name}` | any of `enabled`, `trust_hints`, `sandbox`, `network`, `folders`, `timeout_seconds`, `load` (`auto`, `always` or `on_request`; takes effect from the next message, without reconnecting), `args`, `only` (tools to offer by their name on the server; `null` for all), `env` and `headers` (a string sets, `null` removes, names not sent are kept), and `rules` (`{"<server>_<tool>": "allow"\|"ask"\|"deny"\|""}`, only for this server's tools; `"<server>_*"` sets the rule for all of them) |
+| `DELETE /api/admin/mcp/servers/{name}` | remove it, its tools' rules and its sandbox home |
+| `GET /api/admin/mcp/registry?search=&cursor=` | search the MCP Registry: each server's `name`, `title`, `description`, `version`, `repository`, a `suggested_name`, and its `options` (ways to run it), each with `kind`, `identifier`, `runner`, `supported`, `why_not`, `runner_present`, and the `inputs` it asks for (`key`, `name`, `required`, `secret`, `default`, `choices`) |
+| `POST /api/admin/mcp/install` | `{"registry_name", "version"? (default latest), "option"?, "values": {"<input key>": "…"}, "name"?, "sandbox"?, "network"?, "folders"?, "preview"?}`. The entry is fetched again here and the command built from it; values for inputs it does not declare are refused |
 
 ### Models and memory
 

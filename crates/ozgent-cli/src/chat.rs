@@ -970,6 +970,113 @@ impl<'a> Chat<'a> {
         self.ui.say(self.theme.style(Style::dim(), &reply));
     }
 
+    /// `/mcp`: the daemon's MCP servers and how they are doing; switching
+    /// one on or off. Asked of the daemon, which is what runs them; a switch
+    /// writes `config.toml`, which the daemon reloads within seconds.
+    async fn mcp(&mut self, arg: &str) -> Result<()> {
+        let theme = self.theme.clone();
+        let dim = |t: &str| theme.style(Style::dim(), t);
+        let (word, rest) = arg.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));
+        if matches!(word, "on" | "off") {
+            // Which servers to use in the chats: the same choice as the
+            // chat page's Settings → Tools, kept by the daemon. Whether a
+            // server runs at all is the admin's (admin page, or
+            // `ozgent mcp enable|disable`).
+            let on = word == "on";
+            let listed = match self.backend.get("/api/mcp").await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.ui.say(dim(&format!("could not ask the daemon: {e}")));
+                    return Ok(());
+                }
+            };
+            let names: Vec<String> = listed["servers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect();
+            let mut off: Vec<String> = listed["servers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|s| s["used"].as_bool() == Some(false))
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect();
+            let what = if rest.is_empty() {
+                off = if on { Vec::new() } else { names.clone() };
+                "every MCP server".to_string()
+            } else {
+                if !names.iter().any(|n| n == rest) {
+                    self.ui.say(dim(&format!("there is no MCP server called {rest}")));
+                    return Ok(());
+                }
+                off.retain(|n| n != rest);
+                if !on {
+                    off.push(rest.to_string());
+                }
+                rest.to_string()
+            };
+            match self.backend.put("/api/tools", serde_json::json!({ "mcp_off": off })).await {
+                Ok(_) => self.ui.say(dim(&format!(
+                    "{what} {} in your chats, from the next message",
+                    if on { "used" } else { "left out" }
+                ))),
+                Err(e) => self.ui.say(dim(&format!("could not change it: {e}"))),
+            }
+            return Ok(());
+        }
+
+        let listed = match self.backend.get("/api/mcp").await {
+            Ok(v) => v,
+            Err(e) => {
+                self.ui.say(dim(&format!("could not ask the daemon: {e}")));
+                return Ok(());
+            }
+        };
+        let servers = listed["servers"].as_array().cloned().unwrap_or_default();
+        if servers.is_empty() {
+            self.ui.say(dim("no MCP servers. Add one with `ozgent mcp install` or on the admin page, under MCP."));
+            return Ok(());
+        }
+        if listed["tools_enabled"].as_bool() == Some(false) {
+            self.ui.say(dim("tools are switched off, so no MCP server runs"));
+        } else if listed["enabled"].as_bool() == Some(false) {
+            self.ui.say(dim("MCP servers are switched off: /mcp on"));
+        } else if listed["reconnecting"].as_bool() == Some(true) {
+            self.ui.say(dim("reconnecting…"));
+        }
+        let wanted = word;
+        for s in servers {
+            let name = s["name"].as_str().unwrap_or("?");
+            if !wanted.is_empty() && name != wanted {
+                continue;
+            }
+            let state = if s["enabled"].as_bool() == Some(false) {
+                "switched off by the admin".to_string()
+            } else if s["used"].as_bool() == Some(false) {
+                "left out of your chats (/mcp on to use it)".to_string()
+            } else {
+                s["state"].as_str().unwrap_or("connecting").to_string()
+            };
+            let tools = s["tools"].as_array().cloned().unwrap_or_default();
+            let sandbox = if s["sandboxed"].as_bool() == Some(true) { " · sandboxed" } else { "" };
+            self.ui.say(dim(&format!("  {name}  {state}{sandbox} · {} tools", tools.len())));
+            if let Some(e) = s["error"].as_str() {
+                self.ui.say(dim(&format!("    {e}")));
+            }
+            if !wanted.is_empty() {
+                for t in tools {
+                    self.ui.say(dim(&format!("    {}", t.as_str().unwrap_or("?"))));
+                }
+            }
+        }
+        if !wanted.is_empty() && !listed["servers"].as_array().is_some_and(|a| a.iter().any(|s| s["name"] == wanted)) {
+            self.ui.say(dim(&format!("there is no MCP server called {wanted}")));
+        }
+        Ok(())
+    }
+
     fn configure_tool(&mut self, arg: &str) -> Result<()> {
         // A clone, not a borrow of `self.theme`: writing to the screen
         // takes `&mut self`, and a closure holding the theme would block it.
@@ -1159,6 +1266,8 @@ impl<'a> Chat<'a> {
             }
 
             "/tools" if !arg.is_empty() => self.configure_tool(arg)?,
+
+            "/mcp" => self.mcp(arg).await?,
 
             // Asked of the daemon, which is the only thing that knows what
             // actually loaded — including tools from MCP servers this process
@@ -1419,6 +1528,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/models", "list models, or switch to one"),
     ("/config", "show or change this model's settings"),
     ("/tools", "list tools, or point one at a provider"),
+    ("/mcp", "MCP servers · <server> its tools · on|off <server> use it in your chats"),
     ("/agents", "list agents, or show one"),
     ("/call", "force a tool call, constrained by grammar"),
     ("/permissions", "what tools may do without asking"),
@@ -1472,6 +1582,8 @@ const HELP: &str = "\
                    gpu_ram keeps the weights on the card and the KV cache in
                    RAM: the full window, several times slower per token
 /tools             list available tools
+/mcp               MCP servers and how they are doing · /mcp <server> its tools
+/mcp on|off <srv>  use a server in your chats, or not; alone, every server
 /agents [name]     list agents, or show one · write @name in a message to call it
 /copy              copy the last reply to the clipboard
 /default           use this model when none is named · /default clear to unset
@@ -1562,7 +1674,7 @@ mod tests {
     #[test]
     fn help_lists_every_command_the_parser_accepts() {
         // A command that exists but is undocumented is invisible to the user.
-        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/style", "/persona", "/remember", "/memory", "/tools", "/stats", "/default", "/permissions"] {
+        for cmd in ["/help", "/exit", "/clear", "/new", "/conv", "/think", "/effort", "/system", "/style", "/persona", "/remember", "/memory", "/tools", "/mcp", "/stats", "/default", "/permissions"] {
             assert!(HELP.contains(cmd), "{cmd} is missing from /help");
         }
     }
@@ -1888,6 +2000,8 @@ fn answer_permission(
             ozgent_core::Choice::Once => "once",
             ozgent_core::Choice::Session => "session",
             ozgent_core::Choice::Always => "always",
+            // Offered on the web page, where the tool's server is known.
+            ozgent_core::Choice::AlwaysServer => "always_server",
             ozgent_core::Choice::Deny => "deny",
             // The terminal never offers this one, but the type carries it.
             ozgent_core::Choice::DenyAlways => "deny_always",

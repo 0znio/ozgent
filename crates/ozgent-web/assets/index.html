@@ -129,6 +129,12 @@
   <symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M14.7 6.3a4 4 0 0 0-5.4 5.1L4 16.7V20h3.3l5.3-5.3a4 4 0 0 0 5.1-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>
   </symbol>
+  <!-- A plug: a tool that comes from an MCP server, not from ozgent. -->
+  <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M9 3v4.5M15 3v4.5"/>
+    <path d="M6.5 7.5h11V11a5.5 5.5 0 0 1-11 0V7.5Z"/>
+    <path d="M12 16.5V21"/>
+  </symbol>
   <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6L12 3Z"/>
     <path d="M9.5 12.2 11.3 14l3.4-3.6"/>
@@ -234,7 +240,21 @@
           <button type="button" class="linky" id="tools-all-off">all off</button>
         </div>
         <div class="tools-tray-list" id="tools-tray-list"></div>
-        <p class="hint tools-tray-foot">Web search and reading pages are the <b>Web</b> switch. What each tool may do without asking is in Settings → Permissions.</p>
+        <p class="hint tools-tray-foot">Web search and reading pages are the <b>Web</b> switch. MCP servers' tools are under <b>MCP</b>. What each tool may do without asking is in Settings → Permissions.</p>
+      </div>
+      <!-- MCP servers, one switch each, their tools folded under them. The
+           same kind of choice as the tools tray, remembered the same way. -->
+      <div class="tools-tray" id="mcp-tray" role="dialog" aria-label="MCP servers" hidden>
+        <div class="tools-tray-head">
+          <span class="tools-tray-title">MCP servers</span>
+          <span class="hint inline">for the model in this browser · agents keep their own</span>
+          <span class="spacer"></span>
+          <a class="linky" href="/admin#mcp" title="Add, switch and set up MCP servers on the admin page">add or manage</a>
+          <button type="button" class="linky" id="mcp-all-on">all on</button>
+          <button type="button" class="linky" id="mcp-all-off">all off</button>
+        </div>
+        <div class="tools-tray-list" id="mcp-tray-list"></div>
+        <p class="hint tools-tray-foot">Servers are added, and switched off for everyone, on the admin page. What their tools may do without asking is in Settings → Permissions.</p>
       </div>
 
       <!-- The turn is stopped on this, so it sits where the answer will be
@@ -252,6 +272,7 @@
           <span class="consent-alt">
             <button type="button" class="linky" data-choice="session">this session</button>
             <button type="button" class="linky" data-choice="always" id="consent-always">always</button>
+            <button type="button" class="linky" data-choice="always_server" id="consent-server" hidden></button>
           </span>
         </div>
       </section>
@@ -281,6 +302,10 @@
           <button type="button" id="tools-open" class="pill-toggle tools-open" aria-expanded="false"
                   data-tip="Choose which tools the model may use" aria-label="Tools">
             <svg class="ic"><use href="#i-wrench"></use></svg><span class="pill-label">Tools</span>
+          </button>
+          <button type="button" id="mcp-open" class="pill-toggle tools-open" aria-expanded="false"
+                  data-tip="Choose which MCP servers the model may use" aria-label="MCP servers">
+            <svg class="ic"><use href="#i-plug"></use></svg><span class="pill-label">MCP</span>
           </button>
           <span class="spacer"></span>
           <span class="hint inline" id="attach-hint">paste or drop to attach</span>
@@ -387,6 +412,10 @@
     <p class="hint" id="key-hint"></p>
     <h3 class="sub">Available tools</h3>
     <div id="tool-list" class="tool-list"></div>
+    <h3 class="sub">MCP servers</h3>
+    <p class="hint">Programs and services that give the model more tools. Untick one to leave it out of your chats; it keeps running for everyone else. Adding and setting them up is on the admin page, because adding one is running a program on this machine.</p>
+    <div id="set-mcp" class="tool-list"></div>
+    <a class="ghost-btn auto set-mcp-link" href="/admin#mcp">Add or manage MCP servers</a>
   </section>
 
   <section class="panel" data-panel="agents" hidden>

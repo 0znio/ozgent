@@ -6,6 +6,7 @@ mod chat;
 mod input;
 mod cli;
 mod logging;
+mod mcp_cmd;
 mod permission;
 mod scheduler;
 mod setup;
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
         Some(Command::Scheduler { command }) => scheduler::run(&paths, &config, command).await,
         Some(Command::Admin { command }) => setup::admin(&paths, config, command),
         Some(Command::Agent { command }) => agent(&paths, command),
-        Some(Command::Mcp) => mcp(&config).await,
+        Some(Command::Mcp { command }) => mcp_cmd::run(&paths, &config, command).await,
         Some(Command::Serve { port, host, api_key, options }) => {
             // The environment is the right place for a secret; a flag lands in
             // shell history and in `ps`.
@@ -732,8 +733,9 @@ pub(crate) async fn start_tools(paths: &Paths, config: &Config) -> Result<Toolbo
         .await
         .context("starting the Python tool worker")?;
 
-    let (mut sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
-    for problem in &problems {
+    let launcher = ozgent_mcp::Launcher::from_config(config, paths);
+    let (mut sources, statuses) = ozgent_mcp::connect_all_with(&config.mcp, launcher.as_ref()).await;
+    for problem in ozgent_mcp::problems(&statuses) {
         eprintln!("warning: mcp: {problem}");
     }
     // The scheduler, so "do that every weekday at 9:20" works from the
@@ -1209,71 +1211,6 @@ fn open_in_editor(path: &std::path::Path, name: &str) -> Result<()> {
     match ozgent_core::Agent::parse(name, &text, ozgent_core::agents::Origin::User) {
         Ok(_) => println!("@{name} is ready. Write @{name} in a message to call it."),
         Err(e) => println!("warning: @{name} will not load until this is fixed: {e}"),
-    }
-    Ok(())
-}
-
-async fn mcp(config: &Config) -> Result<()> {
-    if !config.mcp.enabled {
-        println!("MCP is switched off. Add to {}:", "config.toml");
-        println!();
-        println!("  [mcp]");
-        println!("  enabled = true");
-        println!();
-        println!("Then a server, e.g.:");
-        println!();
-        println!("  [mcp.servers.files]");
-        println!("  command = \"npx\"");
-        println!("  args    = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]");
-        return Ok(());
-    }
-    if config.mcp.servers.is_empty() {
-        println!("MCP is on, but no servers are configured.");
-        return Ok(());
-    }
-
-    println!("connecting…");
-    println!();
-    let (sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
-
-    for source in &sources {
-        // `mcp:<name>` — the name is what its tools are prefixed with.
-        let name = source.origin().strip_prefix("mcp:").unwrap_or(source.origin());
-        let trusted = config
-            .mcp
-            .servers
-            .get(name)
-            .is_some_and(|s| s.trust_hints);
-        println!("{name}");
-        println!(
-            "  hints         {}",
-            if trusted { "trusted — read-only tools run unasked" } else { "not trusted — every tool asks" }
-        );
-        println!("  tools         {}", source.tools().len());
-        for tool in source.tools() {
-            let rule = config.permissions.rule_for(&tool.name, tool.effect);
-            println!("    {:<34} {:<8} {rule}", tool.name, tool.effect.to_string());
-            if !tool.description.is_empty() {
-                println!("      {}", ozgent_tools::first_line(&tool.description));
-            }
-        }
-        println!();
-    }
-
-    if !problems.is_empty() {
-        println!("could not be used");
-        for problem in &problems {
-            println!("  {problem}");
-        }
-        println!();
-    }
-
-    for source in &sources {
-        source.shutdown().await;
-    }
-
-    if sources.is_empty() && problems.is_empty() {
-        println!("Nothing is enabled.");
     }
     Ok(())
 }

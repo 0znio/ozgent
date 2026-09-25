@@ -31,6 +31,23 @@ pub fn openers() -> impl Iterator<Item = &'static str> {
     OPENERS.iter().map(|(open, _)| *open)
 }
 
+/// `text` without a half-written call at its end: what the model said before
+/// it began calling. Unchanged when no call was begun.
+pub fn text_before_call(text: &str) -> String {
+    // The unfinished call starts at the first opener after the last finished
+    // one: Qwen wraps `<function=…>` in `<tool_call>`, and both belong to it.
+    let after = OPENERS
+        .iter()
+        .filter_map(|(_, close)| close.and_then(|c| text.rfind(c).map(|i| i + c.len())))
+        .max()
+        .unwrap_or(0);
+    let start = OPENERS.iter().filter_map(|(open, _)| text[after..].find(open).map(|i| after + i)).min();
+    match start {
+        Some(i) => text[..i].trim_end().to_string(),
+        None => text.to_string(),
+    }
+}
+
 /// The tool a half-written call is for, as soon as its name is readable.
 ///
 /// A tool call is parsed from the finished reply, which is the right moment to
@@ -298,6 +315,20 @@ pub fn extract(output: &str) -> Parsed {
         }
         if calls.len() == before {
             harvest(body, name.as_deref(), &mut calls);
+        }
+        // A named function with nothing inside is a call without arguments —
+        // `list_tabs` takes none. Dropped, it left `<tool_call>` as the whole
+        // reply and the turn ended with neither a result nor an answer.
+        if calls.len() == before {
+            if let Some(name) = name.as_deref().and_then(identifier) {
+                if body.replace("</function>", "").trim().is_empty() {
+                    calls.push(ToolCall {
+                        id: String::new(),
+                        name: name.to_string(),
+                        arguments: Value::Object(serde_json::Map::new()),
+                    });
+                }
+            }
         }
         if calls.len() == before {
             // Nothing parseable: keep the text rather than silently dropping it.
@@ -667,6 +698,28 @@ fn from_fenced_json(text: &str) -> Option<(String, Vec<ToolCall>)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_native_call_without_parameters_is_still_a_call() {
+        for raw in [
+            "<tool_call>\n<function=camofox_list_tabs>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=camofox_list_tabs>\n</tool_call>",
+            "<function=camofox_list_tabs>\n</function>",
+        ] {
+            let out = extract(raw);
+            assert_eq!(out.calls.len(), 1, "{raw:?}");
+            assert_eq!(out.calls[0].name, "camofox_list_tabs");
+            assert_eq!(out.calls[0].arguments, json!({}));
+            assert_eq!(out.text, "", "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_half_written_call_is_cut_from_the_text() {
+        assert_eq!(text_before_call("Let me check.\n<tool_call>\n<function=files_rea"), "Let me check.");
+        assert_eq!(text_before_call(r#"Sure. <tool_call>{"name": "x"#), "Sure.");
+        assert_eq!(text_before_call("No call here."), "No call here.");
+    }
 
     #[test]
     fn parses_the_qwen_hermes_format() {
@@ -1291,3 +1344,4 @@ mod pending_name_tests {
         assert_eq!(pending_name(whole), Some(parsed.calls[0].name.as_str()));
     }
 }
+

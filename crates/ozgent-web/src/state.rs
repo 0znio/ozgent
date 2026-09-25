@@ -12,6 +12,9 @@ pub struct ToolSummary {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    /// `mcp:<server>` for a tool from an MCP server; absent for ozgent's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Ask the Python worker what tools exist.
@@ -23,16 +26,14 @@ pub struct ToolSummary {
 pub async fn discover_tools(
     paths: &Paths,
     config: &Config,
+    running: Option<&Tools>,
 ) -> anyhow::Result<Vec<ToolSummary>> {
     let mut tools_config = config.tools.clone();
     let disabled = std::mem::take(&mut tools_config.disabled);
 
     let host_config = ozgent_tools::HostConfig::from_config(&tools_config, paths)?;
     let host = ozgent_tools::ToolHost::start(host_config).await?;
-    // MCP servers too: the settings page lists what the model can actually
-    // reach, and a tool from a server is no less a tool.
-    let (sources, _) = ozgent_mcp::connect_all(&config.mcp).await;
-    let host = ozgent_tools::Toolbox::new(Some(host), sources);
+    let host = ozgent_tools::Toolbox::new(Some(host), Vec::new());
 
     let mut out: Vec<ToolSummary> = host
         .tools()
@@ -41,11 +42,37 @@ pub async fn discover_tools(
             name: t.name.clone(),
             description: t.description.clone(),
             enabled: !disabled.contains(&t.name),
+            source: None,
         })
         .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
     host.shutdown().await;
+
+    // MCP servers too: the settings page lists what the model can actually
+    // reach, and a tool from a server is no less a tool. Taken from the
+    // servers already running, never by starting them again: that launched
+    // every server a second time each time the page opened, `npx` downloads
+    // and all.
+    if let Some(running) = running {
+        for t in running.host.tools() {
+            let Some(source) = running.host.source_of(&t.name).filter(|s| s.starts_with("mcp:")) else {
+                continue;
+            };
+            out.push(ToolSummary {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                enabled: !disabled.contains(&t.name),
+                source: Some(source),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// What MCP servers need to run in ozgent's sandbox, when the Python
+/// runtime that provides it can be found.
+pub fn mcp_launcher(paths: &Paths, config: &Config) -> Option<ozgent_mcp::Launcher> {
+    ozgent_mcp::Launcher::from_config(config, paths)
 }
 
 /// Everything the handlers need.
@@ -154,6 +181,24 @@ pub fn watch_config(state: &State) {
                 config.default_model = fresh.default_model;
                 true
             };
+            // `[mcp]` is taken too, and the servers reconnected: `ozgent mcp
+            // add` and friends write the file, and a server added from the
+            // terminal should not wait for a restart.
+            let mcp_changed = {
+                let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+                if config.mcp != fresh.mcp {
+                    config.mcp = fresh.mcp;
+                    true
+                } else {
+                    false
+                }
+            };
+            if mcp_changed {
+                tracing::info!("[mcp] changed; reconnecting the servers");
+                // Queued with the admin page's own reconnects, so the two
+                // cannot finish in the wrong order.
+                crate::admin_mcp::reconnect(&state);
+            }
             if changed {
                 tracing::info!("config.toml changed; reloaded");
             }
@@ -236,8 +281,9 @@ pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools
     let python = ozgent_tools::ToolHost::start(host_config).await?;
     // A server that will not start is reported and skipped: one bad entry in
     // config.toml must not take away the tools that do work.
-    let (mut sources, problems) = ozgent_mcp::connect_all(&config.mcp).await;
-    for problem in &problems {
+    let launcher = mcp_launcher(paths, config);
+    let (mut sources, mcp) = ozgent_mcp::connect_all_with(&config.mcp, launcher.as_ref()).await;
+    for problem in ozgent_mcp::problems(&mcp) {
         tracing::warn!("mcp: {problem}");
     }
     // The scheduler, so the model can make and change jobs mid-conversation.
@@ -267,6 +313,7 @@ pub async fn start_tools(paths: &Paths, config: &Config) -> anyhow::Result<Tools
         host: std::sync::Arc::new(host),
         runtime: tokio::runtime::Handle::current(),
         scheduler,
+        mcp: std::sync::Arc::new(mcp),
     })
 }
 

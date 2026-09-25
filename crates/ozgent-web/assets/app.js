@@ -1402,9 +1402,18 @@ const TOOL_WORDS = {
   schedule: { icon: "i-clock", doing: "Scheduling", done: "Scheduled", lead: ["name", "prompt"] },
 };
 
+/// The MCP server a tool comes from, if it does: from the running list, or
+/// for a card from an older conversation, by the server's prefix.
+function mcpServerOf(name) {
+  const running = state.available?.find((t) => t.name === name);
+  if (running) return running.server ?? null;
+  const server = (state.mcp?.servers ?? []).find((s) => name.startsWith(`${s.name}_`));
+  return server?.name ?? null;
+}
+
 function toolWords(name) {
   return TOOL_WORDS[name] ?? {
-    icon: "i-wrench",
+    icon: mcpServerOf(name) ? "i-plug" : "i-wrench",
     doing: `Using ${name}`,
     done: `Used ${name}`,
     lead: ["path", "query", "url", "command", "symbol"],
@@ -1505,6 +1514,12 @@ function askConsent(event) {
   $("consent-q").innerHTML = question;
   $("consent-meta").innerHTML = meta;
   $("consent-always").textContent = "always";
+  // A tool from an MCP server can be allowed with the rest of its server's
+  // tools, so fifty tools are one answer rather than fifty.
+  const server = mcpServerOf(event.name);
+  const everyTool = $("consent-server");
+  everyTool.hidden = !server;
+  everyTool.textContent = server ? `always, all ${server} tools` : "";
   panel.hidden = false;
 
   return new Promise((resolve) => {
@@ -1597,6 +1612,7 @@ function noteConsent(answerEl, event, choice) {
     once: "allowed once",
     session: "allowed for this session",
     always: `always allowed — ${event.name} will not ask again`,
+    always_server: `always allowed — ${mcpServerOf(event.name) ?? "its server"}'s tools will not ask again`,
     deny: "declined",
   }[choice];
   const note = document.createElement("p");
@@ -2817,6 +2833,47 @@ function renderTools(data) {
     row.querySelector(".d").textContent = t.description.split("\n")[0];
     list.append(row);
   }
+  renderSettingsMcp();
+}
+
+/// The MCP servers: which to use in the chats, and how each is doing. The
+/// admin decides which exist and run; this only chooses among them, the way
+/// the tool list above does for single tools.
+async function renderSettingsMcp() {
+  const box = $("set-mcp");
+  box.replaceChildren();
+  box.dataset.loaded = "0";
+  let data = null;
+  try { data = await api("/api/mcp"); } catch { /* shown as none */ }
+  const servers = data?.servers ?? [];
+  if (!data) {
+    box.innerHTML = '<p class="hint">Could not read the MCP servers.</p>';
+    return;
+  }
+  box.dataset.loaded = "1";
+  if (!servers.length) {
+    box.innerHTML = '<p class="hint">None yet.</p>';
+    return;
+  }
+  for (const s of servers) {
+    const row = document.createElement("label");
+    row.className = "tool";
+    row.innerHTML = '<input type="checkbox"><div class="meta"><div class="n"><span class="set-mcp-dot"></span></div><div class="d"></div></div>';
+    const use = row.querySelector("input");
+    use.dataset.mcp = s.name;
+    use.checked = s.used !== false;
+    use.setAttribute("aria-label", `Use ${s.name} in chats`);
+    const state =
+      !data.enabled ? "MCP servers are switched off" :
+      !s.enabled ? "switched off" :
+      s.state === "connected" ? `connected · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}` :
+      s.state === "failed" ? `failed${s.error ? `: ${s.error}` : ""}` : "connecting…";
+    const dot = row.querySelector(".set-mcp-dot");
+    dot.classList.add(s.state === "connected" && s.enabled && data.enabled ? "good" : s.state === "failed" ? "bad" : "off");
+    row.querySelector(".n").append(s.name + (s.sandboxed ? "  · sandboxed" : ""));
+    row.querySelector(".d").textContent = s.description ? `${state} — ${s.description}` : state;
+    box.append(row);
+  }
 }
 
 function syncKeyRow() {
@@ -3074,6 +3131,11 @@ async function saveSettings() {
         search_provider: $("search-provider").value,
         api_key: key === "" ? null : key,
         disabled,
+        // Only when the MCP list loaded: a failed load must not switch
+        // every server back on.
+        ...($("set-mcp").dataset.loaded === "1" ? {
+          mcp_off: [...$("set-mcp").querySelectorAll("[data-mcp]")].filter((c) => !c.checked).map((c) => c.dataset.mcp),
+        } : {}),
       }),
     });
 
@@ -3734,11 +3796,29 @@ function syncTools() {
   button.dataset.tip = state.web
     ? "Web on: the model may search the web and read pages"
     : "Web off: no searching, no pages";
-  const others = state.available.filter((t) => !WEB_TOOLS.includes(t.name));
-  const off = others.filter((t) => state.toolsOff.includes(t.name)).length;
+  const own = state.available.filter((t) => !WEB_TOOLS.includes(t.name) && !t.server);
+  const off = own.filter((t) => state.toolsOff.includes(t.name)).length;
   const open = $("tools-open");
   open.querySelector(".pill-label").textContent = off ? `Tools · ${off} off` : "Tools";
   open.classList.toggle("some-off", off > 0);
+  // Servers left out entirely, and whether any tool of one is.
+  const servers = mcpGroups();
+  const serversOff = servers.filter(([, tools]) => tools.every((t) => state.toolsOff.includes(t.name))).length;
+  const anyOff = servers.some(([, tools]) => tools.some((t) => state.toolsOff.includes(t.name)));
+  const mcp = $("mcp-open");
+  mcp.querySelector(".pill-label").textContent = serversOff ? `MCP · ${serversOff} off` : "MCP";
+  mcp.classList.toggle("some-off", anyOff);
+}
+
+/// Running MCP servers and their tools, by server name.
+function mcpGroups() {
+  const by = new Map();
+  for (const t of state.available) {
+    if (!t.server) continue;
+    if (!by.has(t.server)) by.set(t.server, []);
+    by.get(t.server).push(t);
+  }
+  return [...by.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
 $("web-toggle").addEventListener("click", () => {
@@ -3754,6 +3834,13 @@ async function loadAvailable() {
   } catch {
     state.available = [];
   }
+  // The servers too, including those with no tools to show — switched off,
+  // failed, still connecting — so the tray can say so instead of nothing.
+  try {
+    state.mcp = await api("/api/mcp");
+  } catch {
+    state.mcp = null;
+  }
   // Forget choices about tools that are gone.
   const names = new Set(state.available.map((t) => t.name));
   state.toolsOff = state.toolsOff.filter((n) => names.has(n));
@@ -3765,17 +3852,114 @@ const EFFECT = { read: "reads", write: "writes", execute: "runs programs", unkno
 function renderTray() {
   const list = $("tools-tray-list");
   list.replaceChildren();
-  const others = state.available.filter((t) => !WEB_TOOLS.includes(t.name));
-  if (!others.length) {
+  const own = state.available.filter((t) => !WEB_TOOLS.includes(t.name) && !t.server);
+  if (!own.length) {
     const p = document.createElement("p");
     p.className = "hint";
     p.textContent = "No other tools are running. Tools can be switched on in Settings → Tools.";
     list.append(p);
-    return;
   }
-  for (const t of others) {
+  for (const t of own) list.append(trayRow(t));
+}
+
+/// The MCP popup: each running server with one switch for all its tools,
+/// which fold under it; then those configured but offering nothing now,
+/// saying why.
+function renderMcpTray() {
+  const list = $("mcp-tray-list");
+  list.replaceChildren();
+  const groups = mcpGroups();
+  const running = new Set(groups.map(([server]) => server));
+  const configured = state.mcp?.servers ?? [];
+  if (!configured.length && !running.size) {
+    const p = document.createElement("p");
+    p.className = "hint tray-note";
+    p.textContent = "None yet. MCP servers give the model more tools: add one from the MCP Registry, as an npm or PyPI package, or by pasting its JSON, on the admin page.";
+    list.append(p);
+  }
+  for (const [server, tools] of groups) {
+    const head = document.createElement("label");
+    head.className = "tray-tool tray-server";
+    const sw = document.createElement("span");
+    sw.className = "switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = tools.some((t) => !state.toolsOff.includes(t.name));
+    input.setAttribute("aria-label", `${server}: every tool`);
+    input.addEventListener("change", () => {
+      const off = new Set(state.toolsOff);
+      for (const t of tools) { if (input.checked) off.delete(t.name); else off.add(t.name); }
+      state.toolsOff = [...off];
+      writeStored("ozgent-tools-off", state.toolsOff);
+      renderMcpTray();
+      syncTools();
+    });
+    const track = document.createElement("span");
+    track.className = "track";
+    sw.append(input, track);
+    const text = document.createElement("span");
+    text.className = "tray-text";
+    const name = document.createElement("span");
+    name.className = "tray-name";
+    name.textContent = server;
+    const desc = document.createElement("span");
+    desc.className = "tray-desc";
+    const on = tools.filter((t) => !state.toolsOff.includes(t.name)).length;
+    const about = configured.find((c) => c.name === server)?.description;
+    desc.textContent = `${on === tools.length ? `${tools.length} tools` : `${on} of ${tools.length} tools on`}${about ? ` · ${about}` : ""}`;
+    desc.title = desc.textContent;
+    text.append(name, desc);
+    // Its tools fold under it: one server can list dozens.
+    state.trayOpen ??= new Set();
+    const open = state.trayOpen.has(server);
+    const caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "linky tray-caret";
+    caret.textContent = open ? "hide tools" : "tools";
+    caret.setAttribute("aria-expanded", String(open));
+    caret.addEventListener("click", (e) => {
+      // Redrawn under the pointer: stopped here, or the popup's own "click
+      // outside closes me" sees a detached element and closes it.
+      e.preventDefault();
+      e.stopPropagation();
+      if (open) state.trayOpen.delete(server); else state.trayOpen.add(server);
+      renderMcpTray();
+    });
+    head.append(sw, text, caret);
+    list.append(head);
+    if (open) for (const t of tools) list.append(trayRow(t, true));
+  }
+  for (const s of configured) {
+    if (running.has(s.name)) continue;
+    const row = document.createElement("div");
+    row.className = "tray-tool tray-server tray-idle";
+    const text = document.createElement("span");
+    text.className = "tray-text";
+    const name = document.createElement("span");
+    name.className = "tray-name";
+    name.textContent = s.name;
+    const desc = document.createElement("span");
+    desc.className = "tray-desc";
+    desc.textContent =
+      !state.mcp.tools_enabled ? "tools are switched off" :
+      !state.mcp.enabled ? "MCP servers are switched off" :
+      !s.enabled ? "switched off on the admin page" :
+      s.used === false ? "not used in chats · Settings → Tools" :
+      s.state === "failed" ? `failed${s.error ? `: ${s.error}` : ""}` :
+      s.state === "connected" ? "offers no tools" : "connecting…";
+    desc.title = desc.textContent;
+    text.append(name, desc);
+    const pip = document.createElement("span");
+    pip.className = `tray-pip${s.enabled && s.state === "failed" ? " bad" : ""}`;
+    row.append(pip, text);
+    list.append(row);
+  }
+}
+
+function trayRow(t, nested) {
+  {
     const row = document.createElement("label");
-    row.className = "tray-tool";
+    row.className = `tray-tool${nested ? " tray-nested" : ""}`;
     const sw = document.createElement("span");
     sw.className = "switch";
     const input = document.createElement("input");
@@ -3788,6 +3972,8 @@ function renderTray() {
       state.toolsOff = [...off];
       writeStored("ozgent-tools-off", state.toolsOff);
       syncTools();
+      // The server's own switch reflects its tools.
+      if (nested) renderMcpTray();
     });
     const track = document.createElement("span");
     track.className = "track";
@@ -3805,32 +3991,51 @@ function renderTray() {
     chip.className = `tray-chip ${t.rule}`;
     chip.textContent = t.rule === "allow" ? EFFECT[t.effect] ?? t.effect : `${EFFECT[t.effect] ?? t.effect} · ${t.rule === "ask" ? "asks" : "refused"}`;
     row.append(sw, text, chip);
-    list.append(row);
+    return row;
   }
 }
 
-function setTray(open) {
-  $("tools-tray").hidden = !open;
-  $("tools-open").setAttribute("aria-expanded", String(open));
-  if (open) renderTray();
+/// Open one of the two popups — "tools" or "mcp" — or close both with null.
+function setTray(which) {
+  for (const [name, tray, button, render] of [
+    ["tools", "tools-tray", "tools-open", renderTray],
+    ["mcp", "mcp-tray", "mcp-open", renderMcpTray],
+  ]) {
+    const open = which === name;
+    $(tray).hidden = !open;
+    $(button).setAttribute("aria-expanded", String(open));
+    if (open) render();
+  }
 }
+const trayOpen = () => !$("tools-tray").hidden || !$("mcp-tray").hidden;
 
-$("tools-open").addEventListener("click", async () => {
-  const open = $("tools-tray").hidden;
-  if (open) await loadAvailable();
-  setTray(open);
-});
-for (const [id, on] of [["tools-all-on", true], ["tools-all-off", false]]) {
-  $(id).addEventListener("click", () => {
-    state.toolsOff = on ? [] : state.available.filter((t) => !WEB_TOOLS.includes(t.name)).map((t) => t.name);
-    writeStored("ozgent-tools-off", state.toolsOff);
-    renderTray();
-    syncTools();
+for (const [button, tray, name] of [["tools-open", "tools-tray", "tools"], ["mcp-open", "mcp-tray", "mcp"]]) {
+  $(button).addEventListener("click", async () => {
+    const open = $(tray).hidden;
+    if (open) await loadAvailable();
+    setTray(open ? name : null);
   });
 }
+/// "All on" and "all off" touch only the popup's own tools; the other's
+/// choices stay as they were.
+function setAll(mcp, on) {
+  const mine = state.available.filter((t) => !WEB_TOOLS.includes(t.name) && Boolean(t.server) === mcp).map((t) => t.name);
+  const off = new Set(state.toolsOff);
+  for (const n of mine) { if (on) off.delete(n); else off.add(n); }
+  state.toolsOff = [...off];
+  writeStored("ozgent-tools-off", state.toolsOff);
+  if (mcp) renderMcpTray(); else renderTray();
+  syncTools();
+}
+for (const [id, mcp, on] of [
+  ["tools-all-on", false, true], ["tools-all-off", false, false],
+  ["mcp-all-on", true, true], ["mcp-all-off", true, false],
+]) {
+  $(id).addEventListener("click", () => setAll(mcp, on));
+}
 document.addEventListener("click", (e) => {
-  if ($("tools-tray").hidden) return;
-  if (!e.target.closest("#tools-tray, #tools-open")) setTray(false);
+  if (!trayOpen()) return;
+  if (!e.target.closest("#tools-tray, #tools-open, #mcp-tray, #mcp-open")) setTray(null);
 });
 
 $("lightbox").addEventListener("click", (e) => {
@@ -3841,7 +4046,7 @@ $("lightbox-close").addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("lightbox").hidden) closeLightbox();
-  else if (!$("tools-tray").hidden) setTray(false);
+  else if (trayOpen()) setTray(null);
   else if (el.sidebar.classList.contains("open")) setDrawer(false);
 });
 

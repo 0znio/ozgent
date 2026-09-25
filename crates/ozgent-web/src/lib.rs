@@ -7,6 +7,8 @@
 pub mod access;
 pub mod admin;
 mod admin_access;
+mod admin_mcp;
+mod toolsearch;
 pub mod agents;
 pub mod anthropic;
 pub mod api;

@@ -360,7 +360,27 @@ enabled = true
 [mcp.servers.files]
 command = "npx"
 args    = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/notes"]
+sandbox = true                 # run it in ozgent's sandbox
+network = true                 # a sandboxed server may use the network
+folders = ["/home/you/notes"]  # and read and write these
+load    = "auto"               # tools up front while they fit; "always", "on_request"
 ```
+
+Add, install, switch and remove servers on the admin page under **MCP**, or
+with `ozgent mcp add`, `install`, `enable`, `disable` and `remove`; a running
+daemon picks up changes to `[mcp]` within seconds. The chat page's settings
+API neither shows nor changes `[mcp]`.
+
+Which of the admin's servers the chats use is the chat page's choice, like
+single tools:
+
+```toml
+[tools]
+disabled = ["run_command"]   # single tools, a server's included
+mcp_off  = ["github"]        # whole servers: running, but not used in chats
+```
+
+Set in **Settings → Tools**, or `/mcp off <server>` in the terminal.
 
 ## Downloads
 

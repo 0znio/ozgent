@@ -337,6 +337,16 @@ pub fn router(state: State) -> Router {
         .route("/api/admin/embedding", get(crate::admin_access::embedding_view).put(crate::admin_access::embedding_update))
         .route("/api/admin/embedding/backfill", post(crate::admin_access::embedding_backfill))
         .route("/api/admin/server", get(crate::admin_access::server_view).put(crate::admin_access::server_update))
+        .route("/api/admin/mcp", get(crate::admin_mcp::view).put(crate::admin_mcp::switch))
+        .route("/api/admin/mcp/reconnect", post(crate::admin_mcp::reconnect_now))
+        .route("/api/admin/mcp/servers", post(crate::admin_mcp::add_manual))
+        .route(
+            "/api/admin/mcp/servers/{name}",
+            axum::routing::patch(crate::admin_mcp::update).delete(crate::admin_mcp::remove),
+        )
+        .route("/api/admin/mcp/registry", get(crate::admin_mcp::registry_search))
+        .route("/api/admin/mcp/install", post(crate::admin_mcp::install))
+        .route("/api/admin/mcp/import", post(crate::admin_mcp::import))
         .route_layer(middleware::from_fn_with_state(state.clone(), gate));
 
     Router::new()

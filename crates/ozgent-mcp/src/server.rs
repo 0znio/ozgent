@@ -12,7 +12,8 @@ use ozgent_tools::source::{Boxed, ToolSource};
 use serde_json::{Value, json};
 
 use crate::protocol::{self, ServerInfo};
-use crate::transport::{HttpLink, Link, StdioLink, TransportError};
+use crate::sandbox::Launcher;
+use crate::transport::{HttpLink, Link, Log, StdioLink, TransportError};
 
 /// How long the handshake may take.
 ///
@@ -34,6 +35,75 @@ pub enum ConnectError {
     Transport(#[from] TransportError),
     #[error("offers no tools")]
     NoTools,
+    #[error("{0}")]
+    Sandbox(String),
+}
+
+/// How a configured server is doing, for the admin page, `/mcp` and
+/// `ozgent mcp`. Carries no settings, so nothing secret.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Status {
+    pub name: String,
+    pub state: State,
+    /// Why it is not connected, when it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The last lines it wrote to stderr.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+    /// What it calls itself, and its version, once connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// Every tool it lists, offered or not.
+    pub tools: Vec<ToolStatus>,
+    pub sandboxed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolStatus {
+    /// The name the model sees: `<server>_<tool>`.
+    pub name: String,
+    /// The name the server knows it by.
+    pub remote: String,
+    pub description: String,
+    pub effect: ozgent_core::permission::Effect,
+    /// Offered to the model: not left out by the server's `tools` list.
+    pub offered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    Connected,
+    Failed,
+    /// Switched off on its own.
+    Disabled,
+    /// `[mcp]` itself is switched off.
+    Off,
+}
+
+/// Environment variables a server is given from ozgent's own, before its
+/// configured `env`. What a program needs to find itself and the network —
+/// never the keys and tokens ozgent was started with.
+const ENV_KEEP: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "SHELL", "TMPDIR",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "GOROOT", "JAVA_HOME", "VIRTUAL_ENV",
+    "NVM_DIR", "PNPM_HOME", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+];
+
+const SECRETISH: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "COOKIE", "SESSION", "AUTH"];
+
+/// The environment a stdio server starts with: [`ENV_KEEP`] from ozgent's
+/// own, then what its entry configures, which wins.
+pub fn server_env(configured: &std::collections::BTreeMap<String, String>) -> std::collections::BTreeMap<String, String> {
+    let mut env: std::collections::BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| ENV_KEEP.contains(&k.as_str()) || k.starts_with("LC_"))
+        .filter(|(k, _)| !SECRETISH.iter().any(|s| k.to_ascii_uppercase().contains(s)))
+        .collect();
+    env.extend(configured.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
 }
 
 pub struct Server {
@@ -58,15 +128,51 @@ impl Server {
 
     /// Connect, shake hands, and read the tool list.
     pub async fn connect(name: &str, config: &mcp::Server) -> Result<Self, ConnectError> {
+        Self::connect_with(name, config, None, Log::default()).await.map(|(server, _)| server)
+    }
+
+    /// [`Self::connect`], with ozgent's sandbox for a server that asks for it
+    /// and its stderr kept in `log`. Also returns every tool the server
+    /// listed, including those its `tools` setting leaves out.
+    pub async fn connect_with(
+        name: &str,
+        config: &mcp::Server,
+        launcher: Option<&Launcher>,
+        log: Log,
+    ) -> Result<(Self, Vec<ToolStatus>), ConnectError> {
         let origin = format!("mcp:{name}");
         let link = match config.transport()? {
-            Transport::Stdio { command } => Link::Stdio(Box::new(StdioLink::start(
-                command,
-                &config.args,
-                &config.env,
-                config.cwd.as_deref(),
-                &origin,
-            )?)),
+            Transport::Stdio { command } => {
+                let env = server_env(&config.env);
+                let link = if config.sandbox {
+                    let Some(launcher) = launcher else {
+                        return Err(ConnectError::Sandbox(
+                            "asks for the sandbox, but ozgent's Python runtime was not found to provide one"
+                                .into(),
+                        ));
+                    };
+                    let wrapped = launcher
+                        .wrap(name, command, &config.args, &config.env, &config.folders, config.network)
+                        .await
+                        .map_err(ConnectError::Sandbox)?;
+                    StdioLink::start(&wrapped.command, &wrapped.args, &wrapped.env, Some(&wrapped.cwd), &origin, log)?
+                } else {
+                    // Not sandboxed, so it keeps the real `HOME`; but what
+                    // `npx` and `uvx` download for it still goes in its own
+                    // folder under ~/ozgent/mcp, so removing that removes it.
+                    let mut env = env;
+                    if let Some(home) = launcher.map(|l| l.home(name)) {
+                        let cache = home.join(".cache");
+                        if std::fs::create_dir_all(&cache).is_ok() {
+                            for (key, dir) in [("npm_config_cache", "npm"), ("UV_CACHE_DIR", "uv")] {
+                                env.entry(key.to_string()).or_insert_with(|| cache.join(dir).display().to_string());
+                            }
+                        }
+                    }
+                    StdioLink::start(command, &config.args, &env, config.cwd.as_deref(), &origin, log)?
+                };
+                Link::Stdio(Box::new(link))
+            }
             Transport::Http { url } => Link::Http(Box::new(HttpLink::new(url, config.headers.clone()))),
         };
 
@@ -99,13 +205,24 @@ impl Server {
 
         let mut specs = Vec::new();
         let mut real_name = HashMap::new();
-        for tool in listed.into_iter().filter(wanted) {
+        let mut all = Vec::new();
+        for tool in listed {
             let spec = protocol::to_spec(name, &tool, config.trust_hints);
-            real_name.insert(spec.name.clone(), tool.name);
-            specs.push(spec);
+            let offered = wanted(&tool);
+            all.push(ToolStatus {
+                name: spec.name.clone(),
+                remote: tool.name.clone(),
+                description: ozgent_tools::first_line(&spec.description).to_string(),
+                effect: spec.effect,
+                offered,
+            });
+            if offered {
+                real_name.insert(spec.name.clone(), tool.name);
+                specs.push(spec);
+            }
         }
 
-        Ok(Self { name: name.to_string(), origin, link, info, specs, real_name, timeout })
+        Ok((Self { name: name.to_string(), origin, link, info, specs, real_name, timeout }, all))
     }
 }
 
@@ -158,6 +275,12 @@ impl ToolSource for Server {
                 return Err(failed(name, INTERNAL_ERROR, format!("{} does not offer {name}", self.origin)));
             };
 
+            // Small models write `"true"` for true and `"5"` for 5 often
+            // enough that a strict server's refusal cost a whole round.
+            let arguments = match self.specs.iter().find(|s| s.name == name) {
+                Some(spec) => coerce(&spec.input_schema, arguments),
+                None => arguments,
+            };
             let params = json!({ "name": real, "arguments": arguments });
             let result = self.link.request("tools/call", params, self.timeout).await.map_err(
                 |e| match e {
@@ -182,6 +305,46 @@ impl ToolSource for Server {
     }
 }
 
+/// Fix arguments whose type is plainly a model's slip, by the tool's own
+/// schema: a string `"true"`/`"false"` where it asks for a boolean, a string
+/// holding a number where it asks for a number or integer. Top-level only,
+/// and nothing is guessed — a value that does not read cleanly as the type
+/// asked for is sent as it was, for the server to refuse and the model to see.
+pub fn coerce(schema: &Value, arguments: Value) -> Value {
+    let Value::Object(mut args) = arguments else { return arguments };
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else { return Value::Object(args) };
+    for (key, value) in args.iter_mut() {
+        let Some(text) = value.as_str().map(str::trim) else { continue };
+        let wants = |t: &str| {
+            let ty = &props.get(key).map(|p| p["type"].clone()).unwrap_or(Value::Null);
+            // A property that also accepts strings is left alone.
+            match ty {
+                Value::String(s) => s == t,
+                Value::Array(list) => list.iter().any(|x| x == t) && !list.iter().any(|x| x == "string"),
+                _ => false,
+            }
+        };
+        if wants("boolean") {
+            match text.to_ascii_lowercase().as_str() {
+                "true" => *value = Value::Bool(true),
+                "false" => *value = Value::Bool(false),
+                _ => {}
+            }
+        } else if wants("integer") {
+            if let Ok(n) = text.parse::<i64>() {
+                *value = json!(n);
+            }
+        } else if wants("number") {
+            if let Ok(n) = text.parse::<f64>() {
+                if n.is_finite() {
+                    *value = json!(n);
+                }
+            }
+        }
+    }
+    Value::Object(args)
+}
+
 fn failed(name: &str, code: i32, message: String) -> ToolCallError {
     ToolCallError::Failed {
         name: name.to_string(),
@@ -197,12 +360,69 @@ fn failed(name: &str, code: i32, message: String) -> ToolCallError {
 pub async fn connect_all(
     config: &ozgent_core::McpConfig,
 ) -> (Vec<Arc<dyn ToolSource>>, Vec<String>) {
-    let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
-    let mut problems = Vec::new();
+    let (sources, statuses) = connect_all_with(config, None).await;
+    (sources, problems(&statuses))
+}
 
-    for (name, settings) in config.active() {
-        match Server::connect(name, settings).await {
-            Ok(server) => {
+/// One line per server that is meant to run and does not.
+pub fn problems(statuses: &[Status]) -> Vec<String> {
+    statuses
+        .iter()
+        .filter(|s| s.state == State::Failed)
+        .map(|s| format!("{}: {}", s.name, s.error.as_deref().unwrap_or("failed")))
+        .collect()
+}
+
+/// [`connect_all`], with ozgent's sandbox for the servers that ask for it,
+/// and a status for every configured server, running or not.
+///
+/// Servers are connected at the same time: an `npx` server downloading its
+/// package on first run takes a minute, and must not hold up the others.
+pub async fn connect_all_with(
+    config: &ozgent_core::McpConfig,
+    launcher: Option<&Launcher>,
+) -> (Vec<Arc<dyn ToolSource>>, Vec<Status>) {
+    let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+    let mut statuses = Vec::new();
+
+    let mut connecting = tokio::task::JoinSet::new();
+    for (name, settings) in &config.servers {
+        let base = Status {
+            name: name.clone(),
+            state: State::Failed,
+            error: None,
+            log: Vec::new(),
+            server: None,
+            tools: Vec::new(),
+            sandboxed: settings.sandbox,
+        };
+        if !config.enabled {
+            statuses.push(Status { state: State::Off, ..base });
+            continue;
+        }
+        if !settings.enabled {
+            statuses.push(Status { state: State::Disabled, ..base });
+            continue;
+        }
+        // Not startable at all — both transports given, or neither — so it
+        // never reaches a connection attempt, and is reported here or nowhere.
+        if let Err(e) = settings.transport() {
+            statuses.push(Status { error: Some(e.to_string()), ..base });
+            continue;
+        }
+        let (name, settings, launcher) = (name.clone(), settings.clone(), launcher.cloned());
+        connecting.spawn(async move {
+            let log = Log::default();
+            let result = Server::connect_with(&name, &settings, launcher.as_ref(), log.clone()).await;
+            let log: Vec<String> = log.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+            (name, result, log, base)
+        });
+    }
+
+    while let Some(joined) = connecting.join_next().await {
+        let Ok((name, result, log, base)) = joined else { continue };
+        match result {
+            Ok((server, tools)) => {
                 tracing::info!(
                     target: "ozgent::mcp",
                     "{name}: {} tools from {} {}",
@@ -210,33 +430,55 @@ pub async fn connect_all(
                     server.info().name,
                     server.info().version,
                 );
+                let about = format!("{} {}", server.info().name, server.info().version).trim().to_string();
+                statuses.push(Status {
+                    state: State::Connected,
+                    server: (!about.is_empty()).then_some(about),
+                    tools,
+                    log,
+                    ..base
+                });
                 sources.push(Arc::new(server));
             }
-            Err(e) => problems.push(format!("{name}: {e}")),
+            Err(e) => statuses.push(Status { error: Some(e.to_string()), log, ..base }),
         }
     }
 
-    // Servers listed but not startable at all — a typo in `command`, both
-    // transports given — never reach `active()`, so they are reported here or
-    // nowhere.
-    for (name, settings) in &config.servers {
-        if settings.enabled && config.enabled {
-            if let Err(e) = settings.transport() {
-                problems.push(format!("{name}: {e}"));
-            }
-        }
-    }
-
+    // In name order, whatever order they finished in: a tool list that
+    // reordered itself between restarts would change the prompt, and with it
+    // every cached prefix.
+    sources.sort_by(|a, b| a.origin().cmp(b.origin()));
+    statuses.sort_by(|a, b| a.name.cmp(&b.name));
     // Returned rather than logged here. Every caller already reports them in
     // the way its surface calls for — a warning line in the terminal, the
     // server log, the settings page — and logging as well printed each
     // problem twice.
-    (sources, problems)
+    (sources, statuses)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_models_type_slips_are_fixed_by_the_schema() {
+        let schema = json!({ "properties": {
+            "headless": { "type": "boolean" },
+            "count": { "type": "integer" },
+            "scale": { "type": "number" },
+            "name": { "type": "string" },
+            "either": { "type": ["boolean", "string"] },
+        }});
+        let fixed = coerce(&schema, json!({
+            "headless": "True", "count": " 5", "scale": "1.5", "name": "true", "either": "true", "extra": "1",
+        }));
+        assert_eq!(fixed, json!({
+            "headless": true, "count": 5, "scale": 1.5, "name": "true", "either": "true", "extra": "1",
+        }));
+        // Nothing is guessed.
+        let left = coerce(&schema, json!({ "headless": "yes please", "count": "five" }));
+        assert_eq!(left, json!({ "headless": "yes please", "count": "five" }));
+    }
 
     #[tokio::test]
     async fn a_server_that_cannot_be_reached_is_reported_and_skipped() {

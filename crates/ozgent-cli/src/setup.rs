@@ -67,7 +67,7 @@ pub(crate) fn choose(prompt: &str, options: &[&str], default: usize) -> Result<u
 
 /// Read something secret without echoing it. Falls back to a plain line when
 /// stdin is not a terminal, so it can be piped in.
-fn ask_secret(prompt: &str) -> Result<String> {
+pub(crate) fn ask_secret(prompt: &str) -> Result<String> {
     use ozgent_render::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
     use ozgent_render::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 

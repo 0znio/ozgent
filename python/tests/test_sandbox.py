@@ -186,6 +186,35 @@ class CommandSandboxTest(unittest.TestCase):
         pids = [p for p in out["stdout"].split() if p.isdigit()]
         self.assertLessEqual(len(pids), 3, pids)
 
+    @unittest.skipUnless(HAS_PRIVATE_PROC, "commands cannot get a mount namespace here")
+    def test_shared_memory_works_and_is_private(self):
+        # Python's multiprocessing needs /dev/shm; the sandbox's is its own,
+        # so nothing another process keeps there is visible.
+        marker = Path("/dev/shm") / f"ozgent-test-{os.getpid()}"
+        marker.write_text("not yours")
+        try:
+            out = self.run_(f"{EXE} -c \"print(__import__('multiprocessing').Lock() and 'LOCKED', __import__('os').listdir('/dev/shm'))\"")
+            self.assertIn("LOCKED", out["stdout"], out)
+            self.assertNotIn(marker.name, out["stdout"])
+        finally:
+            marker.unlink()
+
+    @unittest.skipUnless(HAS_PRIVATE_PROC and os.path.exists("/run/dbus/system_bus_socket"), "needs namespaces and a system bus")
+    def test_the_session_sockets_are_out_of_reach(self):
+        # Landlock does not stop connecting to a socket; the private mount
+        # over /run/dbus does.
+        script = "print(__import__('socket').socket(1).connect('/run/dbus/system_bus_socket') or 'CONNECTED')"
+        out = self.run_(f"{EXE} -c \"{script}\"")
+        self.assertNotIn("CONNECTED", out["stdout"])
+
+    def test_system_settings_are_readable_and_homes_are_not(self):
+        # DNS settings, and on Ubuntu the resolver's file under /run.
+        out = self.run_(f"{EXE} -c \"print(bool(open('/etc/hosts').read()))\"")
+        self.assertIn("True", out["stdout"], out)
+        home = os.path.expanduser("~")
+        out = self.run_(f"{EXE} -c \"print(__import__('os').listdir({home!r}))\"")
+        self.assertNotEqual(out["exit_code"], 0)
+
     def test_another_process_is_unreadable(self):
         # This test's own process holds the secret; its pid is only reachable
         # when there is no PID namespace, and then Landlock must refuse it.

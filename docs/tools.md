@@ -244,11 +244,14 @@ program:
 
 - gives it its own user, mount, PID and network namespaces, so it sees no
   other process and, unless `shell_network` is on, has no network at all;
-- adds Landlock rules: it may read the system's programs and libraries and
-  the folder it runs in, write only in that folder and a private temporary
-  one, and reach nothing under ozgent's own home or your credential folders
-  (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, browser profiles and so on) even
-  where those sit inside the folder;
+- adds Landlock rules: it may read the system (everything but people's home
+  folders, shared temporary folders, your session's runtime folder, mail and
+  mounted drives) and the folder it runs in, write only in that folder and a
+  private temporary one, and reach nothing under ozgent's own home or your
+  credential folders (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, browser
+  profiles and so on) even where those sit inside the folder;
+- gives it a private `/dev/shm`, so programs that use shared memory work,
+  and hides your session's D-Bus and agent sockets behind empty mounts;
 - hands it a clean environment, so API keys in ozgent's own environment never
   reach it;
 - turns off core dumps and caps any file it writes at 2 GB;
@@ -417,7 +420,96 @@ list per turn:
 - **4536 tokens is fourteen percent of a 32k window** spent before anyone has
   said anything.
 
-The answer to both is a subset chosen **once per conversation** and held
-stable — which keeps every property the cache depends on while cutting what is
-carried. A conversation about files does not need the market tools, and it does
-not need to re-decide that on every turn.
+### Hundreds of tools, or thousands
+
+MCP servers make both problems real. Six servers brought 119 tools, whose
+descriptions took **38,896 tokens** — most of a 64k window — and a thousand
+tools would not fit in any window a 4B has. So past a budget, the tools of MCP
+servers are described **on request** — and the prompt's head still does not
+change from turn to turn.
+
+**What the model is told up front.** ozgent's own tools, any server set to
+`load = "always"`, and one more tool, `find_tools`, whose description is a
+directory of everything else. The directory is as detailed as fits in about
+4,000 tokens:
+
+1. every tool's name and what it does, one line each — up to about two
+   hundred tools;
+2. else each server, what it is, and its tools' names;
+3. else each server and what it is;
+4. else the servers' names.
+
+The directory depends only on which tools exist, so it is the same every turn
+and cached like the rest of the head.
+
+**What each message gets.** Before the model answers, ozgent looks up the
+tools that message is most likely about and records the lookup as a
+`find_tools` call and its result, at the *end* of the prompt, where it costs
+nothing to what is cached. The first three matches come in full, parameters
+and all, ready to call; the next seven by name and purpose, one line each. The
+model can also call `find_tools` itself, and a call to a tool it has only seen
+named is answered with that tool's parameters when it leaves required ones
+out.
+
+**How the lookup ranks.** By keywords (BM25) and by meaning (the embedding
+model, with an instruction that says it is looking for a tool), the two
+rankings fused by reciprocal rank — the way [memory recall](settings.md#memory-embeddings) does.
+Measured on the MCP-Zero set (2,797 tools from 308 real MCP servers) with 260
+requests written by a model for tools picked at random, a fitting tool was
+found in the first *k* for this share of requests (fitting: the tool the
+request was written for, or one a model judged could do it just as well —
+the set is full of near-duplicates, five ways to read an S3 bucket):
+
+| tools | first 1 | first 3 | first 5 | first 10 |
+|---|---|---|---|---|
+| 130 | 0.72 | 0.85 | 0.87 | 0.92 |
+| 1,000 | 0.63 | 0.79 | 0.84 | 0.89 |
+| 2,797 | 0.61 | 0.79 | 0.85 | 0.89 |
+
+Twenty times the tools cost three points in the first ten. At 2,797 tools,
+keywords alone found a fitting tool in the first ten for 79% of requests, and
+meaning alone for 88%.
+
+End to end, with a 4B choosing: 48 requests written for the tools of 16
+servers (134 tools), and 8 messages that need no tool, run against those
+servers alone and then with more servers added around them. The tools were
+stand-ins that did nothing, served over MCP; what was measured is the first
+tool the model called.
+
+| tools | described | right tool | a fitting one | no tool when none was needed | context, one short message |
+|---|---|---|---|---|---|
+| 134 | all up front | 43 | 43 | 7 of 8 | 11,926 tokens |
+| 134 | looked up | 46 | 46 | 7 of 8 | 5,763 tokens |
+| 1,008 | looked up | 38 | 42 | 8 of 8 | — |
+| 2,792 | looked up | 34 | 38 | 7 of 8 | 5,143 tokens |
+
+With as many tools as fit up front, looking them up lost nothing and halved
+the context. With thousands, most of what was lost is the requests
+themselves: written for a machine with one messaging server, "send this to
+Alex in the Work Projects channel" is ambiguous on one with five, and the
+model asked or chose another. Of the fourteen misses at 2,792 tools, two
+named their service and still went wrong. A thousand tools described up
+front would not have fit in the window at all.
+
+Showing five tools in full instead of three did worse at 2,792 tools (30
+right, and small talk drew tool calls): more descriptions in front of the
+model are more to be distracted by.
+
+What did *not* work, measured on the same set:
+
+- **Routing to a server first** (MCP-Zero's hierarchy): worse at every size —
+  0.47 against 0.62 for the exact tool in the first three at 2,797 tools.
+  Servers overlap, and a request's words name a server's topic more often
+  than its tools.
+- **The memory layer's embedding instruction** for tool lookups: 0.54 against
+  0.62. The instruction says what is being looked for, and it matters.
+- **Deciding from the scores whether a message needs a tool.** With a
+  thousand tools, "write me a haiku" matched something as well as real
+  requests matched theirs, by keywords and by meaning alike. So every message
+  gets its lookup.
+- **Forcing the model's tool name to be a real one** with a grammar. It
+  turns a visible miss into a silent wrong call, with arguments meant for
+  something else. Instead a call to a name that does not exist is taken as a
+  search — the invented name and its arguments are a good query — and
+  answered with the three closest real tools.
+

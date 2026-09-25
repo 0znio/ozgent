@@ -1004,6 +1004,7 @@ async fn answer(shared: &Arc<Shared>, token: u64, choice: Choice) {
         Choice::Once => format!("**{}** — allowed, this once.", ask.tool),
         Choice::Session => format!("**{}** — allowed for the rest of this session.", ask.tool),
         Choice::Always => format!("**{}** — always allowed from now on.", ask.tool),
+        Choice::AlwaysServer => format!("**{}** and the rest of its server's tools — always allowed from now on.", ask.tool),
         Choice::Deny => format!("**{}** — not allowed.", ask.tool),
         Choice::DenyAlways => format!("**{}** — never allowed from now on.", ask.tool),
     };

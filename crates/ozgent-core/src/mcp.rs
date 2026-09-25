@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
     /// Master switch. Off means no server is contacted, whatever is listed.
@@ -44,10 +44,20 @@ impl McpConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Server {
     pub enabled: bool,
+
+    /// What it is, in a line, for lists. Filled from the registry when a
+    /// server is installed from there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Where it came from, e.g. `registry:io.github.x/y@1.2.0` or `npm:pkg`.
+    /// Shown beside it; never used to decide anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 
     /// Program to run, for a server that speaks over its own stdin and stdout.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,12 +95,62 @@ pub struct Server {
     /// everything it lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
+
+    /// Run the program inside ozgent's sandbox.
+    ///
+    /// A stdio server is someone else's program running as you; installed
+    /// from a registry, it is code nobody here has read. Sandboxed, it gets
+    /// a home of its own under `~/ozgent/mcp/<name>`, can write only there
+    /// and in `folders`, and cannot read ozgent's files, your SSH and cloud
+    /// credentials, or other processes. Off by default for entries written
+    /// by hand before this existed; on for servers added from the admin page.
+    pub sandbox: bool,
+
+    /// Whether a sandboxed server may use the network. Most need it: `npx`
+    /// and `uvx` download the package, and many servers are API clients.
+    pub network: bool,
+
+    /// Folders a sandboxed server may read and write, beyond its own home.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<PathBuf>,
+
+    /// When its tools' descriptions are put in front of the model.
+    #[serde(skip_serializing_if = "Load::is_auto")]
+    pub load: Load,
+}
+
+/// When a server's tools are described to the model.
+///
+/// Every tool described up front costs context before anyone has said
+/// anything — a browser server alone can be 47 tools — and too many at once
+/// make a model worse at choosing. A tool loaded on request is still
+/// callable: the model finds it with `find_tools`, which answers with its
+/// full description.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Load {
+    /// Up front while all the tools fit the budget; on request once they
+    /// do not.
+    #[default]
+    Auto,
+    /// Always up front: a server used in most conversations.
+    Always,
+    /// Only when the model asks for it.
+    OnRequest,
+}
+
+impl Load {
+    pub fn is_auto(&self) -> bool {
+        *self == Load::Auto
+    }
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
             enabled: true,
+            description: None,
+            source: None,
             command: None,
             args: Vec::new(),
             env: BTreeMap::new(),
@@ -100,8 +160,24 @@ impl Default for Server {
             timeout_seconds: 60,
             trust_hints: false,
             tools: None,
+            sandbox: false,
+            network: true,
+            folders: Vec::new(),
+            load: Load::Auto,
         }
     }
+}
+
+/// Whether `name` can name a server: it prefixes every tool the server
+/// offers, so it keeps to what a tool name may contain, and short.
+pub fn valid_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 32 {
+        return Err("a server name is 1 to 32 characters".into());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("a server name uses letters, digits, hyphens and underscores only".into());
+    }
+    Ok(())
 }
 
 /// How to reach a server.
@@ -120,7 +196,7 @@ pub enum Invalid {
     Nothing,
     #[error("says both `command` and `url`; a server is reached one way or the other")]
     Both,
-    #[error("`args`, `env` and `cwd` describe a program to run, but this server has a `url`")]
+    #[error("`args`, `env`, `cwd`, `sandbox` and `folders` describe a program to run, but this server has a `url`")]
     StdioSettingsOnHttp,
     #[error("`headers` describes an HTTP request, but this server has a `command`")]
     HttpSettingsOnStdio,
@@ -138,7 +214,13 @@ impl Server {
             // than ignored: silently dropping an `env` that carries the API
             // key would look like the server rejecting the credentials.
             (Some(_), None) if !self.headers.is_empty() => Err(Invalid::HttpSettingsOnStdio),
-            (None, Some(_)) if !self.args.is_empty() || !self.env.is_empty() || self.cwd.is_some() => {
+            (None, Some(_))
+                if !self.args.is_empty()
+                    || !self.env.is_empty()
+                    || self.cwd.is_some()
+                    || self.sandbox
+                    || !self.folders.is_empty() =>
+            {
                 Err(Invalid::StdioSettingsOnHttp)
             }
             (Some(command), None) => Ok(Transport::Stdio { command }),
@@ -296,6 +378,33 @@ mod tests {
         assert_eq!(docs.timeout_seconds, 20);
         assert_eq!(docs.tools.as_deref(), Some(&["search".to_string()][..]));
         assert!(!docs.trust_hints, "hints are not believed unless asked for");
+    }
+
+    #[test]
+    fn a_sandbox_is_for_a_program_not_a_url() {
+        let http = Server { url: Some("https://x.test/mcp".into()), sandbox: true, ..Default::default() };
+        assert_eq!(http.transport(), Err(Invalid::StdioSettingsOnHttp));
+        let sandboxed = Server { sandbox: true, folders: vec!["/tmp".into()], ..stdio() };
+        assert_eq!(sandboxed.transport(), Ok(Transport::Stdio { command: "npx" }));
+    }
+
+    #[test]
+    fn entries_written_before_the_sandbox_existed_still_parse_and_run_as_before() {
+        let text = "[mcp]\nenabled = true\n[mcp.servers.files]\ncommand = \"npx\"\n";
+        let config: crate::Config = toml::from_str(text).unwrap();
+        let files = &config.mcp.servers["files"];
+        assert!(!files.sandbox);
+        assert!(files.network);
+    }
+
+    #[test]
+    fn server_names_are_what_a_tool_prefix_can_be() {
+        assert!(valid_name("github").is_ok());
+        assert!(valid_name("my-files_2").is_ok());
+        assert!(valid_name("").is_err());
+        assert!(valid_name("a b").is_err());
+        assert!(valid_name("../x").is_err());
+        assert!(valid_name(&"a".repeat(33)).is_err());
     }
 
     #[test]

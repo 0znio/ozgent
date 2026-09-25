@@ -29,7 +29,7 @@ They run models. ozgent runs models **and does the work around them**.
 | Runs tools for you | built in — search, fetch, files, shell, markets, Reddit | you write the client | you wire it up |
 | Agents you call with `@name` | yes, with their own tools — or the model hands over itself | — | — |
 | **Asks before writing or running** | yes, before the content is even generated | — | — |
-| MCP servers | yes | — | yes |
+| MCP servers | yes — installed from the MCP Registry, and sandboxed | — | yes |
 | Full-screen terminal UI | yes | plain prompt | — |
 | Web interface | built in | desktop app | desktop app |
 | OpenAI-compatible API | yes, and Anthropic-compatible | yes | yes |
@@ -211,19 +211,30 @@ too. → [docs/agents.md](docs/agents.md)
 
 ### MCP servers
 
-Point ozgent at any Model Context Protocol server and its tools join the list.
+Add any Model Context Protocol server and its tools join the list — in the
+browser, the terminal, on your phone and over the API. Install one from the
+official MCP Registry on the admin page (**Admin → MCP → Add a server**), or:
 
-```toml
-[mcp]
-enabled = true
-
-[mcp.servers.files]
-command = "npx"
-args    = ["-y", "@modelcontextprotocol/server-filesystem", "~/notes"]
+```bash
+ozgent mcp search github
+ozgent mcp install io.github.YawLabs/fetch-mcp
+ozgent mcp add files --npm @modelcontextprotocol/server-filesystem -- ~/notes
 ```
 
-Every MCP tool asks before running, because a server's own "this is read-only"
-claim is written by the thing that wants to be run.
+A server you add runs in ozgent's sandbox: a home of its own, only the folders
+you give it, none of your credentials, and ozgent's own keys stay out of its
+environment. You see the exact command before anything is saved. Switch
+servers and single tools on and off on the admin page, or `/mcp` in the
+terminal.
+
+Add as many as you like. Past about 4,000 tokens of descriptions, a server's
+tools are no longer described up front: the model gets a directory of them,
+and each message brings the few it is most likely about in full. Measured
+with 2,792 tools from 308 servers, one short message took 5,143 tokens of
+context.
+
+Every MCP tool asks before running unless you allow it, because a server's own
+"this is read-only" claim is written by the thing that wants to be run.
 → [docs/mcp.md](docs/mcp.md)
 
 ### Chat from your phone

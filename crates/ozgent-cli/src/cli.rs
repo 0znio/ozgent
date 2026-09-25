@@ -349,12 +349,16 @@ pub enum Command {
         command: ToolsCommand,
     },
 
-    /// Show the Model Context Protocol servers and what they offer.
+    /// MCP servers: show them, or add, install, switch and remove them.
     ///
-    /// Connects to each one exactly as a chat would, so what it prints is what
-    /// the model will actually be given — including the servers that failed,
-    /// and why.
-    Mcp,
+    /// On its own, connects to each one exactly as a chat would, so what it
+    /// prints is what the model will actually be given — including the
+    /// servers that failed, and why. A running daemon picks up changes made
+    /// here within seconds.
+    Mcp {
+        #[command(subcommand)]
+        command: Option<McpCommand>,
+    },
 
     /// Read or change configuration.
     Config {
@@ -410,6 +414,123 @@ pub enum AgentCommand {
     /// Delete one of your agents. Deleting an edited built-in restores it.
     #[command(alias = "remove", alias = "delete")]
     Rm { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Connect to every server and show what it offers (the default).
+    #[command(alias = "list", alias = "ls")]
+    Status,
+    /// Search the MCP Registry.
+    ///
+    ///   ozgent mcp search github
+    Search {
+        #[arg(num_args = 0..)]
+        query: Vec<String>,
+    },
+    /// Install a server from the MCP Registry, by its registry name.
+    ///
+    ///   ozgent mcp install io.github.example/weather
+    ///   ozgent mcp install io.github.example/files --set arg:0=/home/you/notes
+    ///
+    /// Asks for anything it needs that `--set` did not give, shows the exact
+    /// command, and asks before saving.
+    Install {
+        /// The server's name in the registry, from `ozgent mcp search`.
+        registry_name: String,
+        /// A version other than the latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// What to call it here; its tools are named after it.
+        #[arg(long)]
+        name: Option<String>,
+        /// Which of its ways to run, when it lists several (0 is the first).
+        #[arg(long)]
+        option: Option<usize>,
+        /// A value it asks for, as KEY=VALUE (keys as `ozgent mcp install` lists them).
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[command(flatten)]
+        placement: McpPlacement,
+        /// Do not ask before saving.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Add a server by hand: a command, a URL, or an npm or PyPI package.
+    ///
+    ///   ozgent mcp add files --npm @modelcontextprotocol/server-filesystem -- ~/notes
+    ///   ozgent mcp add time --pypi mcp-server-time
+    ///   ozgent mcp add mine -- /usr/local/bin/my-server --flag
+    ///   ozgent mcp add docs --url https://example.com/mcp --header "Authorization=Bearer …"
+    Add {
+        name: String,
+        #[arg(long, conflicts_with_all = ["pypi", "url"])]
+        npm: Option<String>,
+        #[arg(long, conflicts_with_all = ["npm", "url"])]
+        pypi: Option<String>,
+        #[arg(long, conflicts_with_all = ["npm", "pypi"])]
+        url: Option<String>,
+        /// A package version, with --npm or --pypi.
+        #[arg(long)]
+        version: Option<String>,
+        /// NAME=VALUE for the server's environment.
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+        /// Name=Value, sent with every request to a --url server.
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        header: Vec<String>,
+        #[command(flatten)]
+        placement: McpPlacement,
+        /// The program and its arguments, or the package's arguments.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Add servers from another client's MCP settings, pasted as JSON.
+    ///
+    ///   ozgent mcp import claude_desktop_config.json
+    ///   ozgent mcp import            (then paste, and end with Ctrl-D)
+    ///
+    /// Reads `{"mcpServers": {…}}` (Claude Desktop, Cursor), `{"servers":
+    /// {…}}` (VS Code, comments allowed) or one server's object with --name.
+    Import {
+        /// The file to read; standard input when left out.
+        file: Option<std::path::PathBuf>,
+        /// Name for a single server pasted without one.
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        placement: McpPlacement,
+        /// Do not ask before saving.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Remove a server, and the rules set for its tools.
+    #[command(alias = "rm", alias = "delete")]
+    Remove { name: String },
+    /// Switch one server on.
+    Enable { name: String },
+    /// Switch one server off, keeping its settings.
+    Disable { name: String },
+    /// Use MCP servers at all.
+    On,
+    /// Stop using MCP servers, keeping every setting.
+    Off,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct McpPlacement {
+    /// Run it without ozgent's sandbox (for a program you trust).
+    #[arg(long)]
+    pub no_sandbox: bool,
+    /// Keep a sandboxed server off the network.
+    #[arg(long)]
+    pub no_network: bool,
+    /// A folder a sandboxed server may read and write. Repeatable.
+    #[arg(long = "folder", value_name = "PATH")]
+    pub folders: Vec<std::path::PathBuf>,
+    /// Believe its read-only hints about its own tools.
+    #[arg(long)]
+    pub trust_hints: bool,
 }
 
 #[derive(Debug, Subcommand)]

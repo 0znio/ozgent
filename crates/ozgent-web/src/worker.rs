@@ -239,6 +239,8 @@ pub struct Tools {
     /// source a tool came from, so the handle is held here instead of
     /// downcasting back out of it.
     pub scheduler: Option<Arc<ozgent_schedule::ScheduleTools>>,
+    /// How each configured MCP server fared when these tools started.
+    pub mcp: Arc<Vec<ozgent_mcp::Status>>,
 }
 
 /// The Python tool host, shared so the settings page can replace it.
@@ -264,6 +266,15 @@ struct Context {
     cli: CliOptions,
 }
 
+static TOOL_EMBED: std::sync::OnceLock<Worker> = std::sync::OnceLock::new();
+
+/// A way to embed from inside a turn: the embedding model has a thread of
+/// its own, so a model's thread can ask it and wait. `None` when embeddings
+/// are off or no embedding model is installed.
+pub(crate) fn tool_embedder() -> Option<&'static Worker> {
+    TOOL_EMBED.get().filter(|w| w.embedding_model().is_some())
+}
+
 /// The key embeddings are held under.
 ///
 /// Its own thread rather than a branch inside a chat model's loop: the
@@ -281,10 +292,14 @@ impl Worker {
         permissions: Permissions,
         cli: CliOptions,
     ) -> Self {
-        Self {
+        let worker = Self {
             pool: Arc::new(crate::pool::Pool::default()),
             context: Context { paths, config, tools, permissions, cli },
-        }
+        };
+        // For the tool lookup, which runs on a model's thread and embeds
+        // through the embedding thread; see `tool_embedder`.
+        let _ = TOOL_EMBED.set(worker.clone());
+        worker
     }
 
     /// Queue a generation, loading the model if it is not already resident.
@@ -1425,7 +1440,29 @@ fn permit(
     // touches the file. Saving is best-effort: a config that could not be
     // written must not turn an approval into a refusal.
     let mut policy = config.lock().unwrap_or_else(|e| e.into_inner());
-    if policy.permissions.apply(&call.name, choice) {
+    // "Every tool of this server": the server is the configured one whose
+    // name the tool's begins with — the longest, where one name begins
+    // another. A tool from no server gets the answer for itself alone.
+    let changed = if choice == ozgent_core::Choice::AlwaysServer {
+        let server = policy
+            .mcp
+            .servers
+            .keys()
+            .filter(|s| call.name.starts_with(&format!("{s}_")))
+            .max_by_key(|s| s.len())
+            .cloned();
+        match server {
+            Some(server) => {
+                let key = ozgent_core::permission::Permissions::server_key(&server);
+                let before = policy.permissions.tools.insert(key, ozgent_core::permission::Rule::Allow);
+                before != Some(ozgent_core::permission::Rule::Allow)
+            }
+            None => policy.permissions.apply(&call.name, ozgent_core::Choice::Always),
+        }
+    } else {
+        policy.permissions.apply(&call.name, choice)
+    };
+    if changed {
         let saved = ozgent_core::Paths::discover()
             .map_err(|e| e.to_string())
             .and_then(|p| policy.save(&p).map_err(|e| e.to_string()));
@@ -1503,7 +1540,8 @@ fn turn(
 
     let mut totals = Outcome::default();
     if request.agents.is_empty() {
-        let Some(offered) = offer(tools.as_ref(), request) else { return Ok(()) };
+        let config = snapshot(&permissions.config);
+        let Some(offered) = offer(tools.as_ref(), request, &config) else { return Ok(()) };
         // Caller-supplied tools are additive: a request may use the server's
         // Python tools, its own, or both. A name collision resolves in favour
         // of the server's, because that is the one this process can actually
@@ -1522,18 +1560,47 @@ fn turn(
                 offered.push(spec.clone());
             }
         }
+        // Everything offered stays callable. Past a budget, MCP servers'
+        // tools are described on request instead of up front, behind
+        // `find_tools` — see `toolsearch`. Not when the caller named its
+        // tools: that list is the caller's choice, made already.
+        let callable = offered.clone();
+        let (offered, deferred) = match (tools.as_ref(), &request.native_tools) {
+            (Some(t), None) => {
+                let split = crate::toolsearch::split(offered, t, &config);
+                (split.declared, split.deferred)
+            }
+            _ => (offered, Vec::new()),
+        };
 
         let mut messages = request.messages.clone();
         prepare(&mut messages, &offered, native_tools, projector, &images, observation.as_deref());
         if offered.iter().any(|s| s.name == ozgent_core::agents::HANDOFF_TOOL) {
             append_system(&mut messages, &ozgent_core::agents::handoff_prompt(&request.handoff));
         }
-        if !install(engine, session, &offered, request.response_grammar.as_deref(), request) {
+        // A small model does not search for what it was not shown — measured,
+        // it guessed tool names instead — so ozgent looks them up for it:
+        // the tools that match this message are found before the model
+        // answers, and recorded as a `find_tools` call and its result. That
+        // lands at the end of the conversation, so the cached head is
+        // untouched, and the model reads the full descriptions of exactly
+        // the tools this message is about.
+        if !deferred.is_empty() {
+            if let Some(t) = tools.as_ref() {
+                auto_lookup(t, &config, session, &mut messages, &deferred, native_tools);
+            }
+        }
+
+        // The gate's grammar is not part of the prompt, so it takes every
+        // callable tool: a tool found with `find_tools` must be writable.
+        let mut gated = callable.clone();
+        gated.extend(offered.iter().filter(|s| s.name == crate::toolsearch::FIND_TOOLS).cloned());
+        if !install(engine, session, &gated, request.response_grammar.as_deref(), request) {
             return Ok(());
         }
         totals = rounds(
             engine, session, resolved, thinking, tools.as_ref(), permissions, projector, &images,
-            request, messages, &offered, &client_owned, MAX_TOOL_ROUNDS, None,
+            request, messages, &offered, &gated, &deferred, &client_owned, MAX_TOOL_ROUNDS, None,
         )?;
 
         // The model passed the request to an agent: it answers from here,
@@ -1601,8 +1668,9 @@ fn run_agents(
     // What each agent may be shown. A channel's allowlist narrows agents
     // too: consent arriving over a chat is consent from whoever holds that
     // account, and an agent is not a way round the list.
+    let config = snapshot(&permissions.config);
     let available: Vec<ozgent_core::ToolSpec> = tools
-        .map(|t| t.host.tools().to_vec())
+        .map(|t| t.host.tools().iter().filter(|s| !switched_off(t, &config, &s.name)).cloned().collect::<Vec<_>>())
         .unwrap_or_default()
         .into_iter()
         .filter(|s| request.native_tools.as_ref().is_none_or(|list| list.contains(&s.name)))
@@ -1667,6 +1735,8 @@ fn run_agents(
             request,
             messages,
             &offered,
+            &offered,
+            &[],
             &Default::default(),
             agent.definition.rounds(),
             Some(agent),
@@ -1725,8 +1795,15 @@ fn prewarm(
     } else {
         Vec::new()
     };
-    let mut specs = t.host.tools().to_vec();
+    // The list a turn would describe up front: without the tools switched
+    // off in Settings, and with the tools loaded on request behind
+    // `find_tools` — as `offer` and `toolsearch::split` make it. Built from
+    // everything the host has, the held prefix matched no real turn once
+    // either of those applied, and every conversation read its start cold.
+    let mut specs: Vec<ozgent_core::ToolSpec> =
+        t.host.tools().iter().filter(|s| !switched_off(&t, config, &s.name)).cloned().collect();
     specs.extend(ozgent_core::agents::handoff_spec(&handoff));
+    let specs = crate::toolsearch::split(specs, &t, config).declared;
     if specs.is_empty() && system.is_none() {
         return;
     }
@@ -1753,15 +1830,32 @@ fn prewarm(
     }
 }
 
-fn offer(tools: Option<&Tools>, request: &Request) -> Option<Vec<ozgent_core::ToolSpec>> {
+/// The tools switched off in Settings: single tools by name, and every tool
+/// of an MCP server switched off for the chats.
+///
+/// ozgent's own Python tools are also kept out by not being loaded, but a
+/// server's tools are always loaded — so without this, unticking one in
+/// Settings hid it from the lists and still offered it to the model.
+pub(crate) fn switched_off(t: &Tools, config: &Config, name: &str) -> bool {
+    config.tools.disabled.iter().any(|d| d == name)
+        || (!config.tools.mcp_off.is_empty()
+            && t.host
+                .source_of(name)
+                .and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
+                .is_some_and(|server| config.tools.mcp_off.contains(&server)))
+}
+
+fn offer(tools: Option<&Tools>, request: &Request, config: &Config) -> Option<Vec<ozgent_core::ToolSpec>> {
     let Some(t) = tools.filter(|_| request.tools_enabled) else { return Some(Vec::new()) };
+    let usable: Vec<&ozgent_core::ToolSpec> =
+        t.host.tools().iter().filter(|s| !switched_off(t, config, &s.name)).collect();
     let mut out: Vec<ozgent_core::ToolSpec> = match &request.native_tools {
-        None => t.host.tools().to_vec(),
+        None => usable.iter().map(|s| (*s).clone()).collect(),
         Some(allowed) => {
             // A name that matches nothing is a caller mistake worth reporting:
             // silently dropping it would leave them believing a tool is
             // available when the model was never told about it.
-            let available: Vec<&str> = t.host.tools().iter().map(|s| s.name.as_str()).collect();
+            let available: Vec<&str> = usable.iter().map(|s| s.name.as_str()).collect();
             if let Some(unknown) = allowed.iter().find(|a| !available.iter().any(|n| n == &a.as_str())) {
                 let _ = request.out.send(Event::Error {
                     message: format!(
@@ -1771,7 +1865,7 @@ fn offer(tools: Option<&Tools>, request: &Request) -> Option<Vec<ozgent_core::To
                 });
                 return None;
             }
-            t.host.tools().iter().filter(|s| allowed.iter().any(|a| a == &s.name)).cloned().collect()
+            usable.iter().filter(|s| allowed.iter().any(|a| a == &s.name)).map(|s| (*s).clone()).collect()
         }
     };
     out.retain(|s| !request.tools_off.contains(&s.name));
@@ -1961,6 +2055,8 @@ fn rounds(
     request: &Request,
     mut messages: Vec<Message>,
     offered: &[ozgent_core::ToolSpec],
+    callable: &[ozgent_core::ToolSpec],
+    deferred: &[ozgent_core::ToolSpec],
     client_owned: &std::collections::HashSet<String>,
     max_rounds: usize,
     agent: Option<&ozgent_core::Agent>,
@@ -1974,7 +2070,9 @@ fn rounds(
     // Ids are prefixed per agent: two agents in one message each number from
     // zero, and the transcript pairs results with cards by id.
     let id_prefix = agent.map(|a| format!("{}_", a.name)).unwrap_or_default();
-    let offered_names: Vec<String> = offered.iter().map(|s| s.name.clone()).collect();
+    // Described up front is `offered`; callable is that and whatever is
+    // described on request. A call is checked against the second.
+    let offered_names: Vec<String> = callable.iter().map(|s| s.name.clone()).collect();
 
     for round in 0..=max_rounds {
         out.rounds = round + 1;
@@ -1999,7 +2097,7 @@ fn rounds(
         // them out changes the system block, and the whole conversation would
         // be read again from the top. The instruction to answer does the job.
         let (reply, stats, reason, early) = generate(
-            engine, session, resolved, thinking, &messages, media, request, offered, permissions, agent,
+            engine, session, resolved, thinking, &messages, media, request, offered, callable, permissions, agent,
         )?;
         // A turn can span several generations; the client is told once, at the
         // end, with the totals. Sending `Done` per round ended the SSE stream
@@ -2014,6 +2112,21 @@ fn rounds(
         out.stop = reason;
 
         let mut parsed = ozgent_llama::extract_tool_calls(&reply);
+        // A call refused while it was being written stopped generation
+        // part-way, so there is no whole call to parse. It still happened:
+        // left out, the turn ended with neither a card nor an answer, and the
+        // model never learned why. Recorded, it is refused like any other.
+        if let Some((name, false)) = &early {
+            if !name.is_empty() && !parsed.calls.iter().any(|c| &c.name == name) {
+                let arguments = ozgent_llama::toolcall::pending_arguments(&reply);
+                parsed.text = ozgent_llama::toolcall::text_before_call(&parsed.text);
+                parsed.calls.push(ozgent_core::ToolCall {
+                    id: String::new(),
+                    name: name.clone(),
+                    arguments: serde_json::Value::Object(arguments),
+                });
+            }
+        }
         // The parser numbers calls from zero each time it runs, so round two
         // reissues `call_0`. Within a turn that has to be unique: it is how a
         // client pairs a result with the card that asked for it, and how the
@@ -2046,7 +2159,7 @@ fn rounds(
             tracing::info!("the model called a tool on its last round; asking again without tools");
             session.forbid_tool_calls(true);
             let retried = generate(
-                engine, session, resolved, thinking, &messages, None, request, &[], permissions, agent,
+                engine, session, resolved, thinking, &messages, None, request, &[], &[], permissions, agent,
             );
             session.forbid_tool_calls(false);
             let (reply, stats, reason, _) = retried?;
@@ -2108,6 +2221,99 @@ fn rounds(
                         continue;
                     }
                 }
+            }
+        }
+
+        // A lookup is answered here, by no host: it returns the full
+        // descriptions of the tools found, at the end of the conversation,
+        // and those can be called from the next round on.
+        if !deferred.is_empty() && parsed.calls.iter().any(|c| c.name == crate::toolsearch::FIND_TOOLS) {
+            let server_of = |n: &str| {
+                tools.and_then(|t| t.host.source_of(n)).and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
+            };
+            for call in parsed.calls.iter().filter(|c| c.name == crate::toolsearch::FIND_TOOLS) {
+                let query = call.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let server = call.arguments.get("server").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+                let found = crate::toolsearch::search(deferred, server_of, query, server);
+                tracing::info!(
+                    "find_tools {query:?}: {}",
+                    found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                );
+                let _ = request.out.send(Event::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+                out.calls += 1;
+                record(request, session, &mut messages, call, Ok(crate::toolsearch::answer(&found, &[], query)), 0);
+            }
+            parsed.calls.retain(|c| c.name != crate::toolsearch::FIND_TOOLS);
+            if parsed.calls.is_empty() {
+                continue;
+            }
+        }
+
+        // A call to a name that is no tool at all, when tools are described
+        // on request: the model guessed at one it was not shown. The guess —
+        // its name and arguments — is a good search, better than what people
+        // type (MCP-Zero's finding), so it is answered with the closest real
+        // tools in full rather than with the list of every name, which past a
+        // few hundred tools is longer than the conversation. Nothing runs.
+        if !deferred.is_empty() {
+            let mut kept = Vec::new();
+            for call in std::mem::take(&mut parsed.calls) {
+                if offered_names.contains(&call.name) || client_owned.contains(&call.name) {
+                    kept.push(call);
+                    continue;
+                }
+                let server_of = |n: &str| {
+                    tools.and_then(|t| t.host.source_of(n)).and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
+                };
+                let query = crate::toolsearch::guess_as_query(&call.name, &call.arguments);
+                let mut found = crate::toolsearch::search(callable, server_of, &query, None);
+                found.truncate(3);
+                tracing::info!(
+                    "no tool {:?}; closest: {}",
+                    call.name,
+                    found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                );
+                let _ = request.out.send(Event::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+                let reason = crate::toolsearch::not_a_tool(&found);
+                let err = ozgent_tools::ToolCallError::Invalid { name: call.name.clone(), reason };
+                record(request, session, &mut messages, &call, Err(err), 0);
+            }
+            parsed.calls = kept;
+            if parsed.calls.is_empty() {
+                continue;
+            }
+        }
+
+        // A tool described on request, called without parameters it needs:
+        // it has perhaps not seen them yet. Answered with its full
+        // description instead of calling it, so the next round gets it right.
+        if !deferred.is_empty() {
+            let mut kept = Vec::new();
+            for call in std::mem::take(&mut parsed.calls) {
+                let spec = deferred.iter().find(|s| s.name == call.name);
+                match spec.and_then(|s| crate::toolsearch::missing_parameters(s, &call.arguments)) {
+                    Some(answer) => {
+                        let _ = request.out.send(Event::ToolCall {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        });
+                        record(request, session, &mut messages, &call, Ok(answer), 0);
+                    }
+                    None => kept.push(call),
+                }
+            }
+            parsed.calls = kept;
+            if parsed.calls.is_empty() {
+                continue;
             }
         }
 
@@ -2239,6 +2445,56 @@ fn rounds(
 }
 
 /// Report one call's result to the client and hand it back to the model.
+/// Find the deferred tools the latest user message is about, and record the
+/// lookup as the model's own `find_tools` call with its result.
+fn auto_lookup(
+    t: &Tools,
+    config: &Config,
+    session: &ozgent_llama::engine::Session<'_>,
+    messages: &mut Vec<Message>,
+    deferred: &[ozgent_core::ToolSpec],
+    native_tools: bool,
+) {
+    let Some(latest) = messages.iter().rev().find(|m| m.role == ozgent_core::Role::User).map(|m| m.text_content()) else {
+        return;
+    };
+    let server_of = |n: &str| t.host.source_of(n).and_then(|o| o.strip_prefix("mcp:").map(str::to_string));
+    let about = |server: &str| {
+        let s = config.mcp.servers.get(server);
+        format!(
+            "{server} {} {}",
+            s.and_then(|s| s.description.clone()).unwrap_or_default(),
+            s.and_then(|s| s.source.clone()).unwrap_or_default()
+        )
+    };
+    let started = std::time::Instant::now();
+    let found = crate::toolsearch::lookup(deferred, server_of, about, &latest);
+    tracing::info!("tool lookup took {} ms", started.elapsed().as_millis());
+    if found.full.is_empty() {
+        return;
+    }
+    let query: String = latest.chars().take(200).collect();
+    let call = ozgent_core::ToolCall {
+        id: "lookup_0".into(),
+        name: crate::toolsearch::FIND_TOOLS.into(),
+        arguments: serde_json::json!({ "query": query }),
+    };
+    messages.push(if native_tools {
+        Message {
+            role: ozgent_core::Role::Assistant,
+            content: vec![ozgent_core::Part::Text { text: String::new() }],
+            thinking: None,
+            tool_calls: vec![call.clone()],
+            tool_call_id: None,
+        }
+    } else {
+        Message::assistant(format!("<tool_call>{{\"name\": \"{}\", \"arguments\": {}}}</tool_call>", call.name, call.arguments))
+    });
+    // Not shown as a card: it is ozgent preparing the prompt, made for every
+    // message, not something the model chose to do.
+    feed(session, messages, &call, Ok(crate::toolsearch::answer(&found.full, &found.related, &query)));
+}
+
 fn record(
     request: &Request,
     session: &ozgent_llama::engine::Session<'_>,
@@ -2641,6 +2897,7 @@ fn generate(
     media: Option<(&LoadedProjector<'_>, &[ozgent_llama::mtmd::Media], &[ozgent_core::ImageSource])>,
     request: &Request,
     tools: &[ozgent_core::ToolSpec],
+    callable: &[ozgent_core::ToolSpec],
     permissions: &Permissions,
     agent: Option<&ozgent_core::Agent>,
 ) -> anyhow::Result<(String, ozgent_llama::engine::Stats, StopReason, Option<(String, bool)>)> {
@@ -2736,7 +2993,7 @@ fn generate(
                     name: name.clone(),
                     arguments: serde_json::Value::Object(arguments),
                 };
-                let spec = tools.iter().find(|t| t.name == name);
+                let spec = callable.iter().find(|t| t.name == name);
                 // A call to something this run was not offered is not asked
                 // about: there is nothing to allow. Generation stops, and the
                 // round reports it as unavailable.

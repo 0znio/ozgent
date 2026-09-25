@@ -148,6 +148,12 @@ pub struct Permissions {
     ///
     /// This is what "don't ask again" writes, and what the settings page and
     /// `/permissions` edit. One place, three front ends.
+    ///
+    /// A name ending in `*` covers every tool it begins: `github_*` is every
+    /// tool of the `github` MCP server, whose tools are always named
+    /// `github_<tool>`. A tool's own entry beats one of these, and the longest
+    /// of these beats a shorter one — so `github_* = "allow"` with
+    /// `github_delete_repo = "ask"` asks about exactly the one.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, Rule>,
 }
@@ -193,6 +199,11 @@ pub enum Choice {
     Session,
     /// Run it, and write `allow` into the config so it never asks again.
     Always,
+    /// Run it, and write `allow` for every tool of the MCP server it comes
+    /// from. Only offered for such a tool; the caller knows the server and
+    /// writes [`Permissions::server_key`], since the name alone cannot say
+    /// where a server's name ends.
+    AlwaysServer,
     /// Refuse this call.
     Deny,
     /// Refuse, and write `deny` into the config.
@@ -201,7 +212,7 @@ pub enum Choice {
 
 impl Choice {
     pub fn is_allow(self) -> bool {
-        matches!(self, Self::Once | Self::Session | Self::Always)
+        matches!(self, Self::Once | Self::Session | Self::Always | Self::AlwaysServer)
     }
 }
 
@@ -243,7 +254,7 @@ impl Grants {
                 self.denied.remove(tool);
                 self.allowed.insert(tool.to_string());
             }
-            Choice::Once | Choice::Deny | Choice::Always | Choice::DenyAlways => {}
+            Choice::Once | Choice::Deny | Choice::Always | Choice::AlwaysServer | Choice::DenyAlways => {}
         }
     }
 }
@@ -251,8 +262,8 @@ impl Grants {
 impl Permissions {
     /// The standing rule for a tool, ignoring anything decided this session.
     pub fn rule_for(&self, tool: &str, effect: Effect) -> Rule {
-        if let Some(rule) = self.tools.get(tool) {
-            return *rule;
+        if let Some(rule) = self.named(tool) {
+            return rule;
         }
         match effect {
             Effect::Read => self.read,
@@ -262,9 +273,29 @@ impl Permissions {
         }
     }
 
-    /// Whether the rule for a tool was set by name rather than inherited.
+    /// Whether the rule for a tool was set by name — its own, or its
+    /// server's — rather than inherited from its effect.
     pub fn is_overridden(&self, tool: &str) -> bool {
-        self.tools.contains_key(tool)
+        self.named(tool).is_some()
+    }
+
+    /// The rule a person set for this tool: its own entry, else the longest
+    /// `prefix*` entry that covers it.
+    fn named(&self, tool: &str) -> Option<Rule> {
+        if let Some(rule) = self.tools.get(tool) {
+            return Some(*rule);
+        }
+        self.tools
+            .iter()
+            .filter_map(|(key, rule)| key.strip_suffix('*').map(|prefix| (prefix, rule)))
+            .filter(|(prefix, _)| !prefix.is_empty() && tool.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, rule)| *rule)
+    }
+
+    /// The `[permissions.tools]` key covering every tool of an MCP server.
+    pub fn server_key(server: &str) -> String {
+        format!("{server}_*")
     }
 
     /// What to do about one call, given what has already been answered.
@@ -294,7 +325,8 @@ impl Permissions {
             Choice::DenyAlways => {
                 self.tools.insert(tool.to_string(), Rule::Deny) != Some(Rule::Deny)
             }
-            Choice::Once | Choice::Session | Choice::Deny => false,
+            // Written by the caller, which knows the server.
+            Choice::Once | Choice::Session | Choice::Deny | Choice::AlwaysServer => false,
         }
     }
 
@@ -346,6 +378,34 @@ pub fn refusal(tool: &str) -> String {
         "The user declined to run {tool}. Do not try it again in this turn; \
          say what you were about to do and ask how they would like to proceed."
     )
+}
+
+#[cfg(test)]
+mod server_rules {
+    use super::*;
+
+    #[test]
+    fn a_server_rule_covers_its_tools_and_a_tool_rule_beats_it() {
+        let mut p = Permissions::default();
+        p.tools.insert(Permissions::server_key("camofox"), Rule::Allow);
+        p.tools.insert("camofox_delete_all".into(), Rule::Ask);
+        p.tools.insert(Permissions::server_key("camofox_admin"), Rule::Deny);
+        let g = Grants::default();
+        assert_eq!(p.verdict("camofox_create_tab", Effect::Unknown, &g), Verdict::Allow { by_user: true });
+        assert_eq!(p.verdict("camofox_delete_all", Effect::Unknown, &g), Verdict::Ask);
+        assert_eq!(p.verdict("camofox_admin_reset", Effect::Unknown, &g), Verdict::Deny, "the longer prefix wins");
+        assert_eq!(p.verdict("camo_other", Effect::Unknown, &g), Verdict::Ask, "a prefix is not a substring");
+        assert_eq!(p.verdict("files_read", Effect::Read, &g), Verdict::Allow { by_user: false });
+        assert!(p.is_overridden("camofox_scroll"));
+        assert!(!p.is_overridden("files_read"));
+    }
+
+    #[test]
+    fn a_bare_star_is_not_a_rule_for_everything() {
+        let mut p = Permissions::default();
+        p.tools.insert("*".into(), Rule::Allow);
+        assert_eq!(p.verdict("run_command", Effect::Execute, &Grants::default()), Verdict::Ask);
+    }
 }
 
 #[cfg(test)]

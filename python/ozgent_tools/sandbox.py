@@ -3,6 +3,7 @@
 Invoked as a separate interpreter, never imported by the worker to fork from:
 
     python -S -E sandbox.py '<json policy>' -- program arg...
+    OZGENT_SANDBOX_POLICY='<json policy>' python -S -E sandbox.py - -- program arg...
 
 Starting fresh matters. Applying a sandbox between ``fork`` and ``exec``
 (``preexec_fn``) in the worker, which has threads, can deadlock on a lock some
@@ -347,6 +348,50 @@ def remount_proc() -> bool:
     return _libc.mount(b"proc", b"/proc", b"proc", ctypes.c_ulong(MS_NOSUID | MS_NODEV | MS_NOEXEC), None) == 0
 
 
+def private_shm() -> bool:
+    """A /dev/shm of its own: an empty tmpfs, capped, seen by nobody else.
+
+    POSIX shared memory lives there, and plenty of programs need it —
+    Chromium, and Python's multiprocessing. The real /dev/shm is shared by
+    every process on the machine, so it is not granted; this one can be.
+    Needs the mount namespace; False where there is none.
+    """
+    if not os.path.isdir("/dev/shm"):
+        return False
+    return _libc.mount(b"tmpfs", b"/dev/shm", b"tmpfs",
+                       ctypes.c_ulong(MS_NOSUID | MS_NODEV), b"size=512m,mode=1777") == 0
+
+
+def _within(path: str, parent: str) -> bool:
+    path, parent = os.path.realpath(path), os.path.realpath(parent)
+    return path == parent or path.startswith(parent.rstrip("/") + "/")
+
+
+def hide_private(policy: dict) -> None:
+    """Cover `policy["hide"]` with empty private mounts, and give the program
+    a /tmp of its own when `policy["private_tmp"]` asks for one.
+
+    A place the program was given — its home, a folder, where it runs — is
+    never covered, even when it sits inside one of these (a test's temporary
+    directory under /tmp, say).
+    """
+    given = list(policy.get("write", [])) + [policy.get("cwd", "/")]
+    targets = list(policy.get("hide", []))
+    if policy.get("private_tmp"):
+        targets.append("/tmp")
+    for path in targets:
+        if not os.path.isdir(path) or any(_within(g, path) for g in given if g):
+            continue
+        mode = b"size=512m,mode=1777" if path == "/tmp" else b"size=16m,mode=0755"
+        if _libc.mount(b"tmpfs", path.encode(), b"tmpfs", ctypes.c_ulong(MS_NOSUID | MS_NODEV), mode) != 0:
+            continue
+        if path == "/tmp":
+            # Short, private, and the program's to use: TMPDIR, and
+            # writable (Landlock rules are added after this).
+            policy.setdefault("write", []).append("/tmp")
+            policy.setdefault("env", {})["TMPDIR"] = "/tmp"
+
+
 def private_proc_available() -> bool:
     """Whether a command here would get a /proc of its own: namespaces, and a
     mount inside them. Forks, so call it from a fresh process."""
@@ -373,7 +418,13 @@ def main() -> int:
     except ValueError:
         print("usage: sandbox.py POLICY -- PROGRAM ARGS...", file=sys.stderr)
         return 126
-    policy = json.loads(sys.argv[1])
+    # "-" reads the policy from the environment instead of the arguments: an
+    # MCP server's policy carries its API keys, and anyone on the machine can
+    # read another process's arguments.
+    if sys.argv[1] == "-":
+        policy = json.loads(os.environ.pop("OZGENT_SANDBOX_POLICY", "{}"))
+    else:
+        policy = json.loads(sys.argv[1])
     argv = sys.argv[sep + 1 :]
     if not argv:
         return 126
@@ -401,7 +452,20 @@ def main() -> int:
             _prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
         except OSError:
             pass
-        remount_proc()
+        # A /proc of its own is also writable by the program: browsers and
+        # Electron apps build their own sandbox inside this one — a nested
+        # user namespace, which means writing /proc/self/uid_map — and
+        # without that their processes crashed on start (Firefox, and so
+        # Camoufox) or had to be told `--no-sandbox` (Chromium). Only the
+        # private /proc: it shows this sandbox's processes alone, and what
+        # the rest of the system keeps there is not reachable from it.
+        if remount_proc():
+            policy.setdefault("write", []).append("/proc")
+        # Before Landlock, which forbids mounting; and granted only when it
+        # is the private one.
+        if private_shm():
+            policy.setdefault("write", []).append("/dev/shm")
+        hide_private(policy)
 
     try:
         limits(policy)

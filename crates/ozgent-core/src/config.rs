@@ -198,6 +198,13 @@ pub struct ToolsConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
 
+    /// MCP servers switched off for the chats, by name: the admin runs them,
+    /// and whoever chats chooses not to use them — as `disabled` does for a
+    /// single tool. Set from the chat page's Settings and the terminal's
+    /// `/mcp off <server>`; the servers themselves keep running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp_off: Vec<String>,
+
     /// Let the model hand a request to an `@agent` by itself, through the
     /// `ask_agent` tool, when the request is squarely that agent's job.
     pub handoff: bool,
@@ -216,6 +223,7 @@ impl Default for ToolsConfig {
             timeout_seconds: 30,
             max_calls_per_turn: 8,
             disabled: Vec::new(),
+            mcp_off: Vec::new(),
             handoff: true,
             config: BTreeMap::new(),
         }

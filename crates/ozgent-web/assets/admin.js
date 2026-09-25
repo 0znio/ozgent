@@ -110,14 +110,15 @@ $("signout").addEventListener("click", async () => {
 
 // ------------------------------------------------------------------ views
 
-let timers = { gateway: null, jobs: null };
+let timers = { gateway: null, jobs: null, mcp: null };
 function stopPolling() {
   clearTimeout(timers.gateway);
   clearTimeout(timers.jobs);
+  clearTimeout(timers.mcp);
 }
 
 function openView(name) {
-  if (!["gateway", "models", "security", "account"].includes(name)) name = "gateway";
+  if (!["gateway", "models", "mcp", "security", "account"].includes(name)) name = "gateway";
   for (const t of document.querySelectorAll(".adm-nav .tab")) {
     t.setAttribute("aria-selected", String(t.dataset.view === name));
   }
@@ -127,6 +128,7 @@ function openView(name) {
   if (name === "gateway") pollGateway();
   if (name === "models") { openModels(); openEmbedding(); openServer(); }
   if (name === "security") openSecurity();
+  if (name === "mcp") loadMcp();
 }
 
 for (const t of document.querySelectorAll(".adm-nav .tab")) {
@@ -1247,3 +1249,728 @@ $("srv-form").addEventListener("submit", async (ev) => {
     note.textContent = err.message;
   }
 });
+
+// ================================================================== mcp
+//
+// MCP servers: programs and services that give the model more tools. The
+// page never says what to run: a registry install names the entry and the
+// server looks it up again; every add is reviewed (the exact command, from
+// the server) before it can be saved. Secret values never come back here.
+
+const mcp = {
+  data: null,
+  /// Cards with unsaved edits are not re-rendered under the cursor.
+  dirty: new Set(),
+  way: "registry",
+  manualKind: "command",
+  picked: null,
+  next: null,
+};
+
+const MCP_STATE = {
+  connected: ["connected", "good"],
+  failed: ["failed", "bad"],
+  disabled: ["switched off", ""],
+  off: ["off", ""],
+};
+
+const RULE_TEXT = { allow: "runs without asking", ask: "asks first", deny: "never runs" };
+
+async function loadMcp() {
+  clearTimeout(timers.mcp);
+  try {
+    mcp.data = await api("/api/admin/mcp");
+    renderMcp();
+  } catch (e) {
+    if (e.message !== "signed out") mcpDetail(e.message, "bad");
+  }
+  const d = mcp.data;
+  const waiting = d && (d.reconnecting ||
+    (d.enabled && d.tools_enabled && d.servers.some((s) => s.enabled && !s.status && !s.invalid)));
+  if (waiting && !$("view-mcp").hidden) timers.mcp = setTimeout(loadMcp, 1500);
+}
+
+function mcpDetail(text, tone) {
+  const box = $("mcp-detail");
+  box.hidden = !text;
+  box.textContent = text ?? "";
+  box.className = `adm-detail ${tone ?? ""}`;
+}
+
+function renderMcp() {
+  const d = mcp.data;
+  $("mcp-enabled").checked = d.enabled;
+  const pill = $("mcp-pill");
+  const connected = d.servers.filter((s) => s.status?.state === "connected").length;
+  const failed = d.servers.filter((s) => s.status?.state === "failed" || s.invalid).length;
+  if (!d.tools_enabled) { pill.textContent = "tools off"; pill.className = "adm-pill"; }
+  else if (!d.enabled) { pill.textContent = "off"; pill.className = "adm-pill"; }
+  else if (d.reconnecting) { pill.textContent = "connecting"; pill.className = "adm-pill live"; }
+  else if (failed) { pill.textContent = `${connected} connected · ${failed} failed`; pill.className = "adm-pill bad"; }
+  else { pill.textContent = `${connected} connected`; pill.className = `adm-pill ${connected ? "good" : ""}`; }
+
+  mcpDetail(!d.tools_enabled
+    ? "Tools are switched off in the chat page's Settings, so no server runs until they are on."
+    : "", "");
+  const r = d.runtimes;
+  const have = ["npx", "uvx", "docker"].filter((k) => r[k]);
+  const lack = ["npx", "uvx", "docker"].filter((k) => !r[k]);
+  $("mcp-runtimes").textContent =
+    (have.length ? `Can run ${have.join(", ")} packages.` : "Neither npx nor uvx is installed.") +
+    (lack.length ? ` Not installed: ${lack.join(", ")}.` : "") +
+    (r.sandbox ? "" : " The sandbox is unavailable: ozgent's Python runtime was not found.");
+
+  const box = $("mcp-servers");
+  const existing = new Map([...box.children].filter((c) => c.dataset.name).map((c) => [c.dataset.name, c]));
+  const cards = [];
+  for (const server of d.servers) {
+    const old = existing.get(server.name);
+    if (old && mcp.dirty.has(server.name)) {
+      setServerPill(old.querySelector("[data-role=pill]"), server, d);
+      cards.push(old);
+    } else {
+      cards.push(serverCard(server, d));
+    }
+  }
+  if (!cards.length) {
+    const empty = el("div", "adm-card mcp-empty",
+      "No servers yet. Add one from the MCP Registry, as an npm or PyPI package, or as a command or URL.");
+    cards.push(empty);
+  }
+  box.replaceChildren(...cards);
+}
+
+function setServerPill(pill, s, d) {
+  let label, tone = "";
+  if (s.invalid) { label = "misconfigured"; tone = "bad"; }
+  else if (!d.tools_enabled || !d.enabled) { label = "off"; }
+  else if (!s.enabled) { label = "switched off"; }
+  else if (!s.status) { label = "connecting"; tone = "live"; }
+  else {
+    [label, tone] = MCP_STATE[s.status.state] ?? [s.status.state, ""];
+    if (s.status.state === "connected") {
+      const offered = s.tools.filter((t) => t.offered).length;
+      label = `connected · ${offered} tool${offered === 1 ? "" : "s"}`;
+    }
+  }
+  pill.textContent = label;
+  pill.className = `adm-pill ${tone}`;
+}
+
+function row(label, ...body) {
+  const r = el("div", "adm-row");
+  r.append(el("div", "adm-row-label", label));
+  const b = el("div", "adm-row-body");
+  b.append(...body);
+  r.append(b);
+  return r;
+}
+
+function toggle(checked, text) {
+  const label = el("label", "adm-check");
+  const sw = el("span", "switch");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = checked;
+  sw.append(input, el("span", "track"));
+  const t = el("span");
+  t.innerHTML = text;
+  label.append(sw, t);
+  return [label, input];
+}
+
+function serverCard(s, d) {
+  const card = el("article", "adm-card adm-channel mcp-card");
+  card.dataset.name = s.name;
+  const markDirty = () => { mcp.dirty.add(s.name); save.disabled = false; note.textContent = ""; };
+
+  // ---- head
+  const head = el("header", "adm-ch-head");
+  head.append(el("h2", null, s.name));
+  const pill = el("span", "adm-pill");
+  pill.dataset.role = "pill";
+  setServerPill(pill, s, d);
+  head.append(pill);
+  if (s.sandbox) head.append(el("span", "adm-pill sandboxed", "sandboxed"));
+  head.append(el("span", "spacer"));
+  const sw = el("label", "switch");
+  sw.dataset.tip = s.enabled ? "Switch this server off" : "Switch this server on";
+  const on = document.createElement("input");
+  on.type = "checkbox";
+  on.checked = s.enabled;
+  on.setAttribute("aria-label", `Use ${s.name}`);
+  on.addEventListener("change", async () => {
+    try { await api(`/api/admin/mcp/servers/${encodeURIComponent(s.name)}`, { method: "PATCH", body: JSON.stringify({ enabled: on.checked }) }); }
+    catch (e) { on.checked = !on.checked; mcpDetail(e.message, "bad"); }
+    loadMcp();
+  });
+  sw.append(on, el("span", "track"));
+  head.append(sw);
+  card.append(head);
+
+  if (s.description) card.append(el("p", "adm-detail", s.description));
+  if (s.used === false) {
+    card.append(el("p", "adm-detail",
+      "Running, but left out of the chats: it is unticked in the chat page's Settings → Tools."));
+  }
+  const problem = s.invalid ?? s.status?.error;
+  if (problem) {
+    const p = el("p", "adm-detail bad", problem);
+    card.append(p);
+    if (s.sandbox && s.status?.state === "failed") {
+      card.append(el("p", "adm-detail",
+        "It runs in the sandbox, which keeps your home folder, other programs' temporary files and your session " +
+        "out of its reach. If it needs a folder of yours, add it under Sandbox below. To check whether the sandbox " +
+        "is the cause at all, switch it off, save, and see if it connects."));
+    }
+  }
+
+  // ---- what runs
+  const run = el("div", "mcp-run", s.transport === "http" ? s.url : [s.command, ...s.args].join(" "));
+  const runBody = [run];
+  if (s.source) runBody.push(el("span", "mcp-source", s.source));
+  if (s.status?.server) runBody.push(el("span", "mcp-source", `reports itself as ${s.status.server}`));
+  if (s.status?.log?.length) {
+    const log = el("details", "mcp-log");
+    log.append(el("summary", null, `Its last ${s.status.log.length} lines of output`));
+    log.append(el("pre", null, s.status.log.join("\n")));
+    if (s.status.state === "failed") log.open = true;
+    runBody.push(log);
+  }
+  card.append(row(s.transport === "http" ? "Connects to" : "Runs", ...runBody));
+
+  // ---- tools
+  const toolsBox = el("div", "mcp-tools");
+  const toolInputs = [];
+  for (const t of s.tools) {
+    const r = el("div", `mcp-tool${t.offered ? "" : " off"}`);
+    const pick = document.createElement("input");
+    pick.type = "checkbox";
+    pick.checked = t.offered;
+    pick.setAttribute("aria-label", `Offer ${t.name}`);
+    const name = el("span", "mcp-tool-name", t.name);
+    name.append(el("span", "mcp-tool-effect", t.effect));
+    const rule = document.createElement("select");
+    rule.className = "select";
+    rule.setAttribute("aria-label", `When the model calls ${t.name}`);
+    const def = document.createElement("option");
+    def.value = "";
+    def.textContent = t.own_rule ? "default rule"
+      : `${s.server_rule ? "server's rule" : "default"}: ${RULE_TEXT[t.rule] ?? t.rule}`;
+    rule.append(def);
+    for (const [v, text] of Object.entries(RULE_TEXT)) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = text;
+      rule.append(o);
+    }
+    rule.value = t.own_rule ?? "";
+    pick.addEventListener("change", () => { r.classList.toggle("off", !pick.checked); markDirty(); });
+    rule.addEventListener("change", markDirty);
+    r.append(pick, name, rule);
+    if (t.description) {
+      const d = el("span", "mcp-tool-desc", t.description);
+      d.title = t.description;
+      r.append(d);
+    }
+    toolsBox.append(r);
+    toolInputs.push({ t, pick, rule });
+  }
+  const toolHint = el("span", "hint inline", s.tools.length
+    ? "Untick a tool to keep it from the model. A tool that asks first cannot be used by API keys or scheduled jobs, since nobody is there to answer; allow it to let them."
+    : s.status?.state === "connected" ? "It offers no tools." : "Its tools are listed once it connects.");
+  if (s.tools.length) {
+    // Folded: a server can list dozens, and the page is a list of servers.
+    const offered = s.tools.filter((t) => t.offered).length;
+    const allowed = s.tools.filter((t) => t.offered && t.rule === "allow").length;
+    const fold = el("details", "mcp-tools-fold");
+    fold.append(el("summary", null,
+      `${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}` +
+      (offered === s.tools.length ? ", all offered" : `, ${offered} offered`) +
+      (allowed ? ` · ${allowed} run without asking` : " · every one asks first")));
+    fold.append(toolsBox, toolHint);
+    fold.open = mcp.openTools?.has(s.name) ?? false;
+    fold.addEventListener("toggle", () => {
+      mcp.openTools ??= new Set();
+      if (fold.open) mcp.openTools.add(s.name); else mcp.openTools.delete(s.name);
+    });
+    card.append(row("Tools", fold));
+  } else {
+    card.append(row("Tools", toolHint));
+  }
+
+  // ---- one rule for all of them: fifty tools are one decision, not fifty.
+  // A rule set on a single tool above still wins over this.
+  const serverRule = document.createElement("select");
+  serverRule.className = "select";
+  serverRule.setAttribute("aria-label", `When the model calls any of ${s.name}'s tools`);
+  for (const [v, text] of [["", "each tool by its own rule"], ...Object.entries(RULE_TEXT)]) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = v ? `every tool ${text}` : text;
+    serverRule.append(o);
+  }
+  serverRule.value = s.server_rule ?? "";
+  serverRule.addEventListener("change", markDirty);
+  card.append(row("All its tools", serverRule, el("span", "hint inline",
+    "Without a rule here, a tool without its own rule asks first unless the server is trusted. " +
+    "A rule set on a single tool in the list above still wins.")));
+
+  // ---- sandbox
+  let sandbox, network, folders;
+  if (s.transport !== "http") {
+    const [sbLabel, sbInput] = toggle(s.sandbox,
+      "<b>Run it in the sandbox.</b> It gets a home of its own and can't read your files, credentials or other programs.");
+    const [netLabel, netInput] = toggle(s.network, "It may use the network (needed to download the package).");
+    const fold = el("textarea", "text-input st-mono mcp-lines");
+    fold.rows = 2;
+    fold.placeholder = "Folders it may use, one per line";
+    fold.value = (s.folders ?? []).join("\n");
+    for (const i of [sbInput, netInput, fold]) i.addEventListener("input", markDirty);
+    sandbox = sbInput; network = netInput; folders = fold;
+    card.append(row("Sandbox", sbLabel, netLabel, fold));
+  }
+
+  // ---- environment or headers: names only; values are replaced, never read.
+  const pairName = s.transport === "http" ? "headers" : "env";
+  const changes = {};
+  const pairs = el("div", "mcp-pairs");
+  for (const key of s[pairName]) {
+    const p = el("div", "mcp-pair");
+    const value = el("input", "text-input");
+    value.type = "password";
+    value.placeholder = "set · type to replace";
+    value.autocomplete = "off";
+    value.addEventListener("input", () => { changes[key] = value.value; markDirty(); });
+    const x = el("button", "adm-chip-x", "×");
+    x.type = "button";
+    x.setAttribute("aria-label", `Remove ${key}`);
+    x.addEventListener("click", () => { changes[key] = null; p.remove(); markDirty(); });
+    p.append(el("span", "mcp-pair-name", key), value, x);
+    pairs.append(p);
+  }
+  const addPair = el("div", "mcp-pair");
+  const newName = el("input", "text-input st-mono");
+  newName.placeholder = pairName === "env" ? "NEW_VARIABLE" : "Header-Name";
+  newName.spellcheck = false;
+  const newValue = el("input", "text-input");
+  newValue.type = "password";
+  newValue.placeholder = "value";
+  newValue.autocomplete = "off";
+  for (const i of [newName, newValue]) i.addEventListener("input", markDirty);
+  addPair.append(newName, newValue, el("span"));
+  pairs.append(addPair);
+  card.append(row(pairName === "env" ? "Environment" : "Headers", pairs));
+
+  // ---- trust and time
+  const [trustLabel, trust] = toggle(s.trust_hints,
+    "Believe what it says about its own tools: one it calls read-only then runs under your <i>read</i> rule. Only for a server you run yourself.");
+  trust.addEventListener("input", markDirty);
+  const timeout = el("input", "text-input");
+  timeout.type = "number";
+  timeout.min = "1";
+  timeout.max = "3600";
+  timeout.value = s.timeout_seconds;
+  timeout.style.maxWidth = "120px";
+  timeout.addEventListener("input", markDirty);
+  card.append(row("Trust", trustLabel));
+  card.append(row("Seconds per call", timeout));
+  const load = el("select", "select");
+  for (const [v, text] of [["auto", "Automatic"], ["always", "Always"], ["on_request", "Looked up when needed"]]) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = text;
+    load.append(o);
+  }
+  load.value = s.load ?? "auto";
+  load.style.maxWidth = "260px";
+  load.addEventListener("change", markDirty);
+  card.append(row("Tools up front", load, el("span", "hint inline",
+    "Every tool described up front takes context before anyone has said anything, and a long list makes a model " +
+    "worse at choosing. Automatic describes this server's tools up front while all the tools fit a budget; past " +
+    "it, the model sees their names, and each message brings the few it is most likely about in full. Its tools " +
+    "can be called either way.")));
+
+  // ---- actions
+  const actions = el("div", "adm-actions");
+  const save = el("button", "primary-btn", "Save");
+  save.type = "button";
+  save.disabled = true;
+  const note = el("span", "hint inline");
+  const remove = el("button", "ghost-btn auto", "Remove");
+  remove.type = "button";
+  let armed = null;
+  remove.addEventListener("click", async () => {
+    if (!armed) {
+      remove.textContent = `Remove ${s.name} and its tools?`;
+      remove.classList.add("st-delete");
+      armed = setTimeout(() => { armed = null; remove.textContent = "Remove"; remove.classList.remove("st-delete"); }, 4000);
+      return;
+    }
+    clearTimeout(armed);
+    try {
+      await api(`/api/admin/mcp/servers/${encodeURIComponent(s.name)}`, { method: "DELETE" });
+      mcp.dirty.delete(s.name);
+    } catch (e) { note.textContent = e.message; note.className = "error"; }
+    loadMcp();
+  });
+  save.addEventListener("click", async () => {
+    const body = {};
+    if (toolInputs.length) {
+      const offered = toolInputs.filter((x) => x.pick.checked).map((x) => x.t.remote);
+      const all = offered.length === toolInputs.length;
+      const before = s.only;
+      const same = all ? before == null : before && before.length === offered.length && offered.every((o) => before.includes(o));
+      if (!same) body.only = all ? null : offered;
+      const rules = {};
+      for (const { t, rule } of toolInputs) if ((t.own_rule ?? "") !== rule.value) rules[t.name] = rule.value;
+      if (Object.keys(rules).length) body.rules = rules;
+    }
+    if ((s.server_rule ?? "") !== serverRule.value) {
+      body.rules = { ...(body.rules ?? {}), [`${s.name}_*`]: serverRule.value };
+    }
+    if (sandbox) {
+      body.sandbox = sandbox.checked;
+      body.network = network.checked;
+      body.folders = folders.value.split("\n").map((f) => f.trim()).filter(Boolean);
+    }
+    body.trust_hints = trust.checked;
+    body.timeout_seconds = Number(timeout.value) || s.timeout_seconds;
+    body.load = load.value;
+    const pairChanges = { ...changes };
+    if (newName.value.trim()) pairChanges[newName.value.trim()] = newValue.value;
+    if (Object.keys(pairChanges).length) body[pairName] = pairChanges;
+    save.disabled = true;
+    try {
+      await api(`/api/admin/mcp/servers/${encodeURIComponent(s.name)}`, { method: "PATCH", body: JSON.stringify(body) });
+      mcp.dirty.delete(s.name);
+      note.className = "hint inline";
+      note.textContent = "Saved.";
+      loadMcp();
+    } catch (e) {
+      save.disabled = false;
+      note.className = "error";
+      note.textContent = e.message;
+    }
+  });
+  actions.append(save, note, el("span", "spacer"), remove);
+  card.append(actions);
+  return card;
+}
+
+$("mcp-enabled").addEventListener("change", async (e) => {
+  try { await api("/api/admin/mcp", { method: "PUT", body: JSON.stringify({ enabled: e.target.checked }) }); }
+  catch (err) { e.target.checked = !e.target.checked; mcpDetail(err.message, "bad"); }
+  loadMcp();
+});
+
+$("mcp-reconnect").addEventListener("click", async () => {
+  try { await api("/api/admin/mcp/reconnect", { method: "POST" }); } catch (e) { mcpDetail(e.message, "bad"); }
+  setTimeout(loadMcp, 300);
+});
+
+// ------------------------------------------------------------ add a server
+
+function mcpSetWay(way) {
+  mcp.way = way;
+  for (const b of $("mcp-way").querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.way === way));
+  for (const p of $("mcp-dialog").querySelectorAll("[data-panel]")) p.hidden = p.dataset.panel !== way;
+  mcpInvalidate();
+  mcpSandboxVisibility();
+  $("mcp-common").hidden = way === "registry" && !mcp.picked;
+  // Pasted JSON names its servers; the field is only for a lone one.
+  $("mcp-name").placeholder = way === "json" ? "only for a single unnamed server" : "files";
+}
+
+function mcpSetManualKind(kind) {
+  mcp.manualKind = kind;
+  for (const b of $("mcp-manual-kind").querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.kind === kind));
+  for (const p of $("mcp-dialog").querySelectorAll("[data-kind-panel]")) p.hidden = p.dataset.kindPanel !== kind;
+  mcpInvalidate();
+  mcpSandboxVisibility();
+}
+
+/// A URL has no program to sandbox.
+function mcpSandboxVisibility() {
+  let remote = false;
+  if (mcp.way === "manual") remote = mcp.manualKind === "url";
+  if (mcp.way === "registry" && mcp.picked) remote = mcp.picked.options[Number($("mcp-option").value)]?.kind === "remote";
+  $("mcp-sandbox-box").hidden = remote;
+}
+
+/// Anything edited after a review needs reviewing again before it saves.
+function mcpInvalidate() {
+  $("mcp-review").hidden = true;
+  $("mcp-save").disabled = true;
+  $("mcp-save").textContent = "Add server";
+  $("mcp-error").hidden = true;
+}
+
+function mcpNameExample() {
+  const n = $("mcp-name").value.trim() || "files";
+  $("mcp-name-eg").textContent = `${n}_read_file`;
+}
+
+function openMcpDialog() {
+  mcp.picked = null;
+  for (const id of ["mcp-search", "mcp-name", "mcp-json", "mcp-pkg-name", "mcp-pkg-version", "mcp-pkg-args", "mcp-pkg-env",
+                    "mcp-cmd", "mcp-cmd-args", "mcp-cmd-env", "mcp-url", "mcp-url-headers", "mcp-folders"]) $(id).value = "";
+  $("mcp-sandbox").checked = true;
+  $("mcp-network").checked = true;
+  $("mcp-results").replaceChildren();
+  $("mcp-more").hidden = true;
+  $("mcp-pick").hidden = true;
+  mcpSetManualKind("command");
+  mcpSetWay("registry");
+  mcpNameExample();
+  $("mcp-dialog").showModal();
+  $("mcp-search").focus();
+}
+
+async function mcpSearch(more) {
+  const q = $("mcp-search").value.trim();
+  const box = $("mcp-results");
+  $("mcp-pick").hidden = true;
+  box.hidden = false;
+  mcp.picked = null;
+  $("mcp-common").hidden = true;
+  if (!more) {
+    box.replaceChildren(el("div", "mcp-empty", "Searching the registry… its search can take up to half a minute."));
+  }
+  try {
+    const cursor = more && mcp.next ? `&cursor=${encodeURIComponent(mcp.next)}` : "";
+    const res = await api(`/api/admin/mcp/registry?search=${encodeURIComponent(q)}${cursor}`);
+    if (!more) box.replaceChildren();
+    for (const l of res.servers) box.append(mcpResult(l));
+    if (!box.children.length) box.append(el("div", "mcp-empty", "Nothing in the registry matches that."));
+    mcp.next = res.next;
+    $("mcp-more").hidden = !res.next || !res.servers.length;
+  } catch (e) {
+    box.replaceChildren(el("div", "mcp-empty", e.message));
+  }
+}
+
+function mcpResult(l) {
+  const b = el("button", "mcp-result");
+  b.type = "button";
+  b.append(el("span", "mcp-result-name", l.title || l.name.split("/").pop()));
+  const kinds = el("span", "mcp-kinds");
+  for (const o of l.options) {
+    const k = el("span", `mcp-kind${o.supported && o.runner_present ? "" : " no"}`, o.kind);
+    k.title = !o.supported ? o.why_not : !o.runner_present ? `needs ${o.runner}, which is not installed` : o.identifier;
+    kinds.append(k);
+  }
+  b.append(kinds);
+  b.append(el("span", "mcp-result-id", `${l.name} · ${l.version}`));
+  if (l.description) b.append(el("span", "mcp-result-desc", l.description));
+  b.addEventListener("click", () => mcpPick(l));
+  return b;
+}
+
+function mcpPick(l) {
+  mcp.picked = l;
+  $("mcp-results").hidden = true;
+  $("mcp-more").hidden = true;
+  $("mcp-pick").hidden = false;
+  $("mcp-common").hidden = false;
+  const head = $("mcp-pick-head");
+  head.replaceChildren(el("h3", null, l.title || l.name));
+  head.append(el("p", null, `${l.name} · version ${l.version}`));
+  if (l.description) head.append(el("p", null, l.description));
+  const src = l.repository || l.website;
+  if (src) {
+    const a = el("a", null, `Source: ${src}`);
+    a.href = src;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    head.append(a);
+  } else {
+    head.append(el("p", "error", "It lists no source repository."));
+  }
+  const select = $("mcp-option");
+  select.replaceChildren();
+  let first = -1;
+  l.options.forEach((o, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    const where = o.kind === "remote" ? o.identifier : `${o.kind} · ${o.identifier}${o.version ? `@${o.version}` : ""}`;
+    opt.textContent = o.supported && o.runner_present ? where : `${where} (can't: ${o.why_not ?? `needs ${o.runner}`})`;
+    opt.disabled = !(o.supported && o.runner_present);
+    if (!opt.disabled && first < 0) first = i;
+    select.append(opt);
+  });
+  select.value = String(Math.max(first, 0));
+  $("mcp-option-why").hidden = first >= 0;
+  $("mcp-option-why").textContent = "None of its ways to run can be used here.";
+  $("mcp-name").value = l.suggested_name;
+  mcpNameExample();
+  mcpInputs();
+}
+
+function mcpInputs() {
+  const o = mcp.picked?.options[Number($("mcp-option").value)];
+  const box = $("mcp-inputs");
+  box.replaceChildren();
+  for (const input of o?.inputs ?? []) {
+    const f = el("label", "st-field");
+    const title = el("span", null, input.name);
+    if (!input.required) title.append(el("em", "st-optional", "optional"));
+    f.append(title);
+    let control;
+    if (input.choices?.length) {
+      control = el("select", "select");
+      for (const c of input.choices) { const opt = document.createElement("option"); opt.value = c; opt.textContent = c; control.append(opt); }
+      if (input.default) control.value = input.default;
+    } else {
+      control = el("input", "text-input st-mono");
+      control.type = input.secret ? "password" : "text";
+      control.autocomplete = "off";
+      control.spellcheck = false;
+      if (input.default && !input.secret) control.value = input.default;
+    }
+    control.dataset.key = input.key;
+    control.addEventListener("input", mcpInvalidate);
+    f.append(control);
+    if (input.description) f.append(el("small", null, input.description));
+    box.append(f);
+  }
+  mcpSandboxVisibility();
+  mcpInvalidate();
+}
+
+function mcpLines(id) {
+  return $(id).value.split("\n").map((x) => x.trim()).filter(Boolean);
+}
+
+function mcpPairs(id, sep) {
+  const out = {};
+  for (const line of mcpLines(id)) {
+    const at = line.indexOf(sep);
+    if (at < 1) throw new Error(`"${line}" needs a ${sep === "=" ? "NAME=value" : "Name: value"} form`);
+    out[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  return out;
+}
+
+function mcpRequest(preview) {
+  const common = {
+    name: $("mcp-name").value.trim(),
+    sandbox: $("mcp-sandbox").checked,
+    network: $("mcp-network").checked,
+    folders: mcpLines("mcp-folders"),
+    preview,
+  };
+  if (mcp.way === "json") {
+    if (!$("mcp-json").value.trim()) throw new Error("Paste the JSON first.");
+    return ["/api/admin/mcp/import", { ...common, name: common.name || null, text: $("mcp-json").value }];
+  }
+  if (mcp.way === "registry") {
+    if (!mcp.picked) throw new Error("Choose a server from the results first.");
+    const values = {};
+    for (const c of $("mcp-inputs").querySelectorAll("[data-key]")) if (c.value.trim()) values[c.dataset.key] = c.value;
+    return ["/api/admin/mcp/install", {
+      ...common,
+      registry_name: mcp.picked.name,
+      version: mcp.picked.version,
+      option: Number($("mcp-option").value),
+      values,
+    }];
+  }
+  if (mcp.way === "package") {
+    return ["/api/admin/mcp/servers", {
+      ...common,
+      kind: $("mcp-pkg-kind").value,
+      package: $("mcp-pkg-name").value.trim(),
+      version: $("mcp-pkg-version").value.trim() || null,
+      args: mcpLines("mcp-pkg-args"),
+      env: mcpPairs("mcp-pkg-env", "="),
+    }];
+  }
+  if (mcp.manualKind === "url") {
+    return ["/api/admin/mcp/servers", {
+      ...common,
+      kind: "url",
+      url: $("mcp-url").value.trim(),
+      headers: mcpPairs("mcp-url-headers", ":"),
+    }];
+  }
+  return ["/api/admin/mcp/servers", {
+    ...common,
+    kind: "command",
+    command: $("mcp-cmd").value.trim(),
+    args: mcpLines("mcp-cmd-args"),
+    env: mcpPairs("mcp-cmd-env", "="),
+  }];
+}
+
+async function mcpSubmit(preview) {
+  const error = $("mcp-error");
+  error.hidden = true;
+  try {
+    if (!$("mcp-name").value.trim() && mcp.way !== "json") throw new Error("Give it a name.");
+    const [path, body] = mcpRequest(preview);
+    const res = await api(path, { method: "POST", body: JSON.stringify(body) });
+    if (res.servers) {
+      // Pasted JSON: one line per server, and the ones that cannot come over.
+      const lines = res.servers.map((s) => s.error
+        ? `✗ ${s.name}: ${s.error}`
+        : `${s.name}:  ${s.preview}${s.sandbox ? "  (in the sandbox)" : ""}` +
+          (s.folders?.length ? `\n    may use ${s.folders.join(", ")}` : "") +
+          (s.notes?.length ? `\n    note: ${s.notes.join("; ")}` : ""));
+      const usable = res.servers.filter((s) => !s.error).length;
+      if (preview) {
+        $("mcp-review-cmd").textContent = lines.join("\n");
+        $("mcp-review").hidden = false;
+        $("mcp-save").disabled = !usable;
+        $("mcp-save").textContent = usable > 1 ? `Add ${usable} servers` : "Add server";
+      } else {
+        $("mcp-dialog").close();
+        loadMcp();
+      }
+      return;
+    }
+    if (preview) {
+      $("mcp-review-cmd").textContent = res.preview + (res.sandbox ? "\n(in the sandbox)" : "");
+      $("mcp-review").hidden = false;
+      $("mcp-save").disabled = false;
+    } else {
+      $("mcp-dialog").close();
+      loadMcp();
+    }
+  } catch (e) {
+    error.textContent = e.message;
+    error.hidden = false;
+  }
+}
+
+for (const b of $("mcp-way").querySelectorAll("button")) b.addEventListener("click", () => mcpSetWay(b.dataset.way));
+for (const b of $("mcp-manual-kind").querySelectorAll("button")) b.addEventListener("click", () => mcpSetManualKind(b.dataset.kind));
+$("mcp-add").addEventListener("click", openMcpDialog);
+$("mcp-cancel").addEventListener("click", () => $("mcp-dialog").close());
+$("mcp-check").addEventListener("click", () => mcpSubmit(true));
+$("mcp-save").addEventListener("click", () => mcpSubmit(false));
+$("mcp-search-go").addEventListener("click", () => mcpSearch(false));
+$("mcp-more").addEventListener("click", () => mcpSearch(true));
+$("mcp-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); mcpSearch(false); } });
+$("mcp-back").addEventListener("click", () => {
+  mcp.picked = null;
+  $("mcp-pick").hidden = true;
+  $("mcp-results").hidden = false;
+  $("mcp-more").hidden = !mcp.next;
+  $("mcp-common").hidden = true;
+  mcpInvalidate();
+});
+$("mcp-option").addEventListener("change", mcpInputs);
+$("mcp-name").addEventListener("input", () => { mcpNameExample(); mcpInvalidate(); });
+$("mcp-pkg-name").addEventListener("blur", () => {
+  if ($("mcp-name").value.trim()) return;
+  const last = $("mcp-pkg-name").value.trim().split("/").pop() ?? "";
+  $("mcp-name").value = last.replace(/^(mcp-server-|server-)/, "").replace(/(-mcp-server|-mcp)$/, "")
+    .replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 24);
+  mcpNameExample();
+});
+$("mcp-save").textContent = "Add server";
+for (const id of ["mcp-json", "mcp-pkg-kind", "mcp-pkg-name", "mcp-pkg-version", "mcp-pkg-args", "mcp-pkg-env", "mcp-cmd", "mcp-cmd-args",
+                  "mcp-cmd-env", "mcp-url", "mcp-url-headers", "mcp-folders", "mcp-sandbox", "mcp-network"]) {
+  $(id).addEventListener("input", mcpInvalidate);
+}

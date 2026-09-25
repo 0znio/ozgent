@@ -39,6 +39,7 @@ pub fn router(state: State) -> Router {
         .route("/api/styles/{name}", axum::routing::put(save_style).delete(delete_style))
         .route("/api/tools", get(tools).put(set_tool_config))
         .route("/api/tools/active", get(active_tools))
+        .route("/api/mcp", get(crate::admin_mcp::summary))
         .route("/api/permissions", get(get_permissions).put(put_permissions))
         .route("/api/permissions/decide", post(decide_permission))
         .route("/api/conversations/{id}/facts", get(facts).post(add_fact))
@@ -590,6 +591,10 @@ fn public(config: &ozgent_core::Config) -> ozgent_core::Config {
     let mut c = config.clone();
     c.channels = Default::default();
     c.web = Default::default();
+    // MCP servers are the admin page's: their environment and headers carry
+    // credentials under any name (`DATABASE_URL`, `Authorization`), which
+    // masking by key name would miss, and nothing on the chat page reads them.
+    c.mcp = Default::default();
     c
 }
 
@@ -1004,6 +1009,9 @@ struct ActiveTool {
     effect: String,
     /// What the permission rules say: allow, ask or deny.
     rule: String,
+    /// The MCP server it comes from, for a tool that is not ozgent's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
 }
 
 /// The tools that are running, read from the live host — unlike `/api/tools`,
@@ -1019,13 +1027,17 @@ async fn active_tools(AxumState(state): AxumState<State>) -> Json<Vec<ActiveTool
             t.host
                 .tools()
                 .iter()
-                .filter(|s| !config.tools.disabled.contains(&s.name))
+                .filter(|s| !crate::worker::switched_off(&t, &config, &s.name))
                 .map(|s| ActiveTool {
                     name: s.name.clone(),
                     label: None,
                     description: ozgent_tools::first_line(&s.description).to_string(),
                     effect: format!("{:?}", s.effect).to_lowercase(),
                     rule: config.permissions.rule_for(&s.name, s.effect).to_string(),
+                    server: t
+                        .host
+                        .source_of(&s.name)
+                        .and_then(|o| o.strip_prefix("mcp:").map(str::to_string)),
                 })
                 .collect()
         })
@@ -1038,6 +1050,7 @@ async fn active_tools(AxumState(state): AxumState<State>) -> Json<Vec<ActiveTool
             description: "Let the model pass a question to an agent when it fits one".into(),
             effect: "read".into(),
             rule: "allow".into(),
+            server: None,
         });
     }
     Json(out)
@@ -1070,7 +1083,8 @@ async fn tools(AxumState(state): AxumState<State>) -> ApiResult<Json<ToolsView>>
 
     // Listing tools means starting the Python worker, so a failure here is
     // reported as an empty list with the reason rather than a dead page.
-    let available = match crate::state::discover_tools(&state.paths, &config).await {
+    let running = crate::worker::current_tools(&state.tools);
+    let available = match crate::state::discover_tools(&state.paths, &config, running.as_ref()).await {
         Ok(list) => list,
         Err(e) => {
             tracing::warn!("listing tools: {e}");
@@ -1097,6 +1111,8 @@ struct ToolUpdate {
     /// an empty string clears it.
     api_key: Option<String>,
     disabled: Option<Vec<String>>,
+    /// MCP servers not to use in the chats. Needs no restart: read per turn.
+    mcp_off: Option<Vec<String>>,
 }
 
 async fn set_tool_config(
@@ -1105,9 +1121,22 @@ async fn set_tool_config(
 ) -> ApiResult<StatusCode> {
     // Scoped so the guard is provably gone before the await below: held
     // across one, the handler's future is not `Send` and axum rejects it.
-    let snapshot = {
+    let (snapshot, restart) = {
         let mut config = state.config.lock().unwrap();
+        // What the tool host reads when it starts. Only a change to these
+        // needs a restart — which also reconnects every MCP server, so a
+        // save that changed nothing it reads must not cause one.
+        let reads = |c: &ozgent_core::Config| {
+            (c.tools.enabled, c.tools.disabled.clone(), toml::to_string(&c.tools.config).unwrap_or_default())
+        };
+        let before = reads(&config);
 
+        if let Some(off) = body.mcp_off {
+            let mut off: Vec<String> = off.into_iter().filter(|s| !s.trim().is_empty()).collect();
+            off.sort();
+            off.dedup();
+            config.tools.mcp_off = off;
+        }
         if let Some(enabled) = body.enabled {
             config.tools.enabled = enabled;
         }
@@ -1126,14 +1155,17 @@ async fn set_tool_config(
         config.save(&state.paths)?;
         // The key lives in this file; it must not be world-readable.
         harden(&state.paths.config_file());
-        config.clone()
+        let restart = reads(&config) != before;
+        (config.clone(), restart)
     };
 
     // The host read its configuration when its interpreter started, so a new
     // provider or key reaches it only through a new interpreter. Without this
     // the page said "saved" and the old provider went on answering until the
     // server was restarted.
-    restart_tools(&state, snapshot).await;
+    if restart {
+        restart_tools(&state, snapshot).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1542,6 +1574,20 @@ mod settings_tests {
         replaced["tools"]["config"]["web_search"]["tavily"]["api_key"] = "tvly-new".into();
         unredact(&mut replaced, &current);
         assert_eq!(replaced["tools"]["config"]["web_search"]["tavily"]["api_key"], "tvly-new");
+    }
+
+    #[test]
+    fn mcp_servers_are_not_on_the_chat_page_at_all() {
+        // Masking goes by key name, and a server's credentials can be under
+        // any name: `DATABASE_URL=postgres://user:pass@…`.
+        let mut config = ozgent_core::Config::default();
+        config.mcp.enabled = true;
+        let mut server = ozgent_core::mcp::Server { command: Some("npx".into()), ..Default::default() };
+        server.env.insert("DATABASE_URL".into(), "postgres://me:hunter2@db".into());
+        config.mcp.servers.insert("db".into(), server);
+        let shown = serde_json::to_value(public(&config)).unwrap();
+        assert!(!shown.to_string().contains("hunter2"), "{shown}");
+        assert!(shown["mcp"]["servers"].as_object().is_none_or(|s| s.is_empty()));
     }
 }
 

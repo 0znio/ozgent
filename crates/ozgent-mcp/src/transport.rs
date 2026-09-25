@@ -6,10 +6,10 @@
 //! may return a stream, and may hand back a session id that every later
 //! request has to quote.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -70,25 +70,40 @@ impl Link {
 
 type Waiting = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
+/// The last lines a server wrote to stderr: what is wanted first when it will
+/// not start, and shown beside it on the admin page.
+pub type Log = Arc<std::sync::Mutex<VecDeque<String>>>;
+
+/// Lines of stderr kept per server.
+const LOG_LINES: usize = 40;
+
 /// A child process speaking JSON-RPC over its own stdin and stdout.
 pub struct StdioLink {
     child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    /// Taken on close: dropping it is how a stdio server is told to stop.
+    stdin: Mutex<Option<ChildStdin>>,
     waiting: Waiting,
+    /// Set once its stdout has ended. Every request after that fails at once
+    /// instead of waiting out its timeout for a reply that cannot come.
+    gone: Arc<AtomicBool>,
     next_id: AtomicU64,
 }
 
 impl StdioLink {
+    /// Start `command` with exactly `env` as its environment: nothing of
+    /// ozgent's own is passed on unless the caller put it there.
     pub fn start(
         command: &str,
         args: &[String],
         env: &std::collections::BTreeMap<String, String>,
         cwd: Option<&std::path::Path>,
         label: &str,
+        log: Log,
     ) -> Result<Self, TransportError> {
         let mut process = Command::new(command);
         process
             .args(args)
+            .env_clear()
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -110,7 +125,8 @@ impl StdioLink {
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let waiting: Waiting = Arc::new(Mutex::new(HashMap::new()));
-        tokio::spawn(read_replies(stdout, Arc::clone(&waiting)));
+        let gone = Arc::new(AtomicBool::new(false));
+        tokio::spawn(read_replies(stdout, Arc::clone(&waiting), Arc::clone(&gone)));
         // Drained, not discarded: an unread pipe eventually blocks the child,
         // and a server's own diagnostics are the first thing wanted when it
         // will not start.
@@ -119,10 +135,21 @@ impl StdioLink {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(target: "ozgent::mcp", "{label}: {line}");
+                let mut kept = log.lock().unwrap_or_else(|e| e.into_inner());
+                if kept.len() == LOG_LINES {
+                    kept.pop_front();
+                }
+                kept.push_back(line.chars().take(400).collect());
             }
         });
 
-        Ok(Self { child: Mutex::new(child), stdin: Mutex::new(stdin), waiting, next_id: AtomicU64::new(1) })
+        Ok(Self {
+            child: Mutex::new(child),
+            stdin: Mutex::new(Some(stdin)),
+            waiting,
+            gone,
+            next_id: AtomicU64::new(1),
+        })
     }
 
     async fn request(
@@ -133,7 +160,15 @@ impl StdioLink {
     ) -> Result<Value, TransportError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.waiting.lock().await.insert(id, tx);
+        {
+            let mut waiting = self.waiting.lock().await;
+            // Checked under the lock the reader clears the map under, so a
+            // request can never be left waiting on a reader that has finished.
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(TransportError::Gone);
+            }
+            waiting.insert(id, tx);
+        }
 
         if let Err(e) = self.write(&protocol::request(id, method, params)).await {
             self.waiting.lock().await.remove(&id);
@@ -160,6 +195,7 @@ impl StdioLink {
         let mut line = serde_json::to_vec(message).map_err(|e| TransportError::Io(e.to_string()))?;
         line.push(b'\n');
         let mut stdin = self.stdin.lock().await;
+        let Some(stdin) = stdin.as_mut() else { return Err(TransportError::Gone) };
         stdin.write_all(&line).await.map_err(|e| TransportError::Io(e.to_string()))?;
         stdin.flush().await.map_err(|e| TransportError::Io(e.to_string()))
     }
@@ -167,8 +203,9 @@ impl StdioLink {
     async fn close(&self) {
         let mut child = self.child.lock().await;
         // MCP has no shutdown message: closing stdin is how a stdio server is
-        // told to stop, and the kill is for one that does not.
-        drop(self.stdin.lock().await);
+        // told to stop, and the kill is for one that does not. Taken, not
+        // just locked: dropping a guard closes nothing.
+        drop(self.stdin.lock().await.take());
         if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
             let _ = child.kill().await;
         }
@@ -176,7 +213,17 @@ impl StdioLink {
 }
 
 /// Match replies to the requests waiting for them.
-async fn read_replies(stdout: tokio::process::ChildStdout, waiting: Waiting) {
+async fn read_replies(stdout: tokio::process::ChildStdout, waiting: Waiting, gone: Arc<AtomicBool>) {
+    read_until_closed(stdout, &waiting).await;
+    // The process has ended, or closed its stdout. Dropping every waiting
+    // sender fails those requests now; left in place, a server that died on
+    // start-up held its handshake for the full two minutes.
+    let mut waiting = waiting.lock().await;
+    gone.store(true, Ordering::SeqCst);
+    waiting.clear();
+}
+
+async fn read_until_closed(stdout: tokio::process::ChildStdout, waiting: &Waiting) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
@@ -391,10 +438,53 @@ mod tests {
             &Default::default(),
             None,
             "test",
+            Log::default(),
         );
         let Err(err) = started else { panic!("that program should not exist") };
         let text = err.to_string();
         assert!(text.contains("definitely-not-a-real-program-xyz"), "{text}");
         assert!(text.contains("installed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_dies_at_once_fails_at_once_with_its_last_words() {
+        // It used to hold the handshake for the full two minutes.
+        let log = Log::default();
+        let env: std::collections::BTreeMap<String, String> =
+            std::env::vars().filter(|(k, _)| k == "PATH").collect();
+        let link = StdioLink::start(
+            "sh",
+            &["-c".into(), "echo 'npm error 404 Not Found' >&2; exit 1".into()],
+            &env,
+            None,
+            "test",
+            log.clone(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = link.request("initialize", serde_json::json!({}), Duration::from_secs(60)).await;
+        assert!(matches!(result, Err(TransportError::Gone)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let kept: Vec<String> = log.lock().unwrap().iter().cloned().collect();
+        assert_eq!(kept, ["npm error 404 Not Found"]);
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn only_the_given_environment_reaches_the_server() {
+        // SAFETY: test-only; nothing else reads this variable.
+        unsafe { std::env::set_var("OZGENT_TEST_LEAK_TOKEN", "must-not-leak") };
+        let env = crate::server::server_env(&[("MINE".to_string(), "yes".to_string())].into());
+        assert_eq!(env.get("MINE").map(String::as_str), Some("yes"));
+        assert!(!env.contains_key("OZGENT_TEST_LEAK_TOKEN"));
+        assert!(env.contains_key("PATH"));
+        let log = Log::default();
+        let link = StdioLink::start("sh", &["-c".into(), "env >&2".into()], &env, None, "test", log.clone()).unwrap();
+        let _ = link.request("x", serde_json::json!({}), Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seen = log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(seen.contains("MINE=yes"), "{seen}");
+        assert!(!seen.contains("must-not-leak"), "{seen}");
     }
 }
