@@ -1786,18 +1786,30 @@ impl Engine {
 }
 
 /// Map our cache type onto llama.cpp's KV cache type.
+/// The longest draft one verification may carry, from any drafter.
+///
+/// The n-gram drafter proposes up to `draft_tokens` (16 by default) when its
+/// drafts keep landing — which is exactly when the model is copying text it
+/// has just read, a tool result say. Sizing the rows below for the MTP head's
+/// single token let that 17-row batch through, and llama.cpp aborts the whole
+/// process on it (`n_outputs_max <= cparams.n_outputs_max`) rather than
+/// returning an error. Every draft is cut to this, so no setting can ask for
+/// more rows than the context has.
+pub(crate) const MAX_VERIFY_DRAFT: usize = 16;
+
 /// Rows of logits a micro-batch may ask for, on a context carrying
 /// `sequences` conversations.
 ///
 /// Every conversation may verify a draft in the same pass, which is the
-/// confirmed token plus what was drafted for it. The floor leaves room for
-/// the diagnostics that ask for more — [`Engine::probe_verify_cost`] times
-/// batches of up to eight — and costs a megabyte of scratch per row.
+/// confirmed token plus up to [`MAX_VERIFY_DRAFT`] drafted after it. About
+/// three quarters of a megabyte of scratch per row: seventeen rows a
+/// conversation, where leaving it to llama.cpp reserved a row for every
+/// token of the micro-batch.
 fn outputs_max(sequences: u32) -> u32 {
     if let Some(n) = std::env::var("OZGENT_OUTPUTS_MAX").ok().and_then(|v| v.parse().ok()) {
         return n;
     }
-    (sequences * (1 + crate::mtp::DRAFT_TOKENS as u32)).max(16)
+    sequences * (1 + MAX_VERIFY_DRAFT as u32)
 }
 
 /// The vision projector installed beside `model`, and what it weighs.
@@ -3794,7 +3806,8 @@ impl<'a> Session<'a> {
                 };
                 let cap = budget
                     .min(room)
-                    .min(n_batch.saturating_sub(1));
+                    .min(n_batch.saturating_sub(1))
+                    .min(MAX_VERIFY_DRAFT);
                 match drafter.as_mut() {
                     // A draft model proposes from the whole distribution rather
                     // than from repetition, so it needs neither the reach
@@ -3803,7 +3816,8 @@ impl<'a> Session<'a> {
                     Some(d) => {
                         let want = (tuning.draft_tokens as usize)
                             .min(room)
-                            .min(n_batch.saturating_sub(1));
+                            .min(n_batch.saturating_sub(1))
+                            .min(MAX_VERIFY_DRAFT);
                         d.propose(&self.cached, want)?
                     }
                     // Draft longer while drafts are landing, shorter when they
