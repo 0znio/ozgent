@@ -18,6 +18,9 @@ use crate::retrieve::{Hit, Retriever};
 use crate::store::{Fact, OwnerKind, Store, StoreError, StoredMessage};
 use ozgent_core::{Message, Role};
 
+/// Characters of one recalled item shown in the prompt.
+pub const EXCERPT_CHARS: usize = 800;
+
 /// How much room each tier gets.
 #[derive(Debug, Clone)]
 pub struct Budget {
@@ -68,52 +71,50 @@ impl AssembledContext {
 
     /// Render as messages for the model.
     ///
-    /// Facts and recalled excerpts go in a system message rather than being
-    /// forged as conversation turns, so the model is never misled about what
-    /// was actually said in this window.
+    /// The system prompt alone goes first, the same in every conversation,
+    /// so the start of the prompt is served from the cache that holds it.
+    /// What memory adds — pinned facts, excerpts recalled from beyond the
+    /// recent window — goes with the newest message instead: it differs from
+    /// one message to the next, and in the system prompt it made every new
+    /// conversation re-read the whole start (5,162 tokens, 3 s on a 4B).
+    /// It is still labelled for what it is, so the model is never misled
+    /// about what was said in the window.
     pub fn to_messages(&self, system_prompt: Option<&str>) -> Vec<Message> {
         let mut out = Vec::new();
-        let mut preamble = String::new();
-
-        if let Some(sp) = system_prompt {
-            preamble.push_str(sp.trim());
+        if let Some(sp) = system_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(Message::system(sp));
         }
 
+        let mut note = String::new();
         if !self.pinned.is_empty() {
-            if !preamble.is_empty() {
-                preamble.push_str("\n\n");
-            }
-            preamble.push_str("What you know about the user:\n");
+            note.push_str("What you know about the user:\n");
             for f in &self.pinned {
-                preamble.push_str("- ");
-                preamble.push_str(f.text.trim());
-                preamble.push('\n');
+                note.push_str("- ");
+                note.push_str(f.text.trim());
+                note.push('\n');
             }
         }
-
         if !self.retrieved.is_empty() {
-            if !preamble.is_empty() {
-                preamble.push_str("\n");
+            if !note.is_empty() {
+                note.push('\n');
             }
-            preamble.push_str(
-                "\nRelevant excerpts from earlier in this conversation, \
-                 outside the messages shown below:\n",
-            );
+            note.push_str("From memory — earlier in this conversation, or known about the user:\n");
             for hit in &self.retrieved {
                 match hit.seq {
-                    Some(seq) => preamble.push_str(&format!("- (message {seq}) ")),
-                    None => preamble.push_str("- "),
+                    Some(seq) => note.push_str(&format!("- (message {seq}) ")),
+                    None => note.push_str("- "),
                 }
-                preamble.push_str(hit.text.trim());
-                preamble.push('\n');
+                note.push_str(hit.text.trim());
+                note.push('\n');
             }
         }
 
-        if !preamble.trim().is_empty() {
-            out.push(Message::system(preamble.trim()));
-        }
-
-        for m in &self.recent {
+        let newest_user = self.recent.iter().rposition(|m| m.role == "user");
+        for (i, m) in self.recent.iter().enumerate() {
+            let mut text = m.content.clone();
+            if Some(i) == newest_user && !note.is_empty() {
+                text = format!("[{}]\n\n{text}", note.trim());
+            }
             out.push(Message {
                 role: match m.role.as_str() {
                     "system" => Role::System,
@@ -121,7 +122,7 @@ impl AssembledContext {
                     "tool" => Role::Tool,
                     _ => Role::User,
                 },
-                content: vec![ozgent_core::Part::Text { text: m.content.clone() }],
+                content: vec![ozgent_core::Part::Text { text }],
                 thinking: None,
                 tool_calls: Vec::new(),
                 tool_call_id: m.tool_call_id.clone(),
@@ -129,6 +130,47 @@ impl AssembledContext {
         }
         out
     }
+}
+
+/// A message without the memory note `to_messages` puts in front of it:
+/// what the person actually wrote, for anything that searches by it.
+pub fn without_memory_note(text: &str) -> &str {
+    if text.starts_with("[What you know about the user") || text.starts_with("[From memory") {
+        if let Some(at) = text.find("]\n\n") {
+            return &text[at + 3..];
+        }
+    }
+    text
+}
+
+/// Whether a recalled text has anything to do with the question: a word of
+/// four letters or more in common, near enough (a plural, a tense). The
+/// retrievers rank; they do not judge, and the best of nothing relevant is
+/// still returned — a saved preference for a news source came back for
+/// "what is the capital of France?".
+fn relevant(text: &str, query: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "the", "and", "you", "are", "for", "was", "did", "how", "who", "why", "not", "can", "get", "has", "had",
+        "her", "him", "his", "its", "our", "out", "all", "any", "one", "use", "what", "which", "that", "this",
+        "with", "have", "from", "about", "your", "there", "they", "them", "then", "when", "where", "would",
+        "could", "should", "does", "tell", "know", "like", "just", "some", "much", "many", "more", "most",
+    ];
+    fn words(t: &str) -> Vec<String> {
+        t.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3 || w.chars().any(|c| c.is_ascii_digit()))
+            .map(|w| {
+                let w = w.to_lowercase();
+                if w.len() > 4 {
+                    w.strip_suffix("ing").or_else(|| w.strip_suffix("ed")).or_else(|| w.strip_suffix('s')).unwrap_or(&w).to_string()
+                } else {
+                    w
+                }
+            })
+            .filter(|w| !COMMON.contains(&w.as_str()))
+            .collect()
+    }
+    let asked = words(query);
+    words(text).iter().any(|w| asked.contains(w))
 }
 
 /// Builds context for a turn.
@@ -204,9 +246,28 @@ impl<'a> ContextBuilder<'a> {
         }
         let hits = retriever.search(conversation_id, query, self.budget.max_retrieved * 3)?;
 
-        for hit in hits {
+        for mut hit in hits {
             if ctx.retrieved.len() >= self.budget.max_retrieved {
                 break;
+            }
+            if !relevant(&hit.text, query) {
+                continue;
+            }
+            // What tools returned reaches the model another way — the last
+            // turn's rides along with its reply, older ones through the
+            // memory tool, excerpted where they answer the question. Here it
+            // could only be cut from its start, and a model shown the start
+            // of a long article answered from that.
+            if hit.kind == OwnerKind::Message
+                && self.store.get_message(hit.id).ok().flatten().is_some_and(|m| m.role == "tool")
+            {
+                continue;
+            }
+            // An excerpt, not the item: a page a tool read can be tens of
+            // thousands of characters, and the model can read the rest with
+            // its memory tool.
+            if let Some((at, _)) = hit.text.char_indices().nth(EXCERPT_CHARS) {
+                hit.text = format!("{}…", &hit.text[..at]);
             }
             // Never repeat something already shown verbatim.
             if hit.kind == OwnerKind::Message && in_window.contains(&hit.id) {
@@ -266,5 +327,14 @@ mod tests {
     fn usable_budget_never_underflows() {
         let b = Budget { total: 100, reserve_for_reply: 500, ..Default::default() };
         assert_eq!(b.usable(), 0, "must saturate rather than wrap");
+    }
+}
+
+#[cfg(test)]
+mod note {
+    #[test]
+    fn the_note_comes_off_and_nothing_else_does() {
+        assert_eq!(super::without_memory_note("[From memory — x:\n- a [b] c]\n\n[14:09] what now?"), "[14:09] what now?");
+        assert_eq!(super::without_memory_note("[14:09] plain"), "[14:09] plain");
     }
 }

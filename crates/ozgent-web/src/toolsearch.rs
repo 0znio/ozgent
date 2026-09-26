@@ -538,9 +538,10 @@ pub fn web_bridge(specs: &[ToolSpec], server_of: impl Fn(&str) -> Option<String>
 pub fn browser_hint(b: &Browser) -> String {
     let start = b.start.as_ref().map(|s| format!("{s}, then ")).unwrap_or_default();
     format!(
-        "There is no web_search tool here, but there is a web browser, {server}. To search the web, \
-         use it: {start}{open} with https://duckduckgo.com/html/?q=<search words>, then {read} to read the \
-         results; open a result the same way to read it.",
+        "There is no web_search tool here, but there is a web browser, {server}. To read a site the \
+         user names, {start}{open} with its address, then {read}. To search the web, open \
+         https://duckduckgo.com/html/?q=<search words> the same way and read the results; open a \
+         result to read it.",
         server = b.server,
         open = b.open,
         read = b.read,

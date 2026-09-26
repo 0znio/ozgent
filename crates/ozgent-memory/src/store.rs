@@ -566,7 +566,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, conversation_id, seq, role, content, thinking, tool_calls,
                     tool_call_id, tokens, created_at, media, stats
-             FROM messages WHERE conversation_id = ?1 ORDER BY seq",
+             FROM messages WHERE conversation_id = ?1 AND role != 'tool' ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![conversation_id], row_to_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -581,13 +581,51 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, conversation_id, seq, role, content, thinking, tool_calls,
                     tool_call_id, tokens, created_at, media, stats
-             FROM messages WHERE conversation_id = ?1
+             FROM messages WHERE conversation_id = ?1 AND role != 'tool'
              ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![conversation_id, n], row_to_message)?;
         let mut out: Vec<StoredMessage> = rows.collect::<Result<_, _>>()?;
         out.reverse();
         Ok(out)
+    }
+
+    /// Full-text search within one conversation, what tools returned
+    /// included, best first. No vectors: sub-millisecond, for a second pass
+    /// seeded by what a first one found.
+    pub fn search_in_conversation(&self, conversation_id: i64, query: &str, limit: i64) -> Result<Vec<StoredMessage>, StoreError> {
+        let Some(fts) = crate::retrieve::to_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.db.prepare(
+            "SELECT m.id, m.conversation_id, m.seq, m.role, m.content, m.thinking, m.tool_calls,
+                    m.tool_call_id, m.tokens, m.created_at, m.media, m.stats
+               FROM messages_fts f
+               JOIN messages m ON m.id = f.rowid
+              WHERE messages_fts MATCH ?1 AND m.conversation_id = ?2 AND m.content != ''
+              ORDER BY bm25(messages_fts)
+              LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![fts, conversation_id, limit], row_to_message)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// What tools returned in the turn before the one being answered: the
+    /// `tool` rows after the last question before `before_seq`. Kept apart
+    /// from the dialogue — stored so they can be searched and carried into
+    /// the next turn, never replayed as turns of their own.
+    pub fn previous_turn_tools(&self, conversation_id: i64, before_seq: i64) -> Result<Vec<StoredMessage>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, conversation_id, seq, role, content, thinking, tool_calls,
+                    tool_call_id, tokens, created_at, media, stats
+             FROM messages
+             WHERE conversation_id = ?1 AND role = 'tool' AND seq < ?2
+               AND seq > COALESCE((SELECT MAX(seq) FROM messages
+                                   WHERE conversation_id = ?1 AND role = 'user' AND seq < ?2), -1)
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![conversation_id, before_seq], row_to_message)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn get_message(&self, id: i64) -> Result<Option<StoredMessage>, StoreError> {
@@ -649,6 +687,12 @@ impl Store {
     /// and they do not remember which thread it was in. Ranked by FTS5's own
     /// bm25, newest first among equals.
     pub fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>, StoreError> {
+        self.search_messages_in(query, limit, false)
+    }
+
+    /// Full-text search over every conversation, with what tools returned
+    /// (`with_tools`) or only what was said.
+    pub fn search_messages_in(&self, query: &str, limit: i64, with_tools: bool) -> Result<Vec<SearchHit>, StoreError> {
         let Some(fts) = crate::retrieve::to_fts_query(query) else {
             return Ok(Vec::new());
         };
@@ -658,11 +702,11 @@ impl Store {
                FROM messages_fts f
                JOIN messages m ON m.id = f.rowid
                JOIN conversations c ON c.id = m.conversation_id
-              WHERE messages_fts MATCH ?1 AND m.content != ''
+              WHERE messages_fts MATCH ?1 AND m.content != '' AND (m.role != 'tool' OR ?3)
               ORDER BY bm25(messages_fts), m.created_at DESC
               LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts, limit], |r| {
+        let rows = stmt.query_map(params![fts, limit, with_tools], |r| {
             Ok(SearchHit {
                 message_id: r.get(0)?,
                 conversation_id: r.get(1)?,
@@ -679,7 +723,7 @@ impl Store {
 
     pub fn message_count(&self, conversation_id: i64) -> Result<i64, StoreError> {
         Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND role != 'tool'",
             params![conversation_id],
             |r| r.get(0),
         )?)
@@ -1806,5 +1850,37 @@ mod search_tests {
         s.truncate_conversation(c, 1).unwrap();
         assert!(s.search_messages("deploy", 10).unwrap().is_empty());
         assert_eq!(s.search_messages("keep this", 10).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tool_rows {
+    use super::*;
+
+    #[test]
+    fn tool_results_stay_out_of_the_dialogue_and_come_back_one_turn_at_a_time() {
+        let s = Store::open_in_memory().unwrap();
+        let c = s.create_conversation("t", None).unwrap();
+        s.append_message(c, "user", "first question", 0).unwrap();
+        s.append_message_full(c, "tool", "old page", None, Some(r#"{"name":"fetch_url"}"#), Some("call_0"), 0).unwrap();
+        s.append_message(c, "assistant", "first answer", 0).unwrap();
+        s.append_message(c, "user", "second question", 0).unwrap();
+        s.append_message_full(c, "tool", "new page about tariffs", None, Some(r#"{"name":"fetch_url"}"#), Some("call_1"), 0).unwrap();
+        s.append_message(c, "assistant", "second answer", 0).unwrap();
+        let now = s.append_message(c, "user", "summarise that", 0).unwrap();
+
+        let roles: Vec<String> = s.messages(c).unwrap().into_iter().map(|m| m.role).collect();
+        assert!(!roles.iter().any(|r| r == "tool"), "{roles:?}");
+        assert_eq!(s.message_count(c).unwrap(), 5);
+        assert!(s.recent_messages(c, 10).unwrap().iter().all(|m| m.role != "tool"));
+
+        let seq = s.get_message(now).unwrap().unwrap().seq;
+        let carried = s.previous_turn_tools(c, seq).unwrap();
+        assert_eq!(carried.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["new page about tariffs"]);
+
+        let found = s.search_in_conversation(c, "tariffs", 5).unwrap();
+        assert_eq!(found[0].role, "tool", "what tools returned can be searched");
+        assert!(s.search_messages("tariffs", 5).unwrap().is_empty(), "but not by the history page");
+        assert_eq!(s.search_messages_in("tariffs", 5, true).unwrap().len(), 1);
     }
 }

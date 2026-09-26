@@ -178,11 +178,15 @@ fn pinned_facts_are_always_present_regardless_of_the_question() {
         "pinned facts must not depend on retrieval"
     );
 
+    // With the newest message, not in the system prompt: that stays the same
+    // in every conversation so the start of the prompt is served from cache.
     let rendered = ctx.to_messages(Some("You are helpful."));
+    assert_eq!(rendered[0].text_content(), "You are helpful.");
+    let newest = rendered.iter().rev().find(|m| matches!(m.role, ozgent_core::Role::User)).unwrap();
     assert!(
-        rendered[0].text_content().contains("Arfan"),
+        newest.text_content().contains("Arfan"),
         "pinned facts must reach the prompt: {}",
-        rendered[0].text_content()
+        newest.text_content()
     );
 }
 
@@ -371,18 +375,16 @@ fn rendered_context_separates_recall_from_actual_turns() {
         .unwrap();
     let rendered = ctx.to_messages(Some("You are ozgent."));
 
-    // Recalled text must arrive as system context, never forged as a turn the
-    // user did not just say.
-    let system = rendered
-        .iter()
-        .find(|m| matches!(m.role, ozgent_core::Role::System))
-        .expect("a system message should carry the recall");
-    assert!(system.text_content().contains("10.0.4.19"));
-    assert!(system.text_content().contains("You are ozgent."));
-
+    // Recalled text arrives labelled, with the newest message — never forged
+    // as a turn of its own, and never in the system prompt, which stays the
+    // same in every conversation so the start of the prompt is cached.
+    assert_eq!(rendered[0].text_content(), "You are ozgent.");
+    let newest = rendered.iter().rev().find(|m| matches!(m.role, ozgent_core::Role::User)).unwrap();
+    assert!(newest.text_content().contains("10.0.4.19"), "{}", newest.text_content());
+    assert!(newest.text_content().starts_with("[From memory"), "{}", newest.text_content());
     assert!(
         rendered[1..].iter().all(|m| !matches!(m.role, ozgent_core::Role::System)),
-        "only one system message should be synthesised"
+        "no second system message"
     );
 }
 

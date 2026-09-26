@@ -360,6 +360,7 @@ pub async fn messages(
     state
         .worker
         .submit(Request {
+            memory: None,
             can_ask: false,
             grant: grant.clone(),
             model: resolved.model.model.to_string(),

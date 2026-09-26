@@ -12,7 +12,7 @@ pub mod jobs;
 pub mod retrieve;
 pub mod store;
 
-pub use context::{AssembledContext, Budget, ContextBuilder, estimate_tokens};
+pub use context::{AssembledContext, Budget, ContextBuilder, estimate_tokens, without_memory_note};
 pub use embed::{Embedder, HashingEmbedder, cosine};
 pub use facts::{Candidate, parse_extraction, store_candidates};
 pub use jobs::{Job, JobEdit, JobRun, NewJob, Status as JobStatus};

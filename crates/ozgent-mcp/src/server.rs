@@ -278,7 +278,8 @@ async fn open(name: &str, config: &mcp::Server, launcher: Option<&Launcher>, log
                 // `npx` and `uvx` download for it still goes in its own
                 // folder under ~/ozgent/mcp, so removing that removes it.
                 let mut env = env;
-                if let Some(home) = launcher.map(|l| l.home(name)) {
+                let home = launcher.map(|l| l.home(name));
+                if let Some(home) = &home {
                     let cache = home.join(".cache");
                     if std::fs::create_dir_all(&cache).is_ok() {
                         for (key, dir) in [("npm_config_cache", "npm"), ("UV_CACHE_DIR", "uv")] {
@@ -286,7 +287,11 @@ async fn open(name: &str, config: &mcp::Server, launcher: Option<&Launcher>, log
                         }
                     }
                 }
-                StdioLink::start(command, &config.args, &env, config.cwd.as_deref(), origin, log)?
+                // Working in its own folder, not wherever ozgent was started:
+                // a browser server wrote its identity.toml into the directory
+                // the daemon happened to be launched from.
+                let cwd = config.cwd.clone().or(home.filter(|h| h.is_dir()));
+                StdioLink::start(command, &config.args, &env, cwd.as_deref(), origin, log)?
             };
             Link::Stdio(Box::new(link))
         }

@@ -85,6 +85,21 @@ fn block<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// What of a stored text is embedded: its opening, up to [`EMBED_CHARS`].
+///
+/// A page a tool read can run to tens of thousands of characters, and
+/// embedding all of it kept the embedding model busy for seconds — time a
+/// chat model being loaded waits out. Meaning is found from the gist; the
+/// full text is still searched word for word.
+pub fn for_embedding(text: &str) -> String {
+    match text.char_indices().nth(EMBED_CHARS) {
+        Some((at, _)) => text[..at].to_string(),
+        None => text.to_string(),
+    }
+}
+
+pub const EMBED_CHARS: usize = 3000;
+
 /// Embed a stored message after the fact, without holding up anybody.
 pub fn embed_later(state: &State, id: i64, text: String) {
     if text.trim().is_empty() {
@@ -92,7 +107,7 @@ pub fn embed_later(state: &State, id: i64, text: String) {
     }
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
-        let vector = state.embedder.embed(&text);
+        let vector = state.embedder.embed(&for_embedding(&text));
         if vector.iter().all(|x| *x == 0.0) {
             return;
         }
@@ -169,7 +184,7 @@ async fn run_backfill(state: &State) -> Result<usize, String> {
         if batch.is_empty() {
             return Ok(done);
         }
-        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let texts: Vec<String> = batch.iter().map(|(_, t)| for_embedding(t)).collect();
         let worker = state.worker.clone();
         let vectors = tokio::task::spawn_blocking(move || worker.embed_as(Role::Document, texts))
             .await

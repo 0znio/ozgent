@@ -84,6 +84,9 @@ pub struct Request {
     /// Agents the model may hand the request to itself, through the
     /// `ask_agent` tool. Empty when that is switched off or not offered here.
     pub handoff: Vec<ozgent_core::Agent>,
+    /// The conversation's memory the `memory` tool may search, or `None` for
+    /// a caller with no conversation — an API request, a one-off job.
+    pub memory: Option<crate::memory_tool::Reach>,
     pub out: UnboundedSender<Event>,
 }
 
@@ -299,6 +302,7 @@ impl Worker {
         // For the tool lookup, which runs on a model's thread and embeds
         // through the embedding thread; see `tool_embedder`.
         let _ = TOOL_EMBED.set(worker.clone());
+        crate::memory_tool::set_root(worker.context.paths.root().to_path_buf());
         worker
     }
 
@@ -1650,6 +1654,15 @@ fn turn(
                 auto_lookup(t, &config, session, &mut messages, &deferred, native_tools, web_bridge.as_ref());
             }
         }
+        // A message that points back at something earlier gets a memory
+        // search made for it, recorded as the model's own `memory` call, so
+        // what was read before is in front of it before it decides to fetch
+        // it again. Only such messages, and only when something matches.
+        if offered.iter().any(|s| s.name == crate::memory_tool::NAME) {
+            if let Some(reach) = request.memory.as_ref() {
+                auto_recall(reach, session, &mut messages, native_tools);
+            }
+        }
 
         // The gate's grammar is not part of the prompt, so it takes every
         // callable tool: a tool found with `find_tools` must be writable.
@@ -1863,6 +1876,11 @@ fn prewarm(
     let mut specs: Vec<ozgent_core::ToolSpec> =
         t.host.tools().iter().filter(|s| !switched_off(&t, config, &s.name)).cloned().collect();
     specs.extend(ozgent_core::agents::handoff_spec(&handoff));
+    // What a chat from the web page or the terminal is offered, which is what
+    // most turns are; see `offer`.
+    if !config.tools.disabled.iter().any(|n| n == crate::memory_tool::NAME) {
+        specs.push(crate::memory_tool::spec(true));
+    }
     // The same note about reaching the web as a turn adds; see `web_bridge`.
     let web_bridge = crate::toolsearch::web_bridge(&specs, |n| {
         t.host.source_of(n).and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
@@ -1938,6 +1956,15 @@ fn offer(tools: Option<&Tools>, request: &Request, config: &Config) -> Option<Ve
     out.retain(|s| !request.tools_off.contains(&s.name));
     if !request.tools_off.iter().any(|n| n == ozgent_core::agents::HANDOFF_TOOL) {
         out.extend(ozgent_core::agents::handoff_spec(&request.handoff));
+    }
+    // `memory`, for a turn that has a conversation to remember: answered
+    // here rather than by the tool host, so it is offered beside the host's.
+    let named = request.native_tools.as_ref().is_none_or(|n| n.iter().any(|x| x == crate::memory_tool::NAME));
+    if let Some(reach) = request.memory.as_ref().filter(|_| named) {
+        let off = request.tools_off.iter().chain(config.tools.disabled.iter()).any(|n| n == crate::memory_tool::NAME);
+        if !off {
+            out.push(crate::memory_tool::spec(reach.everywhere));
+        }
     }
     Some(out)
 }
@@ -2320,6 +2347,30 @@ fn rounds(
             }
         }
 
+        // `memory` is answered here, from ozgent's own database: what this
+        // conversation said, what its tools returned, what was remembered.
+        if let Some(reach) = request.memory.as_ref() {
+            if parsed.calls.iter().any(|c| c.name == crate::memory_tool::NAME) {
+                for call in parsed.calls.iter().filter(|c| c.name == crate::memory_tool::NAME) {
+                    let _ = request.out.send(Event::ToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
+                    out.calls += 1;
+                    let started = std::time::Instant::now();
+                    let outcome = crate::memory_tool::call(reach, &call.arguments).map_err(|reason| {
+                        ozgent_tools::ToolCallError::Invalid { name: call.name.clone(), reason }
+                    });
+                    record(request, session, &mut messages, call, outcome, started.elapsed().as_millis() as u64);
+                }
+                parsed.calls.retain(|c| c.name != crate::memory_tool::NAME);
+                if parsed.calls.is_empty() {
+                    continue;
+                }
+            }
+        }
+
         // A call to a name that is no tool at all, when tools are described
         // on request: the model guessed at one it was not shown. The guess —
         // its name and arguments — is a good search, better than what people
@@ -2523,7 +2574,7 @@ fn auto_lookup(
     native_tools: bool,
     web_bridge: Option<&crate::toolsearch::WebBridge>,
 ) {
-    let Some(latest) = messages.iter().rev().find(|m| m.role == ozgent_core::Role::User).map(|m| m.text_content()) else {
+    let Some(latest) = messages.iter().rev().find(|m| m.role == ozgent_core::Role::User).map(|m| ozgent_memory::without_memory_note(&m.text_content()).to_string()) else {
         return;
     };
     let server_of = |n: &str| t.host.source_of(n).and_then(|o| o.strip_prefix("mcp:").map(str::to_string));
@@ -2578,6 +2629,39 @@ fn auto_lookup(
     // Not shown as a card: it is ozgent preparing the prompt, made for every
     // message, not something the model chose to do.
     feed(session, messages, &call, Ok(crate::toolsearch::answer(&found.full, &found.related, &query)));
+}
+
+/// See the call site: a `memory` search for a message that points back.
+fn auto_recall(
+    reach: &crate::memory_tool::Reach,
+    session: &ozgent_llama::engine::Session<'_>,
+    messages: &mut Vec<Message>,
+    native_tools: bool,
+) {
+    let Some(latest) = messages.iter().rev().find(|m| m.role == ozgent_core::Role::User).map(|m| ozgent_memory::without_memory_note(&m.text_content()).to_string()) else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let Some(found) = crate::memory_tool::recall_for(reach, &latest) else { return };
+    tracing::info!("recalled from memory for this message in {} ms", started.elapsed().as_millis());
+    let query: String = latest.chars().take(200).collect();
+    let call = ozgent_core::ToolCall {
+        id: "recall_0".into(),
+        name: crate::memory_tool::NAME.into(),
+        arguments: serde_json::json!({ "action": "search", "query": query }),
+    };
+    messages.push(if native_tools {
+        Message {
+            role: ozgent_core::Role::Assistant,
+            content: vec![ozgent_core::Part::Text { text: String::new() }],
+            thinking: None,
+            tool_calls: vec![call.clone()],
+            tool_call_id: None,
+        }
+    } else {
+        Message::assistant(format!("<tool_call>{{\"name\": \"{}\", \"arguments\": {}}}</tool_call>", call.name, call.arguments))
+    });
+    feed(session, messages, &call, Ok(found));
 }
 
 fn record(
@@ -3328,6 +3412,7 @@ mod tests {
 
     fn request(model: &str, out: tokio::sync::mpsc::UnboundedSender<Event>) -> Request {
         Request {
+            memory: None,
             // No stream is being watched in a test.
             can_ask: false,
             grant: None,

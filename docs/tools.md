@@ -38,6 +38,7 @@ its own user.
 | `run_command` | run one allowed program | execute | `shell = true` + allowlist |
 | `yahoo_finance` | quotes, price history, technical indicators, fundamentals, news, symbol search | read | — |
 | `reddit` | search posts, list a subreddit, read a thread | read | none; app credentials optional |
+| `memory` | search what the conversation and ozgent already hold, read an item, remember a fact | read | the conversation's own; all of yours only at this machine |
 
 **`yahoo_finance`** needs no key. One tool with an `action` — `quote`,
 `history`, `technicals`, `fundamentals`, `news`, `search` — because a small
@@ -362,6 +363,50 @@ answer from what it has — and to say what is missing rather than invent it.
 A turn that ends without answering is asked once more. A model can close its
 reasoning and stop without either answering or calling anything, and the reply
 would otherwise be an empty string.
+
+## Memory
+
+A conversation carries its recent messages verbatim — a quarter of the model's
+window, between 4k and 32k tokens, cached from turn to turn. Beyond that,
+ozgent keeps everything, and the model can reach it:
+
+- **What tools returned is kept.** Every page read, every search result, every
+  tool's answer is stored with the conversation, searchable by its words at
+  once and by meaning once embedded (in the background, only its first 3,000
+  characters, so it never ties up the embedding model).
+- **The last turn's results come with it.** The next message sees what the
+  tools returned for the reply before, up to about 3,000 tokens, shared by
+  length and leaving out acknowledgements like session ids — so "summarise
+  that", "make it ADHD-friendly" or "what did Reuters say about it" is answered
+  from what was read. Measured: the follow-up summary to a Bloomberg and
+  Reuters search made no tool calls and began in 4.6 s, where it used to fetch
+  everything again for 47 s.
+- **`memory`, a tool the model calls.** `search` finds what is kept about
+  something in this conversation — messages, tool results, facts — and follows
+  it: the names and figures the best matches mention are searched for in turn,
+  and a remembered fact leads to the facts about its value (`project → uses →
+  Postgres`, then what is known about Postgres). It answers with short excerpts
+  taken where the question is answered, and ids; `read` gives one in full, the
+  part the search was about first. `remember` keeps a fact — about you
+  everywhere by default, tidied to stand alone ("the user prefers Reuters") —
+  and `forget` drops one. A search takes about 40 ms with the embedding model
+  on the GPU (300-500 ms on the CPU); `read` and `remember` a few.
+- **A message that points back gets a search made for it.** "The article you
+  read earlier", "what did you find last time", "that report": ozgent searches
+  memory before the model answers, since a small model rarely thinks to look.
+- **Facts about you reach every conversation** they are relevant to — only
+  relevant ones: a recalled item must share a word with the question.
+
+None of this touches the start of the prompt, which every conversation shares
+and which stays cached: what memory adds goes with the newest message.
+Measured, a new conversation reused 4,436 cached tokens and processed 474 ms of
+new ones; with recall in the system prompt it had re-read all 5,162 (3 s).
+
+Who can see what: the person at this machine searches all their
+conversations; a chat on a messaging channel, only its own, and what it asks
+ozgent to remember stays in that chat. API requests have no conversation and
+no `memory` tool. `[tools] disabled = ["memory"]` switches the tool off; what
+is kept and carried is not affected.
 
 ## Why the tool list does not change per turn
 

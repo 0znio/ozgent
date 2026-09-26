@@ -688,6 +688,7 @@ async fn chat_completions(
     state
         .worker
         .submit(Request {
+            memory: None,
             // An OpenAI client is a program; it cannot consent for a person.
             can_ask: false,
             grant: grant.clone(),

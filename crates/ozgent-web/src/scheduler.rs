@@ -597,6 +597,7 @@ async fn worth_sending(
     state
         .worker
         .submit(crate::worker::Request {
+            memory: None,
             model,
             messages: vec![ozgent_core::Message {
                 role: ozgent_core::Role::User,

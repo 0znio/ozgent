@@ -128,7 +128,9 @@ same sandbox as `run_command`:
 server deletes its home.
 
 Everything a server keeps is in `~/ozgent/mcp/<name>`: its sandbox home, and
-for a server without the sandbox, what `npx` and `uvx` download for it.
+for a server without the sandbox, what `npx` and `uvx` download for it and its
+working folder (unless `cwd` names another), so nothing it writes lands where
+ozgent happened to be started.
 Deleting `~/ozgent/mcp` removes every trace. (A temporary folder goes under
 the system's own only when that path would be too long for a socket, and
 container images live in Docker's storage.)

@@ -24,12 +24,23 @@ use crate::worker::{Event, Request};
 /// Shared rather than per-surface: the same conversation continued from a
 /// phone and from the browser has to be assembled the same way, or the model
 /// sees a different history depending on which one you happened to pick up.
-pub const BUDGET: Budget = Budget {
-    total: 4096,
-    reserve_for_reply: 1024,
-    recent_messages: 12,
-    max_retrieved: 6,
-};
+/// How much of the conversation is carried verbatim into a prompt: a
+/// quarter of the model's window, between 4k and 32k tokens. It was a fixed
+/// 4k, so on a 64k model a few long answers pushed the start of a
+/// conversation out of view while three quarters of the window sat unused.
+/// What is carried is cached from turn to turn, so a longer window costs
+/// room, not time.
+pub fn budget_for(context_length: u32) -> Budget {
+    Budget {
+        total: (context_length as usize / 4).clamp(4096, 32_768),
+        reserve_for_reply: 1024,
+        recent_messages: 40,
+        max_retrieved: 6,
+    }
+}
+
+/// Characters of the last turn's tool results carried into the next.
+const CARRIED_CHARS: usize = 12_000;
 
 /// One question, from whichever surface asked it.
 pub struct Turn {
@@ -139,10 +150,17 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
     // there is something older than the recent window to search. With a real
     // embedding model this is a forward pass — cheap on the GPU, not on the
     // CPU — and a short conversation has nothing to recall anyway.
+    let budget = {
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        let key = ozgent_core::resolve(&state.paths, &turn.model)
+            .map(|f| f.model.to_string())
+            .unwrap_or_else(|_| turn.model.clone());
+        budget_for(config.options_for(&key).resolve().context_length)
+    };
     let query_vector = {
         let wants = {
             let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-            store.message_count(turn.conversation).unwrap_or(0) as usize > BUDGET.recent_messages
+            store.message_count(turn.conversation).unwrap_or(0) as usize > budget.recent_messages
                 || !store
                     .embeddings_in_conversation(OwnerKind::Fact, turn.conversation)
                     .unwrap_or_default()
@@ -193,10 +211,21 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
         // Stored in the background, so the reply does not wait for it.
         crate::memory::embed_later(state, id, turn.message.clone());
 
-        let assembled = ContextBuilder::new(&store, &state.embedder)
-            .with_budget(BUDGET)
+        let mut assembled = ContextBuilder::new(&store, &state.embedder)
+            .with_budget(budget)
             .with_query_vector(query_vector)
             .build(turn.conversation, &turn.message)?;
+        // What the last turn's tools returned rides along with the reply they
+        // informed, so "summarise that" or "what did Reuters say about it"
+        // is answered from what was already read instead of fetched again.
+        let asked_at = store.get_message(id).ok().flatten().map(|m| m.seq).unwrap_or(i64::MAX);
+        if let Ok(rows) = store.previous_turn_tools(turn.conversation, asked_at) {
+            if let Some(material) = carried_material(&rows) {
+                if let Some(reply) = assembled.recent.iter_mut().rev().find(|m| m.role == "assistant") {
+                    reply.content = format!("{}\n\n{material}", reply.content.trim_end());
+                }
+            }
+        }
 
         let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         // The model's persona and response style, then ozgent's own lines.
@@ -214,7 +243,6 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             (Some(p), Some(ours)) => Some(format!("{p}\n\n{ours}")),
             (p, ours) => p.or(ours),
         };
-        let mut assembled = assembled;
         if config.ui.date_awareness {
             stamp_user_messages(&mut assembled.recent);
         }
@@ -270,6 +298,12 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             agents,
             tools_off: turn.tools_off,
             handoff,
+            // Every conversation of the person at this machine; only its own
+            // for a chat on a messaging channel.
+            memory: Some(crate::memory_tool::Reach {
+                conversation: turn.conversation,
+                everywhere: turn.caller.as_ref().is_none_or(|c| !c.origin.starts_with("chat:")),
+            }),
             out: tx,
         })
         // The inference thread is gone, which is ozgent's problem, not the
@@ -301,6 +335,10 @@ fn relay(
         let mut answer = String::new();
         let mut thinking = String::new();
         let mut activity: Vec<serde_json::Value> = Vec::new();
+        // What each tool returned, whole: stored beside the reply so the next
+        // turn, and `memory`, can find it (see `store_tool_results`).
+        let mut called: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut returned: Vec<(String, String, serde_json::Value, serde_json::Value)> = Vec::new();
         // The agent running now, so its calls and reasoning are filed under it.
         let mut agent: Option<usize> = None;
         // When the reply's own reasoning began and last grew, for "thought for
@@ -343,7 +381,8 @@ fn relay(
                     }
                     None => thinking.push_str(text),
                 },
-                Event::ToolCall { name, arguments, .. } => {
+                Event::ToolCall { id, name, arguments } => {
+                    called.push((id.clone(), name.clone(), arguments.clone()));
                     let mut call = serde_json::json!({
                         "kind": "tool",
                         "name": name,
@@ -358,7 +397,11 @@ fn relay(
                     }
                     activity.push(call);
                 }
-                Event::ToolResult { name, ok, summary, ms, detail, .. } => {
+                Event::ToolResult { id, name, ok, summary, ms, detail } => {
+                    if *ok {
+                        let arguments = called.iter().rev().find(|(i, ..)| i == id).map(|(.., a)| a.clone()).unwrap_or_default();
+                        returned.push((id.clone(), name.clone(), arguments, detail.clone()));
+                    }
                     // Attach to the call this answers, so a reload replays the
                     // pair rather than two loose halves.
                     let slot = activity.iter_mut().rev().find(|c| {
@@ -448,6 +491,7 @@ fn relay(
         let trace = (!thinking.trim().is_empty()).then(|| thinking.trim().to_string());
         let calls =
             (!activity.is_empty()).then(|| serde_json::to_string(&activity).unwrap_or_default());
+        store_tool_results(&state, &store, conversation, &returned);
         // Only the end is trimmed: the offsets recorded above count from the
         // start of the reply, and trimming it there would shift every card.
         match store.append_message_full(
@@ -472,6 +516,41 @@ fn relay(
     });
 
     out_rx
+}
+
+#[cfg(test)]
+mod carried {
+    use super::*;
+
+    fn row(content: &str, call: &str) -> ozgent_memory::StoredMessage {
+        ozgent_memory::StoredMessage {
+            id: 1, conversation_id: 1, seq: 1, role: "tool".into(), content: content.into(), thinking: None,
+            tool_calls: Some(call.into()), tool_call_id: None, media: None, stats: None, tokens: 0, created_at: 0,
+        }
+    }
+
+    #[test]
+    fn the_last_turns_results_are_carried_within_a_share_each() {
+        assert!(carried_material(&[]).is_none(), "a turn without tools carries nothing");
+        let long = "x ".repeat(20_000);
+        let rows = [
+            row("ph50ridt", r#"{"name":"ghostcloak_session_create","arguments":{}}"#),
+            row(&"Reuters: tariffs paused. ".repeat(10), r#"{"name":"ghostcloak_page_snapshot","arguments":{"url":"https://reuters.com"}}"#),
+            row(&long, r#"{"name":"fetch_url","arguments":{"url":"https://bloomberg.com"}}"#),
+        ];
+        let block = carried_material(&rows).unwrap();
+        assert!(block.contains("ghostcloak_page_snapshot https://reuters.com: Reuters: tariffs paused"), "{block}");
+        assert!(!block.contains("ph50ridt"), "an id is not material: {block}");
+        assert!(block.contains("fetch_url https://bloomberg.com"), "{block}");
+        assert!(block.chars().count() < CARRIED_CHARS + 600, "bounded: {}", block.chars().count());
+    }
+
+    #[test]
+    fn the_history_grows_with_the_window_within_limits() {
+        assert_eq!(budget_for(65_536).total, 16_384);
+        assert_eq!(budget_for(8_192).total, 4096);
+        assert_eq!(budget_for(262_144).total, 32_768);
+    }
 }
 
 #[cfg(test)]
@@ -513,4 +592,87 @@ mod tests {
         assert!(text.contains("time zone"), "the zone must be named: {text}");
         assert_eq!(text.lines().count(), 1, "{text}");
     }
+}
+
+
+/// Characters of one tool result kept in the conversation.
+const TOOL_RESULT_CHARS: usize = 24_000;
+
+/// Store what the turn's tools returned, as `tool` rows just before the
+/// reply: never replayed as turns, but carried into the next turn (see
+/// `carried_material`) and searchable with `memory`, by word at once and by
+/// meaning once embedded, in the background.
+fn store_tool_results(
+    state: &State,
+    store: &ozgent_memory::Store,
+    conversation: i64,
+    returned: &[(String, String, serde_json::Value, serde_json::Value)],
+) {
+    for (id, name, arguments, detail) in returned {
+        // Looking things up in memory is not something to remember.
+        if name == crate::memory_tool::NAME {
+            continue;
+        }
+        let text = match detail {
+            serde_json::Value::String(s) => s.clone(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        if text.trim().is_empty() || text == "null" {
+            continue;
+        }
+        let text: String = text.chars().take(TOOL_RESULT_CHARS).collect();
+        let call = serde_json::json!({ "name": name, "arguments": arguments }).to_string();
+        match store.append_message_full(conversation, "tool", &text, None, Some(&call), Some(id), 0) {
+            // Embedded now only where that takes milliseconds. On the CPU it
+            // took seconds, and the next message's tool lookup queued behind
+            // it; there the row is found by its words at once and embedded by
+            // the next catch-up pass (`memory::backfill`).
+            Ok(row) if embedder_on_gpu() => crate::memory::embed_later(state, row, text),
+            Ok(_) => {}
+            Err(e) => tracing::debug!("storing a tool result: {e}"),
+        }
+    }
+}
+
+
+/// The last turn's tool results, as a block after the reply they informed:
+/// each tool, what it was given, and as much of what it returned as fits in
+/// an even share of [`CARRIED_CHARS`]. `None` when the turn used no tools.
+fn carried_material(rows: &[ozgent_memory::StoredMessage]) -> Option<String> {
+    // A session id, a page id, "ok": what a browser returns for opening a
+    // page is not material. What was read is.
+    let rows: Vec<&ozgent_memory::StoredMessage> = rows.iter().filter(|r| r.content.trim().chars().count() >= TRIVIAL_CHARS).collect();
+    if rows.is_empty() {
+        return None;
+    }
+    // Shared in proportion to length, so one long page is not cut to the
+    // size of a short one, and every result keeps at least a little.
+    let total: usize = rows.iter().map(|r| r.content.chars().count()).sum();
+    let mut out = String::from(
+        "[What the tools returned for that reply. Answer follow-up questions about it from here; \
+         use tools again only for something newer or not covered. Older results: the memory tool.]",
+    );
+    for row in rows {
+        let call: serde_json::Value = row.tool_calls.as_deref().and_then(|c| serde_json::from_str(c).ok()).unwrap_or_default();
+        let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+        let lead = call
+            .get("arguments")
+            .and_then(|a| a.as_object())
+            .and_then(|a| ["url", "query", "path", "command", "symbol"].iter().find_map(|k| a.get(*k).and_then(|v| v.as_str())))
+            .unwrap_or("");
+        let flat: String = row.content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let len = flat.chars().count();
+        let share = (CARRIED_CHARS * len / total.max(1)).max(400);
+        let body: String = flat.chars().take(share).collect();
+        let more = if len > share { " …" } else { "" };
+        out.push_str(&format!("\n- {name} {lead}: {body}{more}"));
+    }
+    Some(out)
+}
+
+/// A tool result shorter than this is an acknowledgement, not something read.
+const TRIVIAL_CHARS: usize = 80;
+
+fn embedder_on_gpu() -> bool {
+    crate::worker::embed_status().device.as_deref() == Some("gpu")
 }
