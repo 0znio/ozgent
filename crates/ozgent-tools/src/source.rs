@@ -81,6 +81,13 @@ pub struct Shadowed {
 }
 
 impl Toolbox {
+    /// Whether ozgent's own Python worker, if there is one, is still running.
+    /// A worker that has exited fails every call to its tools, and nothing
+    /// short of starting a new one brings them back.
+    pub fn python_alive(&self) -> bool {
+        self.python.as_ref().is_none_or(ToolHost::is_alive)
+    }
+
     /// Merge the Python worker and any other sources.
     ///
     /// The Python worker wins a name clash, and earlier sources beat later

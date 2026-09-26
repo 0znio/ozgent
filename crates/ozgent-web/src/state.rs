@@ -137,8 +137,24 @@ pub fn watch_config(state: &State) {
         let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         let mut seen = modified(&path);
         let mut warned = false;
+        let mut revived: Option<std::time::Instant> = None;
         loop {
             tokio::time::sleep(WATCH_EVERY).await;
+            // ozgent's own tool worker, if it has died — a Python tool that
+            // took the interpreter down, or the process killed — is started
+            // again: until then every search, fetch and file tool fails.
+            // Not more than once a minute, so one that dies on start does
+            // not loop.
+            let dead = {
+                let tools = state.tools.lock().unwrap_or_else(|e| e.into_inner());
+                tools.as_ref().is_some_and(|t| !t.host.python_alive())
+            };
+            if dead && revived.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(60)) {
+                revived = Some(std::time::Instant::now());
+                tracing::warn!("the tool worker stopped; starting the tools again");
+                let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                crate::api::restart_tools(&state, config).await;
+            }
             let now = modified(&path);
             if now == seen {
                 continue;

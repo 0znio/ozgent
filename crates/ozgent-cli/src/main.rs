@@ -615,11 +615,11 @@ async fn pull(
             }
             Event::FileStart { name, index, total, size } => {
                 eprintln!("[{index}/{total}] {name}");
-                *bar.lock().unwrap() =
+                *bar.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(ozgent_hub::Bar::new(name, size, terminal_columns(), use_colour()));
             }
             Event::FileProgress { done, total, .. } => {
-                let mut guard = bar.lock().unwrap();
+                let mut guard = bar.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(b) = guard.as_mut() {
                     // Re-read every draw so a resize mid-download is followed.
                     // A line wider than the terminal wraps, and the redraw
@@ -638,7 +638,7 @@ async fn pull(
                 }
             }
             Event::FileDone { name, skipped } => {
-                let mut guard = bar.lock().unwrap();
+                let mut guard = bar.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = write!(err, "\r\x1b[2K");
                 match (skipped, guard.as_ref()) {
                     (true, _) => eprintln!("  {name}: already present"),

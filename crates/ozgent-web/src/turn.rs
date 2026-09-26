@@ -141,7 +141,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
     // CPU — and a short conversation has nothing to recall anyway.
     let query_vector = {
         let wants = {
-            let store = state.store.lock().unwrap();
+            let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
             store.message_count(turn.conversation).unwrap_or(0) as usize > BUDGET.recent_messages
                 || !store
                     .embeddings_in_conversation(OwnerKind::Fact, turn.conversation)
@@ -151,7 +151,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
         if wants { state.embedder.embed_query(&turn.message) } else { Vec::new() }
     };
 
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
 
         // Name the conversation after its first line, so every list of
         // conversations shows something readable instead of "New chat".
@@ -198,7 +198,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
             .with_query_vector(query_vector)
             .build(turn.conversation, &turn.message)?;
 
-        let config = state.config.lock().unwrap();
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         // The model's persona and response style, then ozgent's own lines.
         // Per model, and stable from turn to turn, so the cached prompt
         // prefix survives; changing either costs one re-read.
@@ -227,7 +227,7 @@ pub fn start(state: &State, turn: Turn) -> anyhow::Result<UnboundedReceiver<Even
     let agents: Vec<ozgent_core::Agent> = catalog.mentioned(&turn.message).into_iter().cloned().collect();
     // The model may hand a request to an agent itself — but not when the
     // person already named one, and not when handing off is switched off.
-    let handoff = if agents.is_empty() && state.config.lock().unwrap().tools.handoff {
+    let handoff = if agents.is_empty() && state.config.lock().unwrap_or_else(|e| e.into_inner()).tools.handoff {
         catalog.all().to_vec()
     } else {
         Vec::new()
@@ -432,16 +432,19 @@ fn relay(
         drop(rx);
 
         // Always said last, whatever became of the reply.
+        // A stream that ended with neither `done` nor `error` means the model's
+        // thread went away mid-reply. Said, so the page does not simply stop.
         let finish = |last: Option<Event>| {
-            if let Some(event) = last {
-                let _ = out_tx.send(event);
-            }
+            let event = last.unwrap_or_else(|| Event::Error {
+                message: "The model stopped before finishing this reply. Send it again to retry.".into(),
+            });
+            let _ = out_tx.send(event);
         };
         if answer.trim().is_empty() {
             finish(last);
             return;
         }
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         let trace = (!thinking.trim().is_empty()).then(|| thinking.trim().to_string());
         let calls =
             (!activity.is_empty()).then(|| serde_json::to_string(&activity).unwrap_or_default());

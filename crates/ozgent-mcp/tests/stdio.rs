@@ -172,3 +172,74 @@ async fn environment_reaches_the_server() {
     let with_env = mcp::Server { env, ..settings() };
     assert!(connect(with_env).await.is_some());
 }
+
+/// The fixture with its misbehaving tools, noting what it saw in a file.
+fn unruly(notes: &std::path::Path) -> mcp::Server {
+    let mut s = settings();
+    s.env.insert("FIXTURE_UNRULY".into(), "1".into());
+    s.env.insert("FIXTURE_NOTES".into(), notes.display().to_string());
+    s
+}
+
+/// A fresh notes file, removed when dropped.
+struct Notes(PathBuf);
+impl Drop for Notes {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn notes() -> (Notes, PathBuf) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("ozgent-mcp-notes-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    (Notes(path.clone()), path)
+}
+
+#[tokio::test]
+async fn a_request_from_the_server_is_answered_and_not_taken_for_a_reply() {
+    let (_dir, path) = notes();
+    let Some(server) = connect(unruly(&path)).await else { return };
+    // The fixture pings back under the id of this very call, then asks for
+    // roots; the real answer comes only after both are answered.
+    let out = server.call("fix_ask", serde_json::json!({}), false).await.expect("the call's own answer");
+    assert_eq!(out["text"], "ping=True roots_refused=True", "{out}");
+}
+
+#[tokio::test]
+async fn a_server_that_dies_is_started_again_by_the_next_call() {
+    let (_dir, path) = notes();
+    let Some(server) = connect(unruly(&path)).await else { return };
+    let err = server.call("fix_crash", serde_json::json!({}), false).await.unwrap_err();
+    assert!(err.for_model().contains("stopped") || err.for_model().contains("fix"), "{}", err.for_model());
+    // The next call finds it gone, starts it again, and gets its answer.
+    let out = server.call("fix_echo", serde_json::json!({"text": "back"}), false).await.expect("restarted");
+    assert_eq!(out["text"], "back");
+    let starts = std::fs::read_to_string(&path).unwrap_or_default().matches("started").count();
+    assert_eq!(starts, 2, "started once, and once again after the crash");
+}
+
+#[tokio::test]
+async fn a_server_that_keeps_dying_is_not_restarted_in_a_loop() {
+    let (_dir, path) = notes();
+    let Some(server) = connect(unruly(&path)).await else { return };
+    let _ = server.call("fix_crash", serde_json::json!({}), false).await;
+    let _ = server.call("fix_crash", serde_json::json!({}), false).await;
+    let err = server.call("fix_echo", serde_json::json!({"text": "x"}), false).await.unwrap_err();
+    assert!(err.for_model().contains("moments ago"), "{}", err.for_model());
+}
+
+#[tokio::test]
+async fn a_call_given_up_on_is_cancelled_on_the_server() {
+    let (_dir, path) = notes();
+    let mut settings = unruly(&path);
+    settings.timeout_seconds = 1;
+    let Some(server) = connect(settings).await else { return };
+    let err = server.call("fix_slow", serde_json::json!({}), false).await.unwrap_err();
+    assert!(err.for_model().contains("timed out"), "{}", err.for_model());
+    // The fixture reads the cancellation once its two-second sleep is over.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let notes = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(notes.contains("cancelled"), "{notes}");
+}

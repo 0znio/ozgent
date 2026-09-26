@@ -292,7 +292,7 @@ impl<'a> Hub<'a> {
         if !self.windowed {
             return;
         }
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if q.unsettled.remove(&seq) {
             self.woke.notify_all();
         }
@@ -310,7 +310,7 @@ impl<'a> Hub<'a> {
                 usage: crate::threads::Usage::now(),
                 batch: physical,
             };
-            *self.threads.lock().unwrap() = Some(state);
+            *self.threads.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
         }
         self
     }
@@ -350,14 +350,14 @@ impl<'a> Hub<'a> {
     pub fn propose(&self, seq: i32, token: LlamaToken, pos: i32) -> Option<LlamaToken> {
         let drafter = self.drafter.as_ref()?;
         let id = {
-            let mut q = self.drafts.lock().unwrap();
+            let mut q = self.drafts.lock().unwrap_or_else(|e| e.into_inner());
             let id = q.next_id;
             q.next_id += 1;
             q.waiting.push((id, (seq, token, pos)));
             self.drafts_woke.notify_all();
             id
         };
-        let mut q = self.drafts.lock().unwrap();
+        let mut q = self.drafts.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(done) = q.ready.remove(&id) {
                 return done;
@@ -371,9 +371,9 @@ impl<'a> Hub<'a> {
         // Hold the step open for the other conversations still generating,
         // but only for a sliver of a pass: they arrive within a sampling step
         // of each other or not this round at all.
-        let running = self.queue.lock().unwrap().running.max(1);
+        let running = self.queue.lock().unwrap_or_else(|e| e.into_inner()).running.max(1);
         let window = {
-            let pass = self.queue.lock().unwrap().pass_secs;
+            let pass = self.queue.lock().unwrap_or_else(|e| e.into_inner()).pass_secs;
             Duration::from_secs_f64(pass * DRAFT_WINDOW_SHARE).clamp(MIN_WINDOW, MAX_DRAFT_WINDOW)
         };
         let deadline = Instant::now() + window;
@@ -387,8 +387,8 @@ impl<'a> Hub<'a> {
         let taken: Vec<(u64, (i32, LlamaToken, i32))> = std::mem::take(&mut q.waiting);
         drop(q);
         let requests: Vec<(i32, LlamaToken, i32)> = taken.iter().map(|(_, r)| *r).collect();
-        let answers = drafter.lock().unwrap().propose(&requests);
-        let mut q = self.drafts.lock().unwrap();
+        let answers = drafter.lock().unwrap_or_else(|e| e.into_inner()).propose(&requests);
+        let mut q = self.drafts.lock().unwrap_or_else(|e| e.into_inner());
         let mut mine = None;
         for ((rid, _), answer) in taken.into_iter().zip(answers) {
             if rid == id {
@@ -404,7 +404,7 @@ impl<'a> Hub<'a> {
 
     fn forget_drafts(&self, seq: i32, from: i32) {
         if let Some(d) = &self.drafter {
-            d.lock().unwrap().forget(seq, from);
+            d.lock().unwrap_or_else(|e| e.into_inner()).forget(seq, from);
         }
     }
 
@@ -464,7 +464,7 @@ impl<'a> Hub<'a> {
 
     /// What the shared prefix currently holds.
     pub fn commons(&self) -> Vec<LlamaToken> {
-        self.commons.lock().unwrap().tokens.clone()
+        self.commons.lock().unwrap_or_else(|e| e.into_inner()).tokens.clone()
     }
 
     /// Note a prompt from slot `seq`, and say what to do about the shared
@@ -485,7 +485,7 @@ impl<'a> Hub<'a> {
         if !self.has_commons {
             return None;
         }
-        let mut c = self.commons.lock().unwrap();
+        let mut c = self.commons.lock().unwrap_or_else(|e| e.into_inner());
         let shared = match c.previous.replace((seq, prompt.to_vec())) {
             Some((from, previous)) if from != seq => shared_head(&previous, prompt),
             _ => return None,
@@ -520,13 +520,13 @@ impl<'a> Hub<'a> {
         if !self.has_commons || len < MIN_COMMONS {
             return false;
         }
-        let c = self.commons.lock().unwrap();
+        let c = self.commons.lock().unwrap_or_else(|e| e.into_inner());
         !c.filling && c.tokens.is_empty()
     }
 
     /// Publish what the commons sequence now holds, or give up on filling it.
     pub fn filled(&self, tokens: Vec<LlamaToken>) {
-        let mut c = self.commons.lock().unwrap();
+        let mut c = self.commons.lock().unwrap_or_else(|e| e.into_inner());
         c.tokens = tokens;
         c.filling = false;
     }
@@ -592,7 +592,7 @@ impl<'a> Hub<'a> {
 
     /// Hand a copy of the shared prefix to `seq`, which must hold nothing.
     pub fn lend(&self, seq: i32) -> Result<usize, HubError> {
-        let c = self.commons.lock().unwrap();
+        let c = self.commons.lock().unwrap_or_else(|e| e.into_inner());
         if c.tokens.is_empty() {
             return Ok(0);
         }
@@ -606,7 +606,7 @@ impl<'a> Hub<'a> {
         // The head's cache of the prefix goes with it, or the conversation
         // drafts against whatever that sequence held before.
         if let Some(d) = &self.drafter {
-            d.lock().unwrap().copy(from, seq);
+            d.lock().unwrap_or_else(|e| e.into_inner()).copy(from, seq);
         }
         Ok(n)
     }
@@ -629,7 +629,7 @@ impl<'a> Hub<'a> {
     /// [`solo`]: Hub::solo
     /// [`with_context`]: Hub::with_context
     pub fn raw(&self) -> *mut ozgent_mtmd_sys::llama_cpp_sys_2::llama_context {
-        self.context.lock().unwrap().as_ptr()
+        self.context.lock().unwrap_or_else(|e| e.into_inner()).as_ptr()
     }
 
     /// Passes run and requests carried, since the hub was made.
@@ -637,19 +637,19 @@ impl<'a> Hub<'a> {
     /// `merged / passes` is the average batch width: 1.0 means nothing ever
     /// shared a pass and the hub bought nothing.
     pub fn traffic(&self) -> (u64, u64) {
-        let q = self.queue.lock().unwrap();
+        let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         (q.passes, q.merged)
     }
 
     /// Seconds spent inside `decode`, and passes run, since the last reset.
     /// Separated from wall time so a slow pass can be told from a slow slot.
     pub fn spent(&self) -> (f64, u64) {
-        let q = self.queue.lock().unwrap();
+        let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         (q.spent, q.passes)
     }
 
     pub fn reset_traffic(&self) {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.passes = 0;
         q.merged = 0;
         q.spent = 0.0;
@@ -661,7 +661,7 @@ impl<'a> Hub<'a> {
     /// Blocks while a pass is in flight, which is the point: these all mutate
     /// cache the pass is reading.
     pub fn with_context<T>(&self, f: impl FnOnce(&mut LlamaContext<'a>) -> T) -> T {
-        let mut ctx = self.context.lock().unwrap();
+        let mut ctx = self.context.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut ctx)
     }
 
@@ -673,7 +673,7 @@ impl<'a> Hub<'a> {
         }
 
         let id = {
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             let id = q.next_id;
             q.next_id += 1;
             q.waiting.push(Pending { id, work });
@@ -685,7 +685,7 @@ impl<'a> Hub<'a> {
             // Either my answer is here, or somebody is producing it, or
             // nobody is and it falls to me.
             {
-                let mut q = self.queue.lock().unwrap();
+                let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if let Some(done) = q.ready.remove(&id) {
                         return done.map_err(HubError::Decode);
@@ -703,7 +703,7 @@ impl<'a> Hub<'a> {
             // makes the batching continuous rather than a fixed window.
             let outcome = self.drive(id);
 
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.driving = false;
             self.woke.notify_all();
             match outcome {
@@ -747,7 +747,7 @@ impl<'a> Hub<'a> {
             let results = self.pass(&batch);
             let took = started.elapsed().as_secs_f64();
 
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             // Smoothed, because a pass that happened to wait on the queue lock
             // says nothing about what the model costs.
             q.pass_secs = if q.pass_secs <= 0.0 { took } else { q.pass_secs * 0.8 + took * 0.2 };
@@ -788,7 +788,7 @@ impl<'a> Hub<'a> {
     /// than the pass, on a large one far faster — so it is derived from what
     /// a pass has been costing rather than picked.
     fn gather(&self) -> std::sync::MutexGuard<'_, Queue> {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if q.waiting.is_empty() {
             return q;
         }
@@ -876,12 +876,12 @@ impl<'a> Hub<'a> {
             filled += p.work.tokens.len() as i32;
         }
 
-        let mut ctx = self.context.lock().unwrap();
+        let mut ctx = self.context.lock().unwrap_or_else(|e| e.into_inner());
         // A decode pass carries a token or two per slot; anything wider is a
         // prefill, which is timed by its length and would tell the tuner
         // nothing about decoding.
         let decoding = total <= (self.slots as usize) * 2;
-        let mut tuning = self.threads.lock().unwrap();
+        let mut tuning = self.threads.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tuning.as_mut() {
             t.apply(&mut ctx);
         }
@@ -937,7 +937,7 @@ impl<'a> Hub<'a> {
                 })
                 .collect();
             // SAFETY: the context is held, and its last decode is this one.
-            unsafe { d.lock().unwrap().absorb(ctx.as_ptr(), &runs) };
+            unsafe { d.lock().unwrap_or_else(|e| e.into_inner()).absorb(ctx.as_ptr(), &runs) };
         }
 
         // Copied out rather than borrowed: the caller samples on its own
@@ -983,7 +983,7 @@ impl<'a> Hub<'a> {
     /// round (see [`Slot::evictions`]) and come back from its saved state. The
     /// commons stays; every new conversation starts from it.
     fn make_room(&self, ctx: &mut LlamaContext<'a>, busy: &[i32]) -> bool {
-        let live = self.queue.lock().unwrap().live.clone();
+        let live = self.queue.lock().unwrap_or_else(|e| e.into_inner()).live.clone();
         let mut cleared = Vec::new();
         for seq in 0..self.slots as i32 {
             if busy.contains(&seq) || live.contains(&seq) {
@@ -1158,7 +1158,7 @@ impl<'a> Slot<'a> {
     pub fn resume(&mut self) {
         if !self.running {
             self.running = true;
-            let mut q = self.hub.queue.lock().unwrap();
+            let mut q = self.hub.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.running += 1;
             q.live.insert(self.seq);
         }
@@ -1169,7 +1169,7 @@ impl<'a> Slot<'a> {
         self.hub.settle(self.seq);
         if self.running {
             self.running = false;
-            let mut q = self.hub.queue.lock().unwrap();
+            let mut q = self.hub.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.running = q.running.saturating_sub(1);
             q.live.remove(&self.seq);
             // A driver may be holding a pass open for this slot right now.
@@ -1256,7 +1256,7 @@ impl<'a> Slot<'a> {
         // A pass ran past this sequence while it was deciding; its window may
         // be missing cells this trim would need. Refusing sends the caller
         // down the path every cache that cannot trim takes.
-        if self.hub.windowed && self.hub.queue.lock().unwrap().tainted.remove(&self.seq) {
+        if self.hub.windowed && self.hub.queue.lock().unwrap_or_else(|e| e.into_inner()).tainted.remove(&self.seq) {
             self.hub.settle(self.seq);
             return Ok(false);
         }
@@ -1277,7 +1277,7 @@ impl<'a> Slot<'a> {
             let _ = c.clear_kv_cache_seq(Some(self.seq as u32), None, None);
         });
         if self.hub.windowed {
-            self.hub.queue.lock().unwrap().tainted.remove(&self.seq);
+            self.hub.queue.lock().unwrap_or_else(|e| e.into_inner()).tainted.remove(&self.seq);
         }
         self.hub.settle(self.seq);
         self.hub.forget_drafts(self.seq, 0);

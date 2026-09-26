@@ -54,7 +54,7 @@ pub fn resolve(
             let known: Vec<String> = catalog.all().iter().map(|a| format!("@{}", a.name)).collect();
             Refusal::NotFound(format!("no agent {model:?}. Agents: {}", known.join(", ")))
         })?;
-        let base = state.config.lock().unwrap().default_model.clone().ok_or_else(|| {
+        let base = state.config.lock().unwrap_or_else(|e| e.into_inner()).default_model.clone().ok_or_else(|| {
             Refusal::BadRequest(format!(
                 "{model} runs on the default model, and none is set. \
                  Run `ozgent default <model>`, or name a model and write {model} in the message"
@@ -94,7 +94,7 @@ pub fn resolve(
 
 /// Agents as `/v1/models` entries, so a model picker offers them.
 pub fn as_models(state: &State) -> Vec<serde_json::Value> {
-    let base = state.config.lock().unwrap().default_model.clone();
+    let base = state.config.lock().unwrap_or_else(|e| e.into_inner()).default_model.clone();
     AgentCatalog::load(&state.paths)
         .all()
         .iter()

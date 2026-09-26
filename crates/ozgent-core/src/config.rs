@@ -144,10 +144,10 @@ pub struct EmbeddingConfig {
     /// was the failure this default exists to prevent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Where the embedding model runs. `auto` uses the GPU only when it fits
-    /// above what the chat model already holds and needs for its next decode;
-    /// otherwise the CPU, which is 10-20x slower per text but takes nothing
-    /// from the chat model.
+    /// Where the embedding model runs. `auto` uses the GPU when it fits above
+    /// what is resident and a decode needs, loaded on demand and unloaded when
+    /// idle; otherwise the CPU, which is 10-20x slower per text but takes
+    /// nothing from the card.
     pub device: EmbedDevice,
     /// Longest text embedded whole, in tokens. `0` — the default — is the
     /// whole window the model was trained on (32,768 for Qwen3-Embedding);

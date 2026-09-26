@@ -65,6 +65,39 @@ PROBE = {
 }
 
 
+# Listed only when asked for: a server that misbehaves the ways real ones do.
+UNRULY = [
+    {"name": "crash", "description": "Dies mid-call.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "ask", "description": "Asks the client things before answering.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "slow", "description": "Answers after two seconds.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "starts", "description": "How many times this server has started.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def note(text):
+    path = os.environ.get("FIXTURE_NOTES")
+    if path:
+        with open(path, "a") as f:
+            f.write(text + "\n")
+
+
+def ask_client(id_):
+    """Send the client a request, and read its answer from stdin."""
+    send({"jsonrpc": "2.0", "id": id_, "method": "ping" if id_ < 10000 else "roots/list"})
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if message.get("id") == id_ and "method" not in message:
+            return message
+
+
 def attempt(action):
     try:
         return f"ok: {action()}"
@@ -127,6 +160,21 @@ def call(id_, params):
         reply(id_, {"content": []})
     elif name == "wipe":
         reply(id_, {"content": [{"type": "text", "text": "wiped"}]})
+    elif name == "crash":
+        os._exit(1)
+    elif name == "ask":
+        # Its own request under the very id the client used for this call:
+        # a client matching by id alone takes the ping for the answer.
+        ping = ask_client(id_)
+        roots = ask_client(id_ + 10000)
+        ping_ok = ping is not None and ping.get("result") == {}
+        roots_refused = roots is not None and roots.get("error", {}).get("code") == -32601
+        reply(id_, {"content": [{"type": "text", "text": f"ping={ping_ok} roots_refused={roots_refused}"}]})
+    elif name == "slow":
+        time.sleep(2)
+        reply(id_, {"content": [{"type": "text", "text": "late"}]})
+    elif name == "starts":
+        reply(id_, {"content": [{"type": "text", "text": os.environ.get("FIXTURE_NOTES", "")}]})
     elif name == "probe":
         reply(id_, {"content": [{"type": "text", "text": "probed"}], "structuredContent": probe(arguments)})
     else:
@@ -134,6 +182,7 @@ def call(id_, params):
 
 
 def main():
+    note("started")
     # Servers really do print to stdout; the client must survive it rather
     # than treating the line as protocol and giving up.
     sys.stdout.write("starting up\n")
@@ -153,6 +202,8 @@ def main():
 
         # A notification. Answering one would be a protocol error.
         if id_ is None:
+            if method == "notifications/cancelled":
+                note(f"cancelled {(message.get('params') or {}).get('requestId')}")
             continue
 
         if method == "initialize":
@@ -170,6 +221,7 @@ def main():
                 reply(id_, {"tools": TOOLS_PAGE_ONE, "nextCursor": "page2"})
             else:
                 extra = [PROBE] if os.environ.get("FIXTURE_PROBE") == "1" else []
+                extra += UNRULY if os.environ.get("FIXTURE_UNRULY") == "1" else []
                 reply(id_, {"tools": TOOLS_PAGE_TWO + extra})
         elif method == "tools/call":
             call(id_, message.get("params") or {})

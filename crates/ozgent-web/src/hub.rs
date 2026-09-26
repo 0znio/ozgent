@@ -101,13 +101,13 @@ impl Rate {
 
 impl Pulls {
     fn update(&self, id: u64, f: impl FnOnce(&mut Job)) {
-        if let Some(job) = self.jobs.lock().unwrap().get_mut(&id) {
+        if let Some(job) = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
             f(job);
         }
     }
 
     pub fn list(&self) -> Vec<Job> {
-        self.jobs.lock().unwrap().values().cloned().collect()
+        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }
 
     /// Whether this model is being downloaded right now.
@@ -319,7 +319,7 @@ pub async fn pull(
     }
 
     let id = {
-        let mut next = state.pulls.next.lock().unwrap();
+        let mut next = state.pulls.next.lock().unwrap_or_else(|e| e.into_inner());
         *next += 1;
         *next
     };
@@ -342,7 +342,7 @@ pub async fn pull(
         finished_files: 0,
         rate: Rate::default(),
     };
-    state.pulls.jobs.lock().unwrap().insert(id, job);
+    state.pulls.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(id, job);
 
     let pulls = Arc::clone(&state.pulls);
     let paths = state.paths.clone();
@@ -352,7 +352,7 @@ pub async fn pull(
             // An earlier attempt at the same model that was cancelled or
             // failed is settled by this one; leaving it offering "Resume"
             // would invite downloading what is already installed.
-            let mut jobs = pulls.jobs.lock().unwrap();
+            let mut jobs = pulls.jobs.lock().unwrap_or_else(|e| e.into_inner());
             let finished = jobs.get(&id).map(|j| (j.repo.to_ascii_lowercase(), j.quant.clone()));
             if let Some((repo, quant)) = finished {
                 jobs.retain(|other, j| {
@@ -378,7 +378,7 @@ pub async fn pull(
         });
     });
     state.pulls.update(id, |job| job.task = Some(task.abort_handle()));
-    let job = state.pulls.jobs.lock().unwrap().get(&id).cloned().expect("just inserted");
+    let job = state.pulls.jobs.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().expect("just inserted");
     Ok(Json(job))
 }
 
@@ -444,7 +444,7 @@ pub async fn cancel(
     AxumState(state): AxumState<State>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, HubFailure> {
-    let mut jobs = state.pulls.jobs.lock().unwrap();
+    let mut jobs = state.pulls.jobs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(job) = jobs.get_mut(&id) else {
         return Err(HubFailure(StatusCode::NOT_FOUND, format!("no download {id}")));
     };
@@ -506,7 +506,7 @@ pub async fn remove(
     // start. Cleared, and said, rather than left to be discovered.
     let mut cleared_default = false;
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         let was = config.default_model.as_deref().is_some_and(|d| {
             d == reference || Some(d) == found.manifest.alias.as_deref()
         });
@@ -556,12 +556,12 @@ mod tests {
             finished_files: 0,
             rate: Rate::default(),
         };
-        pulls.jobs.lock().unwrap().insert(1, job.clone());
+        pulls.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(1, job.clone());
         assert_eq!(pulls.active_for("unsloth/qwen3.5-4b-gguf", Some("q4_k_m")), Some(1));
         assert_eq!(pulls.active_for("unsloth/Qwen3.5-4B-GGUF", Some("Q8_0")), None);
         let mut done = job;
         done.status = Status::Done;
-        pulls.jobs.lock().unwrap().insert(1, done);
+        pulls.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(1, done);
         assert_eq!(pulls.active_for("unsloth/Qwen3.5-4B-GGUF", Some("Q4_K_M")), None);
     }
 }

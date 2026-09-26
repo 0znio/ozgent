@@ -129,10 +129,19 @@ impl Membership {
     pub fn admit<P: Replan>(&self, plan: P) -> (std::sync::MutexGuard<'_, ()>, P::Out) {
         let guard = self.pool.loading.lock().unwrap_or_else(|e| e.into_inner());
         let first = plan.plan();
-        if !P::is_poor(&first) {
+        if P::is_full(&first) {
             return (guard, first);
         }
-        let freed = self.pool.evict_idle(&self.key);
+        // Short of a full fit: what is cheap to bring back goes first — the
+        // embedding model, which reloads in a second, and chat models nobody
+        // has used for a while. A 4B loaded 27 of 32 layers on the GPU beside
+        // an idle embedding model and decoded slower for it. Only a poor fit
+        // is worth unloading a model someone may still be about to use.
+        let freed = if P::is_poor(&first) {
+            self.pool.evict_idle(&self.key, Evict::AnyIdle)
+        } else {
+            self.pool.evict_idle(&self.key, Evict::Cheap)
+        };
         if freed == 0 {
             return (guard, first);
         }
@@ -153,11 +162,6 @@ impl Membership {
         self.pool.loading.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether any model other than this one is loaded.
-    pub fn others_resident(&self) -> bool {
-        self.pool.names().iter().any(|n| n != &self.key)
-    }
-
     /// Deregister this model. Called when its thread stops.
     pub fn leave(&self) {
         self.pool.remove(&self.key, self.id);
@@ -173,9 +177,23 @@ impl Membership {
 pub trait Replan {
     type Out;
     fn plan(&self) -> Self::Out;
+    fn is_full(out: &Self::Out) -> bool;
     fn is_poor(out: &Self::Out) -> bool;
     fn describe(out: &Self::Out) -> String;
 }
+
+/// Which idle models to unload to make room.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Evict {
+    /// Every idle one: the new model would otherwise barely be on the GPU.
+    AnyIdle,
+    /// Only those cheap to bring back: the embedding model, and chat models
+    /// idle for at least [`LONG_IDLE_SECS`].
+    Cheap,
+}
+
+/// A chat model idle this long is not in the middle of being used.
+pub const LONG_IDLE_SECS: i64 = 5 * 60;
 
 /// Planning a model's placement on the GPU.
 pub struct PlanFor<F>(pub F);
@@ -188,6 +206,10 @@ where
 
     fn plan(&self) -> Self::Out {
         (self.0)()
+    }
+
+    fn is_full(out: &Self::Out) -> bool {
+        out.is_full()
     }
 
     fn is_poor(out: &Self::Out) -> bool {
@@ -274,11 +296,17 @@ impl Pool {
     /// candidate without reloading the file each time. Models are cheap to
     /// bring back and the alternative — evicting one, re-planning, evicting
     /// another — pays the release wait once per model instead of once.
-    fn evict_idle(&self, keep: &str) -> usize {
+    fn evict_idle(&self, keep: &str, which: Evict) -> usize {
         let models = self.models.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now();
         let mut idle: Vec<(i64, &String, &Entry)> = models
             .iter()
             .filter(|(name, e)| name.as_str() != keep && !e.busy.load(Ordering::SeqCst))
+            .filter(|(name, e)| {
+                which == Evict::AnyIdle
+                    || name.as_str() == crate::worker::EMBED_KEY
+                    || now - e.last_used.load(Ordering::SeqCst) >= LONG_IDLE_SECS
+            })
             .map(|(name, e)| (e.last_used.load(Ordering::SeqCst), name, e))
             .collect();
         idle.sort_by_key(|(at, _, _)| *at);
@@ -407,13 +435,34 @@ mod tests {
         pool.insert("new", b);
         // Both were inserted in the same second, so order them explicitly.
         {
-            let models = pool.models.lock().unwrap();
+            let models = pool.models.lock().unwrap_or_else(|e| e.into_inner());
             models["old"].last_used.store(1, Ordering::SeqCst);
             models["new"].last_used.store(2, Ordering::SeqCst);
         }
         assert_eq!(pool.names(), ["new", "old"]);
         pool.get("old");
         assert_eq!(pool.names()[0], "old", "using it moves it to the front");
+    }
+
+    #[test]
+    fn a_near_fit_unloads_only_what_is_cheap_to_bring_back() {
+        let pool = pool();
+        let (e, re) = std::sync::mpsc::channel();
+        let (old, rold) = std::sync::mpsc::channel();
+        let (fresh, rfresh) = std::sync::mpsc::channel();
+        let (me, _mine) = std::sync::mpsc::channel();
+        for m in [pool.insert(crate::worker::EMBED_KEY, e), pool.insert("old", old), pool.insert("fresh", fresh)] {
+            m.working(false);
+        }
+        pool.insert("me", me);
+        {
+            let models = pool.models.lock().unwrap_or_else(|e| e.into_inner());
+            models["old"].last_used.store(now() - LONG_IDLE_SECS - 1, Ordering::SeqCst);
+        }
+        assert_eq!(pool.evict_idle("me", Evict::Cheap), 2);
+        assert!(matches!(re.try_recv(), Ok(Job::Unload)), "the embedding model reloads in a second");
+        assert!(matches!(rold.try_recv(), Ok(Job::Unload)), "nobody has used it for a while");
+        assert!(rfresh.try_recv().is_err(), "a model used a moment ago stays");
     }
 
     #[test]
@@ -428,7 +477,7 @@ mod tests {
         ma.working(false);
         mb.working(false);
 
-        assert_eq!(pool.evict_idle("me"), 2);
+        assert_eq!(pool.evict_idle("me", Evict::AnyIdle), 2);
         assert!(matches!(ra.try_recv(), Ok(Job::Unload)));
         assert!(matches!(rb.try_recv(), Ok(Job::Unload)));
         assert!(mine.try_recv().is_err(), "the model being loaded is spared");
@@ -446,7 +495,7 @@ mod tests {
         working.working(true);
         resting.working(false);
 
-        assert_eq!(pool.evict_idle("none"), 1);
+        assert_eq!(pool.evict_idle("none", Evict::AnyIdle), 1);
         assert!(busy_rx.try_recv().is_err(), "the busy one stays");
         assert!(matches!(idle_rx.try_recv(), Ok(Job::Unload)));
     }
@@ -458,7 +507,7 @@ mod tests {
         let pool = pool();
         let (tx, rx) = std::sync::mpsc::channel();
         pool.insert("loading", tx);
-        assert_eq!(pool.evict_idle("other"), 0);
+        assert_eq!(pool.evict_idle("other", Evict::AnyIdle), 0);
         assert!(rx.try_recv().is_err());
     }
 
@@ -508,7 +557,7 @@ mod tests {
         assert_eq!(pool.loaded(), 0);
         assert!(pool.names().is_empty());
         assert!(pool.get("nothing").is_none());
-        assert_eq!(pool.evict_idle("x"), 0);
+        assert_eq!(pool.evict_idle("x", Evict::AnyIdle), 0);
         pool.unload_all();
     }
 }

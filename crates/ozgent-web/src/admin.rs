@@ -202,7 +202,7 @@ pub struct Guard {
 impl Guard {
     fn issue(&self, hash: &str) -> String {
         let token = secret::random_token(32);
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         sessions.retain(|_, s| now.duration_since(s.last) < IDLE);
         sessions.insert(token.clone(), Session { hash: hash.to_string(), last: now });
@@ -210,7 +210,7 @@ impl Guard {
     }
 
     fn check(&self, token: &str, hash: &str) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let Some(session) = sessions.get_mut(token) else { return false };
         if session.hash != hash || session.last.elapsed() >= IDLE {
             sessions.remove(token);
@@ -221,15 +221,15 @@ impl Guard {
     }
 
     fn end(&self, token: &str) {
-        self.sessions.lock().unwrap().remove(token);
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(token);
     }
 
     /// Forget failures counted against an older password.
     fn sync(&self, hash: &str) {
-        let mut counted = self.counted_for.lock().unwrap();
+        let mut counted = self.counted_for.lock().unwrap_or_else(|e| e.into_inner());
         if counted.as_deref() != Some(hash) {
             *counted = Some(hash.to_string());
-            *self.failures.lock().unwrap() = Failures::default();
+            *self.failures.lock().unwrap_or_else(|e| e.into_inner()) = Failures::default();
         }
     }
 }
@@ -403,7 +403,7 @@ async fn login(AxumState(state): AxumState<State>, request: Request) -> Response
         );
     }
     state.admin.sync(&hash);
-    if let Some(wait) = state.admin.failures.lock().unwrap().locked(ip) {
+    if let Some(wait) = state.admin.failures.lock().unwrap_or_else(|e| e.into_inner()).locked(ip) {
         return fail(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -425,7 +425,7 @@ async fn login(AxumState(state): AxumState<State>, request: Request) -> Response
         .await
         .unwrap_or(false);
     if !ok {
-        let n = state.admin.failures.lock().unwrap().record(ip);
+        let n = state.admin.failures.lock().unwrap_or_else(|e| e.into_inner()).record(ip);
         tracing::warn!("admin: wrong password from {ip} ({n} in the last 15 min)");
         // A pause on every miss, growing with the count: cheap for a person
         // who mistyped, expensive for a script.
@@ -1085,11 +1085,11 @@ mod tests {
         g.sync("old");
         let ip = IpAddr::from([10, 0, 0, 9]);
         for _ in 0..PER_ADDRESS {
-            g.failures.lock().unwrap().record(ip);
+            g.failures.lock().unwrap_or_else(|e| e.into_inner()).record(ip);
         }
-        assert!(g.failures.lock().unwrap().locked(ip).is_some());
+        assert!(g.failures.lock().unwrap_or_else(|e| e.into_inner()).locked(ip).is_some());
         g.sync("new");
-        assert!(g.failures.lock().unwrap().locked(ip).is_none());
+        assert!(g.failures.lock().unwrap_or_else(|e| e.into_inner()).locked(ip).is_none());
     }
 
     #[test]

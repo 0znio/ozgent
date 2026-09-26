@@ -132,6 +132,9 @@ pub fn resolve_runtime() -> Result<PathBuf, HostError> {
 
 pub struct ToolHost {
     child: Mutex<Child>,
+    /// Set when the worker's stdout ends: it has exited, and every call to it
+    /// will fail until a new one is started.
+    gone: Arc<std::sync::atomic::AtomicBool>,
     stdin: Mutex<ChildStdin>,
     pending: Pending,
     next_id: AtomicU64,
@@ -176,11 +179,13 @@ impl ToolHost {
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        tokio::spawn(read_replies(stdout, Arc::clone(&pending)));
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(read_replies(stdout, Arc::clone(&pending), Arc::clone(&gone)));
         tokio::spawn(forward_stderr(stderr));
 
         let host = Self {
             child: Mutex::new(child),
+            gone,
             stdin: Mutex::new(stdin),
             pending,
             next_id: AtomicU64::new(1),
@@ -193,6 +198,11 @@ impl ToolHost {
         };
 
         host.initialize(cfg).await
+    }
+
+    /// Whether the worker process is still running.
+    pub fn is_alive(&self) -> bool {
+        !self.gone.load(Ordering::SeqCst)
     }
 
     async fn initialize(mut self, cfg: HostConfig) -> Result<Self, HostError> {
@@ -360,7 +370,7 @@ impl ToolHost {
     }
 }
 
-async fn read_replies(stdout: tokio::process::ChildStdout, pending: Pending) {
+async fn read_replies(stdout: tokio::process::ChildStdout, pending: Pending, gone: Arc<std::sync::atomic::AtomicBool>) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
         let line = match lines.next_line().await {
@@ -396,6 +406,7 @@ async fn read_replies(stdout: tokio::process::ChildStdout, pending: Pending) {
 
     // The worker is gone; wake everyone still waiting rather than letting them
     // block until their individual timeouts expire.
+    gone.store(true, Ordering::SeqCst);
     pending.lock().await.clear();
 }
 

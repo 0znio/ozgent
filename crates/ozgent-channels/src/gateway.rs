@@ -245,7 +245,7 @@ impl Gateway {
 
     /// Who holds the channels, when it is not this process.
     fn holder(&self) -> Option<String> {
-        if self.shared.lock.lock().unwrap().is_some() {
+        if self.shared.lock.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
             return None;
         }
         let path = lock_path(&self.shared.paths);
@@ -260,7 +260,7 @@ impl Gateway {
 
     /// Take the lock if nobody has it. True when this process holds it.
     fn acquire(&self) -> bool {
-        let mut held = self.shared.lock.lock().unwrap();
+        let mut held = self.shared.lock.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_some() {
             return true;
         }
@@ -285,24 +285,24 @@ impl Gateway {
     }
 
     fn set_runtime(&self, kind: Kind, change: impl FnOnce(&mut Runtime)) {
-        let mut all = self.shared.runtime.lock().unwrap();
+        let mut all = self.shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         change(all.entry(kind).or_default());
     }
 
     fn phase(&self, kind: Kind) -> Phase {
-        self.shared.runtime.lock().unwrap().get(&kind).map(|r| r.phase).unwrap_or_default()
+        self.shared.runtime.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).map(|r| r.phase).unwrap_or_default()
     }
 
     /// Periodic housekeeping: take over the channels when the process that had
     /// them has gone, and give up on a linking code nobody scanned.
     fn tick(&self) {
-        if self.shared.lock.lock().unwrap().is_none() {
+        if self.shared.lock.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             self.apply();
         }
-        let started = *self.shared.linking.lock().unwrap();
+        let started = *self.shared.linking.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(started) = started {
             if started.elapsed() > LINK_FOR && self.phase(Kind::WhatsApp) != Phase::Connected {
-                *self.shared.linking.lock().unwrap() = None;
+                *self.shared.linking.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 self.stop(Kind::WhatsApp);
                 self.set_runtime(Kind::WhatsApp, |r| {
                     r.phase = Phase::Failed;
@@ -367,8 +367,8 @@ impl Gateway {
             }
         };
 
-        self.shared.senders.lock().unwrap().insert(kind, command_tx);
-        self.shared.instances.lock().unwrap().insert(
+        self.shared.senders.lock().unwrap_or_else(|e| e.into_inner()).insert(kind, command_tx);
+        self.shared.instances.lock().unwrap_or_else(|e| e.into_inner()).insert(
             kind,
             Instance { generation, fingerprint, handle: task.abort_handle() },
         );
@@ -382,8 +382,8 @@ impl Gateway {
     /// Stop a channel. Aborting the task drops the bridge process with it
     /// (`kill_on_drop`) and ends a Telegram long poll mid-wait.
     fn stop(&self, kind: Kind) {
-        self.shared.senders.lock().unwrap().remove(&kind);
-        if let Some(instance) = self.shared.instances.lock().unwrap().remove(&kind) {
+        self.shared.senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind);
+        if let Some(instance) = self.shared.instances.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind) {
             instance.handle.abort();
         }
         self.set_runtime(kind, |r| {
@@ -395,13 +395,13 @@ impl Gateway {
     }
 
     fn current_generation(&self, kind: Kind) -> Option<u64> {
-        self.shared.instances.lock().unwrap().get(&kind).map(|i| i.generation)
+        self.shared.instances.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).map(|i| i.generation)
     }
 }
 
 impl GatewayControl for Gateway {
     fn deliver(&self, kind: Kind, chat: &str, markdown: &str) -> Result<(), String> {
-        if self.shared.lock.lock().unwrap().is_none() {
+        if self.shared.lock.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             return Err(match self.holder() {
                 Some(who) => format!("{who} is answering the channels, not this process"),
                 None => "this process is not answering the channels".into(),
@@ -427,8 +427,8 @@ impl GatewayControl for Gateway {
     }
 
     fn view(&self) -> GatewayView {
-        let hosted = self.shared.lock.lock().unwrap().is_some();
-        let runtime = self.shared.runtime.lock().unwrap().clone();
+        let hosted = self.shared.lock.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let runtime = self.shared.runtime.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let config = snapshot(&self.shared.app);
         let mut telegram = runtime.get(&Kind::Telegram).cloned().unwrap_or_default();
         let mut whatsapp = runtime.get(&Kind::WhatsApp).cloned().unwrap_or_default();
@@ -450,7 +450,7 @@ impl GatewayControl for Gateway {
         GatewayView {
             hosted,
             elsewhere: self.holder(),
-            pairing: hosted.then(|| self.shared.pairing.lock().unwrap().clone()),
+            pairing: hosted.then(|| self.shared.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone()),
             telegram,
             whatsapp,
         }
@@ -461,7 +461,7 @@ impl GatewayControl for Gateway {
             return;
         }
         let config = snapshot(&self.shared.app);
-        let linking = self.shared.linking.lock().unwrap().is_some();
+        let linking = self.shared.linking.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         let linked = whatsapp_linked(&self.shared.paths);
 
         for kind in KINDS {
@@ -477,16 +477,16 @@ impl GatewayControl for Gateway {
 
             match (want, running) {
                 (true, None) => {
-                    let failed = self.shared.failed_with.lock().unwrap().get(&kind).cloned();
+                    let failed = self.shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).cloned();
                     if failed.as_deref() != Some(fingerprint.as_str()) {
-                        self.shared.failed_with.lock().unwrap().remove(&kind);
+                        self.shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind);
                         self.start_channel(kind, &config, fingerprint);
                     }
                 }
                 (true, Some(was)) if was != fingerprint => {
                     self.note(format!("{kind}: settings changed, restarting"));
                     self.stop(kind);
-                    self.shared.failed_with.lock().unwrap().remove(&kind);
+                    self.shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind);
                     self.start_channel(kind, &config, fingerprint);
                 }
                 (true, Some(_)) => {}
@@ -498,7 +498,7 @@ impl GatewayControl for Gateway {
                     // Switched off clears a failure; merely not ready yet (no
                     // token, not linked) keeps it on show.
                     if !config.channels.enabled || !config.channels.enabled(kind) {
-                        self.shared.failed_with.lock().unwrap().remove(&kind);
+                        self.shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind);
                         self.set_runtime(kind, |r| {
                             if r.phase != Phase::Installing {
                                 *r = Runtime::default();
@@ -512,13 +512,13 @@ impl GatewayControl for Gateway {
 
     fn restart(&self, kind: Kind) {
         self.stop(kind);
-        self.shared.failed_with.lock().unwrap().remove(&kind);
+        self.shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind);
         self.apply();
     }
 
     fn new_pairing_code(&self) -> String {
         let code = pairing_code();
-        *self.shared.pairing.lock().unwrap() = code.clone();
+        *self.shared.pairing.lock().unwrap_or_else(|e| e.into_inner()) = code.clone();
         code
     }
 
@@ -559,7 +559,7 @@ impl GatewayControl for Gateway {
                         return;
                     }
                 }
-                *gateway.shared.linking.lock().unwrap() = Some(Instant::now());
+                *gateway.shared.linking.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                 let saved = {
                     let mut c = gateway.shared.app.config.lock().unwrap_or_else(|e| e.into_inner());
                     c.channels.set_enabled(Kind::WhatsApp, true);
@@ -575,7 +575,7 @@ impl GatewayControl for Gateway {
                 // A stopped or failed bridge is started fresh, so it asks for
                 // a code rather than reusing a dead session.
                 gateway.stop(Kind::WhatsApp);
-                gateway.shared.failed_with.lock().unwrap().remove(&Kind::WhatsApp);
+                gateway.shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).remove(&Kind::WhatsApp);
                 gateway.apply();
             });
             Ok(())
@@ -590,13 +590,13 @@ impl GatewayControl for Gateway {
                     self.holder().unwrap_or_default()
                 ));
             }
-            *self.shared.linking.lock().unwrap() = None;
+            *self.shared.linking.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let config = snapshot(&self.shared.app);
             let state = self.shared.paths.channel_dir("whatsapp").join("auth");
 
             // A running bridge is already connected: ask it to sign out, and
             // give it a moment to be told yes.
-            let sender = self.shared.senders.lock().unwrap().get(&Kind::WhatsApp).cloned();
+            let sender = self.shared.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&Kind::WhatsApp).cloned();
             let result = if let Some(tx) = sender.filter(|_| self.phase(Kind::WhatsApp) == Phase::Connected) {
                 let _ = tx.send(Command::Logout);
                 for _ in 0..40 {
@@ -725,7 +725,7 @@ fn announce(shared: &Arc<Shared>, config: &Config, active: &[Kind]) {
         println!("  `ozgent gateway <channel>`.");
         println!();
     }
-    println!("  To allow someone else, have them send:   /pair {}", shared.pairing.lock().unwrap());
+    println!("  To allow someone else, have them send:   /pair {}", shared.pairing.lock().unwrap_or_else(|e| e.into_inner()));
     println!("  The code works once, and changes after it is used.");
     println!("  Changes made with `ozgent gateway <channel>` or /admin apply without a restart.");
     println!();
@@ -787,7 +787,7 @@ async fn route(
         Inbound::Ready { who } => {
             gateway.note(format!("{kind}: connected as {who}"));
             if kind == Kind::WhatsApp {
-                *shared.linking.lock().unwrap() = None;
+                *shared.linking.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             gateway.set_runtime(kind, |r| {
                 r.phase = Phase::Connected;
@@ -803,7 +803,7 @@ async fn route(
         Inbound::Qr { data } => {
             // Only while someone asked to link; otherwise a lost session
             // would sit there offering codes to nobody.
-            if shared.linking.lock().unwrap().is_none() {
+            if shared.linking.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                 gateway.stop(kind);
                 gateway.set_runtime(kind, |r| {
                     r.phase = Phase::Failed;
@@ -825,13 +825,13 @@ async fn route(
             if shared.mode == Mode::Terminal {
                 eprintln!("  {kind}: {reason}");
             }
-            let fingerprint = shared.instances.lock().unwrap().remove(&kind).map(|i| i.fingerprint);
-            shared.senders.lock().unwrap().remove(&kind);
+            let fingerprint = shared.instances.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind).map(|i| i.fingerprint);
+            shared.senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&kind);
             if let Some(f) = fingerprint {
-                shared.failed_with.lock().unwrap().insert(kind, f);
+                shared.failed_with.lock().unwrap_or_else(|e| e.into_inner()).insert(kind, f);
             }
             if kind == Kind::WhatsApp {
-                *shared.linking.lock().unwrap() = None;
+                *shared.linking.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             gateway.set_runtime(kind, |r| {
                 r.phase = Phase::Failed;
@@ -851,7 +851,7 @@ async fn route(
             // A typed answer to an outstanding question. Checked before the
             // directive parse and before the queue, because the turn it
             // answers is blocking that queue.
-            let outstanding = shared.waiting.lock().unwrap().get(&key).copied();
+            let outstanding = shared.waiting.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
             if let Some(token) = outstanding {
                 if let Some(choice) = read_choice(&msg.text) {
                     answer(shared, token, choice).await;
@@ -862,7 +862,7 @@ async fn route(
             // `/stop` is the other thing that cannot wait its turn: the point
             // of it is to end what is currently running.
             if matches!(parse(&msg.text), Directive::Stop) {
-                let aborted = shared.running.lock().unwrap().remove(&key);
+                let aborted = shared.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                 match aborted {
                     Some(handle) => {
                         handle.abort();
@@ -928,7 +928,7 @@ async fn offer_pairing(shared: &Arc<Shared>, kind: Kind, msg: &Msg) {
         // addressed to the bot.
         let reply = snapshot(&shared.app).channels.access(kind).reply_unauthorized
             && !msg.group
-            && shared.strangers.lock().unwrap().allow(kind, &msg.sender_id);
+            && shared.strangers.lock().unwrap_or_else(|e| e.into_inner()).allow(kind, &msg.sender_id);
         if reply {
             let channel = match kind {
                 Kind::Telegram => "Telegram",
@@ -940,7 +940,7 @@ async fn offer_pairing(shared: &Arc<Shared>, kind: Kind, msg: &Msg) {
         return;
     };
 
-    let expected = shared.pairing.lock().unwrap().clone();
+    let expected = shared.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if code.trim().to_ascii_uppercase() != expected {
         say(shared, kind, &msg.chat, "That code is not right.").await;
         return;
@@ -960,13 +960,13 @@ async fn offer_pairing(shared: &Arc<Shared>, kind: Kind, msg: &Msg) {
         }
     };
     // Replaced whether or not the write worked: it has been used.
-    *shared.pairing.lock().unwrap() = pairing_code();
+    *shared.pairing.lock().unwrap_or_else(|e| e.into_inner()) = pairing_code();
 
     match saved {
         Ok(()) => {
             note(shared, format!("{kind}: allowed {} ({identity})", msg.name));
             if shared.mode == Mode::Terminal {
-                println!("  next pairing code: /pair {}", shared.pairing.lock().unwrap());
+                println!("  next pairing code: /pair {}", shared.pairing.lock().unwrap_or_else(|e| e.into_inner()));
             }
             say(
                 shared,
@@ -990,12 +990,12 @@ async fn offer_pairing(shared: &Arc<Shared>, kind: Kind, msg: &Msg) {
 /// The same path whether the answer was tapped on a button or typed as a word,
 /// so the two can never come to mean different things.
 async fn answer(shared: &Arc<Shared>, token: u64, choice: Choice) {
-    let Some(ask) = shared.asks.lock().unwrap().remove(&token) else {
+    let Some(ask) = shared.asks.lock().unwrap_or_else(|e| e.into_inner()).remove(&token) else {
         // Answered twice, or after the turn gave up waiting. Not an error.
         return;
     };
     let key = (ask.kind, ask.chat.clone());
-    shared.waiting.lock().unwrap().remove(&key);
+    shared.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 
     // This is what unblocks the inference thread inside `permit`.
     shared.app.permissions.pending.answer(&ask.call_id, choice);
@@ -1013,7 +1013,7 @@ async fn answer(shared: &Arc<Shared>, token: u64, choice: Choice) {
 
 /// Take a question's buttons away and say how it ended.
 async fn settle(shared: &Arc<Shared>, kind: Kind, chat: &str, token: u64, markdown: &str) {
-    let tx = shared.senders.lock().unwrap().get(&kind).cloned();
+    let tx = shared.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).cloned();
     if let Some(tx) = tx {
         let _ = tx.send(Command::Settle {
             chat: chat.to_string(),
@@ -1025,9 +1025,9 @@ async fn settle(shared: &Arc<Shared>, kind: Kind, chat: &str, token: u64, markdo
 
 /// Refuse whatever this chat was being asked, and clear it.
 async fn clear_question(shared: &Arc<Shared>, key: &Key) {
-    let token = shared.waiting.lock().unwrap().remove(key);
+    let token = shared.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     let Some(token) = token else { return };
-    let Some(ask) = shared.asks.lock().unwrap().remove(&token) else { return };
+    let Some(ask) = shared.asks.lock().unwrap_or_else(|e| e.into_inner()).remove(&token) else { return };
     shared.app.permissions.pending.answer(&ask.call_id, Choice::Deny);
     settle(shared, ask.kind, &ask.chat, token, &format!("**{}** — not allowed.", ask.tool)).await;
 }
@@ -1051,9 +1051,9 @@ async fn chat_task(
                 // to abort; the queue still waits for it, so the chat stays
                 // one turn at a time.
                 let task = tokio::spawn(turn_for(shared.clone(), kind, chat.clone(), msg));
-                shared.running.lock().unwrap().insert(key.clone(), task.abort_handle());
+                shared.running.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), task.abort_handle());
                 let _ = task.await;
-                shared.running.lock().unwrap().remove(&key);
+                shared.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                 // A turn that ended with a question outstanding — because it
                 // was aborted, or the model gave up — must not leave the chat
                 // believing it still owes an answer.
@@ -1078,7 +1078,7 @@ async fn chat_task(
                 // Scoped tightly: the guard is not `Send`, and holding it
                 // across the reply would make this whole task unspawnable.
                 let existed = {
-                    let store = shared.app.store.lock().unwrap();
+                    let store = shared.app.store.lock().unwrap_or_else(|e| e.into_inner());
                     store.unbind_channel_chat(kind.as_str(), &chat).unwrap_or(false)
                 };
                 let text = if existed {
@@ -1181,7 +1181,7 @@ fn effects(shared: &Arc<Shared>) -> HashMap<String, Effect> {
 
 /// The conversation this chat continues, creating one if there is none.
 fn conversation(shared: &Arc<Shared>, kind: Kind, chat: &str, msg: &Msg) -> anyhow::Result<i64> {
-    let store = shared.app.store.lock().unwrap();
+    let store = shared.app.store.lock().unwrap_or_else(|e| e.into_inner());
     bind(&store, kind, chat, msg)
 }
 
@@ -1228,7 +1228,7 @@ async fn turn_for(shared: Arc<Shared>, kind: Kind, chat: String, msg: Msg) {
         }
     };
 
-    let Some(tx) = shared.senders.lock().unwrap().get(&kind).cloned() else { return };
+    let Some(tx) = shared.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).cloned() else { return };
     let access = config.channels.access(kind);
     let _ = tx.send(Command::Typing { chat: chat.clone() });
 
@@ -1317,7 +1317,7 @@ async fn ask(
     effect: Effect,
 ) {
     let token = shared.tokens.next();
-    shared.asks.lock().unwrap().insert(
+    shared.asks.lock().unwrap_or_else(|e| e.into_inner()).insert(
         token,
         Ask {
             call_id: call_id.to_string(),
@@ -1326,7 +1326,7 @@ async fn ask(
             tool: tool.to_string(),
         },
     );
-    shared.waiting.lock().unwrap().insert((kind, chat.to_string()), token);
+    shared.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert((kind, chat.to_string()), token);
 
     let _ = tx.send(Command::Ask {
         chat: chat.to_string(),
@@ -1372,7 +1372,7 @@ pub fn describe(arguments: &serde_json::Value) -> String {
 
 /// Say one thing, outside any turn.
 async fn say(shared: &Arc<Shared>, kind: Kind, chat: &str, markdown: &str) {
-    let tx = shared.senders.lock().unwrap().get(&kind).cloned();
+    let tx = shared.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).cloned();
     if let Some(tx) = tx {
         let _ = tx.send(Command::Post {
             chat: chat.to_string(),

@@ -188,7 +188,7 @@ impl Lock {
 /// whose next fire no longer matches their rule.
 fn sweep(state: &State) {
     let now = unix_now();
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     match store.abandon_open_runs() {
         Ok(0) => {}
         Ok(n) => tracing::info!("scheduler: {n} run(s) were interrupted by a restart"),
@@ -228,7 +228,7 @@ fn sweep(state: &State) {
 async fn tick(state: &State) {
     let now = unix_now();
     let due = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         match store.due_jobs(now) {
             Ok(d) => d,
             Err(e) => {
@@ -243,7 +243,7 @@ async fn tick(state: &State) {
         // and a brief that arrives after you switched it off is the kind of
         // thing that makes people stop trusting a scheduler.
         let (fresh, asked) = {
-            let store = state.store.lock().unwrap();
+            let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
             (store.get_job(job.id).ok().flatten(), store.run_requested(job.id).unwrap_or(false))
         };
         // Somebody pressing Run now wants it run, on or off; the schedule's own
@@ -290,7 +290,7 @@ struct Outcome {
 pub async fn run(state: &State, job: &Job) {
     let started = unix_now();
     let run_id = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         // Taken as the run starts, in the same breath as recording it: a
         // second press while this one runs asks for another run.
         let _ = store.take_run_request(job.id);
@@ -308,7 +308,7 @@ pub async fn run(state: &State, job: &Job) {
     let failed = outcome.status == Status::Error;
 
     {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         let _ = store.finish_run(
             run_id,
             outcome.status,
@@ -379,7 +379,7 @@ async fn perform(state: &State, job: &Job) -> Outcome {
     // a row, and a small model handed that often returns nothing at all: the
     // job goes quiet for ever after one crash, which is precisely the silent
     // failure a scheduler cannot have.
-    if let Err(e) = drop_unanswered(&state.store.lock().unwrap(), conversation) {
+    if let Err(e) = drop_unanswered(&state.store.lock().unwrap_or_else(|e| e.into_inner()), conversation) {
         tracing::warn!("scheduler: {} could not tidy its thread: {e}", job.name);
     }
 
@@ -447,7 +447,7 @@ fn model_for(state: &State, job: &Job) -> Result<String, String> {
     if let Some(named) = &job.model {
         return Ok(named.clone());
     }
-    state.config.lock().unwrap().answering_model().ok_or_else(|| {
+    state.config.lock().unwrap_or_else(|e| e.into_inner()).answering_model().ok_or_else(|| {
         "no model is set to answer with. Pick one with `ozgent default <model>`, \
          or give this job its own on the scheduler page."
             .to_string()
@@ -457,12 +457,12 @@ fn model_for(state: &State, job: &Job) -> Result<String, String> {
 /// The conversation this job's runs are written to, making one if needed.
 fn thread_for(state: &State, job: &Job) -> Result<i64, String> {
     if let Some(id) = job.conversation_id {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         if store.get_conversation(id).ok().flatten().is_some() {
             return Ok(id);
         }
     }
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let id = store
         .create_conversation(&job.name, job.model.as_deref())
         .map_err(|e| e.to_string())?;
@@ -663,11 +663,11 @@ fn deliver(state: &State, job: &Job, answer: &str) -> Result<bool, String> {
         .ok_or("no gateway is running in this process, so there is nothing to send with")?;
 
     let allow = {
-        let config = state.config.lock().unwrap();
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         config.channels.access(kind).allow.to_vec()
     };
     let (chats, known) = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         (destination.recipients(&store, &allow), store.channel_chats(channel).unwrap_or_default())
     };
     if chats.is_empty() {

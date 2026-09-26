@@ -213,7 +213,7 @@ async fn list(AxumState(state): AxumState<State>) -> Result<Json<Overview>, ApiE
         .unwrap_or_default();
 
     let allowed = {
-        let config = state.config.lock().unwrap();
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         [
             ("telegram", ozgent_core::ChannelKind::Telegram),
             ("whatsapp", ozgent_core::ChannelKind::WhatsApp),
@@ -229,7 +229,7 @@ async fn list(AxumState(state): AxumState<State>) -> Result<Json<Overview>, ApiE
         .map(|t| t.host.tools().iter().map(|s| s.name.clone()).collect())
         .unwrap_or_default();
 
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let jobs = store
         .list_jobs()
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -254,7 +254,7 @@ async fn show(
     AxumState(state): AxumState<State>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let job = store
         .job_by_name(&name)
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -299,7 +299,7 @@ async fn create(
         conversation_id: None,
         created_by: "web".into(),
     };
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let job = ozgent_schedule::create(&store, &draft).map_err(problem)?;
     Ok(Json(view(&store, &job)))
 }
@@ -331,7 +331,7 @@ async fn change(
         tools: body.tools.map(Some),
         deliver,
     };
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let job = ozgent_schedule::update(&store, &name, &change).map_err(problem)?;
     Ok(Json(view(&store, &job)))
 }
@@ -340,7 +340,7 @@ async fn remove(
     AxumState(state): AxumState<State>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let job = store
         .job_by_name(&name)
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -353,7 +353,7 @@ async fn run_now(
     AxumState(state): AxumState<State>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let job = store
         .job_by_name(&name)
         .map_err(|e| ApiError::internal(e.to_string()))?

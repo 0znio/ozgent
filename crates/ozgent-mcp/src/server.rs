@@ -102,14 +102,34 @@ pub fn server_env(configured: &std::collections::BTreeMap<String, String>) -> st
         .filter(|(k, _)| ENV_KEEP.contains(&k.as_str()) || k.starts_with("LC_"))
         .filter(|(k, _)| !SECRETISH.iter().any(|s| k.to_ascii_uppercase().contains(s)))
         .collect();
+    env.insert(NPM_ALLOW_SCRIPTS.0.into(), NPM_ALLOW_SCRIPTS.1.into());
     env.extend(configured.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
 }
 
+/// The install scripts `npx` may run for an MCP server, by package name.
+///
+/// npm 12 runs no dependency's install script unless it is named, and a
+/// native add-on without its script is a package with no binary: the server
+/// starts, and fails on first use ("Could not locate the bindings file" from
+/// better-sqlite3, measured). These are the add-ons MCP servers pull in, and
+/// only these: everything else stays as npm 12 leaves it, which is stricter
+/// than npm 11, where every script ran. A server's own `env` can set it.
+pub const NPM_ALLOW_SCRIPTS: (&str, &str) = (
+    "npm_config_allow_scripts",
+    "better-sqlite3,sqlite3,sharp,canvas,bcrypt,argon2,keytar,node-pty,re2,bufferutil,utf-8-validate,\
+     onnxruntime-node,@tensorflow/tfjs-node,cpu-features,ssh2,esbuild,@swc/core,protobufjs,puppeteer",
+);
+
 pub struct Server {
     name: String,
     origin: String,
-    link: Link,
+    /// Swapped for a new one when the server has to be started again.
+    link: tokio::sync::RwLock<Arc<Link>>,
+    /// How to start it again: a server that crashed, or whose HTTP session
+    /// expired, is started afresh by the next call instead of every call
+    /// failing until someone reconnects it by hand.
+    revive: Revive,
     info: ServerInfo,
     specs: Vec<ToolSpec>,
     /// The model-facing name back to the name the server knows it by.
@@ -141,54 +161,8 @@ impl Server {
         log: Log,
     ) -> Result<(Self, Vec<ToolStatus>), ConnectError> {
         let origin = format!("mcp:{name}");
-        let link = match config.transport()? {
-            Transport::Stdio { command } => {
-                let env = server_env(&config.env);
-                let link = if config.sandbox {
-                    let Some(launcher) = launcher else {
-                        return Err(ConnectError::Sandbox(
-                            "asks for the sandbox, but ozgent's Python runtime was not found to provide one"
-                                .into(),
-                        ));
-                    };
-                    let wrapped = launcher
-                        .wrap(name, command, &config.args, &config.env, &config.folders, config.network)
-                        .await
-                        .map_err(ConnectError::Sandbox)?;
-                    StdioLink::start(&wrapped.command, &wrapped.args, &wrapped.env, Some(&wrapped.cwd), &origin, log)?
-                } else {
-                    // Not sandboxed, so it keeps the real `HOME`; but what
-                    // `npx` and `uvx` download for it still goes in its own
-                    // folder under ~/ozgent/mcp, so removing that removes it.
-                    let mut env = env;
-                    if let Some(home) = launcher.map(|l| l.home(name)) {
-                        let cache = home.join(".cache");
-                        if std::fs::create_dir_all(&cache).is_ok() {
-                            for (key, dir) in [("npm_config_cache", "npm"), ("UV_CACHE_DIR", "uv")] {
-                                env.entry(key.to_string()).or_insert_with(|| cache.join(dir).display().to_string());
-                            }
-                        }
-                    }
-                    StdioLink::start(command, &config.args, &env, config.cwd.as_deref(), &origin, log)?
-                };
-                Link::Stdio(Box::new(link))
-            }
-            Transport::Http { url } => Link::Http(Box::new(HttpLink::new(url, config.headers.clone()))),
-        };
-
-        let raw = link.request("initialize", protocol::initialize_params(), HANDSHAKE).await?;
-        let info = protocol::server_info(&raw);
-
-        // The session id arrives as a header on this exchange and is required
-        // on every request afterwards by a server that issued one.
-        if let Link::Http(http) = &link {
-            let session = http.session().await;
-            http.adopt(session, &info.protocol_version).await;
-        }
-
-        // The specification requires this before anything else is sent, and a
-        // strict server will refuse `tools/list` until it arrives.
-        link.notify("notifications/initialized", json!({})).await?;
+        let link = open(name, config, launcher, log.clone(), &origin).await?;
+        let info = handshake(&link).await?;
 
         if !info.has_tools {
             link.close().await;
@@ -222,8 +196,117 @@ impl Server {
             }
         }
 
-        Ok((Self { name: name.to_string(), origin, link, info, specs, real_name, timeout }, all))
+        let revive = Revive {
+            config: config.clone(),
+            launcher: launcher.cloned(),
+            log,
+            last: std::sync::Mutex::new(None),
+        };
+        let link = tokio::sync::RwLock::new(Arc::new(link));
+        Ok((Self { name: name.to_string(), origin, link, revive, info, specs, real_name, timeout }, all))
     }
+
+    /// Start the server again after it stopped, at most once per
+    /// [`REVIVE_EVERY`]: a server that dies on every call is not restarted in
+    /// a loop, and says so.
+    async fn revive(&self, dead: &Arc<Link>) -> Result<Arc<Link>, String> {
+        let mut current = self.link.write().await;
+        // Another call may have started it again already.
+        if !Arc::ptr_eq(&current, dead) {
+            return Ok(Arc::clone(&current));
+        }
+        {
+            let mut last = self.revive.last.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|at| at.elapsed() < REVIVE_EVERY) {
+                return Err("it stopped, and was restarted moments ago and stopped again".into());
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        tracing::info!(target: "ozgent::mcp", "{}: the server stopped; starting it again", self.name);
+        let started = async {
+            let link = open(&self.name, &self.revive.config, self.revive.launcher.as_ref(), self.revive.log.clone(), &self.origin).await?;
+            handshake(&link).await?;
+            Ok::<_, ConnectError>(link)
+        };
+        match started.await {
+            Ok(link) => {
+                let link = Arc::new(link);
+                *current = Arc::clone(&link);
+                Ok(link)
+            }
+            Err(e) => Err(format!("it stopped, and starting it again failed: {e}")),
+        }
+    }
+}
+
+/// How to start a server again, kept from when it was first started.
+struct Revive {
+    config: mcp::Server,
+    launcher: Option<Launcher>,
+    log: Log,
+    last: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// The least time between two restarts of one server.
+const REVIVE_EVERY: Duration = Duration::from_secs(10);
+
+/// Start the server's process, or open its HTTP connection.
+async fn open(name: &str, config: &mcp::Server, launcher: Option<&Launcher>, log: Log, origin: &str) -> Result<Link, ConnectError> {
+    let link = match config.transport()? {
+        Transport::Stdio { command } => {
+            let env = server_env(&config.env);
+            let link = if config.sandbox {
+                let Some(launcher) = launcher else {
+                    return Err(ConnectError::Sandbox(
+                        "asks for the sandbox, but ozgent's Python runtime was not found to provide one"
+                            .into(),
+                    ));
+                };
+                let mut configured = config.env.clone();
+                configured.entry(NPM_ALLOW_SCRIPTS.0.into()).or_insert_with(|| NPM_ALLOW_SCRIPTS.1.into());
+                let wrapped = launcher
+                    .wrap(name, command, &config.args, &configured, &config.folders, config.network)
+                    .await
+                    .map_err(ConnectError::Sandbox)?;
+                StdioLink::start(&wrapped.command, &wrapped.args, &wrapped.env, Some(&wrapped.cwd), origin, log)?
+            } else {
+                // Not sandboxed, so it keeps the real `HOME`; but what
+                // `npx` and `uvx` download for it still goes in its own
+                // folder under ~/ozgent/mcp, so removing that removes it.
+                let mut env = env;
+                if let Some(home) = launcher.map(|l| l.home(name)) {
+                    let cache = home.join(".cache");
+                    if std::fs::create_dir_all(&cache).is_ok() {
+                        for (key, dir) in [("npm_config_cache", "npm"), ("UV_CACHE_DIR", "uv")] {
+                            env.entry(key.to_string()).or_insert_with(|| cache.join(dir).display().to_string());
+                        }
+                    }
+                }
+                StdioLink::start(command, &config.args, &env, config.cwd.as_deref(), origin, log)?
+            };
+            Link::Stdio(Box::new(link))
+        }
+        Transport::Http { url } => Link::Http(Box::new(HttpLink::new(url, config.headers.clone()))),
+    };
+    Ok(link)
+}
+
+/// `initialize`, and the notification that must follow it.
+async fn handshake(link: &Link) -> Result<ServerInfo, ConnectError> {
+    let raw = link.request("initialize", protocol::initialize_params(), HANDSHAKE).await?;
+    let info = protocol::server_info(&raw);
+
+    // The session id arrives as a header on this exchange and is required
+    // on every request afterwards by a server that issued one.
+    if let Link::Http(http) = link {
+        let session = http.session().await;
+        http.adopt(session, &info.protocol_version).await;
+    }
+
+    // The specification requires this before anything else is sent, and a
+    // strict server will refuse `tools/list` until it arrives.
+    link.notify("notifications/initialized", json!({})).await?;
+    Ok(info)
 }
 
 /// Read every page of the tool list.
@@ -282,7 +365,20 @@ impl ToolSource for Server {
                 None => arguments,
             };
             let params = json!({ "name": real, "arguments": arguments });
-            let result = self.link.request("tools/call", params, self.timeout).await.map_err(
+            let link = Arc::clone(&*self.link.read().await);
+            let first = link.request("tools/call", params.clone(), self.timeout).await;
+            let result = match first {
+                // Stopped since the last call, so this one never reached it:
+                // started again once, and the call made to the new one. One
+                // that stopped *during* the call is not repeated — the call
+                // may have done its work, or be what kills it.
+                Err(TransportError::Stopped) => match self.revive(&link).await {
+                    Ok(fresh) => fresh.request("tools/call", params, self.timeout).await,
+                    Err(why) => return Err(ToolCallError::Transport(format!("{}: {why}", self.origin))),
+                },
+                other => other,
+            };
+            let result = result.map_err(
                 |e| match e {
                     TransportError::Timeout(after) => {
                         ToolCallError::Timeout { name: name.to_string(), after }
@@ -301,7 +397,7 @@ impl ToolSource for Server {
     }
 
     fn shutdown<'a>(&'a self) -> Boxed<'a, ()> {
-        Box::pin(async move { self.link.close().await })
+        Box::pin(async move { self.link.read().await.close().await })
     }
 }
 

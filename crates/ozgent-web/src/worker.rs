@@ -281,7 +281,7 @@ pub(crate) fn tool_embedder() -> Option<&'static Worker> {
 /// embedding model is a different model, and pinning it to whichever chat
 /// model happened to be resident meant it was dropped and reloaded every time
 /// that one changed.
-const EMBED_KEY: &str = "\u{0}embeddings";
+pub(crate) const EMBED_KEY: &str = "\u{0}embeddings";
 
 impl Worker {
     /// Start the router. Model threads come and go beneath it.
@@ -409,10 +409,27 @@ impl Worker {
         std::thread::Builder::new()
             .name(name)
             .spawn(move || {
-                if embedding {
-                    run_embeddings(context, rx, &member);
-                } else {
-                    run_model(context, rx, &member);
+                // A panic here — a bug on some input nobody foresaw — must
+                // not leave the model registered with no thread behind it:
+                // every later request for it was sent to a dead channel and
+                // failed until the daemon restarted. Caught, it is logged,
+                // the thread leaves the pool, and the next request loads the
+                // model afresh. The turn in flight ends; its client is told
+                // the stream closed.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if embedding {
+                        run_embeddings(context, rx, &member);
+                    } else {
+                        run_model(context, rx, &member);
+                    }
+                }));
+                if let Err(panic) = ran {
+                    let why = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "no message".into());
+                    tracing::error!("the thread for {key} panicked ({why}); it will be started again on the next request");
                 }
                 member.leave();
                 // The engine was dropped with the frame above. Freeing it is
@@ -535,7 +552,28 @@ fn run_model(context: Context, rx: Receiver<Job>, member: &crate::pool::Membersh
 /// its own for every switch.
 fn run_embeddings(context: Context, rx: Receiver<Job>, member: &crate::pool::Membership) {
     let mut embedder: Option<ozgent_llama::embed::Embedder> = None;
-    while let Ok(job) = rx.recv() {
+    loop {
+        // Idle like a chat model, and sooner: it used to wait for work with
+        // no timeout, so after the first message of the day its 1.2-1.7 GB
+        // stayed on the card until something needed the room — the VRAM a
+        // daemon nobody was using still held. It reloads in about a second.
+        let idle = snapshot(&context.config).web.idle_unload().map(|limit| limit.min(EMBED_IDLE));
+        let job = match idle {
+            Some(limit) => match rx.recv_timeout(limit) {
+                Ok(job) => job,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if embedder.is_some() {
+                        tracing::info!("embeddings idle for {} s; unloading", limit.as_secs());
+                    }
+                    return;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            None => match rx.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            },
+        };
         match job {
             Job::Embed { texts, role, strict, reply } => {
                 // Marked busy while it works and recently used afterwards, so
@@ -565,6 +603,9 @@ fn run_embeddings(context: Context, rx: Receiver<Job>, member: &crate::pool::Mem
         }
     }
 }
+
+/// The longest the embedding model stays loaded with nothing to embed.
+const EMBED_IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Return freed heap to the operating system.
 ///
@@ -986,7 +1027,7 @@ fn serve_model(
 
     std::thread::scope(|scope| {
         for (i, mut session) in sessions.into_iter().enumerate() {
-            let rx_mine = work_rx[i].lock().unwrap().take().expect("one receiver per slot");
+            let rx_mine = work_rx[i].lock().unwrap_or_else(|e| e.into_inner()).take().expect("one receiver per slot");
             let (busy, handback, stopping) = (&busy, &handback, &stopping);
             let (served, depth) = (&served, &depth);
             let (engine, resolved, requested, found, mmproj) = (&engine, &resolved, &requested, &found, &mmproj);
@@ -1251,8 +1292,7 @@ fn serve_embeddings(
         // Planned and loaded under the pool's loading lock, so it cannot
         // read the same free memory a chat model is being placed into.
         let _guard = member.map(|m| m.loading());
-        let beside_a_chat_model = member.is_some_and(|m| m.others_resident());
-        match load_embedder(paths, config, beside_a_chat_model) {
+        match load_embedder(paths, config) {
             Ok((embedder, reference, device)) => {
                 *EMBED_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = EmbedStatus {
                     model: Some(reference),
@@ -1310,7 +1350,6 @@ pub(crate) fn choose_embedding_model(
 fn load_embedder(
     paths: &Paths,
     config: &Config,
-    beside_a_chat_model: bool,
 ) -> Result<(ozgent_llama::embed::Embedder, String, &'static str), String> {
     use ozgent_core::config::EmbedDevice;
     let (reference, found) = choose_embedding_model(paths, config)?;
@@ -1319,11 +1358,13 @@ fn load_embedder(
     let gpu = match config.embedding.device {
         EmbedDevice::Gpu => true,
         EmbedDevice::Cpu => false,
-        // Only into room a chat model has already left. Loaded first, it
-        // would take memory the next chat model is planned against, and a
-        // chat model losing a few layers is not a squeeze bad enough for the
-        // pool to evict anything to get them back.
-        EmbedDevice::Auto if !beside_a_chat_model => false,
+        // On the GPU whenever it fits, loaded for the moment it is needed:
+        // it unloads after a few idle minutes, and a chat model that would
+        // not fit whole unloads it first (see `Evict::Cheap`). Once it went
+        // to the CPU whenever no chat model was loaded, so as not to take
+        // room the next one would be planned against; that is what the
+        // eviction now takes care of, and a CPU-bound embedder made every
+        // message's tool lookup slow.
         EmbedDevice::Auto => {
             // Weights, a context of eight 512-token lanes and its scratch,
             // and the decode reserve left untouched for whoever else is here.

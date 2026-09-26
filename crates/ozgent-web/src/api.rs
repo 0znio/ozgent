@@ -232,8 +232,8 @@ struct PermissionsView {
 /// has an answer — the one its effect gives it — which is the thing a user
 /// most needs to see before deciding to override it.
 async fn get_permissions(AxumState(state): AxumState<State>) -> ApiResult<Json<PermissionsView>> {
-    let policy = state.config.lock().unwrap().permissions.clone();
-    let grants = state.permissions.grants.lock().unwrap().clone();
+    let policy = state.config.lock().unwrap_or_else(|e| e.into_inner()).permissions.clone();
+    let grants = state.permissions.grants.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let granted: std::collections::BTreeSet<&str> = grants.allowed().collect();
 
     let installed = match crate::worker::current_tools(&state.tools) {
@@ -307,7 +307,7 @@ async fn put_permissions(
     }
 
     let config = {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         let p = &mut config.permissions;
         if let Some(r) = read {
             p.read = r;
@@ -329,7 +329,7 @@ async fn put_permissions(
     config.save(&state.paths)?;
 
     if body.clear_session {
-        state.permissions.grants.lock().unwrap().clear();
+        state.permissions.grants.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -380,7 +380,7 @@ struct ModelInfo {
 async fn models(AxumState(state): AxumState<State>) -> Json<Vec<ModelInfo>> {
     // The config, not the start-up clone: the default can be changed from the
     // settings page, and a stale copy would keep opening the old model.
-    let default = state.config.lock().unwrap().default_model.clone();
+    let default = state.config.lock().unwrap_or_else(|e| e.into_inner()).default_model.clone();
     let models = ozgent_core::installed(&state.paths)
         .into_iter()
         .map(|m| {
@@ -424,7 +424,7 @@ struct ConversationInfo {
 async fn list_conversations(
     AxumState(state): AxumState<State>,
 ) -> ApiResult<Json<Vec<ConversationInfo>>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     // Only conversations that hold something. One with no messages is a
     // placeholder nobody filled, and offering to reopen nothing is what filled
@@ -453,7 +453,7 @@ async fn new_conversation(
     AxumState(state): AxumState<State>,
     Json(body): Json<NewConversation>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     // Untitled by default, not "New chat": the first message names it, and a
     // placeholder title outlives its usefulness the moment that happens.
     let id = store.create_conversation(
@@ -469,7 +469,7 @@ async fn conversation_by_uuid(
     AxumState(state): AxumState<State>,
     Path(uuid): Path<String>,
 ) -> ApiResult<Json<ConversationInfo>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let found = store
         .conversation_by_uuid(&uuid)?
         .ok_or_else(|| ApiError::bad_request(format!("no conversation {uuid}")))?;
@@ -488,7 +488,7 @@ async fn drop_conversation(
     AxumState(state): AxumState<State>,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
-    state.store.lock().unwrap().delete_conversation(id)?;
+    state.store.lock().unwrap_or_else(|e| e.into_inner()).delete_conversation(id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -502,7 +502,7 @@ async fn rename_conversation(
     Path(id): Path<i64>,
     Json(body): Json<Rename>,
 ) -> ApiResult<StatusCode> {
-    state.store.lock().unwrap().rename_conversation(id, &body.title)?;
+    state.store.lock().unwrap_or_else(|e| e.into_inner()).rename_conversation(id, &body.title)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -534,7 +534,7 @@ async fn messages(
     AxumState(state): AxumState<State>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Vec<MessageInfo>>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let out = store
         .messages(id)?
         .into_iter()
@@ -653,7 +653,7 @@ fn unredact(value: &mut serde_json::Value, current: &serde_json::Value) {
 }
 
 async fn get_settings(AxumState(state): AxumState<State>) -> ApiResult<Json<serde_json::Value>> {
-    let mut value = serde_json::to_value(public(&state.config.lock().unwrap()))
+    let mut value = serde_json::to_value(public(&state.config.lock().unwrap_or_else(|e| e.into_inner())))
         .map_err(|e| ApiError::internal(e.to_string()))?;
     redact(&mut value);
     Ok(Json(value))
@@ -663,7 +663,7 @@ async fn put_settings(
     AxumState(state): AxumState<State>,
     Json(mut raw): Json<serde_json::Value>,
 ) -> ApiResult<StatusCode> {
-    let current = state.config.lock().unwrap().clone();
+    let current = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let current_value = serde_json::to_value(&current).map_err(|e| ApiError::internal(e.to_string()))?;
     unredact(&mut raw, &current_value);
     let mut body: ozgent_core::Config =
@@ -688,7 +688,7 @@ async fn put_settings(
         }
     }
     body.save(&state.paths)?;
-    *state.config.lock().unwrap() = body;
+    *state.config.lock().unwrap_or_else(|e| e.into_inner()) = body;
     // Nothing to unload: the worker reads the live config on every turn and
     // reloads by itself only when a load-time setting changed. Unloading here
     // made every press of Save cost a full model load on the next message.
@@ -803,7 +803,7 @@ async fn model_options(
 ) -> ApiResult<Json<ModelOptions>> {
     let found = ozgent_core::resolve(&state.paths, &model)?;
     let key = found.model.to_string();
-    let config = state.config.lock().unwrap();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
 
     let merged = config.options_for(&key).merge(&found.manifest.defaults);
     let resolved = merged.resolve();
@@ -914,7 +914,7 @@ async fn patch_model_options(
     Json(patch): Json<serde_json::Map<String, serde_json::Value>>,
 ) -> ApiResult<StatusCode> {
     let found = ozgent_core::resolve(&state.paths, &model)?;
-    let current = state.config.lock().unwrap().models.get(&found.model.to_string()).cloned().unwrap_or_default();
+    let current = state.config.lock().unwrap_or_else(|e| e.into_inner()).models.get(&found.model.to_string()).cloned().unwrap_or_default();
     let mut value = serde_json::to_value(current)?;
     let object = value.as_object_mut().ok_or_else(|| ApiError::internal("options are not an object"))?;
     for (k, v) in patch {
@@ -925,7 +925,7 @@ async fn patch_model_options(
         }
     }
     if let Some(style) = object.get("style").and_then(|v| v.as_str()) {
-        let custom = state.config.lock().unwrap().styles.clone();
+        let custom = state.config.lock().unwrap_or_else(|e| e.into_inner()).styles.clone();
         if ozgent_core::styles::find(&custom, style).is_none() {
             return Err(ApiError::bad_request(format!("no style called {style:?}")));
         }
@@ -939,7 +939,7 @@ fn store_model_options(state: &State, model: &str, body: ozgent_core::Options) -
     let found = ozgent_core::resolve(&state.paths, model)?;
     let key = found.model.to_string();
 
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     // A setting that merely repeats what it would inherit is not an override,
     // and storing it as one pins the value for good: the slider a person
     // nudged and put back would go on holding that model to a number long
@@ -1018,7 +1018,7 @@ struct ActiveTool {
 /// which starts an interpreter to find everything installed. Includes
 /// `ask_agent` when the model may hand requests to agents.
 async fn active_tools(AxumState(state): AxumState<State>) -> Json<Vec<ActiveTool>> {
-    let config = state.config.lock().unwrap().clone();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if !config.tools.enabled {
         return Json(Vec::new());
     }
@@ -1059,7 +1059,7 @@ async fn active_tools(AxumState(state): AxumState<State>) -> Json<Vec<ActiveTool
 async fn tools(AxumState(state): AxumState<State>) -> ApiResult<Json<ToolsView>> {
     // Cloned rather than borrowed: discovering tools is async, and holding a
     // std mutex guard across an await makes the whole handler future !Send.
-    let config = state.config.lock().unwrap().clone();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let ws = config.tools.config.get("web_search");
     let current = ws
         .and_then(|v| v.get("provider"))
@@ -1122,7 +1122,7 @@ async fn set_tool_config(
     // Scoped so the guard is provably gone before the await below: held
     // across one, the handler's future is not `Send` and axum rejects it.
     let (snapshot, restart) = {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
         // What the tool host reads when it starts. Only a change to these
         // needs a restart — which also reconnects every MCP server, so a
         // save that changed nothing it reads must not cause one.
@@ -1178,14 +1178,14 @@ pub(crate) async fn restart_tools(state: &State, config: ozgent_core::Config) {
     // the handler's future stops being `Send` and axum will not take it.
     let previous = if config.tools.enabled {
         match crate::state::start_tools(&state.paths, &config).await {
-            Ok(fresh) => state.tools.lock().unwrap().replace(fresh),
+            Ok(fresh) => state.tools.lock().unwrap_or_else(|e| e.into_inner()).replace(fresh),
             Err(e) => {
                 tracing::warn!("keeping the running tools: restarting them failed: {e}");
                 return;
             }
         }
     } else {
-        let taken = state.tools.lock().unwrap().take();
+        let taken = state.tools.lock().unwrap_or_else(|e| e.into_inner()).take();
         taken
     };
 
@@ -1245,7 +1245,7 @@ async fn facts(
     AxumState(state): AxumState<State>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Vec<FactInfo>>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let out = store
         .facts_for(id)?
         .into_iter()
@@ -1284,7 +1284,7 @@ async fn add_fact(
         Some("user") => ozgent_memory::Scope::User,
         _ => ozgent_memory::Scope::Conversation,
     };
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let fact_id = store.add_fact(Some(id), scope, body.text.trim(), None)?;
     if body.pinned {
         store.set_pinned(fact_id, true)?;
@@ -1308,7 +1308,7 @@ async fn pin_fact(
     Path(id): Path<i64>,
     Json(body): Json<PinUpdate>,
 ) -> ApiResult<StatusCode> {
-    state.store.lock().unwrap().set_pinned(id, body.pinned)?;
+    state.store.lock().unwrap_or_else(|e| e.into_inner()).set_pinned(id, body.pinned)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1316,7 +1316,7 @@ async fn forget_fact(
     AxumState(state): AxumState<State>,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
-    state.store.lock().unwrap().delete_fact(id)?;
+    state.store.lock().unwrap_or_else(|e| e.into_inner()).delete_fact(id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1334,7 +1334,7 @@ async fn preview_recall(
     Path(id): Path<i64>,
     Json(body): Json<RecallQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let assembled = ContextBuilder::new(&store, &state.embedder)
         .with_budget(Budget {
             total: 4096,
@@ -1595,7 +1595,7 @@ mod settings_tests {
 
 /// Every response style, built-in and custom.
 async fn list_styles(AxumState(state): AxumState<State>) -> Json<serde_json::Value> {
-    let custom = state.config.lock().unwrap().styles.clone();
+    let custom = state.config.lock().unwrap_or_else(|e| e.into_inner()).styles.clone();
     Json(serde_json::json!({ "styles": ozgent_core::styles::all(&custom) }))
 }
 
@@ -1618,7 +1618,7 @@ async fn save_style(
     if prompt.is_empty() || prompt.chars().count() > 4000 {
         return Err(ApiError::bad_request("a style's instruction is 1 to 4000 characters"));
     }
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     config.styles.insert(name, ozgent_core::styles::CustomStyle { title: body.title.trim().to_string(), prompt });
     config.save(&state.paths)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1627,7 +1627,7 @@ async fn save_style(
 /// Remove a custom style, and stop any model using it.
 async fn delete_style(AxumState(state): AxumState<State>, Path(name): Path<String>) -> ApiResult<StatusCode> {
     let name = ozgent_core::styles::normalise_name(&name);
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     if config.styles.remove(&name).is_none() {
         return Err(ApiError::not_found(format!("no custom style called {name:?}")));
     }

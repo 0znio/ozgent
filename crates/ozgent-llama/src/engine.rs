@@ -715,7 +715,7 @@ impl Engine {
     /// narrow one's measured size scales to it. An estimate is safe here —
     /// if it is short, the next open narrows again exactly as this one did.
     pub fn wide_batch_shortfall(&self) -> Option<u64> {
-        let (wide, narrow, bytes) = (*self.narrowed.lock().unwrap())?;
+        let (wide, narrow, bytes) = (*self.narrowed.lock().unwrap_or_else(|e| e.into_inner()))?;
         (narrow > 0 && wide > narrow)
             .then(|| bytes.saturating_mul((wide - narrow) as u64) / narrow as u64)
     }
@@ -1014,7 +1014,7 @@ impl Engine {
         // Every prompt failed with `NoKvCacheSlot`, measured on a 35B MoE.
         let mut narrow_to = narrow_to;
         let wide = shape.ubatch;
-        *self.narrowed.lock().unwrap() = None;
+        *self.narrowed.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let narrow = |params: &mut LlamaContextParams,
                           shape: &mut ozgent_core::reserve::Shape,
                           narrow_to: &mut Option<u32>|
@@ -1099,7 +1099,7 @@ impl Engine {
                         0
                     };
                     if shape.ubatch < wide && measured > 0 {
-                        *self.narrowed.lock().unwrap() = Some((wide, shape.ubatch, measured));
+                        *self.narrowed.lock().unwrap_or_else(|e| e.into_inner()) = Some((wide, shape.ubatch, measured));
                     }
                     if measured > 0 {
                         tracing::info!(

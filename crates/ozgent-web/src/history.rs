@@ -63,7 +63,7 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<Hit>>, ApiError> {
     let limit = query.limit.unwrap_or(RESULTS).clamp(1, MAX_RESULTS);
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let hits = store
         .search_messages(&query.q, limit)
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -141,7 +141,7 @@ async fn rewind(
     if body.seq < 0 {
         return Err(ApiError::bad_request("a sequence number cannot be negative"));
     }
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     if store
         .get_conversation(id)
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -170,7 +170,7 @@ async fn export(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (title, markdown) = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         let conversation = store
             .get_conversation(id)
             .map_err(|e| ApiError::internal(e.to_string()))?

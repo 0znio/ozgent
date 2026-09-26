@@ -383,7 +383,13 @@ impl Embedder {
             // strategy the model was not trained for produces vectors that
             // decode fine and compare badly — Qwen3-Embedding pools the last
             // token, most BERT-style encoders the mean.
-            .with_pooling_type(LlamaPoolingType::Unspecified);
+            .with_pooling_type(LlamaPoolingType::Unspecified)
+            // Placed on the CPU means off the card entirely. Left to its
+            // defaults, llama.cpp still put the cache and a large-batch
+            // scratch on the GPU — 1.5 GB for "on the cpu", measured, beside
+            // the chat model it was placed there to make room for.
+            .with_offload_kqv(self.gpu)
+            .with_op_offload(self.gpu);
         // SAFETY: the model is boxed, so its address outlives any move of
         // `self`, and `context` is declared before `model`, so it is dropped
         // first. The 'static is never observable outside.
