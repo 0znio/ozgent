@@ -309,6 +309,16 @@ load = "always"      # always described up front, whatever the count
 `always` is for a server used in most conversations, whose tools the model
 should never have to look up. ozgent's own tools are always up front.
 
+**Reaching the web through a server.** With `web_search` switched off or not
+installed, a server that can reach the web is named to the model in one line:
+a tool that searches the web, or else a browser — found by what its tools do
+(go to a URL, read the page's text), whatever they are called. "To search,
+open https://duckduckgo.com/html/?q=… with it and read the page." A message
+that asks for something from the web then gets that browser's tools in full.
+With no such server nothing is said, and the model saying it cannot search
+the web is the truth. A server that describes itself in its handshake is
+listed with that description when you gave it none.
+
 ## Everything else
 
 ```toml

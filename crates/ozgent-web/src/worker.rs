@@ -1371,8 +1371,12 @@ fn load_embedder(
             // The working context's cache (8k tokens, about 60 KB a token at
             // 8 bits for a 0.6B model); longer contexts are checked against
             // free memory when they are needed.
+            // Its compute scratch at a 2,048-token micro-batch is about a
+            // gigabyte, measured (2.8 GB in all for the 0.6B at F16), not the
+            // quarter it was once allowed: an estimate that low let it squeeze
+            // into the margin a chat model's next decode needed.
             let cache = ozgent_llama::embed::WORKING_TOKENS as u64 * (64 << 10);
-            let need = size + size / 10 + cache + (256 << 20) + ozgent_llama::backend::decode_reserve();
+            let need = size + size / 10 + cache + (1 << 30) + ozgent_llama::backend::decode_reserve();
             ozgent_llama::backend::best_gpu()
                 .filter(|d| d.is_gpu())
                 .is_some_and(|d| d.memory_free as u64 >= need)
@@ -1619,6 +1623,19 @@ fn turn(
         if offered.iter().any(|s| s.name == ozgent_core::agents::HANDOFF_TOOL) {
             append_system(&mut messages, &ozgent_core::agents::handoff_prompt(&request.handoff));
         }
+        // No `web_search` this turn — switched off, or not installed — but an
+        // MCP server that can reach the web: the model is told so, once, in
+        // the head. Without it a small model said it had no web access as
+        // often as it used the browser. With no such server nothing is said,
+        // and "I can't search the web" is then the true answer.
+        let web_bridge = tools.as_ref().and_then(|t| {
+            crate::toolsearch::web_bridge(&callable, |n| {
+                t.host.source_of(n).and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
+            })
+        });
+        if let Some(bridge) = &web_bridge {
+            append_system(&mut messages, &bridge.hint());
+        }
         // A small model does not search for what it was not shown — measured,
         // it guessed tool names instead — so ozgent looks them up for it:
         // the tools that match this message are found before the model
@@ -1628,7 +1645,7 @@ fn turn(
         // the tools this message is about.
         if !deferred.is_empty() {
             if let Some(t) = tools.as_ref() {
-                auto_lookup(t, &config, session, &mut messages, &deferred, native_tools);
+                auto_lookup(t, &config, session, &mut messages, &deferred, native_tools, web_bridge.as_ref());
             }
         }
 
@@ -1844,6 +1861,10 @@ fn prewarm(
     let mut specs: Vec<ozgent_core::ToolSpec> =
         t.host.tools().iter().filter(|s| !switched_off(&t, config, &s.name)).cloned().collect();
     specs.extend(ozgent_core::agents::handoff_spec(&handoff));
+    // The same note about reaching the web as a turn adds; see `web_bridge`.
+    let web_bridge = crate::toolsearch::web_bridge(&specs, |n| {
+        t.host.source_of(n).and_then(|o| o.strip_prefix("mcp:").map(str::to_string))
+    });
     let specs = crate::toolsearch::split(specs, &t, config).declared;
     if specs.is_empty() && system.is_none() {
         return;
@@ -1854,6 +1875,9 @@ fn prewarm(
         prepare(&mut messages, &specs, native_tools, None, &[], None);
         if specs.iter().any(|s| s.name == ozgent_core::agents::HANDOFF_TOOL) {
             append_system(&mut messages, &ozgent_core::agents::handoff_prompt(&handoff));
+        }
+        if let Some(bridge) = &web_bridge {
+            append_system(&mut messages, &bridge.hint());
         }
         let prompt = engine
             .render_prompt_full(&messages, resolved.thinking, resolved.reasoning_effort, &specs)
@@ -2495,6 +2519,7 @@ fn auto_lookup(
     messages: &mut Vec<Message>,
     deferred: &[ozgent_core::ToolSpec],
     native_tools: bool,
+    web_bridge: Option<&crate::toolsearch::WebBridge>,
 ) {
     let Some(latest) = messages.iter().rev().find(|m| m.role == ozgent_core::Role::User).map(|m| m.text_content()) else {
         return;
@@ -2504,12 +2529,29 @@ fn auto_lookup(
         let s = config.mcp.servers.get(server);
         format!(
             "{server} {} {}",
-            s.and_then(|s| s.description.clone()).unwrap_or_default(),
+            crate::toolsearch::server_about(t, config, server).unwrap_or_default(),
             s.and_then(|s| s.source.clone()).unwrap_or_default()
         )
     };
     let started = std::time::Instant::now();
-    let found = crate::toolsearch::lookup(deferred, server_of, about, &latest);
+    let mut found = crate::toolsearch::lookup(deferred, &server_of, about, &latest);
+    // A message that wants the web, when the web is reached through an MCP
+    // server: the tools the head's note names come first, in full, so the
+    // model has their parameters for the first call.
+    if let Some(bridge) = web_bridge {
+        if crate::toolsearch::wants_web(deferred, &server_of, &latest) {
+            let named: Vec<&ozgent_core::ToolSpec> =
+                bridge.tools().iter().filter_map(|n| deferred.iter().find(|s| s.name == *n)).collect();
+            if !named.is_empty() {
+                let rest: Vec<&ozgent_core::ToolSpec> =
+                    found.full.iter().chain(found.related.iter()).copied().filter(|s| !named.iter().any(|n| n.name == s.name)).collect();
+                let room = crate::toolsearch::LOOKUP_FULL.saturating_sub(named.len());
+                found.full = named.into_iter().chain(rest.iter().take(room).copied()).collect();
+                found.related = rest.into_iter().skip(room).take(crate::toolsearch::LOOKUP_RELATED).collect();
+                tracing::info!("tool lookup: a web request, answered through {}", bridge.tools().join(", "));
+            }
+        }
+    }
     tracing::info!("tool lookup took {} ms", started.elapsed().as_millis());
     if found.full.is_empty() {
         return;

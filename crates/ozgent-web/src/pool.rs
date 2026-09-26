@@ -127,7 +127,27 @@ impl Membership {
     /// weights are resident — that is what stops two loads reading the same
     /// free memory and both concluding they fit.
     pub fn admit<P: Replan>(&self, plan: P) -> (std::sync::MutexGuard<'_, ()>, P::Out) {
+        // It may be embedding this very turn's message as the chat model is
+        // admitted — a busy model is never evicted — so its current job is
+        // waited out first, briefly, and before taking the loading lock,
+        // which a job still loading the embedder needs itself.
+        if self.key != crate::worker::EMBED_KEY {
+            let waited = std::time::Instant::now();
+            while self.pool.embedder_busy() && waited.elapsed() < EMBEDDER_WAIT {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         let guard = self.pool.loading.lock().unwrap_or_else(|e| e.into_inner());
+        // A chat model is placed on a card without the embedding model on it.
+        // Loaded first — a memory check at start-up embeds a word — it took
+        // 2.9 GB the chat model then planned around: its context came up
+        // short, and a CUDA graph it needed mid-reply found no memory and
+        // llama.cpp aborted the process. The embedder comes back in a second,
+        // beside the chat model, and only where there is room above it and
+        // its next decode (see `load_embedder`).
+        if self.key != crate::worker::EMBED_KEY && self.pool.evict_idle(&self.key, Evict::Embedder) > 0 {
+            wait_for_release();
+        }
         let first = plan.plan();
         if P::is_full(&first) {
             return (guard, first);
@@ -190,7 +210,13 @@ pub enum Evict {
     /// Only those cheap to bring back: the embedding model, and chat models
     /// idle for at least [`LONG_IDLE_SECS`].
     Cheap,
+    /// Only the embedding model.
+    Embedder,
 }
+
+/// The longest a chat model's admission waits for the embedding model to
+/// finish a job, so as to place itself on a card without it.
+const EMBEDDER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A chat model idle this long is not in the middle of being used.
 pub const LONG_IDLE_SECS: i64 = 5 * 60;
@@ -226,6 +252,12 @@ where
 }
 
 impl Pool {
+    /// Whether the embedding model is resident and in the middle of a job.
+    fn embedder_busy(&self) -> bool {
+        let models = self.models.lock().unwrap_or_else(|e| e.into_inner());
+        models.get(crate::worker::EMBED_KEY).is_some_and(|e| e.busy.load(Ordering::SeqCst))
+    }
+
     /// Guard the check-then-start sequence. See [`Pool::spawning`].
     pub fn starting(&self) -> std::sync::MutexGuard<'_, ()> {
         self.spawning.lock().unwrap_or_else(|e| e.into_inner())
@@ -302,10 +334,13 @@ impl Pool {
         let mut idle: Vec<(i64, &String, &Entry)> = models
             .iter()
             .filter(|(name, e)| name.as_str() != keep && !e.busy.load(Ordering::SeqCst))
-            .filter(|(name, e)| {
-                which == Evict::AnyIdle
-                    || name.as_str() == crate::worker::EMBED_KEY
-                    || now - e.last_used.load(Ordering::SeqCst) >= LONG_IDLE_SECS
+            .filter(|(name, e)| match which {
+                Evict::AnyIdle => true,
+                Evict::Embedder => name.as_str() == crate::worker::EMBED_KEY,
+                Evict::Cheap => {
+                    name.as_str() == crate::worker::EMBED_KEY
+                        || now - e.last_used.load(Ordering::SeqCst) >= LONG_IDLE_SECS
+                }
             })
             .map(|(name, e)| (e.last_used.load(Ordering::SeqCst), name, e))
             .collect();

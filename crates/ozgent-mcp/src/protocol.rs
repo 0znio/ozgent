@@ -76,6 +76,10 @@ pub struct ServerInfo {
     pub protocol_version: String,
     /// Whether it offers tools at all.
     pub has_tools: bool,
+    /// What the server says about itself and how to use it, from the
+    /// handshake's `instructions`: "Stealth browser for AI agents. Create a
+    /// session, open pages, take snapshots…". Empty when it says nothing.
+    pub instructions: String,
 }
 
 pub fn server_info(result: &Value) -> ServerInfo {
@@ -97,6 +101,11 @@ pub fn server_info(result: &Value) -> ServerInfo {
             .unwrap_or(PROTOCOL_VERSION)
             .to_string(),
         has_tools: result.get("capabilities").and_then(|c| c.get("tools")).is_some(),
+        instructions: result
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default(),
     }
 }
 

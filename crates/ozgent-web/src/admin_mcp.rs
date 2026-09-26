@@ -676,7 +676,9 @@ pub(crate) async fn summary(AxumState(state): AxumState<State>) -> Response {
             let st = statuses.iter().find(|x| &x.name == name);
             json!({
                 "name": name,
-                "description": s.description,
+                // What it said about itself, when nobody described it.
+                "description": s.description.clone().filter(|d| !d.trim().is_empty())
+                    .or_else(|| st.map(|x| x.instructions.clone()).filter(|i| !i.trim().is_empty())),
                 "enabled": s.enabled,
                 // Switched off for the chats by whoever chats; see
                 // `[tools] mcp_off`. The server itself still runs.

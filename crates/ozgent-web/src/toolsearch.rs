@@ -109,14 +109,7 @@ pub fn find_tools_spec(deferred: &[ToolSpec], tools: &Tools, config: &Config) ->
         specs.sort_by(|a, b| a.name.cmp(&b.name));
     }
     let about = |server: &str| {
-        config
-            .mcp
-            .servers
-            .get(server)
-            .and_then(|s| s.description.clone())
-            .filter(|d| !d.trim().is_empty())
-            .map(|d| format!(" — {}", one_line(&d)))
-            .unwrap_or_default()
+        server_about(tools, config, server).map(|d| format!(" — {d}")).unwrap_or_default()
     };
     let directory = directory(&by_server, &about);
     ToolSpec {
@@ -137,6 +130,37 @@ pub fn find_tools_spec(deferred: &[ToolSpec], tools: &Tools, config: &Config) ->
         output_schema: None,
         effect: ozgent_core::permission::Effect::Read,
     }
+}
+
+/// What a server is, in a line: its `description` if one was given, else
+/// what it said about itself in the handshake ("Stealth browser for AI
+/// agents. Create a session, open pages…"), cut to its first two sentences.
+/// A server pasted in without a description was otherwise just a name, and a
+/// name does not say "this is a browser".
+pub fn server_about(tools: &Tools, config: &Config, server: &str) -> Option<String> {
+    let given = config.mcp.servers.get(server).and_then(|s| s.description.clone()).filter(|d| !d.trim().is_empty());
+    let said = || {
+        tools.mcp.iter().find(|s| s.name == server).map(|s| s.instructions.clone()).filter(|i| !i.trim().is_empty())
+    };
+    given.or_else(said).map(|text| brief(&text, 24))
+}
+
+/// The first two sentences of `text`, at most `limit` words.
+fn brief(text: &str, limit: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = text.len();
+    let mut seen = 0;
+    for (i, c) in text.char_indices() {
+        if matches!(c, '.' | '!' | '?') && text[i + 1..].starts_with(' ') {
+            seen += 1;
+            if seen == 2 {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+    let words: Vec<&str> = text[..end].split(' ').collect();
+    if words.len() > limit { format!("{}…", words[..limit].join(" ")) } else { text[..end].trim_end_matches('.').to_string() }
 }
 
 /// The most detailed directory that fits [`DIRECTORY_TOKENS`].
@@ -390,6 +414,166 @@ fn ranked<'a>(
     ranked.into_iter().map(|(_, s)| s).collect()
 }
 
+/// An MCP server that is a web browser, and the tools that make it one.
+///
+/// Found by what its tools say they do, not by its name: camofox, Playwright
+/// and ghostcloak call the same steps different things.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Browser {
+    pub server: String,
+    /// Starts a session or tab, for a browser that wants one first.
+    pub start: Option<String>,
+    /// Goes to a URL.
+    pub open: String,
+    /// Reads the page as text.
+    pub read: String,
+}
+
+impl Browser {
+    pub fn tools(&self) -> Vec<&str> {
+        self.start.iter().map(String::as_str).chain([self.open.as_str(), self.read.as_str()]).collect()
+    }
+}
+
+/// The browser among these tools, if one server has a tool that goes to a
+/// URL and one that reads the page's text.
+pub fn find_browser(specs: &[ToolSpec], server_of: &dyn Fn(&str) -> Option<String>) -> Option<Browser> {
+    // The name's words, a blank, then what it says it does: the blank lets a
+    // check read the name alone.
+    let text = |s: &ToolSpec| format!("{}  {}", s.name.replace('_', " "), one_line(&s.description)).to_lowercase();
+    let mut servers: Vec<String> = specs.iter().filter_map(|s| server_of(&s.name)).collect();
+    servers.sort();
+    servers.dedup();
+    for server in servers {
+        let own: Vec<&ToolSpec> = specs.iter().filter(|s| server_of(&s.name).as_deref() == Some(&server)).collect();
+        let pick = |score: &dyn Fn(&str) -> i32| {
+            own.iter()
+                .map(|s| (score(&text(s)), s.name.clone()))
+                .filter(|(n, _)| *n > 0)
+                .max_by_key(|(n, name)| (*n, std::cmp::Reverse(name.len())))
+                .map(|(_, name)| name)
+        };
+        let open = pick(&|t| {
+            let url = t.contains("url");
+            let goes = ["navigate", " open", "go to", "visit", "load"].iter().any(|w| t.contains(w));
+            if url && goes { 2 + t.contains("navigate") as i32 + t.contains(" open") as i32 } else { 0 }
+        });
+        let read = pick(&|t| {
+            let page = t.contains("page");
+            let text = ["text", "snapshot", "markdown", "content"].iter().any(|w| t.contains(w));
+            // A screenshot is a picture, not the page's text — judged by the
+            // tool's name: Playwright's snapshot calls itself "better than
+            // screenshot".
+            let picture = t.split(' ').take_while(|w| !w.is_empty()).any(|w| w == "screenshot");
+            if page && text && !picture { 2 + t.contains("snapshot") as i32 + t.contains("text") as i32 } else { 0 }
+        });
+        let start = pick(&|t| {
+            let thing = t.contains("session") || t.contains(" tab");
+            let makes = ["create", "new", "launch", "start"].iter().any(|w| t.contains(w));
+            (thing && makes) as i32
+        });
+        if let (Some(open), Some(read)) = (open, read) {
+            if open != read {
+                return Some(Browser { server, start: start.filter(|s| *s != open), open, read });
+            }
+        }
+    }
+    None
+}
+
+/// How to reach the web when ozgent's own `web_search` is not on offer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WebBridge {
+    /// An MCP tool that searches the web itself.
+    Search(String),
+    /// A browser, which can search by opening a search engine's page.
+    Browser(Browser),
+}
+
+impl WebBridge {
+    /// The tools a web request should have described in full.
+    pub fn tools(&self) -> Vec<&str> {
+        match self {
+            Self::Search(tool) => vec![tool.as_str()],
+            Self::Browser(b) => b.tools(),
+        }
+    }
+
+    /// Said once, in the prompt's head. Nothing is said when there is no way
+    /// to the web at all: then the model saying it cannot search is right.
+    pub fn hint(&self) -> String {
+        match self {
+            Self::Search(tool) => format!(
+                "There is no web_search tool here; to search the web, use {tool}."
+            ),
+            Self::Browser(b) => browser_hint(b),
+        }
+    }
+}
+
+/// The way to the web among `specs` when `web_search` itself is not one of
+/// them: an MCP tool that searches the web, else a browser, else none.
+pub fn web_bridge(specs: &[ToolSpec], server_of: impl Fn(&str) -> Option<String>) -> Option<WebBridge> {
+    if specs.iter().any(|s| s.name == "web_search") {
+        return None;
+    }
+    let search = specs
+        .iter()
+        .filter(|s| server_of(&s.name).is_some())
+        .filter(|s| {
+            let t = format!("{} {}", s.name.replace('_', " "), one_line(&s.description)).to_lowercase();
+            t.contains("search") && ["web", "internet", "online", "search engine"].iter().any(|w| t.contains(w))
+                && !t.contains("page") && !t.contains("history")
+        })
+        .min_by_key(|s| s.name.len());
+    if let Some(tool) = search {
+        return Some(WebBridge::Search(tool.name.clone()));
+    }
+    find_browser(specs, &server_of).map(WebBridge::Browser)
+}
+
+/// Said once, in the prompt's head, when there is no `web_search` but there
+/// is a browser: a small model told only that it has "ghostcloak_page_open"
+/// answered "I don't have access to the web" as often as it used it.
+pub fn browser_hint(b: &Browser) -> String {
+    let start = b.start.as_ref().map(|s| format!("{s}, then ")).unwrap_or_default();
+    format!(
+        "There is no web_search tool here, but there is a web browser, {server}. To search the web, \
+         use it: {start}{open} with https://duckduckgo.com/html/?q=<search words>, then {read} to read the \
+         results; open a result the same way to read it.",
+        server = b.server,
+        open = b.open,
+        read = b.read,
+    )
+}
+
+/// Whether a message is asking for something from the web: a stand-in for
+/// `web_search` is ranked among the tools, as the lookup ranks them, and a
+/// message it comes near the top for is taken to want the web. Measured the
+/// same way as every other match, so it is right when the lookup would have
+/// been, and costs one more document in a ranking already being made.
+pub fn wants_web(pool: &[ToolSpec], server_of: impl Fn(&str) -> Option<String>, message: &str) -> bool {
+    let query = clean_query(message);
+    if words(&query).is_empty() {
+        return false;
+    }
+    let probe = ToolSpec {
+        name: WEB_PROBE.to_string(),
+        description: "Search the web for current information: news, facts, prices, people, places, \
+                      products, anything online. Look it up on the internet and read web pages."
+            .to_string(),
+        input_schema: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+        output_schema: None,
+        effect: ozgent_core::permission::Effect::Read,
+    };
+    let mut all: Vec<&ToolSpec> = pool.iter().collect();
+    all.push(&probe);
+    let ranked = ranked(&all, &server_of, &|_| String::new(), &query);
+    ranked.iter().take(LOOKUP_FULL).any(|s| s.name == WEB_PROBE)
+}
+
+const WEB_PROBE: &str = "search_the_web";
+
 /// What a lookup made for a message found.
 pub struct Lookup<'a> {
     /// Described in full: callable at once.
@@ -435,8 +619,8 @@ pub fn lookup<'a>(
 }
 
 /// How many tools a lookup describes in full, and how many more it names.
-const LOOKUP_FULL: usize = 3;
-const LOOKUP_RELATED: usize = 7;
+pub const LOOKUP_FULL: usize = 3;
+pub const LOOKUP_RELATED: usize = 7;
 
 /// A message as a search: without the time stamp ozgent puts on it, links,
 /// paths and quoted code, which match everything and mean nothing here.
@@ -741,6 +925,78 @@ mod tests {
         ];
         assert_eq!(rank(&pool, &q)[0], "github_issue_write");
         assert!(not_a_tool(&[&pool[0]]).contains("github_issue_write"));
+    }
+
+    fn named(names: &[(&str, &str)]) -> Vec<ToolSpec> {
+        names.iter().map(|(n, d)| spec(n, d)).collect()
+    }
+
+    fn by_prefix(n: &str) -> Option<String> {
+        n.split('_').next().filter(|p| *p != "web" && *p != "read").map(str::to_string)
+    }
+
+    #[test]
+    fn a_browser_is_found_by_what_its_tools_do_whatever_they_are_called() {
+        let ghost = named(&[
+            ("ghostcloak_session_create", "Create a new browsing session: launches the engine with a fresh identity."),
+            ("ghostcloak_page_open", "Navigate to a URL in an existing session. Returns a page_id."),
+            ("ghostcloak_page_snapshot", "Extract the visible text content of a page as plain text."),
+            ("ghostcloak_page_screenshot", "Capture a PNG screenshot of a page."),
+            ("ghostcloak_page_click", "Click an element by CSS selector."),
+        ]);
+        let b = find_browser(&ghost, &by_prefix).expect("a browser");
+        assert_eq!(b.tools(), ["ghostcloak_session_create", "ghostcloak_page_open", "ghostcloak_page_snapshot"]);
+
+        let playwright = named(&[
+            ("browser_browser_navigate", "Navigate to a URL"),
+            ("browser_browser_snapshot", "Capture accessibility snapshot of the current page, this is better than screenshot"),
+            ("browser_browser_click", "Perform click on a web page"),
+        ]);
+        let b = find_browser(&playwright, &by_prefix).expect("a browser");
+        assert_eq!((b.open.as_str(), b.read.as_str(), b.start.as_deref()), ("browser_browser_navigate", "browser_browser_snapshot", None));
+
+        let files = named(&[("files_read_file", "Read a file."), ("files_list_directory", "List a directory.")]);
+        assert!(find_browser(&files, &by_prefix).is_none());
+    }
+
+    #[test]
+    fn a_search_tool_is_preferred_and_nothing_is_said_without_a_way_to_the_web() {
+        let mut tools = named(&[
+            ("ghostcloak_page_open", "Navigate to a URL in an existing session."),
+            ("ghostcloak_page_snapshot", "Extract the visible text content of a page as plain text."),
+        ]);
+        let bridge = web_bridge(&tools, by_prefix).expect("the browser");
+        assert!(bridge.hint().contains("duckduckgo"), "{}", bridge.hint());
+
+        tools.push(spec("brave_web_search", "Search the web with the Brave search engine."));
+        assert_eq!(web_bridge(&tools, by_prefix), Some(WebBridge::Search("brave_web_search".into())));
+
+        tools.push(spec("web_search", "Search the web."));
+        assert!(web_bridge(&tools, by_prefix).is_none(), "ozgent's own web_search needs no note");
+
+        let offline = named(&[("files_read_file", "Read a file.")]);
+        assert!(web_bridge(&offline, by_prefix).is_none(), "no way to the web: nothing is claimed");
+    }
+
+    #[test]
+    fn a_message_asking_for_the_web_is_told_apart_from_one_that_is_not() {
+        let pool = named(&[
+            ("ghostcloak_page_click", "Click an element by CSS selector."),
+            ("files_write_file", "Write text to a file."),
+            ("time_get_current_time", "Get the current time in a timezone."),
+        ]);
+        assert!(wants_web(&pool, by_prefix, "what's the latest news about Nvidia's earnings?"));
+        assert!(wants_web(&pool, by_prefix, "search the web for the price of a Raspberry Pi 5"));
+        assert!(!wants_web(&pool, by_prefix, "write a haiku about rain"));
+        assert!(!wants_web(&pool, by_prefix, "save these notes to a file called ideas.txt"));
+    }
+
+    #[test]
+    fn a_servers_own_words_are_cut_to_two_sentences() {
+        assert_eq!(
+            brief("Stealth browser for AI agents. Create a session, open pages, take snapshots. Identities are coherent.", 24),
+            "Stealth browser for AI agents. Create a session, open pages, take snapshots"
+        );
     }
 
     #[test]

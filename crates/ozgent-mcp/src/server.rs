@@ -57,6 +57,10 @@ pub struct Status {
     /// Every tool it lists, offered or not.
     pub tools: Vec<ToolStatus>,
     pub sandboxed: bool,
+    /// What it says about itself in the handshake; see
+    /// [`ServerInfo::instructions`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -491,6 +495,7 @@ pub async fn connect_all_with(
             server: None,
             tools: Vec::new(),
             sandboxed: settings.sandbox,
+            instructions: String::new(),
         };
         if !config.enabled {
             statuses.push(Status { state: State::Off, ..base });
@@ -530,6 +535,7 @@ pub async fn connect_all_with(
                 statuses.push(Status {
                     state: State::Connected,
                     server: (!about.is_empty()).then_some(about),
+                    instructions: server.info().instructions.clone(),
                     tools,
                     log,
                     ..base

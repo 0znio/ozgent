@@ -82,12 +82,13 @@ max_tokens = 0        # 0: the model's own window; a number caps it
 ```
 
 `auto` loads the embedding model when something needs it — memory recall, or
-finding a message's tools — onto the GPU when there is room, and unloads it
-after five idle minutes (sooner if `idle_unload_minutes` is lower; never if it
-is `0`). A chat model that would not fit whole on the GPU unloads it first,
-along with any chat model nobody has used for five minutes; it comes back in
-about a second when next needed. Only when the GPU has no room does it run on
-the CPU, and then it keeps nothing on the card. An 8k context is kept ready; a
+finding a message's tools — and unloads it after five idle minutes (sooner if
+`idle_unload_minutes` is lower; never if it is `0`). Alone, it goes on the
+GPU. A chat model is always placed on a card without it — it is unloaded
+first, and comes back beside the chat model in about a second: on the GPU if
+there is room above the chat model and what its next reply needs, otherwise
+on the CPU, keeping nothing on the card. A chat model that would not fit
+whole also unloads any chat model nobody has used for five minutes. An 8k context is kept ready; a
 longer text gets a context of its own size for that call, released afterwards.
 All of it is on the admin page, under Models.
 
