@@ -768,6 +768,9 @@ fn serve_model(
     // nothing uses. When fewer slots buy blocks, the model serves one
     // conversation at a time and the rest wait their turn; a model that fits
     // either way keeps them all.
+    // On a card without the embedding model, or the choice below is made
+    // against memory that is about to come back.
+    member.make_way();
     let mut cap = snapshot(shared).web.parallel();
     if cap > 1 {
         let many = ozgent_llama::backend::Plan::for_model_with(&weights, &resolved, cap + 1);

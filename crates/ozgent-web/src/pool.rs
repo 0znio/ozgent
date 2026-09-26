@@ -127,16 +127,7 @@ impl Membership {
     /// weights are resident — that is what stops two loads reading the same
     /// free memory and both concluding they fit.
     pub fn admit<P: Replan>(&self, plan: P) -> (std::sync::MutexGuard<'_, ()>, P::Out) {
-        // It may be embedding this very turn's message as the chat model is
-        // admitted — a busy model is never evicted — so its current job is
-        // waited out first, briefly, and before taking the loading lock,
-        // which a job still loading the embedder needs itself.
-        if self.key != crate::worker::EMBED_KEY {
-            let waited = std::time::Instant::now();
-            while self.pool.embedder_busy() && waited.elapsed() < EMBEDDER_WAIT {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
+        self.make_way();
         let guard = self.pool.loading.lock().unwrap_or_else(|e| e.into_inner());
         // A chat model is placed on a card without the embedding model on it.
         // Loaded first — a memory check at start-up embeds a word — it took
@@ -173,6 +164,32 @@ impl Membership {
             P::describe(&second)
         );
         (guard, second)
+    }
+
+    /// Clear the card of the embedding model before a chat model is planned.
+    ///
+    /// Called before the model decides how many conversations it can serve,
+    /// as well as by `admit`: a decision made with the embedder still on the
+    /// card saw both four conversations and one squeezed, kept four, and the
+    /// 4B then loaded 31 of 33 blocks on the GPU once the embedder had gone —
+    /// 48 tok/s where the whole model on the card gives 70.
+    ///
+    /// The embedder may be embedding this very turn's message, and a busy
+    /// model is never evicted, so its current job is waited out first,
+    /// briefly, without the loading lock, which a job still loading the
+    /// embedder needs itself.
+    pub fn make_way(&self) {
+        if self.key == crate::worker::EMBED_KEY {
+            return;
+        }
+        let waited = std::time::Instant::now();
+        while self.pool.embedder_busy() && waited.elapsed() < EMBEDDER_WAIT {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _guard = self.pool.loading.lock().unwrap_or_else(|e| e.into_inner());
+        if self.pool.evict_idle(&self.key, Evict::Embedder) > 0 {
+            wait_for_release();
+        }
     }
 
     /// Take the loading lock without making room: for a load that must fit
@@ -368,20 +385,28 @@ fn wait_for_release() {
         return;
     };
     let deadline = std::time::Instant::now() + RELEASE_WAIT;
+    let mut last = before;
+    let mut rose = false;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        match free_vram() {
-            // Any rise means the unload has begun landing. A further wait for
-            // it to finish is what the 8% headroom in the plan is for.
-            Some(now) if now > before => {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                return;
-            }
-            _ => {}
+        let Some(now) = free_vram() else { return };
+        // Until it stops rising: a model's memory comes back in pieces —
+        // weights, then cache and scratch — and a plan made at the first rise
+        // saw only part of it.
+        if now > last + SETTLED {
+            rose = true;
+            last = now;
+        } else if rose {
+            return;
         }
     }
-    tracing::warn!("waited {RELEASE_WAIT:?} for evicted memory to come back; loading anyway");
+    if !rose {
+        tracing::warn!("waited {RELEASE_WAIT:?} for evicted memory to come back; loading anyway");
+    }
 }
+
+/// Free memory rising by less than this between two readings has settled.
+const SETTLED: u64 = 16 << 20;
 
 fn free_vram() -> Option<u64> {
     ozgent_llama::backend::best_gpu().map(|d| d.memory_free as u64)
