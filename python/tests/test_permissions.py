@@ -434,8 +434,16 @@ class McpServerReadsTest(unittest.TestCase):
     def policy(self, env: dict[str, str]) -> dict:
         return self.permissions.mcp_sandbox(str(self.program), str(self.homes / "ghostcloak"), [], True, env)
 
-    def test_a_package_under_the_mcp_folder_is_readable_whole(self) -> None:
-        self.assertIn(str(self.package), self.policy({})["read"])
+    def test_a_package_under_the_mcp_folder_is_its_servers_to_write(self) -> None:
+        # Where it downloads its models on first use.
+        self.assertIn(str(self.package), self.policy({})["write"])
+
+    def test_a_folder_named_in_the_environment_is_not_writable(self) -> None:
+        outside = Path(self.dir.name).resolve() / "data"
+        outside.mkdir()
+        policy = self.policy({"DATA": str(outside)})
+        self.assertIn(str(outside), policy["read"])
+        self.assertNotIn(str(outside), policy["write"])
 
     def test_a_folder_named_in_the_environment_is_readable(self) -> None:
         read = self.policy({"GHOSTFOX_HOME": str(self.package / "browser")})["read"]

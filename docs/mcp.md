@@ -104,11 +104,12 @@ same sandbox as `run_command`:
   folders, `/root`, shared temporary folders, your session's runtime folder,
   mail and mounted drives. It writes only its home and the `folders` you give
   it. A folder named in its own arguments (`server-filesystem ~/notes`)
-  counts as given. It may also read, not write, the package it was unpacked
-  from when that is under `~/ozgent/mcp` — all of it, not just the folder
-  the program sits in, since a built server in `release/` starts the browser
-  beside it — and any existing folder its `env` names (`GHOSTFOX_HOME=…`),
-  except inside ozgent's own directories or your credential folders.
+  counts as given. A package unpacked under `~/ozgent/mcp` is its server's
+  to read and write — all of it, not just the folder the program sits in,
+  since a built server in `release/` starts the browser beside it and
+  downloads its models into the package on first use. Any other existing
+  folder its `env` names (`GHOSTFOX_HOME=…`) it may read, not write, except
+  inside ozgent's own directories or your credential folders.
 - **Its own temporary and shared-memory folders,** private to it, where the
   kernel allows namespaces; your session's sockets (D-Bus, the keyring,
   agents) are hidden behind empty private mounts, because Landlock stops

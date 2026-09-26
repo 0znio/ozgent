@@ -441,6 +441,7 @@ def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env:
     read += [os.path.expanduser(p) for p in HOME_TOOLCHAINS if os.path.exists(os.path.expanduser(p))]
     found = shutil.which(program)
     homes = base.parent.resolve()
+    package: str | None = None
     if found:
         real = Path(found).resolve()
         read.append(str(real.parent))
@@ -449,10 +450,13 @@ def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env:
         if real.parent.name == "bin" and real.parent.parent != Path("/"):
             read.append(str(real.parent.parent))
         # A package unpacked into ~/ozgent/mcp/<dir>, where MCP servers are
-        # kept: all of it, not only the folder the program sits in. Built
-        # programs sit in `release/` beside the browser or data they start.
+        # kept: all of it, not only the folder the program sits in, and
+        # writable. Built programs sit in `release/` beside the browser they
+        # start, and download their models into the package on first use —
+        # ghostcloak's OCR writes GHOSTFOX_HOME/models. The package is the
+        # server's own, under the folder that holds only MCP servers.
         if real.is_relative_to(homes) and real != homes:
-            read.append(str(homes / real.relative_to(homes).parts[0]))
+            package = str(homes / real.relative_to(homes).parts[0])
     # Folders the server is told about in its own environment —
     # `GHOSTFOX_HOME=/opt/ghostfox` — are where it will look, so it may read
     # them. Read only: writing is what `folders` is for.
@@ -475,7 +479,7 @@ def mcp_sandbox(program: str, home: str, folders: list[str], network: bool, env:
     return {
         "cwd": str(base),
         "read": read,
-        "write": [str(base), str(tmp)] + folders,
+        "write": [str(base), str(tmp)] + ([package] if package else []) + folders,
         "devices": list(DEVICES),
         "protected": [str(p) for p in protected_dirs() + sensitive_dirs()],
         "network": bool(network),
