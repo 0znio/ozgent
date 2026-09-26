@@ -1,19 +1,23 @@
 """Reading Reddit: searching posts, listing a subreddit, reading a thread.
 
-Two ways in, and the difference matters:
+Three ways in, tried in this order:
 
 - **With API credentials** (a free "script" app from
-  https://www.reddit.com/prefs/apps), requests go to Reddit's API as that app.
-  This is the supported route: 100 requests a minute, and every post comes
-  back with its score and comment count.
-- **Without them**, Reddit's public Atom feeds. Reddit refuses anonymous JSON
-  outright (HTTP 403), but still serves the feeds -- about one request a
-  minute, measured, and no scores. Enough for one search; not enough to read
-  a search *and* its threads. Every result says which route it came from, and
-  a spent window is reported with how long until the next request, rather
-  than retried into a longer one.
+  https://www.reddit.com/prefs/apps), requests go to Reddit's API as that app:
+  100 requests a minute, the supported route.
+- **Without them, Reddit's own page fragments** — the server-rendered pieces
+  reddit.com loads into its pages (``/svc/shreddit/...``). Anonymous, about
+  200 requests per rate-limit window (measured 2026-09-26), with scores,
+  comment counts and whole comment threads. Reddit refuses anonymous JSON
+  (HTTP 403) and old.reddit.com now asks for a login, so these are what a
+  browser without an account is served. A post's own text comes from Arctic
+  Shift (arctic-shift.photon-reddit.com), a public archive of Reddit.
+- **Reddit's Atom feeds**, the last resort should the fragments change shape:
+  about one request a minute, and no scores.
 
-Configure in ``~/ozgent/configs/config.toml``::
+Every result says which route it came from.
+
+Configure in ``~/ozgent/configs/config.toml`` (optional)::
 
     [tools.config.reddit]
     client_id = "..."          # or $REDDIT_CLIENT_ID
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html as htmllib
 import json
 import os
 import re
@@ -37,6 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from typing import Annotated, Any, Literal
 
 from ..base import ToolError, get_config, tool
@@ -273,6 +279,232 @@ def _api(path: str, params: dict[str, Any], creds: tuple[str, str]) -> Any:
     return json.loads(_get(url, {"Authorization": f"Bearer {token}"}))
 
 
+
+# ------------------------------------------------------------------ web route
+
+WEB = "https://www.reddit.com"
+ARCTIC = "https://arctic-shift.photon-reddit.com/api"
+
+#: Elements with no closing tag, which a depth count must not wait for.
+_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
+
+class _Fragments(HTMLParser):
+    """Posts and comments out of a page fragment.
+
+    A post is a ``<shreddit-post>`` whose attributes carry everything but the
+    body, which is the text of its ``slot="text-body"`` child; a comment is a
+    ``<shreddit-comment>`` with its text in a ``slot="comment"`` child.
+    Parsed rather than matched, because comments nest inside comments.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.posts: list[dict[str, Any]] = []
+        self.comments: list[dict[str, Any]] = []
+        self._text_into: dict[str, Any] | None = None
+        self._text_depth = 0
+        self._depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        a = {k: (v or "") for k, v in attrs}
+        if tag not in _VOID:
+            self._depth += 1
+        if tag == "shreddit-post":
+            self.posts.append({**a, "_text": []})
+        elif tag == "shreddit-comment":
+            self.comments.append({**a, "_text": []})
+        elif self._text_into is None and a.get("slot") in ("text-body", "comment"):
+            owner = self.comments if a["slot"] == "comment" else self.posts
+            if owner:
+                self._text_into = owner[-1]
+                self._text_depth = self._depth
+        if tag in ("p", "br", "li") and self._text_into is not None:
+            self._text_into["_text"].append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _VOID:
+            return
+        if self._text_into is not None and self._depth == self._text_depth:
+            self._text_into = None
+        self._depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._text_into is not None:
+            self._text_into["_text"].append(data)
+
+
+def _number(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _stamp(value: str | None) -> str | None:
+    """``2026-09-26T00:40:52.000000+0000`` as ``2026-09-26T00:40:52Z``."""
+    if not value:
+        return None
+    found = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", value)
+    return f"{found.group(1)}Z" if found else value
+
+
+def parse_listing(page: str) -> list[dict[str, Any]]:
+    """The posts of a subreddit listing fragment."""
+    parser = _Fragments()
+    parser.feed(page)
+    posts = []
+    for p in parser.posts:
+        if not p.get("id", "").startswith("t3_"):
+            continue
+        link = p.get("content-href", "")
+        posts.append({
+            "id": p["id"].removeprefix("t3_"),
+            "title": htmllib.unescape(p.get("post-title", "")),
+            "subreddit": p.get("subreddit-name"),
+            "author": p.get("author"),
+            "score": _number(p.get("score")),
+            "upvote_ratio": round(float(p["upvote-ratio"]), 2) if p.get("upvote-ratio") else None,
+            "comments": _number(p.get("comment-count")),
+            "created": _stamp(p.get("created-timestamp")),
+            "url": WEB + p.get("permalink", ""),
+            "snippet": _clip("".join(p["_text"])),
+            "link": None if "/comments/" in link or not link else link,
+        })
+    return posts
+
+
+def parse_comments(page: str) -> list[dict[str, Any]]:
+    """The comments of a thread fragment, in reading order, replies indented
+    by ``depth``."""
+    parser = _Fragments()
+    parser.feed(page)
+    comments = []
+    for c in parser.comments:
+        text = _clip("".join(c["_text"]))
+        if not text or text in ("[deleted]", "[removed]"):
+            continue
+        comments.append({
+            "author": c.get("author"),
+            "score": _number(c.get("score")),
+            "depth": _number(c.get("depth")) or 0,
+            "created": _stamp(c.get("created")),
+            "text": text,
+            "url": WEB + c.get("permalink", "") if c.get("permalink") else None,
+        })
+    return comments
+
+
+def parse_search(page: str) -> tuple[list[dict[str, Any]], str | None]:
+    """The posts of a search fragment, and the fragment of the next page.
+
+    Each result is announced by a tracking context naming the post — its id,
+    title, subreddit, author and a snippet — and followed by its vote and
+    comment counts and its age.
+    """
+    marks = [
+        (m.start(), m.group(1))
+        for m in re.finditer(r'data-faceplate-tracking-context="([^"]*)"', page)
+    ]
+    posts: list[dict[str, Any]] = []
+    starts: list[int] = []
+    for at, raw in marks:
+        try:
+            ctx = json.loads(htmllib.unescape(raw))
+        except ValueError:
+            continue
+        post = ctx.get("post") or {}
+        if (ctx.get("action_info") or {}).get("type") != "post" or not post.get("id"):
+            continue
+        if any(p["id"] == post["id"].removeprefix("t3_") for p in posts):
+            continue
+        starts.append(at)
+        posts.append({
+            "id": post["id"].removeprefix("t3_"),
+            "title": post.get("title", ""),
+            "subreddit": (ctx.get("subreddit") or {}).get("name"),
+            "author": (ctx.get("profile") or {}).get("name"),
+            "snippet": _clip((ctx.get("search") or {}).get("snippet") or ""),
+        })
+    for i, post in enumerate(posts):
+        segment = page[starts[i] : starts[i + 1] if i + 1 < len(starts) else len(page)]
+        row = segment.find('data-testid="search-counter-row"')
+        numbers = re.findall(r'<faceplate-number[^>]*number="([^"]*)"', segment[row : row + 2000]) if row >= 0 else []
+        post["score"] = _number(numbers[0]) if numbers else None
+        post["comments"] = _number(numbers[1]) if len(numbers) > 1 else None
+        ts = re.search(r'<faceplate-timeago[^>]*ts="([^"]*)"', segment)
+        post["created"] = _stamp(ts.group(1)) if ts else None
+        post["url"] = f"{WEB}/r/{post['subreddit']}/comments/{post['id']}/" if post["subreddit"] else f"{WEB}/comments/{post['id']}/"
+    more = re.search(r'<faceplate-partial[^>]*src="(/svc/shreddit/search/[^"]*cursor=[^"]*)"', page)
+    return posts, htmllib.unescape(more.group(1)) if more else None
+
+
+def _web(path_and_query: str) -> str:
+    return _get(WEB + path_and_query, {"Accept": "text/html", "Accept-Language": "en-US,en;q=0.9"}).decode("utf-8", "replace")
+
+
+def web_listing(sub: str, listing: str, period: str, count: int) -> list[dict[str, Any]]:
+    params = {"name": sub, **({"t": period} if listing == "top" else {})}
+    return parse_listing(_web(f"/svc/shreddit/community-more-posts/{listing}/?{urllib.parse.urlencode(params)}"))[:count]
+
+
+def web_search(query: str, sub: str | None, sort: str, period: str, count: int) -> list[dict[str, Any]]:
+    params = {"q": query, "type": "posts", "sort": sort, "t": period}
+    path = f"/svc/shreddit/r/{sub}/search/" if sub else "/svc/shreddit/search/"
+    page = _web(f"{path}?{urllib.parse.urlencode(params)}")
+    posts, more = parse_search(page)
+    # About seven to a page; a few more pages for a larger count.
+    for _ in range(3):
+        if len(posts) >= count or not more:
+            break
+        extra, more = parse_search(_web(more))
+        posts += [p for p in extra if all(p["id"] != q["id"] for q in posts)]
+    return posts[:count]
+
+
+def arctic_post(pid: str) -> dict[str, Any] | None:
+    """A post's title and text from the Arctic Shift archive. Its score and
+    comment count are as they stood when archived, minutes after posting, so
+    they are left out."""
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{ARCTIC}/posts/ids?ids={pid}", headers={"User-Agent": _user_agent()}),
+            timeout=15,
+        ) as resp:
+            data = (json.loads(resp.read()).get("data") or [None])[0]
+    except (urllib.error.URLError, ValueError, OSError):
+        return None
+    if not data:
+        return None
+    return {
+        "id": pid,
+        "title": data.get("title", ""),
+        "subreddit": data.get("subreddit"),
+        "author": data.get("author"),
+        "created": _iso(data.get("created_utc")),
+        "url": WEB + (data.get("permalink") or f"/comments/{pid}/"),
+        "text": _clip(data.get("selftext") or "", MAX_BODY * 3),
+        "link": None if data.get("is_self") else data.get("url"),
+    }
+
+
+def arctic_search(query: str, sub: str | None, count: int) -> list[dict[str, Any]]:
+    params = {"query": query, "limit": count, "sort": "desc", **({"subreddit": sub} if sub else {})}
+    with urllib.request.urlopen(
+        urllib.request.Request(f"{ARCTIC}/posts/search?{urllib.parse.urlencode(params)}", headers={"User-Agent": _user_agent()}),
+        timeout=20,
+    ) as resp:
+        rows = json.loads(resp.read()).get("data") or []
+    return [
+        {
+            "id": d.get("id"), "title": d.get("title", ""), "subreddit": d.get("subreddit"),
+            "author": d.get("author"), "created": _iso(d.get("created_utc")),
+            "url": WEB + (d.get("permalink") or f"/comments/{d.get('id')}/"),
+            "snippet": _clip(d.get("selftext") or ""),
+        }
+        for d in rows
+    ]
+
 # ----------------------------------------------------------------- feed route
 
 
@@ -343,33 +575,42 @@ async def reddit(
     """Read Reddit: search posts, list a subreddit, or read a post's comments. For opinions and discussion."""
     count = max(1, min(int(count), 25))
     creds = _credentials()
-    route = "api" if creds else "feed"
 
     if action == "search":
         if not query.strip():
             raise ToolError("action 'search' needs a query")
         sub = _subreddit(subreddit) if subreddit.strip() else None
-        path = f"/r/{sub}/search" if sub else "/search"
-        params: dict[str, Any] = {"q": query, "sort": sort if sort != "hot" else "relevance",
-                                  "t": period, "limit": count}
-        if sub:
-            params["restrict_sr"] = 1
+        order = sort if sort != "hot" else "relevance"
         if creds:
+            path = f"/r/{sub}/search" if sub else "/search"
+            params: dict[str, Any] = {"q": query, "sort": order, "t": period, "limit": count}
+            if sub:
+                params["restrict_sr"] = 1
             data = await asyncio.to_thread(_api, path, params, creds)
             posts = [shape_api_post(c["data"]) for c in (data.get("data") or {}).get("children") or []]
-        else:
-            posts = feed_posts(await asyncio.to_thread(_feed, path + ".rss", params))
+            return _result(action, "api", {"query": query, "subreddit": sub, "results": posts[:count]})
+        route, posts = await _first_of(
+            ("web", lambda: web_search(query, sub, order, period, count)),
+            ("archive", lambda: arctic_search(query, sub, count)),
+            ("feed", lambda: feed_posts(_feed(f"/r/{sub}/search.rss" if sub else "/search.rss",
+                                              {"q": query, "sort": order, "t": period, "limit": count,
+                                               **({"restrict_sr": 1} if sub else {})}))),
+        )
         return _result(action, route, {"query": query, "subreddit": sub, "results": posts[:count]})
 
     if action == "subreddit":
         sub = _subreddit(subreddit or query)
         listing = sort if sort in ("new", "top", "hot") else "hot"
-        params = {"limit": count, **({"t": period} if listing == "top" else {})}
         if creds:
+            params = {"limit": count, **({"t": period} if listing == "top" else {})}
             data = await asyncio.to_thread(_api, f"/r/{sub}/{listing}", params, creds)
             posts = [shape_api_post(c["data"]) for c in (data.get("data") or {}).get("children") or []]
-        else:
-            posts = feed_posts(await asyncio.to_thread(_feed, f"/r/{sub}/{listing}/.rss", params))
+            return _result(action, "api", {"subreddit": sub, "sort": listing, "results": posts[:count]})
+        route, posts = await _first_of(
+            ("web", lambda: web_listing(sub, listing, period, count)),
+            ("feed", lambda: feed_posts(_feed(f"/r/{sub}/{listing}/.rss",
+                                              {"limit": count, **({"t": period} if listing == "top" else {})}))),
+        )
         return _result(action, route, {"subreddit": sub, "sort": listing, "results": posts[:count]})
 
     if action == "comments":
@@ -378,7 +619,15 @@ async def reddit(
             data = await asyncio.to_thread(
                 _api, f"/comments/{pid}", {"limit": count, "depth": 1, "sort": "top"}, creds
             )
-            return _result(action, route, shape_api_comments(data, count))
+            return _result(action, "api", shape_api_comments(data, count))
+        try:
+            page = await asyncio.to_thread(_web, f"/svc/shreddit/comments/r/all/t3_{pid}")
+            comments = parse_comments(page)
+        except ToolError:
+            comments = []
+        if comments:
+            head = await asyncio.to_thread(arctic_post, pid) or {"id": pid, "url": f"{WEB}/comments/{pid}/"}
+            return _result(action, "web", {"post": head, "comments": comments[:count]})
         entries = await asyncio.to_thread(_feed, f"/comments/{pid}/.rss", {"limit": count + 1})
         posts = [e for e in entries if e["kind"] == "post"]
         comments = [
@@ -387,13 +636,43 @@ async def reddit(
             if e["kind"] == "comment" and e["text"] not in ("[deleted]", "[removed]")
         ][:count]
         head = feed_posts(posts)[0] if posts else {"id": pid}
-        return _result(action, route, {"post": head, "comments": comments})
+        return _result(action, "feed", {"post": head, "comments": comments})
 
     raise ToolError(f"unknown action {action!r}")
 
 
+async def _first_of(*routes: tuple[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """The first route that returns anything, and its name.
+
+    A route that fails, or finds nothing, gives way to the next: an empty
+    page from Reddit more often means its markup changed than that nothing
+    matched, and the archive or the feeds will say which. The last route's
+    answer stands, empty or not; its error is raised if it failed.
+    """
+    last: Exception | None = None
+    for i, (name, fetch) in enumerate(routes):
+        try:
+            found = await asyncio.to_thread(fetch)
+        except (ToolError, urllib.error.URLError, ValueError, OSError) as exc:
+            last = exc
+            continue
+        if found or i == len(routes) - 1:
+            return name, found
+    if isinstance(last, ToolError):
+        raise last
+    raise ToolError(f"could not read Reddit: {last}", retryable=True)
+
+
 def _result(action: str, route: str, body: dict[str, Any]) -> dict[str, Any]:
-    out = {"action": action, "source": "reddit api" if route == "api" else "reddit feeds", **body}
+    source = {
+        "api": "reddit api",
+        "web": "reddit.com (public pages)",
+        "archive": "arctic shift archive of reddit",
+        "feed": "reddit feeds",
+    }[route]
+    out = {"action": action, "source": source, **body}
     if route == "feed":
         out["note"] = "Read from public feeds: no scores or comment counts. " + _setup_hint()
+    elif route == "archive":
+        out["note"] = "From an archive of Reddit: scores and comment counts are as archived, not current."
     return out

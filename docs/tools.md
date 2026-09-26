@@ -37,7 +37,7 @@ its own user.
 | `write_file` | create or modify a file | write | `write = true`, confined to `root` |
 | `run_command` | run one allowed program | execute | `shell = true` + allowlist |
 | `yahoo_finance` | quotes, price history, technical indicators, fundamentals, news, symbol search | read | — |
-| `reddit` | search posts, list a subreddit, read a thread | read | optional app credentials |
+| `reddit` | search posts, list a subreddit, read a thread | read | none; app credentials optional |
 
 **`yahoo_finance`** needs no key. One tool with an `action` — `quote`,
 `history`, `technicals`, `fundamentals`, `news`, `search` — because a small
@@ -52,10 +52,15 @@ and ATR), so every number can be checked against a charting site — plus
 plain-words `signals` ("RSI 74: overbought by the usual 70 rule") that a small
 model would otherwise misread from the raw numbers.
 
-**`reddit`** works without setup, but slowly: Reddit refuses anonymous API
-calls, so it reads the public feeds, which allow about one request a minute
-and carry no scores. For the real thing, create a free *script* app at
-<https://www.reddit.com/prefs/apps> and add it:
+**`reddit`** works without an account or setup. Reddit refuses anonymous API
+calls and old.reddit.com now asks for a login, so it reads what reddit.com
+serves a signed-out browser: the page fragments its own pages are built from,
+which carry scores, comment counts and whole threads, at about two hundred
+requests per rate-limit window. A post's own text comes from Arctic Shift, a
+public archive of Reddit. Should Reddit change those pages, it falls back to
+the archive for search and to the public feeds (about one request a minute,
+no scores) for the rest. With an app of your own — a free *script* app at
+<https://www.reddit.com/prefs/apps> — it uses Reddit's API instead:
 
 ```toml
 [tools.config.reddit]

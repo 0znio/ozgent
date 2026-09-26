@@ -149,7 +149,7 @@ The model decides; you approve.
 | `web_search` | searches the web or the news | a Brave or Tavily key, or none for DuckDuckGo |
 | `fetch_url` | reads a page — the article, not the menus | — |
 | `yahoo_finance` | quotes, price history, technicals (RSI, MACD, averages, support/resistance), fundamentals, news | — |
-| `reddit` | searches posts, reads threads | optional app key for full speed |
+| `reddit` | searches posts, lists subreddits, reads threads | none — no account needed |
 | `read_file` · `list_dir` | read your files | — |
 | `write_file` | writes a file | asks first |
 | `run_command` | runs one program | asks first |
