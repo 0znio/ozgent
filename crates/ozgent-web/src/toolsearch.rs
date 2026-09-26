@@ -650,30 +650,175 @@ fn tool_text(spec: &ToolSpec) -> String {
 /// Tools ranked by meaning, or `None` without an embedding model.
 fn semantic<'a>(pool: &[&'a ToolSpec], query: &str) -> Option<Vec<(f32, &'a ToolSpec)>> {
     let embedder = crate::worker::tool_embedder()?;
-    let texts: Vec<String> = pool.iter().map(|s| tool_text(s)).collect();
-    let missing: Vec<String> = {
-        let cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
-        texts.iter().filter(|t| cache.as_ref().is_none_or(|c| !c.contains_key(*t))).cloned().collect()
-    };
-    if !missing.is_empty() {
-        let vectors = embedder.embed_as(ozgent_llama::embed::Role::Document, missing.clone()).ok()?;
-        let mut cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
-        let map = cache.get_or_insert_with(HashMap::new);
-        for (t, v) in missing.into_iter().zip(vectors) {
-            map.insert(t, v);
-        }
-    }
-    let q = embedder.embed_as(ozgent_llama::embed::Role::ToolQuery, vec![query.to_string()]).ok()?.pop()?;
+    let model = embedder.embedding_model()?;
+    let keys: Vec<String> = pool.iter().map(|s| vector_key(&model, s)).collect();
+    // Normally embedded already, in the background when the tools started
+    // (see `warm`); this is for a tool that arrived since.
+    embed_missing(embedder, &model, pool.iter().copied())?;
+    let q = query_vector(embedder, &model, query)?;
     let cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
     let map = cache.as_ref()?;
     let mut ranked: Vec<(f32, &ToolSpec)> = pool
         .iter()
-        .zip(&texts)
-        .filter_map(|(s, t)| map.get(t).map(|v| (cosine(&q, v), *s)))
+        .zip(&keys)
+        .filter_map(|(s, k)| map.get(k).map(|v| (cosine(&q, v), *s)))
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
     Some(ranked)
 }
+
+/// A tool's vector is keyed by the model that made it as well as the text:
+/// another model's vectors cannot be compared with this one's.
+fn vector_key(model: &str, spec: &ToolSpec) -> String {
+    format!("{model}\u{0}{}", tool_text(spec))
+}
+
+/// Embed the tools that have no vector yet, a few at a time. Small batches,
+/// because a chat model being loaded waits for the embedding model's current
+/// job before it takes the card (see `Membership::admit`).
+fn embed_missing<'a>(
+    embedder: &crate::worker::Worker,
+    model: &str,
+    specs: impl Iterator<Item = &'a ToolSpec>,
+) -> Option<()> {
+    let missing: Vec<(String, String)> = {
+        let cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+        specs
+            .map(|s| (vector_key(model, s), tool_text(s)))
+            .filter(|(k, _)| cache.as_ref().is_none_or(|c| !c.contains_key(k)))
+            .collect()
+    };
+    for chunk in missing.chunks(WARM_BATCH) {
+        let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+        let vectors = embedder.embed_as(ozgent_llama::embed::Role::Document, texts).ok()?;
+        let mut cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = cache.get_or_insert_with(HashMap::new);
+        for ((key, _), v) in chunk.iter().zip(vectors) {
+            map.insert(key.clone(), v);
+        }
+    }
+    Some(())
+}
+
+const WARM_BATCH: usize = 8;
+
+/// Embed every tool described on request, ahead of the first message that
+/// would need it, and keep the vectors on disk. A vector depends only on the
+/// model and the tool's text, so each is made once, ever: done by the first
+/// message, on the CPU beside the chat model, 51 tools took 9.2 s of that
+/// message's time. Blocking.
+pub fn warm(specs: &[ToolSpec], store: &std::path::Path) {
+    let Some(embedder) = crate::worker::tool_embedder() else { return };
+    let Some(model) = embedder.embedding_model() else { return };
+    let started = std::time::Instant::now();
+    let loaded = load_vectors(store);
+    let before = VECTORS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashMap::len);
+    if embed_missing(embedder, &model, specs.iter()).is_none() {
+        return;
+    }
+    let cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+    let made = cache.as_ref().map_or(0, HashMap::len).saturating_sub(before);
+    if made > 0 {
+        if let Some(map) = cache.as_ref() {
+            save_vectors(store, map);
+        }
+    }
+    tracing::info!(
+        "tool lookup: {} tools ready in {} ms ({loaded} vectors from disk, {made} made)",
+        specs.len(),
+        started.elapsed().as_millis()
+    );
+}
+
+/// Read saved vectors into the cache. Returns how many were read. A file
+/// that does not parse is ignored and rewritten: it is a cache.
+fn load_vectors(store: &std::path::Path) -> usize {
+    let Ok(bytes) = std::fs::read(store) else { return 0 };
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let slice = bytes.get(at..at + n)?;
+        at += n;
+        Some(slice)
+    };
+    let mut read = Vec::new();
+    loop {
+        let Some(len) = take(4) else { break };
+        let len = u32::from_le_bytes(len.try_into().unwrap_or_default()) as usize;
+        let (Some(key), Some(dim)) = (take(len).map(|k| String::from_utf8_lossy(k).into_owned()), take(4)) else { break };
+        let dim = u32::from_le_bytes(dim.try_into().unwrap_or_default()) as usize;
+        let Some(raw) = take(dim * 4) else { break };
+        let v: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap_or_default())).collect();
+        read.push((key, v));
+    }
+    let n = read.len();
+    let mut cache = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    for (k, v) in read {
+        map.entry(k).or_insert(v);
+    }
+    n
+}
+
+/// Write the cache, whole, beside the old file and then over it.
+fn save_vectors(store: &std::path::Path, map: &HashMap<String, Vec<f32>>) {
+    let mut out = Vec::new();
+    for (key, v) in map {
+        out.extend((key.len() as u32).to_le_bytes());
+        out.extend(key.as_bytes());
+        out.extend((v.len() as u32).to_le_bytes());
+        for x in v {
+            out.extend(x.to_le_bytes());
+        }
+    }
+    let partial = store.with_extension("partial");
+    if let Some(dir) = store.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(&partial, out).is_ok() {
+        let _ = std::fs::rename(&partial, store);
+    }
+}
+
+/// Where tool vectors are kept.
+pub fn vector_store(paths: &ozgent_core::Paths) -> std::path::PathBuf {
+    paths.cache_dir().join("tool-vectors.bin")
+}
+
+/// [`warm`] on a thread of its own, for the MCP tools of `tools`.
+pub fn warm_in_background(tools: &Tools, paths: &ozgent_core::Paths) {
+    let store = vector_store(paths);
+    let specs: Vec<ToolSpec> = tools
+        .host
+        .tools()
+        .iter()
+        .filter(|s| server_of(tools, &s.name).is_some())
+        .cloned()
+        .collect();
+    if specs.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("ozgent-tool-vectors".into()).spawn(move || warm(&specs, &store));
+}
+
+/// The message's vector, made once per message: the lookup and the check
+/// for a web request both rank by it, and on the CPU each embedding of it
+/// cost a few hundred milliseconds.
+fn query_vector(embedder: &crate::worker::Worker, model: &str, query: &str) -> Option<Vec<f32>> {
+    let key = format!("{model}\u{0}{query}");
+    if let Some((_, v)) = QUERIES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return Some(v.clone());
+    }
+    let v = embedder.embed_as(ozgent_llama::embed::Role::ToolQuery, vec![query.to_string()]).ok()?.pop()?;
+    let mut recent = QUERIES.lock().unwrap_or_else(|e| e.into_inner());
+    if recent.len() >= 8 {
+        recent.pop_front();
+    }
+    recent.push_back((key, v.clone()));
+    Some(v)
+}
+
+static QUERIES: std::sync::Mutex<std::collections::VecDeque<(String, Vec<f32>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {

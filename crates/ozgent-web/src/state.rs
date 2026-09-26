@@ -273,6 +273,9 @@ impl App {
             permissions.clone(),
             std::sync::Arc::new(cli),
         );
+        if let Some(t) = tools.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            crate::toolsearch::warm_in_background(t, &paths);
+        }
         Ok(Arc::new(App {
             paths,
             config,

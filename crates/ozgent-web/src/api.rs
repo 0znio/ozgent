@@ -1178,7 +1178,10 @@ pub(crate) async fn restart_tools(state: &State, config: ozgent_core::Config) {
     // the handler's future stops being `Send` and axum will not take it.
     let previous = if config.tools.enabled {
         match crate::state::start_tools(&state.paths, &config).await {
-            Ok(fresh) => state.tools.lock().unwrap_or_else(|e| e.into_inner()).replace(fresh),
+            Ok(fresh) => {
+                crate::toolsearch::warm_in_background(&fresh, &state.paths);
+                state.tools.lock().unwrap_or_else(|e| e.into_inner()).replace(fresh)
+            }
             Err(e) => {
                 tracing::warn!("keeping the running tools: restarting them failed: {e}");
                 return;

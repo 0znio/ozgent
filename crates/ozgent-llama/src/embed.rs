@@ -29,10 +29,16 @@ use crate::engine::EngineError;
 /// more than the model itself — held permanently for a length that rarely
 /// arrives. The limit used to be 512, applied silently, so a long reply was
 /// represented by its opening alone; it is now the model's own.
-pub const WORKING_TOKENS: u32 = 8192;
+pub const WORKING_TOKENS: u32 = 4096;
 
 /// Micro-batch for a last-token-pooling model, whatever the context.
-const UBATCH: u32 = 2048;
+///
+/// 512 rather than 2,048: the compute scratch grows with it, and at 2,048 it
+/// was about a gigabyte — enough to keep the embedder off a GPU a chat model
+/// was already on, where it embeds a message in 40 ms instead of 600. What is
+/// embedded is mostly short — a message, a tool's description — and a long
+/// text is fed in slices either way.
+const UBATCH: u32 = 512;
 
 /// Texts embedded per decode, at most. They share one pool of cells, so a
 /// group is packed by tokens, not by count: many short texts at once, or one

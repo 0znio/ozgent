@@ -88,7 +88,7 @@ GPU. A chat model is always placed on a card without it — it is unloaded
 first, and comes back beside the chat model in about a second: on the GPU if
 there is room above the chat model and what its next reply needs, otherwise
 on the CPU, keeping nothing on the card. A chat model that would not fit
-whole also unloads any chat model nobody has used for five minutes. An 8k context is kept ready; a
+whole also unloads any chat model nobody has used for five minutes. A 4k context is kept ready; a
 longer text gets a context of its own size for that call, released afterwards.
 All of it is on the admin page, under Models.
 

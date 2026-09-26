@@ -1368,15 +1368,17 @@ fn load_embedder(
         EmbedDevice::Auto => {
             // Weights, a context of eight 512-token lanes and its scratch,
             // and the decode reserve left untouched for whoever else is here.
-            // The working context's cache (8k tokens, about 60 KB a token at
+            // The working context's cache (4k tokens, about 60 KB a token at
             // 8 bits for a 0.6B model); longer contexts are checked against
             // free memory when they are needed.
-            // Its compute scratch at a 2,048-token micro-batch is about a
-            // gigabyte, measured (2.8 GB in all for the 0.6B at F16), not the
-            // quarter it was once allowed: an estimate that low let it squeeze
-            // into the margin a chat model's next decode needed.
+            // Measured for the 0.6B at F16 with its 4k working context and
+            // 512-token micro-batch: 1.78 GB in the process, 1.88 after a
+            // batch of long texts — weights and a tenth, the cache, and a
+            // quarter of a gigabyte of scratch covers it. (At a 2,048-token
+            // micro-batch the scratch alone was a gigabyte, and the embedder
+            // could not sit beside a chat model on an 8 GB card.)
             let cache = ozgent_llama::embed::WORKING_TOKENS as u64 * (64 << 10);
-            let need = size + size / 10 + cache + (1 << 30) + ozgent_llama::backend::decode_reserve();
+            let need = size + size / 10 + cache + (256 << 20) + ozgent_llama::backend::decode_reserve();
             ozgent_llama::backend::best_gpu()
                 .filter(|d| d.is_gpu())
                 .is_some_and(|d| d.memory_free as u64 >= need)
