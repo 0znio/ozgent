@@ -710,6 +710,24 @@ impl Plan {
     /// block, so on a hybrid model the sequence count changes what a block
     /// costs on the card.
     pub fn for_model_with(path: &std::path::Path, opts: &ozgent_core::Resolved, sequences: u32) -> Self {
+        let wide = Self::for_model_batched(path, opts, sequences);
+        // Planned against the wide micro-batch's compute buffer, a model that
+        // does not quite fit gives up blocks to pay for it — and then the
+        // engine, finding the wide batch does not fit, falls back to the
+        // narrow one anyway (see `engine::WIDE_BATCH`). The 4B MTP model lost
+        // 5 of 33 blocks that way on an idle 8 GB card and decoded at 16-39
+        // tok/s instead of 72. When blocks are short, plan for the batch the
+        // engine will actually use.
+        if wide.is_full() || opts.ubatch.is_some() || opts.batch_size > crate::engine::WIDE_BATCH {
+            return wide;
+        }
+        let mut narrow_opts = opts.clone();
+        narrow_opts.ubatch = Some(opts.batch_size);
+        let narrow = Self::for_model_batched(path, &narrow_opts, sequences);
+        if narrow.layers > wide.layers { narrow } else { wide }
+    }
+
+    fn for_model_batched(path: &std::path::Path, opts: &ozgent_core::Resolved, sequences: u32) -> Self {
         let mut layout = crate::layout::read(path).unwrap_or_default();
         layout.bytes_per_layer += layout.recurrent_bytes_per_layer * sequences.max(1) as u64;
         let device = best_gpu();

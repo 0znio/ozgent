@@ -136,8 +136,8 @@ impl Membership {
         // llama.cpp aborted the process. The embedder comes back in a second,
         // beside the chat model, and only where there is room above it and
         // its next decode (see `load_embedder`).
-        if self.key != crate::worker::EMBED_KEY && self.pool.evict_idle(&self.key, Evict::Embedder) > 0 {
-            wait_for_release();
+        if self.key != crate::worker::EMBED_KEY {
+            self.pool.evict_and_wait(&self.key, Evict::Embedder);
         }
         let first = plan.plan();
         if P::is_full(&first) {
@@ -149,14 +149,13 @@ impl Membership {
         // an idle embedding model and decoded slower for it. Only a poor fit
         // is worth unloading a model someone may still be about to use.
         let freed = if P::is_poor(&first) {
-            self.pool.evict_idle(&self.key, Evict::AnyIdle)
+            self.pool.evict_and_wait(&self.key, Evict::AnyIdle)
         } else {
-            self.pool.evict_idle(&self.key, Evict::Cheap)
+            self.pool.evict_and_wait(&self.key, Evict::Cheap)
         };
         if freed == 0 {
             return (guard, first);
         }
-        wait_for_release();
         let second = plan.plan();
         tracing::info!(
             "unloaded {freed} idle model(s) to make room: {} -> {}",
@@ -187,9 +186,7 @@ impl Membership {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let _guard = self.pool.loading.lock().unwrap_or_else(|e| e.into_inner());
-        if self.pool.evict_idle(&self.key, Evict::Embedder) > 0 {
-            wait_for_release();
-        }
+        self.pool.evict_and_wait(&self.key, Evict::Embedder);
     }
 
     /// Take the loading lock without making room: for a load that must fit
@@ -345,7 +342,46 @@ impl Pool {
     /// candidate without reloading the file each time. Models are cheap to
     /// bring back and the alternative — evicting one, re-planning, evicting
     /// another — pays the release wait once per model instead of once.
+    #[cfg(test)]
     fn evict_idle(&self, keep: &str, which: Evict) -> usize {
+        self.ask_unload(keep, which).len()
+    }
+
+    /// Evict as `evict_idle` does, then wait until every model asked to go
+    /// has gone: its thread deregisters only after its weights and context
+    /// have been dropped, so gone means its memory is back on the card.
+    ///
+    /// Watching free memory instead — "until it stops rising" — decided too
+    /// early: an evicted embedder gave its memory back in pieces with pauses
+    /// longer than a poll between them, the plan saw a card still ~1 GB
+    /// short, and the 4B loaded 29 of 33 blocks at 16 tok/s on an idle GPU.
+    fn evict_and_wait(&self, keep: &str, which: Evict) -> usize {
+        let asked = self.ask_unload(keep, which);
+        if !asked.is_empty() {
+            self.wait_gone(&asked);
+        }
+        asked.len()
+    }
+
+    fn wait_gone(&self, asked: &[(String, u64)]) {
+        let deadline = std::time::Instant::now() + RELEASE_WAIT;
+        let present = || {
+            let models = self.models.lock().unwrap_or_else(|e| e.into_inner());
+            asked.iter().any(|(key, id)| models.get(key).is_some_and(|e| e.id == *id))
+        };
+        while present() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("waited {RELEASE_WAIT:?} for evicted models to unload; loading anyway");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Freed synchronously with the context; a moment for the driver's
+        // count to catch up is all that is left.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    fn ask_unload(&self, keep: &str, which: Evict) -> Vec<(String, u64)> {
         let models = self.models.lock().unwrap_or_else(|e| e.into_inner());
         let now = now();
         let mut idle: Vec<(i64, &String, &Entry)> = models
@@ -363,53 +399,15 @@ impl Pool {
             .collect();
         idle.sort_by_key(|(at, _, _)| *at);
 
-        let mut asked = 0;
+        let mut asked = Vec::new();
         for (_, name, entry) in idle {
             tracing::info!("unloading {name} to make room");
             if entry.tx.send(Job::Unload).is_ok() {
-                asked += 1;
+                asked.push((name.clone(), entry.id));
             }
         }
         asked
     }
-}
-
-/// Wait for the driver to hand back memory an evicted model was holding.
-///
-/// Polls rather than sleeps a fixed time: on a small model the memory is back
-/// almost at once, and waiting ten seconds for it would make every eviction
-/// feel like a stall.
-fn wait_for_release() {
-    let Some(before) = free_vram() else {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        return;
-    };
-    let deadline = std::time::Instant::now() + RELEASE_WAIT;
-    let mut last = before;
-    let mut rose = false;
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let Some(now) = free_vram() else { return };
-        // Until it stops rising: a model's memory comes back in pieces —
-        // weights, then cache and scratch — and a plan made at the first rise
-        // saw only part of it.
-        if now > last + SETTLED {
-            rose = true;
-            last = now;
-        } else if rose {
-            return;
-        }
-    }
-    if !rose {
-        tracing::warn!("waited {RELEASE_WAIT:?} for evicted memory to come back; loading anyway");
-    }
-}
-
-/// Free memory rising by less than this between two readings has settled.
-const SETTLED: u64 = 16 << 20;
-
-fn free_vram() -> Option<u64> {
-    ozgent_llama::backend::best_gpu().map(|d| d.memory_free as u64)
 }
 
 fn now() -> i64 {
